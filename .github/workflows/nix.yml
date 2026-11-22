@@ -9,7 +9,7 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
   push:
-    branches: [main]
+    branches: [dev, main]
     paths:
       - ".github/workflows/nix.yml"
       # ci.yml produces two required contexts (`check (macos-15)`,
@@ -20,6 +20,9 @@ on:
       # raises the job budget is the one that can never be verified, and the
       # gate is silently dropped from the review of the next one.
       - ".github/workflows/ci.yml"
+      - ".github/workflows/ci-leg.yml"
+      # Shard placement and nextest group/ceiling changes affect the CI checks.
+      - ".config/**"
       - "assets/**"
       - "build.rs"
       - "Cargo.lock"
@@ -55,6 +58,9 @@ jobs:
   flake-check:
     name: flake check
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -62,11 +68,25 @@ jobs:
           persist-credentials: false
 
       - name: Install Nix
-        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31.11.3
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
             always-allow-substitutes = true
+
+      # Keep one dev cache per platform, replacing old input generations.
+      # GC is a size target: live roots cannot be collected by Nix.
+      - name: Restore Nix store
+        uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7.0.2
+        with:
+          primary-key: nix-v1-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**') }}
+          restore-prefixes-first-match: nix-v1-${{ runner.os }}-
+          save: ${{ github.ref == 'refs/heads/dev' }}
+          gc-max-store-size-linux: 2G
+          purge: ${{ github.ref == 'refs/heads/dev' }}
+          purge-prefixes: nix-v1-${{ runner.os }}-
+          purge-created: 0
+          purge-primary-key: never
 
       - name: Run Nix flake check
         run: |

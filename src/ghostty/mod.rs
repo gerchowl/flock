@@ -24,9 +24,17 @@ use std::slice;
 use std::sync::{Once, OnceLock};
 
 pub use bindings as ffi;
+mod tracked_selection;
+pub(crate) use tracked_selection::TrackedSelection;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Error(ffi::GhosttyResult);
+impl Error {
+    /// No surviving content exists for the requested selection anchor.
+    pub(crate) fn selection_unavailable() -> Self {
+        Self(ffi::GhosttyResult_GHOSTTY_NO_VALUE)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FormatterFormat {
@@ -555,6 +563,7 @@ pub fn encode_focus(event: FocusEvent) -> Result<Vec<u8>, Error> {
 pub struct Terminal {
     raw: ffi::GhosttyTerminal_ptr,
     write_pty_callback: Option<Box<WritePtyCallbackState>>,
+    selection_erases: tracked_selection::SelectionEraseTracker,
 }
 
 impl Terminal {
@@ -572,14 +581,29 @@ impl Terminal {
         Ok(Self {
             raw,
             write_pty_callback: None,
+            selection_erases: tracked_selection::SelectionEraseTracker::new(max_scrollback == 0),
         })
     }
 
     pub fn write(&mut self, bytes: &[u8]) {
+        self.selection_erases
+            .synchronize_screen(self.active_screen().ok());
+        let mut remaining = bytes;
+        while !remaining.is_empty() {
+            let consumed = self.selection_erases.write(remaining);
+            self.write_native(&remaining[..consumed]);
+            remaining = &remaining[consumed..];
+        }
+    }
+
+    /// Preserve native parser state between chunks and observe actual switches.
+    fn write_native(&mut self, bytes: &[u8]) {
         // SAFETY: self.raw is a live terminal handle for self's lifetime.
         unsafe {
             ffi::ghostty_terminal_vt_write(self.raw, bytes.as_ptr(), bytes.len());
         }
+        self.selection_erases
+            .synchronize_screen(self.active_screen().ok());
     }
 
     pub fn resize(
@@ -589,6 +613,9 @@ impl Terminal {
         cell_width_px: u32,
         cell_height_px: u32,
     ) -> Result<(), Error> {
+        // Native Screen.resize discards history only on its no-scrollback screen.
+        // Per-screen facts protect inactive alternate pins without vetoing primary.
+        self.selection_erases.resize();
         let cell_width_px = cell_width_px.max(1);
         let cell_height_px = cell_height_px.max(1);
         // SAFETY: self.raw is valid and sizes are plain values.
@@ -752,8 +779,23 @@ impl Terminal {
         grid_ref_graphemes(&grid_ref)
     }
 
+    pub fn screen_graphemes_and_style(
+        &self,
+        x: u16,
+        y: u32,
+    ) -> Result<(Vec<u32>, CellStyle), Error> {
+        self.graphemes_and_style(ghostty_screen_point(x, y))
+    }
+
     fn viewport_graphemes_and_style(&self, x: u16, y: u32) -> Result<(Vec<u32>, CellStyle), Error> {
-        let grid_ref = self.grid_ref(ghostty_viewport_point(x, y))?;
+        self.graphemes_and_style(ghostty_viewport_point(x, y))
+    }
+
+    fn graphemes_and_style(
+        &self,
+        point: ffi::GhosttyPoint,
+    ) -> Result<(Vec<u32>, CellStyle), Error> {
+        let grid_ref = self.grid_ref(point)?;
         let graphemes = grid_ref_graphemes(&grid_ref)?;
         let mut style = ffi::GhosttyStyle {
             size: mem::size_of::<ffi::GhosttyStyle>(),

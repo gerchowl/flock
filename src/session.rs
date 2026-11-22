@@ -23,17 +23,21 @@ pub struct SessionInfo {
     pub session_dir: String,
 }
 
-pub fn configure_from_args(args: &[String]) -> Result<Vec<String>, String> {
+/// Apply session options while preserving native bytes in all other arguments.
+/// Option values must be UTF-8; decoding command arguments happens after globals.
+pub fn configure_from_args<T: AsRef<std::ffi::OsStr> + Clone>(
+    args: &[T],
+) -> Result<Vec<T>, String> {
     let mut cleaned = Vec::with_capacity(args.len());
     if let Some(program) = args.first() {
         cleaned.push(program.clone());
     }
 
-    if args.get(1).map(String::as_str) == Some("session")
-        && args.get(2).map(String::as_str) == Some("attach")
+    if args.get(1).and_then(|arg| arg.as_ref().to_str()) == Some("session")
+        && args.get(2).and_then(|arg| arg.as_ref().to_str()) == Some("attach")
     {
         if matches!(
-            args.get(3).map(String::as_str),
+            args.get(3).and_then(|arg| arg.as_ref().to_str()),
             Some("help" | "--help" | "-h")
         ) {
             return Ok(args.to_vec());
@@ -44,7 +48,9 @@ pub fn configure_from_args(args: &[String]) -> Result<Vec<String>, String> {
         if args.len() != 4 {
             return Err("usage: flk session attach <name>".to_string());
         }
-        apply_explicit_name(name)?;
+        let name = crate::cli::argv::text_argument(3, name.as_ref().to_os_string())
+            .map_err(|err| err.to_string())?;
+        apply_explicit_name(&name)?;
         return Ok(cleaned);
     }
 
@@ -52,19 +58,23 @@ pub fn configure_from_args(args: &[String]) -> Result<Vec<String>, String> {
     let mut index = 1;
     while index < args.len() {
         let arg = &args[index];
-        if arg == "--" {
+        let text = arg.as_ref().to_str();
+        if text == Some("--") {
             cleaned.extend_from_slice(&args[index..]);
             break;
         }
-        if arg == "--session" {
+        if text == Some("--session") {
             let Some(value) = args.get(index + 1) else {
                 return Err("missing value for --session".to_string());
             };
-            requested_session = Some(value.clone());
+            requested_session = Some(
+                crate::cli::argv::text_argument(index + 1, value.as_ref().to_os_string())
+                    .map_err(|err| err.to_string())?,
+            );
             index += 2;
             continue;
         }
-        if let Some(value) = arg.strip_prefix("--session=") {
+        if let Some(value) = text.and_then(|arg| arg.strip_prefix("--session=")) {
             requested_session = Some(value.to_string());
             index += 1;
             continue;
@@ -128,18 +138,37 @@ pub fn restart_after_update_guidance(stop_command: &str, attach_command: Option<
 pub fn active_restart_after_update_guidance() -> String {
     if !explicit_session_requested() {
         if let Ok(socket_path) = std::env::var(crate::api::SOCKET_PATH_ENV_VAR) {
-            return restart_after_update_guidance(
-                &format!(
-                    "{}={} flk server stop",
-                    crate::api::SOCKET_PATH_ENV_VAR,
-                    socket_path
-                ),
-                None,
+            let prefix = format!("{}={socket_path} ", crate::api::SOCKET_PATH_ENV_VAR);
+            return format!(
+                "{}\n\n{}",
+                live_handoff_after_update_guidance(&format!("{prefix}flk server live-handoff")),
+                restart_after_update_guidance(&format!("{prefix}flk server stop"), None)
             );
         }
     }
 
-    restart_after_update_guidance(&local_stop_command(), Some(&local_attach_command()))
+    format!(
+        "{}\n\n{}",
+        live_handoff_after_update_guidance(&local_live_handoff_command()),
+        restart_after_update_guidance(&local_stop_command(), Some(&local_attach_command()))
+    )
+}
+
+pub fn local_live_handoff_command() -> String {
+    match active_name() {
+        Some(name) => format!("flk --session {name} server live-handoff"),
+        None => "flk server live-handoff".to_string(),
+    }
+}
+
+/// #958: the pane-preserving way onto the new version. A client from before
+/// #958 handed off to the old server's own binary, which on a versioned install
+/// (Nix) is the old version again, so the explicit `--import-exe` form is the
+/// one that works whichever client runs it.
+pub fn live_handoff_after_update_guidance(handoff_command: &str) -> String {
+    format!(
+        "Hand off to the new version and keep every pane:\nRun `{handoff_command}`.\nIf the server stays on the old version, run `{handoff_command} --import-exe \"$(readlink -f \"$(command -v flk)\")\"`."
+    )
 }
 
 pub fn explicit_session_requested() -> bool {
@@ -833,7 +862,7 @@ mod tests {
 
         assert_eq!(
             active_restart_after_update_guidance(),
-            "Stop the old server to use the new version.\nStopping exits pane processes.\nRun `FLOCK_SOCKET_PATH=/tmp/custom-flock.sock flk server stop`, then restart Flock with the same socket override."
+            "Hand off to the new version and keep every pane:\nRun `FLOCK_SOCKET_PATH=/tmp/custom-flock.sock flk server live-handoff`.\nIf the server stays on the old version, run `FLOCK_SOCKET_PATH=/tmp/custom-flock.sock flk server live-handoff --import-exe \"$(readlink -f \"$(command -v flk)\")\"`.\n\nStop the old server to use the new version.\nStopping exits pane processes.\nRun `FLOCK_SOCKET_PATH=/tmp/custom-flock.sock flk server stop`, then restart Flock with the same socket override."
         );
 
         std::env::remove_var(crate::api::SOCKET_PATH_ENV_VAR);

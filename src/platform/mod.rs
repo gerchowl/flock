@@ -3,6 +3,35 @@
 //! Centralizes OS-dependent behavior behind a clean boundary so core
 //! modules don't scatter `#[cfg]` branches through product logic.
 
+pub(crate) mod client_listener;
+#[cfg(feature = "web")]
+pub(crate) mod tailscale;
+mod url;
+pub use url::{open_url, validate_url, OpenUrlError};
+
+pub(crate) mod peer;
+pub(crate) mod process_exit;
+pub(crate) mod profile_bindings;
+pub(crate) mod received_fd;
+pub(crate) mod socket;
+pub(crate) mod socket_deadline;
+pub(crate) mod structured;
+pub(crate) mod suspend_clock;
+pub(crate) mod terminal_geometry;
+
+/// Identity shared by hard links and symlink aliases to one filesystem object.
+pub(crate) fn file_identity(metadata: &std::fs::Metadata) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    (metadata.dev(), metadata.ino())
+}
+
+/// A same-device observation is only a possible unmounted-mount hint, not proof.
+pub(crate) fn same_device_as_parent(path: &std::path::Path) -> Option<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let parent = path.parent()?;
+    Some(std::fs::metadata(path).ok()?.dev() == std::fs::metadata(parent).ok()?.dev())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForegroundProcess {
     pub pid: u32,
@@ -106,7 +135,11 @@ pub(crate) fn read_limited_reader(
     }
 }
 
+pub(crate) mod disk_space;
 pub(crate) mod ssh_agent;
+
+#[cfg(any(target_os = "linux", test))]
+pub(crate) mod machine_id;
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -163,6 +196,14 @@ impl PrefixInputSource for RealPrefixInputSource {
 
     fn restore(&mut self) {
         let _ = self.restore.take();
+    }
+}
+
+/// Kill a probe and its descendants sharing the probe's dedicated process group.
+pub(crate) fn kill_process_group(pgid: u32) {
+    if let Ok(pgid) = i32::try_from(pgid) {
+        // SAFETY: kill takes a numeric process group and does not access memory.
+        unsafe { libc::kill(-pgid, libc::SIGKILL) };
     }
 }
 
@@ -233,3 +274,12 @@ mod tests {
         );
     }
 }
+
+pub(crate) mod blobs;
+pub(crate) mod client_token_lock;
+pub(crate) mod client_tokens;
+
+#[cfg(test)]
+pub(crate) mod socket_test_support;
+
+pub(crate) mod file_lock;

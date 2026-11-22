@@ -24,6 +24,11 @@ use super::responses::{encode_error, encode_error_with_data, encode_success};
 /// caller-supplied identity would be a claim, and depth is exactly the thing a
 /// runaway caller would want to lie about.
 pub(in crate::app) enum SpawnCaller {
+    /// A pane-less lease owner; None is unresolved evidence, never operator authority.
+    Structured {
+        agent_id: Option<String>,
+        depth: u32,
+    },
     /// Ancestry attests a live pane that is running an agent. Whatever it
     /// asks for is agent-initiated, whichever verb it reached for.
     Agent {
@@ -108,7 +113,7 @@ impl SpawnCaller {
             SpawnCaller::Operator {
                 pane: Some((ws_idx, _)),
             } => Some(*ws_idx),
-            SpawnCaller::Operator { pane: None } => None,
+            SpawnCaller::Operator { pane: None } | SpawnCaller::Structured { .. } => None,
         }
     }
 }
@@ -123,6 +128,8 @@ impl SpawnCaller {
 pub(super) struct SpawnLineage {
     pub parent_agent_id: String,
     pub child_depth: u32,
+    /// PTY-only facts; the owner adds lease and pending identities atomically.
+    pub pty_census: SpawnCensus,
 }
 
 impl App {
@@ -158,6 +165,17 @@ impl App {
             );
         }
 
+        if params
+            .name
+            .as_deref()
+            .is_some_and(|name| crate::terminal::agent_name::validate(name).is_err())
+        {
+            return encode_error(
+                id,
+                crate::api::error_code::ErrorCode::InvalidAgentName.as_str(),
+                crate::terminal::agent_name::POLICY,
+            );
+        }
         let Some(kind) = AgentKind::parse(params.agent.trim()) else {
             return encode_error_with_data(
                 id,
@@ -201,6 +219,9 @@ impl App {
         // prevent, which is why fork's answer to the same class is the
         // opposite one.
         let caller = self.spawn_caller();
+        // This first check is an early policy refusal before location resolution
+        // and launch preparation. The shared structured funnel rechecks before
+        // owner-thread reservation, which is the atomic admission authority.
         let lineage = match self.admit_spawn(SpawnVerb::Spawn, &caller, None) {
             Ok(Some(lineage)) => lineage,
             Ok(None) => {
@@ -218,6 +239,26 @@ impl App {
                     refusal.message(),
                     refusal_data(&refusal),
                 );
+            }
+        };
+
+        if params.runtime == crate::api::schema::AgentRuntime::Structured && params.unattended {
+            return encode_error(
+                id,
+                "runtime_unsupported",
+                "structured spawn does not support unattended mode",
+            );
+        }
+
+        // #1179: an agent caller, so `route` unless it narrows to `deny`.
+        let questions = match Self::admit_questions(&caller, params.questions, params.unattended) {
+            Ok(questions) => questions,
+            Err(refused) => {
+                return encode_error(
+                    id,
+                    crate::app::questions::WideningRefused::CODE,
+                    refused.message(),
+                )
             }
         };
 
@@ -240,6 +281,78 @@ impl App {
         else {
             return encode_error(id, "internal_error", "resolved workspace has no cwd");
         };
+
+        if params.runtime == crate::api::schema::AgentRuntime::Structured {
+            if kind != AgentKind::Claude || params.focus || params.questions.is_some() {
+                return encode_error(
+                    id,
+                    "runtime_unsupported",
+                    "unsupported structured spawn options",
+                );
+            }
+            let name = params
+                .name
+                .unwrap_or_else(crate::app::worktrees::generated_fork_run_id);
+            if name == "self" {
+                return encode_error(id, "invalid_agent_name", "self is a reserved agent target");
+            }
+            match self.structured_target(&name) {
+                Ok(None) => {}
+                Ok(Some((agent, _))) => {
+                    let code =
+                        if self
+                            .state
+                            .structured_agents
+                            .get(&agent)
+                            .is_some_and(|(_, p, _)| {
+                                p.update.state.lifecycle
+                                    == crate::api::agent_state::Lifecycle::Unknown
+                            })
+                        {
+                            crate::api::error_code::ErrorCode::StructuredRecoveryRequired
+                        } else {
+                            crate::api::error_code::ErrorCode::AgentNameTaken
+                        };
+                    return encode_error(id, code.as_str(), "MCP spawn requires a fresh identity");
+                }
+                Err(code) => {
+                    return encode_error(id, code.as_str(), "structured name is ambiguous")
+                }
+            }
+            let start = crate::api::schema::AgentStartParams {
+                runtime: params.runtime,
+                model: params.model,
+                name,
+                cwd: Some(cwd.to_string_lossy().into_owned()),
+                argv: vec!["claude".into()],
+                dry_run: false,
+                workspace_id: None,
+                tab_id: None,
+                split: None,
+                active: false,
+                here: false,
+                focus: false,
+                label: None,
+                questions: None,
+                unattended: false,
+            };
+            return match self.start_structured_request(
+                start,
+                &caller,
+                SpawnVerb::Spawn,
+                Some(prompt),
+            ) {
+                Ok(result) => encode_success(id, result),
+                Err(code) => encode_error(id, code.as_str(), "structured spawn refused"),
+            };
+        }
+        if params.model.is_some() {
+            return encode_error(
+                id,
+                "runtime_unsupported",
+                "--model requires structured runtime",
+            );
+        }
 
         // #359: the child is exec'd from argv with no shell in between, so the
         // agent profile the REQUESTER is on has to be carried explicitly or the
@@ -278,8 +391,10 @@ impl App {
         // Armed after the allowlist, and dropped with it: the profile the
         // requester runs under is handed down deliberately, and the server
         // never had it to allow through in the first place.
-        let _spawn_env_guard = crate::integration::set_pending_spawn_env(spawn_env);
+        let _spawn_env_guard = crate::integration::set_pending_spawn_env(spawn_env.clone());
+        let _questions_guard = crate::integration::set_pending_questions(questions);
 
+        self.pretrust_claude_worktree(&argv, &cwd, &spawn_env);
         let (rows, cols) = self.state.estimate_pane_size();
         let spawned = self.spawn_agent_workspace(cwd, rows, cols, &argv, params.focus);
         let (ws_idx, pane_id) = match spawned {
@@ -294,6 +409,14 @@ impl App {
                 );
             }
         };
+
+        if let Some(terminal) = self.state.workspaces[ws_idx]
+            .terminal_id(pane_id)
+            .and_then(|id| self.state.terminals.get_mut(id))
+        {
+            terminal.launch_env = spawn_env;
+            terminal.questions = questions;
+        }
 
         // Stamp the child's lineage BEFORE anything can read it. The run id
         // is what its commits will carry; depth and parent are what the
@@ -312,20 +435,34 @@ impl App {
             .map(str::trim)
             .filter(|n| !n.is_empty())
         {
-            self.set_spawned_agent_name(ws_idx, pane_id, name);
+            if self.set_spawned_agent_name(ws_idx, pane_id, name).is_err() {
+                return encode_error(
+                    id,
+                    crate::api::error_code::ErrorCode::InvalidAgentName.as_str(),
+                    crate::terminal::agent_name::POLICY,
+                );
+            }
         }
 
         let Some(agent) = self.agent_info(ws_idx, pane_id) else {
             return encode_error(id, "internal_error", "spawned pane is not an agent");
         };
+        self.record_delegation(
+            &caller,
+            crate::api::schema::DelegationVia::Spawn,
+            ws_idx,
+            pane_id,
+            None,
+        );
         encode_success(id, ResponseResult::AgentSpawned { run_id, agent })
     }
 
     /// Classify the caller of a spawn-shaped request (#349).
     ///
     /// An AGENT is a caller whose process ancestry lands in a live pane that
-    /// is running one. Anything else — a shell pane, an operator's terminal
-    /// outside flock, a caller ancestry cannot place at all — is the operator,
+    /// is running one. Dedicated and unknown socket UIDs cannot be operators.
+    /// For the operator UID, a shell pane or an operator's terminal
+    /// outside flock is the operator,
     /// because none of them is an agent whose children the ceiling is counting.
     ///
     /// The pane the ancestry landed in rides along (#398) rather than being
@@ -334,6 +471,35 @@ impl App {
     /// one answer — a second classification over the same evidence is the
     /// drift #124 / #197 / #199-#210 are.
     pub(in crate::app) fn spawn_caller(&mut self) -> SpawnCaller {
+        // Neither pending nor enrolled relay processes carry local operator authority.
+        if self
+            .inbound
+            .edge(
+                self.current_api_peer_pid,
+                crate::platform::process_start_time,
+            )
+            .is_some()
+        {
+            return SpawnCaller::Structured {
+                agent_id: None,
+                depth: 0,
+            };
+        }
+        match self.lease_caller() {
+            crate::structured::lease::Caller::Agent { agent, depth } => {
+                return SpawnCaller::Structured {
+                    agent_id: Some(agent),
+                    depth,
+                };
+            }
+            crate::structured::lease::Caller::Uncertain => {
+                return SpawnCaller::Structured {
+                    agent_id: None,
+                    depth: 0,
+                };
+            }
+            crate::structured::lease::Caller::Unrelated => (),
+        }
         let peer_pane = self.parse_pane_id_or_peer("", self.current_api_peer_pid);
         let Some((ws_idx, pane_id)) = peer_pane else {
             return SpawnCaller::Operator { pane: None };
@@ -353,6 +519,16 @@ impl App {
                 pane_id,
                 agent_id,
             },
+            None if self.current_api_peer_uid.is_some_and(|uid| {
+                self.runtime_config.uid_policy.classify(uid)
+                    == crate::structured::identity::Principal::Agent
+            }) =>
+            {
+                SpawnCaller::Structured {
+                    agent_id: None,
+                    depth: 0,
+                }
+            }
             None => SpawnCaller::Operator {
                 pane: Some((ws_idx, pane_id)),
             },
@@ -382,15 +558,45 @@ impl App {
         caller: &SpawnCaller,
         inherits_depth_from: Option<(usize, crate::layout::PaneId)>,
     ) -> Result<Option<SpawnLineage>, SpawnRefusal> {
-        let SpawnCaller::Agent {
-            ws_idx,
-            pane_id,
-            agent_id,
-        } = caller
-        else {
-            return Ok(None);
+        let (mut census, agent_id) = match caller {
+            SpawnCaller::Agent {
+                ws_idx,
+                pane_id,
+                agent_id,
+            } => (self.spawn_census(*ws_idx, *pane_id), agent_id),
+            SpawnCaller::Structured {
+                agent_id: Some(agent_id),
+                depth,
+            } => (
+                SpawnCensus {
+                    live_agent_started: self
+                        .state
+                        .terminals
+                        .values()
+                        .filter(|t| t.spawned_by.is_some())
+                        .count(),
+                    parent_live_children: self
+                        .state
+                        .terminals
+                        .values()
+                        .filter(|t| t.spawned_by.as_deref() == Some(agent_id))
+                        .count(),
+                    child_depth: depth.saturating_add(1),
+                },
+                agent_id,
+            ),
+            SpawnCaller::Structured { agent_id: None, .. } => {
+                return Err(SpawnRefusal::CallerUnknown)
+            }
+            SpawnCaller::Operator { .. } => return Ok(None),
         };
-        let mut census = self.spawn_census(*ws_idx, *pane_id);
+        let pty_census = census;
+        let (leased, children) = self
+            .structured_workers
+            .counts(&self.session_leases, agent_id)
+            .map_err(|_| SpawnRefusal::RegistryBusy)?;
+        census.live_agent_started += leased;
+        census.parent_live_children += children;
         if let Some((ws_idx, pane_id)) = inherits_depth_from {
             census.child_depth = census
                 .child_depth
@@ -405,6 +611,10 @@ impl App {
         Ok(Some(SpawnLineage {
             parent_agent_id: agent_id.clone(),
             child_depth: census.child_depth,
+            pty_census: SpawnCensus {
+                child_depth: census.child_depth,
+                ..pty_census
+            },
         }))
     }
 
@@ -485,7 +695,7 @@ impl App {
         ws_idx: usize,
         pane_id: crate::layout::PaneId,
         name: &str,
-    ) {
+    ) -> Result<(), crate::api::error_code::ErrorCode> {
         let terminal_id = self
             .state
             .workspaces
@@ -493,8 +703,9 @@ impl App {
             .and_then(|ws| ws.pane_state(pane_id))
             .map(|pane| pane.attached_terminal_id.clone());
         if let Some(terminal) = terminal_id.and_then(|tid| self.state.terminals.get_mut(&tid)) {
-            terminal.set_agent_name(name.to_string());
+            terminal.set_agent_name(name.to_string())?;
         }
+        Ok(())
     }
 
     /// Resolve a [`SpawnLocation`] to an OPEN workspace index.
@@ -543,7 +754,10 @@ pub(super) fn refusal_data(refusal: &SpawnRefusal) -> serde_json::Value {
                 map.insert("env_value".into(), value.clone().into());
             }
         }
-        SpawnRefusal::FleetPaused | SpawnRefusal::NotEnabled => {}
+        SpawnRefusal::RegistryBusy
+        | SpawnRefusal::FleetPaused
+        | SpawnRefusal::NotEnabled
+        | SpawnRefusal::CallerUnknown => {}
     }
     data
 }
@@ -560,6 +774,8 @@ mod tests {
         Request {
             id: "req".into(),
             method: Method::AgentSpawn(AgentSpawnParams {
+                runtime: crate::api::schema::AgentRuntime::Pty,
+                model: None,
                 agent: agent.into(),
                 prompt: prompt.into(),
                 location: SpawnLocation::WorktreePath {
@@ -567,13 +783,13 @@ mod tests {
                 },
                 name: None,
                 focus: false,
+                questions: None,
+                unattended: false,
             }),
         }
     }
 
-    /// Make workspace 0's focused pane look like a live agent the API peer is
-    /// running inside: an agent terminal, with this test process standing in
-    /// for the pane's child so the ancestry walk lands on it.
+    /// Give workspace 0 an owned live agent pane and make its child the API peer.
     fn caller_pane_is_an_agent(app: &mut crate::app::App) -> (crate::layout::PaneId, String) {
         let pane_id = app.state.workspaces[0]
             .focused_pane_id()
@@ -586,8 +802,7 @@ mod tests {
         let terminal = app.state.terminals.get_mut(&terminal_id).expect("terminal");
         terminal.launch_argv = Some(vec!["claude".into()]);
         let agent_id = terminal.agent_id.to_string();
-        app.test_pane_child_pids.insert(pane_id, std::process::id());
-        app.current_api_peer_pid = Some(std::process::id());
+        crate::test_support::attest_pane_caller(app, pane_id);
         (pane_id, agent_id)
     }
 
@@ -611,6 +826,30 @@ mod tests {
             rx,
             crate::api::EventHub::default(),
         )
+    }
+
+    /// PTY attribution stays intact when both structured census copies are busy.
+    #[tokio::test]
+    async fn pty_admit_spawn_maps_registry_contention_to_retryable_session_busy() {
+        let mut app = app_with_one_pane();
+        let (pane_id, agent_id) = caller_pane_is_an_agent(&mut app);
+        let caller = super::SpawnCaller::Agent {
+            ws_idx: 0,
+            pane_id,
+            agent_id,
+        };
+        let (release, holder) = app.session_leases.test_hold_census();
+        let result = app.admit_spawn(crate::spawn::SpawnVerb::Fork, &caller, None);
+        let released = release.send(());
+        holder.join().unwrap();
+        released.unwrap();
+        let refusal = result.expect_err("census contention must refuse without waiting");
+        assert_eq!(refusal, crate::spawn::SpawnRefusal::RegistryBusy);
+        assert_eq!(refusal.code(), "session_busy");
+        assert!(refusal.retryable());
+        let data = super::refusal_data(&refusal);
+        assert_eq!(data["refusal"], "session_busy");
+        assert_eq!(data["retryable"], true);
     }
 
     /// Off by default. Exposing a spawn verb to agents is the same
@@ -643,6 +882,82 @@ mod tests {
             serde_json::json!(["claude", "opencode"]),
             "the refusal must name what IS accepted"
         );
+    }
+
+    /// #959: a spawn is always agent-initiated, so it always records the
+    /// edge, with the caller as architect and `via: spawn`.
+    #[tokio::test]
+    async fn an_agent_spawn_records_the_delegation_edge() {
+        // A stub `opencode` on PATH: nextest runs each test in its own
+        // process, so the PATH change stays here. opencode rather than claude
+        // because it carries no profile selector, so the #359 carry has no
+        // requester environment to read, which macOS does not hand over for
+        // this test process.
+        let bin_dir =
+            std::env::temp_dir().join(format!("flock-spawn-edge-bin-{}", std::process::id()));
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let stub = bin_dir.join("opencode");
+        std::fs::write(&stub, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let path = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", format!("{}:{path}", bin_dir.display()));
+
+        let mut app = app_with_one_pane();
+        app.state.config.fleet.agent_spawn_enabled = true;
+        let (_pane, architect) = caller_pane_is_an_agent(&mut app);
+        let response = app.handle_api_request(Request {
+            id: "req".into(),
+            method: Method::AgentSpawn(AgentSpawnParams {
+                runtime: crate::api::schema::AgentRuntime::Pty,
+                model: None,
+                agent: "opencode".into(),
+                prompt: "review #42".into(),
+                location: SpawnLocation::WorkspaceId {
+                    workspace_id: app.public_workspace_id(0),
+                },
+                name: None,
+                focus: false,
+                questions: None,
+                unattended: false,
+            }),
+        });
+        let value: serde_json::Value = serde_json::from_str(&response).expect("json");
+        let delegate = value["result"]["agent"]["agent_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("spawn must succeed: {response}"))
+            .to_string();
+
+        let edges: Vec<_> = app
+            .event_hub
+            .ring_snapshot_after(0)
+            .into_iter()
+            .filter_map(|(_, event)| match event.data {
+                crate::api::schema::EventData::AgentDelegated {
+                    architect,
+                    delegate,
+                    via,
+                    ..
+                } => Some((architect, delegate, via)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            edges,
+            [(
+                architect,
+                delegate,
+                crate::api::schema::DelegationVia::Spawn
+            )]
+        );
+
+        let runtimes: Vec<_> = app.terminal_runtimes.drain().collect();
+        for (_terminal_id, runtime) in runtimes {
+            runtime.shutdown();
+        }
+        let _ = std::fs::remove_dir_all(bin_dir);
     }
 
     /// Without an attested caller the ceiling cannot bound depth or fanout,
@@ -697,7 +1012,9 @@ mod tests {
                 assert_eq!(resolved, pane_id);
                 assert_eq!(resolved_id, agent_id);
             }
-            super::SpawnCaller::Operator { .. } => panic!("an agent pane must attest as an agent"),
+            super::SpawnCaller::Operator { .. } | super::SpawnCaller::Structured { .. } => {
+                panic!("an agent pane must attest as an agent")
+            }
         }
     }
 
@@ -726,8 +1043,7 @@ mod tests {
         let pane_id = app.state.workspaces[0]
             .focused_pane_id()
             .expect("workspace has a pane");
-        app.test_pane_child_pids.insert(pane_id, std::process::id());
-        app.current_api_peer_pid = Some(std::process::id());
+        crate::test_support::attest_pane_caller(&mut app, pane_id);
         let in_pane = app.spawn_caller();
         assert!(
             matches!(in_pane, super::SpawnCaller::Operator { pane: Some((0, _)) }),

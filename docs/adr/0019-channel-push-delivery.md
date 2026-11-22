@@ -258,3 +258,13 @@ leave research preview. That no-go is **still in force**, and it is the reason
 `[msg] channel_push` ships default-off. Nothing in this ADR's `Accepted` status
 touches it: acceptance settled *whether to build the opt-in layer*, not *whether
 to turn it on for everyone*.
+
+## Mesh amendment (v1.0.0)
+
+See [ADR-0026](0026-mesh-fleet-transport.md), implemented by #623 and #661.
+
+Channel push remains a notification over the authoritative inbox. ADR-0026
+supersedes the handed-up reply settlement rule: an original settles when its
+reply or deferral is durably accepted into custody, without claiming remote
+delivery or read. Import deduplication uses the minted message key, not a
+correlation label.

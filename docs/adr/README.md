@@ -35,6 +35,40 @@ can be exempted in `guardrails-adr-exempt.txt`.
 | [0023](0023-decisions-and-agent-filing.md) | A decision is a record with an answer, and an agent may raise one | Accepted |
 | [0024](0024-accept-the-implemented-proposed-adrs.md) | The eleven implemented `Proposed` ADRs are decided; what each acceptance does and does not assert | Accepted |
 | [0025](0025-version-identity-and-release-automation.md) | Version identity: this project restarts its version line, and the deterministic `just release` path stays | Accepted |
+| [0026](0026-mesh-fleet-transport.md) | Mesh fleet transport and durable message custody (implemented: v1.0.0, #623 / #661) | Accepted |
+| [0027](0027-architect-delegate-tracking.md) | An architect's delegates are a server-held edge, and everything else is a projection of it | Proposed |
+| [0028](0028-agent-observation-events-and-waiting.md) | An agent's state has one cross-harness vocabulary, supervisors read it as a resumable event stream, and waiting is a registered wait that the server wakes | Accepted |
+| [0029](0029-agent-facing-cli-contract.md) | The agent-facing CLI keeps one contract: a send submits and says whether it did, one exit-code table, selectable output, stable JSON errors | Accepted |
+| [0030](0030-goal-supervision-built-for-waiting.md) | Goal supervision decides most stops without a judge: parked is silent, the judge is a bounded last step, the goal survives compaction | Accepted |
+| [0031](0031-goal-state-storage.md) | Goal state is a fold over the durable event log, held in memory, folded once per start and re-issued on every rotation | Proposed |
+| [0032](0032-compiled-agent-context.md) | An agent's starting context is compiled in five layers, most stable first, and the stable layers ride the harness's cached system prompt | Accepted |
+| [0033](0033-forked-ax-reviews-and-brief-template.md) | Agent-experience reviews are answered by a fork of the warm agent against a versioned rubric, recorded as events, filed only after a search; briefs put acceptance and size first | Accepted |
+| [0034](0034-harness-hooks-and-question-routing.md) | Delegates never ask the human: flk owns one policy point per harness hook (including the shell command gate and mid-turn notices), a delegate's question becomes a structured question to its architect, only the root reaches the operator | Accepted |
+| [0035](0035-resident-repo-owner.md) | A repo has one resident owner: a hibernated agent that flk wakes on events it has not handled, that triages before it accepts, delegates through edges, and talks to other owners through mail | Accepted |
+| [0036](0036-structured-agent-sessions.md) | An agent can run as a structured session: flk owns its process and its one input queue, translates its typed event stream into flk's state, questions and waits, serves every frontend one wire contract, and forks it at any message boundary | Accepted |
+| [0037](0037-test-wait-liveness-and-hang-ceilings.md) | Condition waits fail on dead, unexpected or silent producers, with measured nextest termination ceilings for every binary | Accepted (2026-10-14) |
+| [0038](0038-gui-workbench.md) | The GUI is a tiled workbench over one wire: a client that holds only presentation state, artifacts in opaque-origin sandboxes with feedback through questions, and goals and work as records on the same log | Accepted 2026-10-29; [artifact amendment](0038-gui/artifact-contract.md) |
+| [0039](0039-vigil-telemetry-integration.md) | flk's logs, metrics and traces go through vig-os/vigil as per-role OTLP/JSON Lines files, carry ids and never content, and are read back only by the flk server | Proposed |
+| [0040](0040-content-anchored-selection.md) | Pane selections retain content identity through scrolling and reflow, re-read surviving rows at copy, and visibly refuse evicted content | Accepted |
+| [0041](0041-configuration-v2.md) | Configuration v2: 12-factor precedence and a typed, scoped config API | Accepted |
+| [0042](0042-complete-scoped-configuration.md) | Typed configuration across files, env, scopes and clients | Accepted |
+| [0043](0043-multi-node-gui-access.md) | Multi-node GUI access through a TLS home server and the mesh | Accepted |
+| [0044](0044-structured-lifecycle-and-hibernation.md) | Durable structured lifecycle and idle hibernation | Accepted |
+| [0045](0045-durable-work-and-supervision-loops.md) | Durable work records and server-owned supervision loops: acknowledged persistence, at-least-once wakes, explicit handling and goal/work projection | Accepted |
+| [0046](0046-slatedb-not-now.md) | Do not adopt SlateDB now: per-store verdicts and revisit triggers | Accepted |
+| [0047](0047-tailnet-origin-for-the-gui-client-listener.md) | The GUI client listener may admit one opt-in tailnet origin behind a verified `tailscale serve` HTTPS proxy, with a required identity allow-list, audience-bound one-time codes and a separately revocable bearer; VM-guest fronting is unsupported | Accepted |
+| [0048](0048-gui-object-model-and-work-first-home.md) | The GUI is mission control for delegated work: six server-projected objects (Project, Work, Agent, Question, Artifact, Run), a work-first home, one ranked attention queue, claim versus verified, the composer as the input queue, and a subject-anchored workbench | Accepted |
+| [0049](0049-agent-types-workflows-and-one-authority-model.md) | Agent types and workflows are versioned declarative definitions adopted by hash, run by a closed executable vocabulary with durable, reconciled effects; permission decisions are operator authority, delegated to architects only by scoped, revocable, audited grants | Accepted |
+| [0050](0050-keyboard-first-command-model.md) | A keyboard-first GUI: one command model, configurable bindings, hints and smart next | Proposed |
+| [0051](0051-durable-writes-off-the-server-loop.md) | Durable writes leave the server loop through bounded, ordered owners | Accepted |
+| [0052](0052-structured-harness-profiles.md) | Structured harness profiles separate operator authority, immutable assets and session storage | Accepted |
+
+ADR-0026 supersedes the affected transport, reply, deferral and deduplication
+contracts in ADR-0006, ADR-0008, ADR-0009, ADR-0018 and ADR-0019. Their other
+decisions remain accepted; each carries a mesh amendment cross-reference.
+
+ADR-0041 supersedes ADR-0002's env-below-file precedence and resolved
+question 1. ADR-0002's remaining decisions stay accepted.
 
 ## Conventions
 

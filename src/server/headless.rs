@@ -70,6 +70,7 @@ use std::fs;
 /// Events that the headless server event loop can process.
 enum LoopEvent {
     Timer,
+    InputWrites,
     Internal(AppEvent),
     Api(api::ApiRequestMessage),
     ServerEvent(ServerEvent),
@@ -211,9 +212,15 @@ pub struct HeadlessServer {
     app: app::App,
     api_tx: Option<api::ApiRequestSender>,
     api_server: Option<api::ServerHandle>,
+    /// Logical-server health survives API socket replacement during handoff rollback.
+    client_wire_health: crate::api::client_listener::Health,
     client_listener: UnixListener,
+    /// Bound structured listener and acceptor lifetime, including handoff preparation.
+    #[cfg(feature = "web")]
+    client_wire: Option<crate::web::client_listener::Listener>,
     client_socket_path: PathBuf,
     client_socket_identity: SocketFileIdentity,
+    client_socket_owner: crate::ipc::SocketOwner,
     clients: HashMap<u64, ClientConnection>,
     next_client_id: u64,
     /// The client currently driving the shared pane runtime size, theme, and input keybindings.
@@ -248,7 +255,13 @@ pub struct HeadlessServer {
     shutting_down: bool,
     /// Flag set while exporting live PTYs to a replacement server.
     handoff_in_progress: bool,
-    /// Imported panes get one app-safe resize nudge after the first client attaches.
+    // True only after the replacement owns the committed handoff.
+    handoff_completed: bool,
+    /// Panes whose pending input the current `--skip-undrained` handoff has
+    /// dropped. Reported with the outcome even when a later step fails.
+    handoff_skipped_undrained: Vec<api::schema::UndrainedPane>,
+    /// Imported panes get a resize nudge at import and another after the
+    /// first client attaches.
     pending_handoff_repaint_nudge: bool,
     /// Flag set by Ctrl+C or `server stop` signal.
     should_quit: Arc<AtomicBool>,
@@ -343,7 +356,212 @@ fn apply_terminal_attach_input(
 #[derive(Debug)]
 enum HandoffError {
     SessionBroken,
+    /// One or more panes' queued input did not drain before the deadline
+    /// (#981, #1011). Named, so the operator can close those panes or rerun
+    /// with `--skip-undrained` rather than lose every pane to a restart.
+    Undrained(Vec<api::schema::UndrainedPane>),
     Failed(io::Error),
+}
+
+/// The operator-facing text of a [`HandoffError::Undrained`] refusal.
+fn undrained_handoff_message(panes: &[api::schema::UndrainedPane]) -> String {
+    let listed = panes
+        .iter()
+        .map(describe_undrained_pane)
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!(
+        "timed out draining PTY writes before handoff: {listed}. \
+         Close those panes and retry, or rerun with --skip-undrained to hand off \
+         anyway and drop their pending input."
+    )
+}
+
+/// Orders `wX:pN` ids by their numbers (`w2` before `wA`, the tenth), not
+/// as strings. Ids that do not parse sort after, by text.
+fn public_pane_sort_key(pane_id: &str) -> (usize, usize, String) {
+    let (workspace, pane) = pane_id
+        .split_once(':')
+        .and_then(|(workspace, pane)| {
+            Some((
+                crate::workspace::public_workspace_number(workspace)?,
+                crate::workspace::decode_public_number(pane.strip_prefix('p')?)?,
+            ))
+        })
+        .unwrap_or((usize::MAX, usize::MAX));
+    (workspace, pane, pane_id.to_string())
+}
+
+/// Retain the failed handoff step and its typed cause through rollback diagnostics.
+#[derive(Debug)]
+struct HandoffRollbackError {
+    context: &'static str,
+    cause: io::Error,
+    restore_error: Option<io::Error>,
+}
+
+impl std::fmt::Display for HandoffRollbackError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}{}", self.context, self.cause)?;
+        if let Some(err) = &self.restore_error {
+            write!(f, "; old server could not restore public sockets: {err}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for HandoffRollbackError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.cause)
+    }
+}
+
+fn handoff_ready_error(cause: io::Error, restore_error: Option<io::Error>) -> io::Error {
+    io::Error::new(
+        cause.kind(),
+        HandoffRollbackError {
+            context: "handoff replacement server did not become ready: ",
+            cause,
+            restore_error,
+        },
+    )
+}
+
+/// Leaf operations for the production commit-recovery closure.
+trait HandoffCommitRecovery {
+    fn cleanup_importer(&mut self);
+    fn restore_public_sockets(&mut self) -> io::Result<()>;
+    fn rollback(&mut self);
+}
+
+/// Share the production order so rollback also runs when restoration fails.
+fn commit_recovery(
+    recovery: &mut impl HandoffCommitRecovery,
+) -> impl FnOnce() -> io::Result<()> + '_ {
+    || {
+        recovery.cleanup_importer();
+        let restore_result = recovery.restore_public_sockets();
+        recovery.rollback();
+        restore_result
+    }
+}
+
+struct ServerCommitRecovery<'a> {
+    server: &'a mut HeadlessServer,
+    importer: &'a mut std::process::Child,
+    socket_path: &'a Path,
+    paused_terminal_ids: &'a [crate::terminal::TerminalId],
+}
+
+impl HandoffCommitRecovery for ServerCommitRecovery<'_> {
+    fn cleanup_importer(&mut self) {
+        crate::server::handoff::cleanup_failed_import_child(self.importer);
+    }
+
+    fn restore_public_sockets(&mut self) -> io::Result<()> {
+        self.server
+            .wait_then_restore_public_sockets_after_failed_handoff()
+    }
+
+    fn rollback(&mut self) {
+        self.server
+            .rollback_handoff_before_commit(self.socket_path, self.paused_terminal_ids);
+    }
+}
+
+/// Finish commit or recover the old server, preserving both failure diagnostics.
+fn finish_handoff_commit(
+    commit_result: io::Result<()>,
+    recover: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
+    match commit_result {
+        Ok(()) => Ok(()),
+        Err(err) => match recover() {
+            Ok(()) => Err(err),
+            Err(restore_err) => Err(io::Error::new(
+                err.kind(),
+                HandoffRollbackError {
+                    context: "handoff replacement server was ready, but commit failed: ",
+                    cause: err,
+                    restore_error: Some(restore_err),
+                },
+            )),
+        },
+    }
+}
+
+/// Preserve typed I/O and importer-refusal evidence in ADR-0029 §4 error data.
+/// `error.data.kind` is `import_refused`, `broken_pipe`, `connection_reset`,
+/// `invalid_input`, or `other`. It describes the cause, not the ownership stage.
+fn failed_handoff_response(
+    id: String,
+    err: &io::Error,
+    dropped: &[api::schema::UndrainedPane],
+) -> String {
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    let mut import_refused = false;
+    while let Some(error) = cause {
+        if error.is::<crate::server::handoff::ImportRefusal>() {
+            import_refused = true;
+            break;
+        }
+        // io::Error::source skips its payload itself, which may be the refusal.
+        cause = if let Some(io_error) = error.downcast_ref::<io::Error>() {
+            io_error
+                .get_ref()
+                .map(|inner| inner as &dyn std::error::Error)
+        } else {
+            error.source()
+        };
+    }
+    let kind = if import_refused {
+        "import_refused"
+    } else {
+        match err.kind() {
+            io::ErrorKind::BrokenPipe => "broken_pipe",
+            io::ErrorKind::ConnectionReset => "connection_reset",
+            io::ErrorKind::InvalidInput => "invalid_input",
+            _ => "other",
+        }
+    };
+    crate::app::encode_error_with_data(
+        id,
+        super::executable::error_code(err)
+            .unwrap_or(api::error_code::ErrorCode::HandoffFailed)
+            .as_str(),
+        failed_handoff_message(err, dropped),
+        serde_json::json!({"kind": kind}),
+    )
+}
+
+/// A failed handoff's message, naming any pane whose input `--skip-undrained`
+/// had already dropped before the failure: that input is gone even though
+/// the old server keeps running.
+fn failed_handoff_message(err: &io::Error, dropped: &[api::schema::UndrainedPane]) -> String {
+    if dropped.is_empty() {
+        return err.to_string();
+    }
+    let listed = dropped
+        .iter()
+        .map(describe_undrained_pane)
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!("{err}; --skip-undrained had already dropped pending input: {listed}")
+}
+
+fn describe_undrained_pane(pane: &api::schema::UndrainedPane) -> String {
+    let mut text = format!("{} ({} bytes pending", pane.pane_id, pane.pending_bytes);
+    if pane.writer_stuck {
+        text.push_str(", writer accepts zero bytes");
+    }
+    if let Some(pid) = pane.pid {
+        text.push_str(&format!(", pid {pid}"));
+    }
+    if let Some(title) = pane.title.as_deref().filter(|title| !title.is_empty()) {
+        text.push_str(&format!(", \"{title}\""));
+    }
+    text.push(')');
+    text
 }
 
 impl From<io::Error> for HandoffError {
@@ -365,8 +583,28 @@ impl HeadlessServer {
         api_tx: Option<api::ApiRequestSender>,
         api_server: Option<api::ServerHandle>,
     ) -> io::Result<Self> {
+        Self::new_owned(app, config_diagnostics, api_tx, api_server, None)
+    }
+
+    /// Import or restore under the existing socket ownership description.
+    fn new_owned(
+        mut app: app::App,
+        config_diagnostics: &[String],
+        api_tx: Option<api::ApiRequestSender>,
+        api_server: Option<api::ServerHandle>,
+        inherited: Option<crate::ipc::SocketOwner>,
+    ) -> io::Result<Self> {
+        app.state.app_client_attached = false;
+        app.initialize_mesh_mail(api_server.as_ref())
+            .map_err(io::Error::other)?;
         let client_path = client_socket_path();
-        prepare_socket_path(&client_path)?;
+        let client_socket_owner = match inherited {
+            Some(owner) => {
+                owner.prepare(&client_path)?;
+                owner
+            }
+            None => prepare_socket_path(&client_path)?,
+        };
 
         let listener = UnixListener::bind(&client_path)?;
         restrict_socket_permissions(&client_path)?;
@@ -384,13 +622,21 @@ impl HeadlessServer {
         let (server_config_diagnostic, server_config_diagnostic_without_keybindings) =
             server_config_diagnostic_summaries(config_diagnostics);
 
+        let client_wire_health = api_server
+            .as_ref()
+            .map(|server| server.client_listener.clone())
+            .unwrap_or_default();
         Ok(Self {
             app,
             api_tx,
             api_server,
+            client_wire_health,
             client_listener: listener,
+            #[cfg(feature = "web")]
+            client_wire: None,
             client_socket_path: client_path,
             client_socket_identity,
+            client_socket_owner,
             clients: HashMap::new(),
             next_client_id: 1,
             foreground_client_id: None,
@@ -404,6 +650,8 @@ impl HeadlessServer {
             last_client_size: None,
             shutting_down: false,
             handoff_in_progress: false,
+            handoff_completed: false,
+            handoff_skipped_undrained: Vec::new(),
             pending_handoff_repaint_nudge: false,
             should_quit,
             server_event_rx,
@@ -422,6 +670,59 @@ impl HeadlessServer {
     /// - Handles scheduled tasks (resize poll, animation, session save, etc.)
     /// - Renders virtually and streams frames to clients
     pub async fn run(&mut self) -> io::Result<()> {
+        #[cfg(feature = "web")]
+        {
+            if let Some(wire) = &mut self.client_wire {
+                wire.activate();
+            }
+        }
+        let result = self.run_loop().await;
+        #[cfg(feature = "web")]
+        if let Some(wire) = self.client_wire.take() {
+            return crate::web::client_listener::finish_shutdown(result, wire.shutdown().await);
+        }
+        result
+    }
+    /// Prepare while rollback is still possible; activation belongs to the run loop.
+    #[cfg(feature = "web")]
+    async fn prepare_client_wire(
+        &mut self,
+        inherited: Option<std::net::TcpListener>,
+        local_owner: Option<crate::ipc::SocketOwner>,
+        deferred: bool,
+    ) -> io::Result<()> {
+        let data = crate::session::data_dir();
+        let core = crate::web::wire::Core::new_shared(
+            data.clone(),
+            self.app.render_notify.clone(),
+            self.app.client_auth.clone(),
+            self.app.event_hub.clone(),
+            deferred,
+        )
+        .await?;
+        self.client_wire = crate::web::client_listener::Listener::prepare(
+            self.app.state.config.client.bind,
+            self.app.client_codes.clone(),
+            data,
+            inherited,
+            (
+                crate::web::local_listener::socket_path(&api::socket_path()),
+                local_owner,
+            ),
+            self.client_wire_health.clone(),
+            core,
+        )
+        .await?;
+        if let Some(socket) = self.client_wire.as_ref().and_then(|w| w.socket.as_ref()) {
+            self.app
+                .client_codes
+                .set_endpoint(socket.local_addr()?)
+                .map_err(io::Error::other)?;
+        }
+        Ok(())
+    }
+    /// Own the event loop inside the structured listener's lifetime.
+    async fn run_loop(&mut self) -> io::Result<()> {
         crate::logging::startup("server");
 
         // Register SIGINT handler for graceful shutdown.
@@ -432,6 +733,14 @@ impl HeadlessServer {
         // No input_rx needed — server doesn't read stdin.
         // We use None for input_rx so the event loop doesn't try to read from stdin.
         self.app.input_rx = None;
+
+        // #959 / ADR-0031 / ADR-0028 §2: edges, goals and the derived agent
+        // events' seed, from one log read, once per server start, cold or
+        // handed off. Here rather than in `App::new` because only now is the
+        // session restored (the live records openness and agent presence are
+        // checked against) and, on a handoff, the exporting server done
+        // writing the log being folded.
+        self.app.reissue_open_records();
 
         let mut needs_render = true;
         let mut needs_full_render = true;
@@ -473,7 +782,7 @@ impl HeadlessServer {
             }
 
             // 3. Drain API requests.
-            if self.drain_api_requests_with_shutdown_check() {
+            if self.drain_api_requests_with_shutdown_check().await {
                 needs_render = true;
                 needs_full_render = true;
                 crate::render_prof::event("full_render_cause.api_requests");
@@ -481,6 +790,7 @@ impl HeadlessServer {
 
             self.app.sync_focus_events();
             self.app.sync_session_save_schedule();
+            self.app.reissue_records_after_rotation();
 
             // 4. Accept new client connections.
             self.accept_client_connections()?;
@@ -682,6 +992,8 @@ impl HeadlessServer {
                 }
             }
 
+            self.app.sync_directory_events();
+
             // 7. Render virtually and stream frames.
             if needs_render && self.app.can_render_now(now) {
                 crate::render_prof::event("render.attempt");
@@ -731,11 +1043,13 @@ impl HeadlessServer {
                         None => LoopEvent::Timer,
                     },
                     _ = sleep_until_or_pending(next_deadline) => LoopEvent::Timer,
+                    _ = self.app.input_writes.notify.notified() => LoopEvent::InputWrites,
                     _ = self.app.render_notify.notified() => LoopEvent::RenderRequested,
                 }
             };
 
             match event {
+                LoopEvent::InputWrites => self.app.service_input_writes(),
                 LoopEvent::Timer => {}
                 LoopEvent::Internal(ev) => {
                     if self.handle_internal_event_with_forwarding(ev) {
@@ -744,7 +1058,7 @@ impl HeadlessServer {
                     }
                 }
                 LoopEvent::Api(msg) => {
-                    if self.handle_api_request_with_shutdown_check(msg) {
+                    if self.handle_api_request_with_shutdown_check(msg).await {
                         needs_render = true;
                         needs_full_render = true;
                     }
@@ -761,11 +1075,6 @@ impl HeadlessServer {
                     }
                 }
             }
-        }
-
-        // Save session on exit.
-        if !self.app.no_session {
-            self.app.save_session_now();
         }
 
         info!("headless server exiting");
@@ -824,6 +1133,16 @@ impl HeadlessServer {
         start_pending_agent_resumes: bool,
     ) {
         if self.foreground_client_id.is_none() {
+            // An unlaid-out active pane still needs its first resizing render (#262).
+            if self.app.state.active.is_none() || !self.app.state.view.pane_infos.is_empty() {
+                // Refresh spawn geometry while preserving already-running PTY sizes.
+                let (cols, rows) = self.effective_size;
+                crate::ui::compute_view_without_resizing_panes(
+                    &mut self.app.state,
+                    &self.app.terminal_runtimes,
+                    Rect::new(0, 0, cols, rows),
+                );
+            }
             return;
         }
         let Some(client_id) = self.foreground_client_id else {
@@ -923,11 +1242,20 @@ impl HeadlessServer {
         }
     }
 
+    /// S3a-3 deliberately stops structured sessions before transferring ownership.
+    /// Full single-writer session handoff belongs to S7-rest.
+    fn stop_structured_before_handoff(&mut self) -> Vec<String> {
+        if let Err(error) = self.app.shutdown_structured_workers() {
+            crate::logging::structured_worker_shutdown_failed(&error);
+        }
+        self.app.state.structured_agents.handoff_unknown()
+    }
+
     #[cfg(unix)]
-    fn perform_live_handoff(
+    async fn perform_live_handoff(
         &mut self,
         params: crate::api::schema::ServerLiveHandoffParams,
-    ) -> Result<(), HandoffError> {
+    ) -> Result<Vec<api::schema::UndrainedPane>, HandoffError> {
         // #426: refuse before anything is spawned or any client is
         // disconnected. This check is first on purpose — the failure it catches
         // is silent until the very end, and every step after this point tears
@@ -948,8 +1276,10 @@ impl HeadlessServer {
             );
             return Err(HandoffError::SessionBroken);
         }
+        let import_exe =
+            super::executable::resolve(params.import_exe.as_deref().map(std::path::Path::new))?;
+        let structured_unknown = self.stop_structured_before_handoff();
         info!("starting live handoff");
-        let import_exe = params.import_exe.as_deref().map(std::path::PathBuf::from);
         let socket_path = crate::server::handoff::handoff_socket_path();
         let token = format!(
             "{}-{}",
@@ -968,40 +1298,109 @@ impl HeadlessServer {
         };
 
         let mut pane_by_terminal = HashMap::new();
-        for ws in &self.app.state.workspaces {
+        let mut public_pane_by_terminal = HashMap::new();
+        for (ws_idx, ws) in self.app.state.workspaces.iter().enumerate() {
             for tab in &ws.tabs {
                 for (pane_id, pane) in &tab.panes {
                     pane_by_terminal.insert(pane.attached_terminal_id.clone(), pane_id.raw());
+                    if let Some(public) = self.app.state.public_pane_id(ws_idx, *pane_id) {
+                        public_pane_by_terminal.insert(pane.attached_terminal_id.clone(), public);
+                    }
                 }
             }
         }
-        if pane_by_terminal.len() > crate::server::handoff::MAX_FDS_PER_HANDOFF {
-            let _ = std::fs::remove_file(&socket_path);
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "live handoff supports at most {} panes in one update; close panes or restart flock normally",
-                    crate::server::handoff::MAX_FDS_PER_HANDOFF
-                ),
-            ).into());
+        if let Err(err) = self.app.cancel_agent_restarts_for_handoff() {
+            self.rollback_handoff_before_commit(&socket_path, &[]);
+            return Err(err.into());
         }
-
+        // #850: a draft an injection holds goes to the stash, which the
+        // manifest carries, and held operator keystrokes reach the PTY before it moves
+        // to the new server, which knows nothing of the lease.
+        self.app
+            .input_writes
+            .retire_all(crate::pty::write_receipt::WriteFailure::OwnerChanged);
+        self.app.settle_injections_for_exit();
         self.handoff_in_progress = true;
         self.disconnect_all_clients_for_handoff();
         let _ = reject_pending_client_connections(&self.client_listener);
 
+        // #981: every pane is tried before giving up, so the refusal names all
+        // the stuck panes at once. The drains run concurrently: every pane is
+        // asked to quiesce first and the answers are collected after, so 24
+        // stuck panes cost one drain deadline, not 24 of them.
+        let mut started = Vec::new();
+        for (terminal_id, raw_pane_id) in &pane_by_terminal {
+            let Some(runtime) = self.app.terminal_runtimes.get(terminal_id) else {
+                continue;
+            };
+            let pending = runtime.start_handoff_pause(
+                crate::server::handoff::PANE_DRAIN_TIMEOUT,
+                params.skip_undrained,
+            );
+            started.push((terminal_id.clone(), *raw_pane_id, pending));
+        }
         let mut paused_terminal_ids = Vec::new();
-        for terminal_id in pane_by_terminal.keys() {
-            if let Some(runtime) = self.app.terminal_runtimes.get(terminal_id) {
-                if let Err(err) = runtime.pause_handoff_reader(Duration::from_secs(2)) {
-                    self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
-                    return Err(err.into());
+        let mut undrained = Vec::new();
+        let mut skipped_undrained = Vec::new();
+        let mut hard_error = None;
+        for (terminal_id, raw_pane_id, pending) in started {
+            let describe = |pending_bytes: usize, writer_stuck: bool| api::schema::UndrainedPane {
+                pane_id: public_pane_by_terminal
+                    .get(&terminal_id)
+                    .cloned()
+                    .unwrap_or_else(|| format!("pane {raw_pane_id}")),
+                title: self
+                    .app
+                    .state
+                    .terminals
+                    .get(&terminal_id)
+                    .and_then(|terminal| terminal.effective_title()),
+                pid: self
+                    .app
+                    .terminal_runtimes
+                    .get(&terminal_id)
+                    .and_then(|runtime| runtime.child_pid()),
+                pending_bytes,
+                writer_stuck,
+            };
+            match pending.and_then(|pending| pending.wait()) {
+                Ok(quiesce) => {
+                    if quiesce.dropped_bytes > 0 {
+                        skipped_undrained
+                            .push(describe(quiesce.dropped_bytes, quiesce.writer_stuck));
+                    }
+                    paused_terminal_ids.push(terminal_id);
                 }
-                paused_terminal_ids.push(terminal_id.clone());
+                Err(err) => match crate::pty::actor::HandoffDrainTimeout::from_io_error(&err) {
+                    Some(timeout) => {
+                        undrained.push(describe(timeout.pending_bytes, timeout.writer_stuck));
+                    }
+                    None => {
+                        hard_error.get_or_insert(err);
+                    }
+                },
             }
         }
+        skipped_undrained.sort_by_cached_key(|pane| public_pane_sort_key(&pane.pane_id));
+        // Recorded before any later step can fail, so a handoff that dropped
+        // input and then failed still reports what it dropped.
+        self.handoff_skipped_undrained = skipped_undrained.clone();
+        if let Some(err) = hard_error {
+            self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
+            return Err(err.into());
+        }
+        if !undrained.is_empty() {
+            undrained.sort_by_cached_key(|pane| public_pane_sort_key(&pane.pane_id));
+            self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
+            return Err(HandoffError::Undrained(undrained));
+        }
 
+        let retained_at_ms = self.app.prepare_retained_save();
         let snapshot = crate::persist::capture(
+            crate::persist::RegistryCapture {
+                registry: &self.app.state.structured_agents,
+                now_ms: retained_at_ms,
+            },
             &self.app.state.workspaces,
             &self.app.state.terminals,
             &self.app.terminal_runtimes,
@@ -1025,12 +1424,11 @@ impl HeadlessServer {
                 continue;
             };
             let mut handoff_runtime = runtime.handoff_runtime_state(pane_id);
-            let has_agent_session = self
-                .app
-                .state
-                .terminals
-                .get(terminal_id)
-                .is_some_and(|terminal| terminal.persisted_agent_session.is_some());
+            let terminal = self.app.state.terminals.get(terminal_id);
+            let has_agent_session =
+                terminal.is_some_and(|terminal| terminal.persisted_agent_session.is_some());
+            handoff_runtime.agent_session_hook_confirmed =
+                terminal.is_some_and(crate::terminal::TerminalState::agent_session_hook_confirmed);
             if !has_agent_session {
                 handoff_runtime.initial_history_ansi = runtime.handoff_history_ansi();
             }
@@ -1041,23 +1439,55 @@ impl HeadlessServer {
             .iter()
             .map(|(_, runtime)| runtime.clone())
             .collect();
-        let manifest = crate::server::handoff::manifest_for(
+        #[cfg(feature = "web")]
+        if let Some(wire) = &self.client_wire {
+            if let Err(error) = wire.freeze_commands().await {
+                self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
+                return Err(error.into());
+            }
+        }
+        let store_generation = match crate::mesh::runtime_store::suspend() {
+            Ok(generation) => generation,
+            Err(err) => {
+                self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
+                return Err(io::Error::other(err).into());
+            }
+        };
+        let mut manifest = crate::server::handoff::manifest_for(
             snapshot,
             panes,
             params.expected_protocol,
             params.expected_version,
         );
-        let mut import_child = match crate::server::handoff::spawn_handoff_import(
-            import_exe.as_deref(),
-            &socket_path,
-            &token,
-        ) {
-            Ok(child) => child,
-            Err(err) => {
-                self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
-                return Err(err.into());
+        manifest.structured_unknown = structured_unknown;
+        manifest.store_generation = store_generation;
+        manifest.kept_drafts = self.app.kept_drafts.borrow().export();
+        if cfg!(debug_assertions)
+            && std::env::var("FLOCK_TEST_HANDOFF_IMPORT_FAIL").as_deref() == Ok("stale_generation")
+        {
+            manifest.store_generation = store_generation.saturating_add(1);
+        }
+        manifest.socket_owners = true;
+        manifest.version = crate::server::handoff::SOCKET_OWNER_HANDOFF_VERSION;
+        #[cfg(feature = "web")]
+        {
+            manifest.client_listener = self
+                .client_wire
+                .as_ref()
+                .is_some_and(|w| w.socket.is_some());
+            manifest.local_ws_owner = self.client_wire.is_some();
+            if manifest.local_ws_owner {
+                manifest.version = crate::server::handoff::LOCAL_WS_HANDOFF_VERSION;
             }
-        };
+        }
+        let mut import_child =
+            match crate::server::handoff::spawn_handoff_import(&import_exe, &socket_path, &token) {
+                Ok(child) => child,
+                Err(err) => {
+                    self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
+                    return Err(err.into());
+                }
+            };
         let child_pid = import_child.id();
         crate::logging::handoff_import_spawned(child_pid, &socket_path);
 
@@ -1068,6 +1498,23 @@ impl HeadlessServer {
                     continue;
                 };
                 fds.push(runtime.duplicate_handoff_fd()?);
+            }
+            #[cfg(feature = "web")]
+            if let Some(socket) = self.client_wire.as_ref().and_then(|w| w.socket.as_ref()) {
+                use std::os::fd::IntoRawFd;
+                fds.push(crate::platform::client_listener::duplicate(socket)?.into_raw_fd());
+            }
+            use std::os::fd::IntoRawFd;
+            let api_owner = &self
+                .api_server
+                .as_ref()
+                .ok_or_else(|| io::Error::other("handoff requires API socket ownership"))?
+                .socket_owner;
+            fds.push(api_owner.duplicate()?.into_raw_fd());
+            fds.push(self.client_socket_owner.duplicate()?.into_raw_fd());
+            #[cfg(feature = "web")]
+            if let Some(wire) = &self.client_wire {
+                fds.push(wire.local_owner().duplicate()?.into_raw_fd());
             }
             Ok::<(), io::Error>(())
         })();
@@ -1097,7 +1544,13 @@ impl HeadlessServer {
             }
         };
 
-        let send_result = crate::server::handoff::send_fds_and_wait_restored(&mut stream, &fds);
+        let send_result = if cfg!(debug_assertions)
+            && std::env::var("FLOCK_TEST_HANDOFF_IMPORT_FAIL").as_deref() == Ok("before_fds")
+        {
+            Err(io::Error::other("test handoff failure before fd transfer"))
+        } else {
+            crate::server::handoff::send_fds_and_wait_restored(&mut stream, &fds)
+        };
         for fd in fds {
             let _ = unsafe { libc::close(fd) };
         }
@@ -1109,11 +1562,16 @@ impl HeadlessServer {
 
         if let Some(api_server) = &self.api_server {
             let _ = api_server.remove_socket_file_if_owned();
-        } else {
-            let _ = std::fs::remove_file(crate::api::socket_path());
         }
         let _ = remove_socket_file_if_owned(&self.client_socket_path, self.client_socket_identity);
-        if let Err(err) = crate::server::handoff::wait_ready(&mut stream) {
+        #[cfg(feature = "web")]
+        let unlinked = self
+            .client_wire
+            .as_ref()
+            .map_or(Ok(()), |wire| wire.unlink_local());
+        #[cfg(not(feature = "web"))]
+        let unlinked: io::Result<()> = Ok(());
+        if let Err(err) = unlinked.and_then(|()| crate::server::handoff::wait_ready(&mut stream)) {
             crate::server::handoff::cleanup_failed_import_child(&mut import_child);
             match self.wait_then_restore_public_sockets_after_failed_handoff() {
                 Ok(()) => {
@@ -1121,33 +1579,25 @@ impl HeadlessServer {
                 }
                 Err(restore_err) => {
                     self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
-                    return Err(io::Error::other(format!(
-                        "handoff replacement server did not become ready: {err}; old server could not restore public sockets: {restore_err}"
-                    ))
-                    .into());
+                    return Err(handoff_ready_error(err, Some(restore_err)).into());
                 }
             }
-            return Err(io::Error::other(format!(
-                "handoff replacement server did not become ready: {err}"
-            ))
-            .into());
+            return Err(handoff_ready_error(err, None).into());
         }
-        if let Err(err) = crate::server::handoff::report_committed(&mut stream) {
-            crate::server::handoff::cleanup_failed_import_child(&mut import_child);
-            match self.wait_then_restore_public_sockets_after_failed_handoff() {
-                Ok(()) => {
-                    self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
-                }
-                Err(restore_err) => {
-                    self.rollback_handoff_before_commit(&socket_path, &paused_terminal_ids);
-                    return Err(io::Error::other(format!(
-                        "handoff replacement server was ready, but commit failed: {err}; old server could not restore public sockets: {restore_err}"
-                    ))
-                    .into());
-                }
-            }
-            return Err(err.into());
-        }
+        let commit_result = if cfg!(debug_assertions)
+            && std::env::var("FLOCK_TEST_HANDOFF_IMPORT_FAIL").as_deref() == Ok("before_commit")
+        {
+            Err(io::Error::other("test handoff failure before commit"))
+        } else {
+            crate::server::handoff::report_committed(&mut stream)
+        };
+        let mut recovery = ServerCommitRecovery {
+            server: self,
+            importer: &mut import_child,
+            socket_path: &socket_path,
+            paused_terminal_ids: &paused_terminal_ids,
+        };
+        finish_handoff_commit(commit_result, commit_recovery(&mut recovery))?;
 
         for (terminal_id, runtime) in self.app.terminal_runtimes.drain_for_handoff() {
             if !pane_by_terminal.contains_key(&terminal_id) {
@@ -1158,19 +1608,25 @@ impl HeadlessServer {
         }
         crate::server::handoff::wait_owned_ack(&mut stream);
 
+        self.commit_handoff_shutdown();
+        info!("live handoff completed; old server exiting");
+        Ok(skipped_undrained)
+    }
+
+    /// Enter exporter shutdown only after the replacement's owned acknowledgement.
+    fn commit_handoff_shutdown(&mut self) {
         self.shutting_down = true;
         self.app.state.should_quit = true;
         self.app.no_session = true;
-        info!("live handoff completed; old server exiting");
-        Ok(())
+        self.handoff_completed = true;
     }
 
     #[cfg(not(unix))]
-    fn perform_live_handoff(
+    async fn perform_live_handoff(
         &mut self,
         _params: crate::api::schema::ServerLiveHandoffParams,
-    ) -> io::Result<()> {
-        Err(io::Error::other("live handoff is only supported on Unix"))
+    ) -> Result<Vec<api::schema::UndrainedPane>, HandoffError> {
+        Err(io::Error::other("live handoff is only supported on Unix").into())
     }
 
     fn sync_visible_server_config_diagnostic(&mut self, uses_local_keybindings: bool) {
@@ -1192,10 +1648,28 @@ impl HeadlessServer {
             .api_tx
             .clone()
             .ok_or_else(|| io::Error::other("cannot restore api socket without api sender"))?;
-        let api_server = api::start_server(api_tx, self.app.event_hub.clone())?;
+        let api_server = api::server::start_server_owned(
+            api_tx,
+            self.app.event_hub.clone(),
+            Some(crate::api::schema::ServerCapabilities {
+                live_handoff: true,
+                node_id: self.app.node_id.clone(),
+                clone_detection_warning: self.app.clone_detection_warning.clone(),
+                agent_start_label: true,
+                agent_questions: true,
+                structured_agents: true,
+                pane_input_write_ack: true,
+                events_live_start: true,
+            }),
+            self.app.runtime_config.uid_policy.clone(),
+            self.client_wire_health.clone(),
+            self.api_server
+                .as_ref()
+                .map(|server| server.socket_owner.clone()),
+        )?;
 
         let client_path = client_socket_path();
-        prepare_socket_path(&client_path)?;
+        self.client_socket_owner.prepare(&client_path)?;
         let listener = UnixListener::bind(&client_path)?;
         restrict_socket_permissions(&client_path)?;
         let client_socket_identity = socket_file_identity(&client_path)?;
@@ -1205,12 +1679,16 @@ impl HeadlessServer {
         self.client_listener = listener;
         self.client_socket_path = client_path;
         self.client_socket_identity = client_socket_identity;
+        #[cfg(feature = "web")]
+        if let Some(wire) = &mut self.client_wire {
+            wire.restore_local(crate::web::local_listener::socket_path(&api::socket_path()))?;
+        }
         Ok(())
     }
 
     #[cfg(unix)]
     fn wait_then_restore_public_sockets_after_failed_handoff(&mut self) -> io::Result<()> {
-        let timeout = crate::server::handoff::COMMIT_TIMEOUT + Duration::from_secs(2);
+        let timeout = crate::server::handoff::ROLLBACK_SOCKET_TIMEOUT;
         wait_for_old_public_sockets_to_close(timeout)?;
         self.restore_public_sockets_after_failed_handoff()
     }
@@ -1226,8 +1704,15 @@ impl HeadlessServer {
                 runtime.set_handoff_reader_paused(false);
             }
         }
+        #[cfg(feature = "web")]
+        if let Some(wire) = &self.client_wire {
+            wire.reopen_commands();
+        }
         self.handoff_in_progress = false;
         let _ = std::fs::remove_file(socket_path);
+        if crate::mesh::runtime_store::suspended().unwrap_or(true) {
+            self.app.resume_mesh_store(0);
+        }
     }
 
     #[cfg(unix)]
@@ -1351,6 +1836,7 @@ impl HeadlessServer {
     fn remove_client(&mut self, client_id: u64) -> bool {
         let was_foreground = self.foreground_client_id == Some(client_id);
         self.send_client_graphics_cleanup(client_id);
+        self.app.detach_native_client(client_id);
         let removed = self.clients.remove(&client_id);
         if let Some(removed) = removed {
             // Staged files are NOT deleted here (#286). The file was handed
@@ -1366,6 +1852,7 @@ impl HeadlessServer {
                 }
             }
         }
+        self.app.state.app_client_attached = self.has_app_client();
         if was_foreground {
             self.promote_latest_remaining_client()
         } else {
@@ -1974,7 +2461,11 @@ impl HeadlessServer {
         let mut broken_clients: Vec<u64> = Vec::new();
         for (&client_id, client) in &mut self.clients {
             if let Some(writer) = &client.writer {
-                if writer.control.send(serialized.clone()).is_err() {
+                if writer
+                    .control
+                    .send_message(&msg, serialized.clone())
+                    .is_err()
+                {
                     debug!(client_id, "client writer channel closed during broadcast");
                     broken_clients.push(client_id);
                 }
@@ -2012,7 +2503,7 @@ impl HeadlessServer {
 
         if let Some(client) = self.clients.get(&client_id) {
             if let Some(writer) = &client.writer {
-                if writer.control.send(serialized).is_err() {
+                if writer.control.send_message(&msg, serialized).is_err() {
                     debug!(
                         client_id,
                         "client writer channel closed during targeted send"
@@ -2117,6 +2608,7 @@ impl HeadlessServer {
         client.render_state.reset_baseline();
         client.last_activity = stamp;
         let was_foreground = self.foreground_client_id == Some(client_id);
+        self.app.state.app_client_attached = self.has_app_client();
         if was_foreground {
             self.promote_latest_remaining_client();
         }
@@ -2167,6 +2659,9 @@ impl HeadlessServer {
                     }
                     return false;
                 }
+                if !direct_attach_requested {
+                    self.app.attach_native_client(client_id, writer.peer);
+                }
                 let first_app_client = !direct_attach_requested && self.app_client_count() == 0;
                 info!(
                     client_id,
@@ -2212,6 +2707,7 @@ impl HeadlessServer {
                     // Last attach wins; an empty/absent theme changes nothing.
                     self.app.set_host_terminal_theme(host_theme);
                 }
+                self.app.state.app_client_attached = self.has_app_client();
                 if first_app_client {
                     self.app.mark_git_status_refresh_due(Instant::now());
                 }
@@ -2322,8 +2818,11 @@ impl HeadlessServer {
                 // self-heals via the split-drag Resize a user does to widen
                 // a split, but a single-pane switch has no such trigger.
                 let focus_before = self.active_focus_snapshot();
-                self.app
-                    .route_client_events(events, self.foreground_client_id == Some(client_id));
+                self.app.route_native_client_events(
+                    client_id,
+                    events,
+                    self.foreground_client_id == Some(client_id),
+                );
                 if self.app.take_config_reloaded_from_disk() {
                     self.reload_server_config(false);
                 } else {
@@ -2335,6 +2834,7 @@ impl HeadlessServer {
                 if self.app.state.detach_requested {
                     self.app.state.detach_requested = false;
                     info!(client_id, "client detach requested via keybind");
+                    self.app.detach_native_client(client_id);
 
                     // Clear client-local host graphics before sending ServerShutdown
                     // so the outer terminal does not retain stale images.
@@ -2528,13 +3028,30 @@ impl HeadlessServer {
         )
     }
 
+    fn refuse_shutdown_request(msg: api::ApiRequestMessage) -> bool {
+        // During shutdown, respond with server_unavailable.
+        let response = serde_json::to_string(&api::schema::ErrorResponse {
+            id: msg.request.id,
+            error: api::schema::ErrorBody {
+                data: None,
+                code: "server_unavailable".into(),
+                message: "server is shutting down".into(),
+            },
+        })
+        .unwrap_or_else(|_| {
+            r#"{"id":"","error":{"code":"server_unavailable","message":"server is shutting down"}}"#
+                .to_string()
+        });
+        let _ = msg.respond_to.send(response);
+        false
+    }
     /// Drains API requests with shutdown awareness.
     ///
     /// During shutdown, remaining requests get a `server_unavailable` error.
-    fn drain_api_requests_with_shutdown_check(&mut self) -> bool {
+    async fn drain_api_requests_with_shutdown_check(&mut self) -> bool {
         let mut changed = false;
         while let Ok(msg) = self.app.api_rx.try_recv() {
-            changed |= self.handle_api_request_with_shutdown_check(msg);
+            changed |= self.handle_api_request_with_shutdown_check(msg).await;
         }
         changed
     }
@@ -2545,30 +3062,68 @@ impl HeadlessServer {
     /// request to connected clients. API methods like `pane.report_agent`
     /// trigger internal events that may set toast state or would normally
     /// play sounds — in headless mode we forward these to clients instead.
-    fn handle_api_request_with_shutdown_check(&mut self, msg: api::ApiRequestMessage) -> bool {
-        if self.shutting_down {
-            // During shutdown, respond with server_unavailable.
-            let response = serde_json::to_string(&api::schema::ErrorResponse {
-                id: msg.request.id,
-                error: api::schema::ErrorBody {
-                    code: "server_unavailable".into(),
-                    message: "server is shutting down".into(),
-                },
-            })
-            .unwrap_or_else(|_| {
-                r#"{"id":"","error":{"code":"server_unavailable","message":"server is shutting down"}}"#
-                    .to_string()
-            });
-            let _ = msg.respond_to.send(response);
+    async fn handle_api_request_with_shutdown_check(
+        &mut self,
+        msg: api::ApiRequestMessage,
+    ) -> bool {
+        if self.app.respond_scope_probe(&msg) {
             return false;
+        }
+        if self.shutting_down {
+            return Self::refuse_shutdown_request(msg);
+        }
+
+        if matches!(
+            msg.request.method,
+            api::schema::Method::ServerLiveHandoff(_) | api::schema::Method::ServerReloadConfig(_)
+        ) {
+            let scope = std::mem::replace(&mut self.app.current_api_scope, msg.scope.clone());
+            let outer = (
+                self.app.current_api_peer_pid,
+                self.app.current_api_peer_birth,
+                self.app.current_api_peer_uid,
+            );
+            self.app.current_api_peer_pid = msg.peer_pid;
+            self.app.current_api_peer_birth = Some(msg.peer_birth);
+            self.app.current_api_peer_uid = Some(msg.peer_uid);
+            let refusal = self.app.peer_uid_refusal(&msg.request);
+            self.app.current_api_scope = scope;
+            (
+                self.app.current_api_peer_pid,
+                self.app.current_api_peer_birth,
+                self.app.current_api_peer_uid,
+            ) = outer;
+            if let Some(response) = refusal {
+                let _ = msg.respond_to.send(response);
+                return false;
+            }
         }
 
         if let api::schema::Method::ServerLiveHandoff(params) = &msg.request.method {
-            let response = match self.perform_live_handoff(params.clone()) {
-                Ok(()) => serde_json::to_string(&api::schema::SuccessResponse {
+            self.handoff_skipped_undrained.clear();
+            let outcome = self.perform_live_handoff(params.clone()).await;
+            let dropped_before_failure = std::mem::take(&mut self.handoff_skipped_undrained);
+            let response = match outcome {
+                Ok(skipped_undrained) if skipped_undrained.is_empty() => {
+                    serde_json::to_string(&api::schema::SuccessResponse {
+                        id: msg.request.id,
+                        result: api::schema::ResponseResult::Ok {},
+                    })
+                }
+                Ok(skipped_undrained) => serde_json::to_string(&api::schema::SuccessResponse {
                     id: msg.request.id,
-                    result: api::schema::ResponseResult::Ok {},
+                    result: api::schema::ResponseResult::LiveHandoff { skipped_undrained },
                 }),
+                Err(HandoffError::Undrained(panes)) => {
+                    serde_json::to_string(&api::schema::ErrorResponse {
+                        id: msg.request.id,
+                        error: api::schema::ErrorBody {
+                            data: None,
+                            code: "handoff_undrained".into(),
+                            message: undrained_handoff_message(&panes),
+                        },
+                    })
+                }
                 // #426: its own error code, not `handoff_failed`. The refusal is
                 // the one handoff outcome an operator can act on differently —
                 // retrying is pointless and the recovery destroys their sessions
@@ -2578,20 +3133,17 @@ impl HeadlessServer {
                     serde_json::to_string(&api::schema::ErrorResponse {
                         id: msg.request.id,
                         error: api::schema::ErrorBody {
+                            data: None,
                             code: "session_broken".into(),
                             message: crate::health::session_warning::HANDOFF_REFUSAL.into(),
                         },
                     })
                 }
-                Err(HandoffError::Failed(err)) => {
-                    serde_json::to_string(&api::schema::ErrorResponse {
-                        id: msg.request.id,
-                        error: api::schema::ErrorBody {
-                            code: "handoff_failed".into(),
-                            message: err.to_string(),
-                        },
-                    })
-                }
+                Err(HandoffError::Failed(err)) => Ok(failed_handoff_response(
+                    msg.request.id,
+                    &err,
+                    &dropped_before_failure,
+                )),
             }
             .unwrap_or_else(|_| "{}".to_string());
             let _ = msg.respond_to.send(response);
@@ -2648,6 +3200,7 @@ impl HeadlessServer {
                 serde_json::to_string(&api::schema::ErrorResponse {
                     id: String::new(),
                     error: api::schema::ErrorBody {
+                        data: None,
                         code: "serialization_error".into(),
                         message: err.to_string(),
                     },
@@ -2655,11 +3208,17 @@ impl HeadlessServer {
                 .unwrap_or_else(|_| "{}".to_string())
             })
         } else {
+            self.app.current_api_scope = msg.scope;
             self.app.current_api_peer_pid = msg.peer_pid;
+            self.app.current_api_peer_birth = Some(msg.peer_birth);
+            self.app.current_api_peer_uid = Some(msg.peer_uid);
             let response = self
                 .app
                 .handle_api_request_after_internal_events_drained(msg.request);
+            self.app.current_api_scope = None;
             self.app.current_api_peer_pid = None;
+            self.app.current_api_peer_birth = None;
+            self.app.current_api_peer_uid = None;
             response
         };
         self.app.respond_or_park(msg.respond_to, response);
@@ -2834,7 +3393,11 @@ impl HeadlessServer {
             let Some(writer) = &client.writer else {
                 continue;
             };
-            if writer.control.send(serialized.clone()).is_err() {
+            if writer
+                .control
+                .send_message(&ServerMessage::MouseCapture { enabled }, serialized.clone())
+                .is_err()
+            {
                 debug!(
                     client_id,
                     "client writer channel closed during mouse capture update"
@@ -3417,7 +3980,16 @@ impl HeadlessServer {
     /// clients render, so a session probe that only ran in the monolithic loop
     /// would never see the fault that only the server can have.
     fn handle_scheduled_tasks_headless(&mut self, now: Instant, geometry_dirty: bool) -> bool {
-        let mut changed = false;
+        self.app.state.app_client_attached = self.has_app_client();
+        self.app.input_writes.service_due(now);
+        let structured_changed = self.app.service_structured_workers(now);
+        #[cfg(feature = "web")]
+        if let Some(wire) = &mut self.client_wire {
+            wire.service_app(&mut self.app, &crate::session::data_dir());
+            wire.service_commands(&mut self.app);
+        }
+        self.app.start_ready_pastes();
+        let mut changed = structured_changed;
 
         self.app.sync_headless_animation_timer(now);
         changed |= self.app.refresh_session_health(now);
@@ -3502,11 +4074,20 @@ impl HeadlessServer {
         // #175 M1: queued messages deliver at dwell-settled Idle boundaries —
         // mirrored in the TUI runtime loop (the #25 dual-loop lesson).
         self.app.expire_undeliverable_messages();
-        self.app.expire_uplink();
+        self.app.tick_mesh_routes();
+        self.app.tick_mesh_collections();
+        self.app.expire_relayed_entries();
         // ADR-0018 §2: mirrored in the TUI runtime loop (#25).
         self.app.tick_idle_wakes(now);
+        // ADR-0028 §5: mirrored in the TUI runtime loop (#25).
+        self.app.tick_waits(now);
+        // ADR-0028 §2: mirrored in the TUI runtime loop (#25).
+        self.app.tick_agent_phases(now);
         // #540: mirrored in the TUI runtime loop (#25).
         self.app.tick_self_compacts(now);
+        // #850: mirrored in the TUI runtime loop (#25).
+        changed |= self.app.tick_injection_leases(now);
+        changed |= self.app.tick_agent_restarts(now);
         for update in &settled {
             self.app.emit_pane_state_update(update);
         }
@@ -3618,8 +4199,14 @@ impl HeadlessServer {
         if self.shutting_down {
             return;
         }
+        self.app
+            .input_writes
+            .retire_all(crate::pty::write_receipt::WriteFailure::PaneGone);
         info!("server shutdown initiated");
         self.shutting_down = true;
+        // #850: keep any draft an injection holds, and write any keystrokes
+        // an injection lease still holds.
+        self.app.settle_injections_for_exit();
 
         // Clear client-local host graphics, then send ServerShutdown to all connected clients.
         self.send_all_clients_graphics_cleanup();
@@ -3642,6 +4229,8 @@ impl HeadlessServer {
     /// close client connections, remove socket files, and clean up.
     fn complete_shutdown(&mut self) -> io::Result<()> {
         info!("completing server shutdown");
+        self.app.settle_injections_for_exit();
+        let structured = self.app.finish_session();
 
         // Send ServerShutdown to all remaining clients.
         if !self.clients.is_empty() {
@@ -3656,7 +4245,11 @@ impl HeadlessServer {
         }
 
         // Drain remaining API requests with server_unavailable.
-        self.drain_api_requests_with_shutdown_check();
+        while let Ok(msg) = self.app.api_rx.try_recv() {
+            if !self.app.respond_scope_probe(&msg) {
+                Self::refuse_shutdown_request(msg);
+            }
+        }
 
         // Close all client connections. Staged handoff files stay on disk
         // (#286): surviving a restart is most of what makes them durable.
@@ -3665,7 +4258,11 @@ impl HeadlessServer {
         // Remove socket files.
         self.cleanup_sockets()?;
 
-        Ok(())
+        if self.handoff_completed {
+            Ok(())
+        } else {
+            structured.map_err(io::Error::other)
+        }
     }
 
     /// Removes socket files created by the server.
@@ -3737,34 +4334,45 @@ fn is_keybinding_config_diagnostic(diagnostic: &str) -> bool {
     clippy::print_stderr,
     reason = "startup fatal errors (socket already in use) must surface on the launching process's stderr before tracing is bootstrapped for the user"
 )]
-pub fn run_server() -> io::Result<()> {
-    init_logging();
+pub fn run_server(args: &[String], handoff_socket: Option<PathBuf>) -> io::Result<()> {
     crate::platform::raise_server_nofile_limit();
 
-    let args: Vec<String> = std::env::args().collect();
-    if args.get(2).map(String::as_str) == Some("--handoff-import") {
-        let socket_path = args
-            .get(3)
-            .map(PathBuf::from)
+    if args.first().map(String::as_str) == Some("--handoff-import") {
+        let socket_path = handoff_socket
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing handoff socket"))?;
-        let token = args
-            .get(4)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing handoff token"))?;
-        return run_handoff_import_server(&socket_path, token);
+        // Old running exporters use the positional channel. Keep import compatible
+        // across upgrades; new exporters supply only the environment channel.
+        let token = std::env::var(crate::server::handoff::HANDOFF_TOKEN_ENV)
+            .or_else(|_| args.get(1).cloned().ok_or(std::env::VarError::NotPresent))
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "missing handoff token"))?;
+        // Consume before starting threads or children, so panes cannot inherit it.
+        // Removal cannot scrub the kernel's startup-environment copy: process
+        // inspection can expose it for the server lifetime. The token is single-use
+        // and is dead after the handoff consumes it.
+        std::env::remove_var(crate::server::handoff::HANDOFF_TOKEN_ENV);
+        let token = zeroize::Zeroizing::new(token);
+        return run_handoff_import_server(&socket_path, &token);
     }
 
+    init_logging();
     let loaded_config = config::Config::load();
     let (api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
     let event_hub =
         api::EventHub::with_persistence(crate::session::data_dir().join("event-log.jsonl"));
+    event_hub.set_read_max_wait_ms(loaded_config.config.events.read_max_wait_ms);
 
     // Start the JSON API socket server.
-    let _api_server = match api::start_server(api_tx.clone(), event_hub.clone()) {
+    let runtime_config = app::AppRuntimeConfig::for_config(&loaded_config.config);
+    let _api_server = match api::start_server(
+        api_tx.clone(),
+        event_hub.clone(),
+        runtime_config.uid_policy.clone(),
+    ) {
         Ok(server) => server,
         Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
-            eprintln!("error: flk server is already running");
+            eprintln!("error: {err}");
             eprintln!("api socket: {}", api::socket_path().display());
-            std::process::exit(1);
+            std::process::exit(crate::cli::exit::FAILURE);
         }
         Err(err) => return Err(err),
     };
@@ -3778,12 +4386,13 @@ pub fn run_server() -> io::Result<()> {
 
     let result = rt.block_on(async {
         // Create the App (with AppState, event channels, etc.).
-        let mut app = app::App::new(
+        let mut app = app::App::new_with_runtime_config(
             &loaded_config.config,
             no_session,
             config::config_diagnostic_summary(&loaded_config.diagnostics),
             api_rx,
             event_hub,
+            runtime_config,
         );
 
         // The server runs headless — disable local notification side effects.
@@ -3801,13 +4410,15 @@ pub fn run_server() -> io::Result<()> {
         ) {
             Ok(server) => server,
             Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
-                eprintln!("error: flk server is already running");
+                eprintln!("error: {err}");
                 eprintln!("client socket: {}", client_socket_path().display());
-                std::process::exit(1);
+                std::process::exit(crate::cli::exit::FAILURE);
             }
             Err(err) => return Err(err),
         };
 
+        #[cfg(feature = "web")]
+        server.prepare_client_wire(None, None, false).await?;
         crate::logging::server_started(&api::socket_path(), &client_socket_path());
         print_ready_message(&api::socket_path(), &client_socket_path());
 
@@ -3821,16 +4432,52 @@ pub fn run_server() -> io::Result<()> {
 
 #[cfg(unix)]
 fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> {
+    crate::mesh::runtime_store::suspend().map_err(io::Error::other)?;
+    let import_deadline = crate::server::handoff::start_import_watchdog()?;
+    init_logging();
     let loaded_config = config::Config::load();
     let mut received = crate::server::handoff::receive(socket_path, token)?;
+    #[cfg(feature = "web")]
+    let local_ws_owner = if received.manifest.local_ws_owner {
+        Some(crate::ipc::SocketOwner::take(
+            &crate::web::local_listener::socket_path(&api::socket_path()),
+            &mut received.fds,
+        )?)
+    } else {
+        None
+    };
+    let (api_owner, client_owner) = if received.manifest.socket_owners {
+        let client = crate::ipc::SocketOwner::take(&client_socket_path(), &mut received.fds)?;
+        let api = crate::ipc::SocketOwner::take(&api::socket_path(), &mut received.fds)?;
+        (Some(api), Some(client))
+    } else {
+        (None, None)
+    };
+    #[cfg(feature = "web")]
+    let wire_listener = if received.manifest.client_listener {
+        Some(
+            crate::platform::client_listener::take(&mut received.fds).inspect_err(|err| {
+                let _ = crate::server::handoff::report_import_refusal(
+                    &mut received.stream,
+                    &err.to_string(),
+                );
+            })?,
+        )
+    } else {
+        None
+    };
     crate::server::handoff::log_import_result(received.manifest.panes.len());
 
     let (api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
     let event_hub =
         api::EventHub::with_persistence(crate::session::data_dir().join("event-log.jsonl"));
+    event_hub.set_read_max_wait_ms(loaded_config.config.events.read_max_wait_ms);
 
     let mut imports = HashMap::new();
-    for (pane, fd) in received.manifest.panes.into_iter().zip(received.fds) {
+    for (pane, fd) in std::mem::take(&mut received.manifest.panes)
+        .into_iter()
+        .zip(received.fds)
+    {
         let pane_id = pane.pane_id;
         imports.insert(
             pane_id,
@@ -3847,35 +4494,107 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
         .map_err(io::Error::other)?;
 
     let result = rt.block_on(async {
-        let mut app = app::App::new_from_handoff(
+        let mut app = match app::App::new_from_handoff(
             &loaded_config.config,
             config::config_diagnostic_summary(&loaded_config.diagnostics),
             api_rx,
             event_hub.clone(),
             &received.manifest.snapshot,
             &mut imports,
-        )?;
+        ) {
+            Ok(app) => app,
+            Err(err) => {
+                // Same as `receive`: tell the exporter why before the stream drops.
+                crate::logging::handoff_import_refused(&err.to_string());
+                if let Err(report_err) = crate::server::handoff::report_import_refusal(
+                    &mut received.stream,
+                    &err.to_string(),
+                ) {
+                    crate::logging::handoff_refusal_report_failed(&report_err.to_string());
+                }
+                return Err(err);
+            }
+        };
+        received
+            .manifest
+            .restore_structured_unknown(&mut app.state.structured_agents);
         app.state.local_sound_playback = false;
         app.local_terminal_notifications = false;
+        app.kept_drafts
+            .borrow_mut()
+            .import(std::mem::take(&mut received.manifest.kept_drafts));
         crate::server::handoff::report_restored(&mut received.stream)?;
-        if std::env::var("FLOCK_TEST_HANDOFF_IMPORT_FAIL").as_deref() == Ok("after_restored") {
+        if cfg!(debug_assertions)
+            && std::env::var("FLOCK_TEST_HANDOFF_IMPORT_FAIL").as_deref() == Ok("after_restored")
+        {
             return Err(io::Error::other(
                 "test handoff import failure after restored",
             ));
         }
         wait_for_old_public_sockets_to_close(Duration::from_secs(5))?;
 
-        let api_server = api::start_server(api_tx.clone(), event_hub.clone())?;
-        let mut server = HeadlessServer::new(
+        let api_server = api::server::start_server_for_mode_owned(
+            api_tx.clone(),
+            event_hub.clone(),
+            true,
+            app.runtime_config.uid_policy.clone(),
+            api_owner,
+        )?;
+        let mut server = HeadlessServer::new_owned(
             app,
             &loaded_config.diagnostics,
             Some(api_tx.clone()),
             Some(api_server),
+            client_owner,
         )?;
+        #[cfg(feature = "web")]
+        if let Err(err) = server
+            .prepare_client_wire(wire_listener, local_ws_owner, true)
+            .await
+        {
+            crate::server::handoff::report_import_refusal(&mut received.stream, &err.to_string())?;
+            return Err(err);
+        }
+        // Late failure tests corrupt only their supplied sandbox identity after bootstrap.
+        if cfg!(debug_assertions) {
+            if let Some(path) = std::env::var_os("FLOCK_TEST_HANDOFF_CORRUPT_IDENTITY_PATH") {
+                std::fs::write(path, b"corrupt during handoff")?;
+            }
+        }
+        if cfg!(debug_assertions)
+            && std::env::var("FLOCK_TEST_HANDOFF_IMPORT_FAIL").as_deref() == Ok("before_ready")
+        {
+            return Err(io::Error::other("test handoff failure before ready"));
+        }
+        if let Err(err) = crate::mesh::store::Store::check_generation(
+            &crate::config::state_dir().join("mesh-mail.sqlite"),
+            received.manifest.store_generation,
+        ) {
+            crate::server::handoff::report_import_refusal(&mut received.stream, &err.to_string())?;
+            return Err(io::Error::other(err));
+        }
+        import_deadline.disarm()?;
         crate::server::handoff::report_ready(&mut received.stream)?;
         crate::server::handoff::wait_committed(&mut received.stream)?;
+        #[cfg(feature = "web")]
+        if let Some(wire) = &server.client_wire {
+            wire.acquire_commands().await?;
+        }
+        server
+            .app
+            .resume_mesh_store(received.manifest.store_generation);
         server.app.assume_handoff_ownership();
         server.app.unpause_handoff_readers();
+        // The importer starts with an empty screen for every pane that does
+        // not replay history, and agent panes never do. An idle TUI has no
+        // reason to redraw, so without a nudge the pane stays blank until a
+        // client attaches, and every screen-gated decision (idle-wake mail
+        // delivery among them) sees nothing (#977). Nudge now, headless or not,
+        // and again on the first attach, when the client size settles.
+        server
+            .app
+            .terminal_runtimes
+            .nudge_child_redraw_after_handoff();
         server.pending_handoff_repaint_nudge = true;
         if let Err(err) = crate::server::handoff::report_owned(&mut received.stream) {
             crate::logging::handoff_report_ownership_failed(&err.to_string());
@@ -3892,18 +4611,45 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
 
 #[cfg(unix)]
 fn wait_for_old_public_sockets_to_close(timeout: Duration) -> io::Result<()> {
-    use std::os::unix::net::UnixStream;
+    wait_for_old_public_sockets_at(api::socket_path(), client_socket_path(), timeout, || {
+        std::thread::sleep(Duration::from_millis(50));
+    })
+}
 
+#[cfg(unix)]
+fn wait_for_old_public_sockets_at(
+    api_socket: PathBuf,
+    client_socket: PathBuf,
+    timeout: Duration,
+    mut wait: impl FnMut(),
+) -> io::Result<()> {
+    let paths = [api_socket, client_socket];
+    #[cfg(feature = "web")]
+    let paths = [
+        paths[0].clone(),
+        paths[1].clone(),
+        crate::web::local_listener::socket_path(&paths[0]),
+    ];
     let deadline = Instant::now() + timeout;
-    let api_socket = api::socket_path();
-    let client_socket = client_socket_path();
     while Instant::now() < deadline {
-        let api_open = api_socket.exists() && UnixStream::connect(&api_socket).is_ok();
-        let client_open = client_socket.exists() && UnixStream::connect(&client_socket).is_ok();
-        if !api_open && !client_open {
+        if !paths.iter().any(|path| {
+            path.exists()
+                && match crate::platform::socket::probe_listener(path) {
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+                        ) =>
+                    {
+                        false
+                    }
+                    // Full backlogs and uncertain probes are still busy, never proof of unlink.
+                    _ => true,
+                }
+        }) {
             return Ok(());
         }
-        std::thread::sleep(Duration::from_millis(50));
+        wait();
     }
     Err(io::Error::new(
         io::ErrorKind::TimedOut,
@@ -3944,10 +4690,325 @@ fn init_logging() {
 
 #[cfg(test)]
 mod tests {
+    mod observer_stall;
     use super::*;
 
     use crate::app::AppState;
     use crate::protocol::CursorState;
+
+    #[test]
+    fn undrained_panes_sort_by_number_not_text() {
+        let mut ids = vec!["pane 7", "wA:p1", "w2:p1", "w1:pA", "w1:p2"];
+        ids.sort_by_cached_key(|id| public_pane_sort_key(id));
+        assert_eq!(ids, vec!["w1:p2", "w1:pA", "w2:p1", "wA:p1", "pane 7"]);
+    }
+
+    #[test]
+    fn failed_handoff_response_preserves_unresolved_executable_code() {
+        let base = crate::test_support::TempDir::socket();
+        let error = super::super::executable::resolve(Some(&base.path().join("removed")))
+            .err()
+            .expect("missing target");
+        let response: serde_json::Value =
+            serde_json::from_str(&failed_handoff_response("unresolved".into(), &error, &[]))
+                .unwrap();
+        assert_eq!(response["error"]["code"], "server_executable_unresolved");
+        assert!(response.get("result").is_none());
+    }
+
+    #[test]
+    fn failed_handoff_response_preserves_kind_without_parsing_diagnostic() {
+        for (kind, expected) in [
+            (io::ErrorKind::BrokenPipe, "broken_pipe"),
+            (io::ErrorKind::ConnectionReset, "connection_reset"),
+            (io::ErrorKind::InvalidInput, "invalid_input"),
+            (io::ErrorKind::TimedOut, "other"),
+            (io::ErrorKind::WouldBlock, "other"),
+            (io::ErrorKind::Other, "other"),
+        ] {
+            let err = io::Error::new(kind, "diagnostic prose can change");
+            let response = failed_handoff_response("typed-failure".into(), &err, &[]);
+            let json: serde_json::Value =
+                serde_json::from_str(&response).expect("decode failed handoff");
+            assert_eq!(json["error"]["code"], "handoff_failed");
+            assert_eq!(json["error"]["data"]["kind"], expected);
+            assert!(json.get("result").is_none());
+            assert!(json["error"].get("kind").is_none());
+            let old: api::schema::ErrorResponse =
+                serde_json::from_value(json).expect("existing clients ignore additive error.data");
+            assert_eq!(old.error.message, "diagnostic prose can change");
+        }
+    }
+
+    #[test]
+    fn refusal_at_ready_preserves_typed_cause_with_rollback_context() {
+        for restore_error in [None, Some(io::Error::other("restore failed"))] {
+            let (mut exporter, mut importer) = std::os::unix::net::UnixStream::pair().unwrap();
+            crate::server::handoff::report_import_refusal(&mut importer, "generation mismatch")
+                .unwrap();
+            let refusal = crate::server::handoff::wait_ready(&mut exporter).unwrap_err();
+            let restore_failed = restore_error.is_some();
+            let err = handoff_ready_error(refusal, restore_error);
+            let response = failed_handoff_response("ready-refusal".into(), &err, &[]);
+            let json: serde_json::Value = serde_json::from_str(&response).unwrap();
+            assert_eq!(json["error"]["code"], "handoff_failed");
+            assert_eq!(json["error"]["data"]["kind"], "import_refused");
+            assert!(json.get("result").is_none());
+            assert!(json["error"].get("kind").is_none());
+            assert!(err
+                .to_string()
+                .contains("did not become ready: handoff import refused: generation mismatch"));
+            assert_eq!(
+                err.to_string()
+                    .contains("old server could not restore public sockets: restore failed"),
+                restore_failed
+            );
+        }
+    }
+
+    fn commit_restore_fixture() -> (crate::test_socket_dir::SocketDir, UnixListener, PathBuf) {
+        let directory = crate::test_socket_dir::SocketDir::reserve("hcr");
+        let socket_path = directory.path().join("restore.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        (directory, listener, socket_path)
+    }
+
+    #[test]
+    fn commit_restore_fixture_is_removed_on_unwind() {
+        let mut fixture_path = None;
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let (directory, _listener, socket_path) = commit_restore_fixture();
+            fixture_path = Some(directory.path().to_path_buf());
+            assert!(socket_path.exists());
+            panic!("fixture assertion failed");
+        }));
+        assert!(panic.is_err());
+        let path = fixture_path.unwrap();
+        assert!(
+            !path.exists(),
+            "fixture directory leaked on panic: {}",
+            path.display()
+        );
+    }
+
+    #[derive(Default)]
+    struct RecordedCommitRecovery {
+        steps: Vec<&'static str>,
+        restore_fails: bool,
+    }
+
+    impl HandoffCommitRecovery for RecordedCommitRecovery {
+        fn cleanup_importer(&mut self) {
+            self.steps.push("cleanup");
+        }
+        fn restore_public_sockets(&mut self) -> io::Result<()> {
+            self.steps.push("restore");
+            if self.restore_fails {
+                Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    "fixture restore failure",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+        fn rollback(&mut self) {
+            self.steps.push("rollback");
+        }
+    }
+
+    #[test]
+    fn production_commit_recovery_orders_cleanup_restore_rollback() {
+        for restore_fails in [false, true] {
+            let mut recovery = RecordedCommitRecovery {
+                restore_fails,
+                ..Default::default()
+            };
+            let err = finish_handoff_commit(
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "commit failed")),
+                commit_recovery(&mut recovery),
+            )
+            .unwrap_err();
+            assert_eq!(recovery.steps, ["cleanup", "restore", "rollback"]);
+            assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+            if restore_fails {
+                let context = err
+                    .get_ref()
+                    .unwrap()
+                    .downcast_ref::<HandoffRollbackError>()
+                    .unwrap();
+                assert_eq!(
+                    context.restore_error.as_ref().unwrap().kind(),
+                    io::ErrorKind::AddrInUse
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn production_commit_recovery_is_unused_after_commit_success() {
+        let mut recovery = RecordedCommitRecovery::default();
+        finish_handoff_commit(Ok(()), commit_recovery(&mut recovery)).unwrap();
+        assert!(recovery.steps.is_empty());
+    }
+
+    #[test]
+    fn commit_and_socket_restore_failures_preserve_original_kind_and_source() {
+        let (mut exporter, importer) = std::os::unix::net::UnixStream::pair().unwrap();
+        exporter
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        drop(importer);
+        let commit_result = crate::server::handoff::report_committed(&mut exporter);
+        let original_kind = commit_result.as_ref().unwrap_err().kind();
+        assert!(matches!(
+            original_kind,
+            io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+        ));
+        let (_directory, _occupied, socket_path) = commit_restore_fixture();
+        let mut recovery_attempted = false;
+        let result = finish_handoff_commit(commit_result, || {
+            recovery_attempted = true;
+            UnixListener::bind(&socket_path).map(drop)
+        });
+        let err = result.unwrap_err();
+        assert!(recovery_attempted);
+        assert_eq!(err.kind(), original_kind);
+        let expected = match original_kind {
+            io::ErrorKind::BrokenPipe => "broken_pipe",
+            io::ErrorKind::ConnectionReset => "connection_reset",
+            other => panic!("unexpected commit kind: {other:?}"),
+        };
+        let response = failed_handoff_response("commit-refusal".into(), &err, &[]);
+        let json: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(json["error"]["code"], "handoff_failed");
+        assert_eq!(json["error"]["data"]["kind"], expected);
+        assert!(json.get("result").is_none());
+        let message = json["error"]["message"].as_str().unwrap();
+        assert!(message.contains("was ready, but commit failed:"));
+        assert!(message.contains("old server could not restore public sockets:"));
+        let source = err.get_ref().unwrap().source().unwrap();
+        assert_eq!(
+            source.downcast_ref::<io::Error>().unwrap().kind(),
+            original_kind
+        );
+    }
+
+    #[test]
+    fn commit_recovery_preserves_each_io_kind_with_or_without_restore_failure() {
+        for (kind, expected) in [
+            (io::ErrorKind::BrokenPipe, "broken_pipe"),
+            (io::ErrorKind::ConnectionReset, "connection_reset"),
+            (io::ErrorKind::InvalidInput, "invalid_input"),
+            (io::ErrorKind::TimedOut, "other"),
+        ] {
+            for restore_fails in [false, true] {
+                let err = finish_handoff_commit(
+                    Err(io::Error::new(kind, "diagnostic prose can change")),
+                    || {
+                        if restore_fails {
+                            Err(io::Error::other("restore diagnostic"))
+                        } else {
+                            Ok(())
+                        }
+                    },
+                )
+                .unwrap_err();
+                assert_eq!(err.kind(), kind);
+                let json: serde_json::Value =
+                    serde_json::from_str(&failed_handoff_response("commit-kind".into(), &err, &[]))
+                        .unwrap();
+                assert_eq!(json["error"]["code"], "handoff_failed");
+                assert_eq!(json["error"]["data"]["kind"], expected);
+                assert!(json.get("result").is_none());
+                assert_eq!(
+                    err.to_string().contains(
+                        "old server could not restore public sockets: restore diagnostic"
+                    ),
+                    restore_fails
+                );
+                if !restore_fails {
+                    assert_eq!(err.to_string(), "diagnostic prose can change");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn successful_commit_does_not_recover_old_server() {
+        finish_handoff_commit(Ok(()), || panic!("committed ownership must not roll back")).unwrap();
+    }
+
+    #[test]
+    fn ready_context_preserves_peer_closed_io_kinds() {
+        for (kind, expected) in [
+            (io::ErrorKind::BrokenPipe, "broken_pipe"),
+            (io::ErrorKind::ConnectionReset, "connection_reset"),
+        ] {
+            let err = handoff_ready_error(io::Error::new(kind, "changed prose"), None);
+            let json: serde_json::Value =
+                serde_json::from_str(&failed_handoff_response("ready-io".into(), &err, &[]))
+                    .unwrap();
+            assert_eq!(json["error"]["data"]["kind"], expected);
+        }
+    }
+
+    #[test]
+    fn failed_handoff_message_reports_input_already_dropped() {
+        let err = io::Error::other("handoff import refused: protocol");
+        assert_eq!(
+            failed_handoff_message(&err, &[]),
+            "handoff import refused: protocol"
+        );
+
+        let message = failed_handoff_message(
+            &err,
+            &[api::schema::UndrainedPane {
+                pane_id: "w1:p2".into(),
+                title: None,
+                pid: None,
+                pending_bytes: 3,
+                writer_stuck: false,
+            }],
+        );
+
+        assert_eq!(
+            message,
+            "handoff import refused: protocol; --skip-undrained had already dropped pending input: w1:p2 (3 bytes pending)"
+        );
+    }
+
+    #[test]
+    fn undrained_handoff_message_names_each_stuck_pane_and_its_bytes() {
+        let message = undrained_handoff_message(&[
+            api::schema::UndrainedPane {
+                pane_id: "w2:p6".into(),
+                title: Some("zsh".into()),
+                pid: Some(4242),
+                pending_bytes: 17,
+                writer_stuck: true,
+            },
+            api::schema::UndrainedPane {
+                pane_id: "w1:p2".into(),
+                title: None,
+                pid: None,
+                pending_bytes: 3,
+                writer_stuck: false,
+            },
+        ]);
+
+        assert!(
+            message.starts_with("timed out draining PTY writes before handoff: "),
+            "{message}"
+        );
+        assert!(
+            message
+                .contains("w2:p6 (17 bytes pending, writer accepts zero bytes, pid 4242, \"zsh\")"),
+            "{message}"
+        );
+        assert!(message.contains("w1:p2 (3 bytes pending)"), "{message}");
+        assert!(message.contains("--skip-undrained"), "{message}");
+    }
 
     #[test]
     fn first_frame_sent_attach_trace_fires_once() {
@@ -3993,7 +5054,553 @@ mod tests {
         );
     }
 
-    fn test_headless_server() -> HeadlessServer {
+    #[tokio::test]
+    async fn shutdown_stops_and_joins_all_structured_workers() {
+        assert_structured_workers_stopped(false).await;
+    }
+
+    #[tokio::test]
+    async fn pre_handoff_stops_and_joins_all_structured_workers() {
+        assert_structured_workers_stopped(true).await;
+    }
+
+    async fn assert_structured_workers_stopped(handoff: bool) {
+        use crate::api::agent_state::Lifecycle;
+        use crate::structured::{
+            supervision::ProcessIdentity,
+            workers::tests::{event, Case},
+        };
+        let mut server = test_headless_server();
+        let notify = server.app.render_notify.clone();
+        let now = Instant::now();
+        let mut cases = Vec::new();
+        let mut children = Vec::new();
+        for n in [33, 34] {
+            let case = Case::start(
+                &mut server.app.state.structured_agents,
+                &mut server.app.structured_workers,
+                n,
+                "state-reducer",
+                vec![event("control_request")],
+            );
+            case.human(
+                &mut server.app.state.structured_agents,
+                &mut server.app.structured_workers,
+                &notify,
+                now,
+            )
+            .await;
+            let pid = std::fs::read_to_string(case.fixture.root.path().join("model.pid"))
+                .unwrap()
+                .parse()
+                .unwrap();
+            children.push(ProcessIdentity::capture(pid).unwrap());
+            cases.push(case);
+        }
+        if handoff {
+            assert!(server.stop_structured_before_handoff().is_empty());
+        } else {
+            server.complete_shutdown().unwrap();
+        }
+        assert!(children.into_iter().all(|child| !child.alive()));
+        for case in cases {
+            case.assert_shutdown(
+                &server.app.state.structured_agents,
+                &server.app.structured_workers,
+            );
+            assert_eq!(
+                server
+                    .app
+                    .state
+                    .structured_agents
+                    .get(&case.id)
+                    .unwrap()
+                    .1
+                    .update
+                    .state
+                    .lifecycle,
+                Lifecycle::Offline
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn uncertain_worker_reports_but_does_not_veto_handoff_and_crosses_as_unknown() {
+        use crate::api::{agent_state::Lifecycle, error_code::ErrorCode};
+        use crate::structured::workers::tests::Case;
+        let _guard = crate::config::test_config_env_guard();
+        let root = crate::test_support::TempDir::socket();
+        struct SavedEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for SavedEnv {
+            fn drop(&mut self) {
+                for (key, value) in &self.0 {
+                    if let Some(value) = value {
+                        std::env::set_var(key, value);
+                    } else {
+                        std::env::remove_var(key);
+                    }
+                }
+            }
+        }
+        let _env = SavedEnv(
+            [
+                crate::config::CONFIG_PATH_ENV_VAR,
+                "XDG_STATE_HOME",
+                "XDG_CONFIG_HOME",
+            ]
+            .into_iter()
+            .map(|key| (key, std::env::var_os(key)))
+            .collect(),
+        );
+        std::env::set_var(
+            crate::config::CONFIG_PATH_ENV_VAR,
+            root.path().join("config.toml"),
+        );
+        std::env::set_var("XDG_STATE_HOME", root.path().join("state"));
+        std::env::set_var("XDG_CONFIG_HOME", root.path().join("config"));
+        let mut server = test_headless_server();
+        let notify = server.app.render_notify.clone();
+        let case = Case::uncertain(
+            &mut server.app.state.structured_agents,
+            &mut server.app.structured_workers,
+            42,
+            &notify,
+        )
+        .await;
+        let (offline, mut restored_launch, _) = Case::prepare(
+            &mut server.app.state.structured_agents,
+            43,
+            "state-reducer",
+            vec![],
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                server.stop_structured_before_handoff(),
+                vec![case.id.clone()]
+            );
+            let error = server
+                .app
+                .structured_workers
+                .shutdown(&mut server.app.state.structured_agents)
+                .unwrap_err();
+            assert!(error
+                .0
+                .contains(&(case.id.clone(), ErrorCode::StructuredWorkerCleanupFailed)));
+            let result = server
+                .perform_live_handoff(crate::api::schema::ServerLiveHandoffParams {
+                    import_exe: Some(
+                        root.path()
+                            .join("missing-importer")
+                            .to_string_lossy()
+                            .into_owned(),
+                    ),
+                    expected_protocol: None,
+                    expected_version: None,
+                    skip_undrained: false,
+                })
+                .await;
+            match result {
+                Err(HandoffError::Failed(error)) => assert_eq!(
+                    error.kind(),
+                    io::ErrorKind::NotFound,
+                    "worker diagnostics must reach the real importer precondition"
+                ),
+                other => panic!("unexpected handoff outcome: {other:?}"),
+            }
+        }
+        let snapshot = serde_json::from_value(serde_json::json!({
+            "workspaces":[],"active":null,"selected":0,"structured_agents":server.app.state.structured_agents,
+        })).unwrap();
+        let mut manifest = crate::server::handoff::manifest_for(snapshot, Vec::new(), None, None);
+        manifest.structured_unknown = server.stop_structured_before_handoff();
+        let manifest: crate::server::handoff::HandoffManifest =
+            serde_json::from_slice(&serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let (_, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut restored = crate::app::App::new_from_handoff(
+            &crate::config::Config::default(),
+            None,
+            rx,
+            crate::api::EventHub::default(),
+            &manifest.snapshot,
+            &mut HashMap::new(),
+        )
+        .unwrap();
+        manifest.restore_structured_unknown(&mut restored.state.structured_agents);
+        assert_eq!(
+            restored
+                .state
+                .structured_agents
+                .get(&case.id)
+                .unwrap()
+                .1
+                .update
+                .state
+                .lifecycle,
+            Lifecycle::Unknown
+        );
+        assert_eq!(
+            restored
+                .state
+                .structured_agents
+                .get(&offline.id)
+                .unwrap()
+                .1
+                .update
+                .state
+                .lifecycle,
+            Lifecycle::Offline
+        );
+        assert_eq!(
+            restored.state.structured_agents.handoff_unknown(),
+            vec![case.id.clone()],
+            "the next handoff must preserve Unknown without a restored worker"
+        );
+        assert!(restored
+            .structured_workers
+            .runtime(&case.id, case.generation)
+            .is_none());
+        let generation = restored.state.structured_agents.get(&case.id).unwrap().2;
+        restored_launch.agent_id = case.id.clone();
+        restored_launch.generation = generation;
+        restored_launch.leases = restored.session_leases.clone();
+        assert_eq!(
+            restored.structured_workers.start(
+                &mut restored.state.structured_agents,
+                restored_launch,
+                |_| panic!("handoff-restored Unknown cannot prepare")
+            ),
+            Err(ErrorCode::StructuredRecoveryRequired)
+        );
+        assert_eq!(
+            restored.state.structured_agents.get(&case.id).unwrap().2,
+            generation
+        );
+        let error = server.complete_shutdown().unwrap_err();
+        let diagnostic = error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<crate::structured::workers::ShutdownError>())
+            .expect("quit must keep the typed shutdown diagnostic as its source");
+        assert!(diagnostic
+            .0
+            .contains(&(case.id.clone(), ErrorCode::StructuredWorkerCleanupFailed)));
+        // The committed handoff keeps this diagnostic but must exit successfully.
+        server.commit_handoff_shutdown();
+        let log = crate::logging::capture_logs(|| assert!(server.complete_shutdown().is_ok()));
+        assert!(log.contains("structured.worker.shutdown_failed"));
+        assert!(log.contains("structured_worker_cleanup_failed"));
+        assert!(
+            server
+                .app
+                .structured_workers
+                .shutdown(&mut server.app.state.structured_agents)
+                .is_err(),
+            "successful handoff does not erase the cached diagnostic"
+        );
+    }
+
+    #[tokio::test]
+    async fn structured_worker_notifications_and_exact_deadlines_reach_the_scheduler() {
+        use crate::api::agent_state::{Lifecycle, Phase};
+        use crate::structured::workers::tests::{event, wait, Case};
+        let mut server = test_headless_server();
+        let now = Instant::now();
+        let notify = server.app.render_notify.clone();
+        server.app.state.workspaces.clear();
+        server.app.state.config.checks.enable = false;
+        server.app.next_auto_update_check = None;
+        server.app.checks_heartbeat_deadline = None;
+        server.app.checks_next_deadline = None;
+        server.app.next_animation_tick = None;
+        server.app.session_save_deadline = None;
+        let (mut case, mut launch, factory) = Case::prepare(
+            &mut server.app.state.structured_agents,
+            11,
+            "state-reducer",
+            vec![event("command_lifecycle")],
+        );
+        // Choose an explicit fixture policy earlier than unrelated app deadlines.
+        launch.stall_after = Duration::from_millis(1);
+        case.generation = server
+            .app
+            .structured_workers
+            .start(&mut server.app.state.structured_agents, launch, factory)
+            .unwrap();
+        wait(&notify, || {
+            server.handle_scheduled_tasks_headless(now, false);
+            assert!(server
+                .app
+                .structured_workers
+                .report(&case.id, case.generation)
+                .is_none());
+            server
+                .app
+                .state
+                .structured_agents
+                .get(&case.id)
+                .unwrap()
+                .1
+                .update
+                .state
+                .lifecycle
+                == Lifecycle::Live
+        })
+        .await;
+        case.submit(&server.app.structured_workers);
+        wait(&notify, || {
+            server.handle_scheduled_tasks_headless(now, false);
+            assert!(server
+                .app
+                .structured_workers
+                .report(&case.id, case.generation)
+                .is_none());
+            server
+                .app
+                .state
+                .structured_agents
+                .get(&case.id)
+                .unwrap()
+                .1
+                .update
+                .state
+                .phase
+                == Phase::Working
+        })
+        .await;
+        server.app.checks_next_deadline = None;
+        server.app.checks_heartbeat_deadline = None;
+        let due = server
+            .app
+            .structured_workers
+            .next_deadline(&server.app.state.structured_agents)
+            .unwrap();
+        assert_eq!(
+            server
+                .app
+                .next_headless_loop_deadline_with_git_refresh(now, false, false),
+            Some(due)
+        );
+        let now = due;
+        server.handle_scheduled_tasks_headless(now, false);
+        let update = &server
+            .app
+            .state
+            .structured_agents
+            .get(&case.id)
+            .unwrap()
+            .1
+            .update;
+        assert_eq!(update.state.phase, Phase::Working);
+        assert!(update.stalled_since_ms.is_some());
+        case.finish(
+            &mut server.app.state.structured_agents,
+            &mut server.app.structured_workers,
+            &notify,
+            now,
+            Some(crate::structured::runtime::Outcome::Stopped),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn s3b_headless_dispatch_deadline_cancels_held_input_without_traffic() {
+        let mut server = test_headless_server();
+        server.app.state.workspaces = vec![crate::workspace::Workspace::test_new("write-ack")];
+        server.app.state.ensure_test_terminals();
+        let pane = server.app.state.workspaces[0].tabs[0].root_pane;
+        let public = server.app.state.public_pane_id(0, pane).unwrap();
+        let (runtime, mut bytes) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        let now = Instant::now();
+        assert!(runtime.begin_injection_lease("held", now + Duration::from_secs(2), now));
+        server.app.state.workspaces[0].tabs[0]
+            .runtimes
+            .insert(pane, runtime);
+        let (respond_to, response) = std::sync::mpsc::channel();
+        server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+            scope: None,
+            request: serde_json::from_value(serde_json::json!({"id":"held","method":"pane.write_input","params":{"pane_id":public,"text":"never","raw":true,"write_timeout_ms":200}})).unwrap(),
+            respond_to, peer_pid:Some(std::process::id()), peer_birth:crate::platform::process_start_time(std::process::id()), peer_uid:Some(crate::platform::peer::effective_uid()),
+        }).await;
+        assert!(matches!(
+            response.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        server.app.next_auto_update_check = None;
+        server.app.checks_heartbeat_deadline = None;
+        assert_eq!(
+            server
+                .app
+                .next_headless_loop_deadline_with_git_refresh(now, false, false),
+            server.app.input_writes.next_deadline()
+        );
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            sleep_until_or_pending(server.app.input_writes.next_deadline()),
+        )
+        .await
+        .unwrap();
+        server.handle_scheduled_tasks_headless(Instant::now(), false);
+        let value: serde_json::Value = serde_json::from_str(&response.try_recv().unwrap()).unwrap();
+        assert_eq!(value["error"]["code"], "input_write_cancelled");
+        assert_eq!(value["error"]["data"]["input_write"]["reason"], "deadline");
+        server.app.state.workspaces[0].tabs[0].runtimes[&pane].end_injection_lease("held");
+        assert!(bytes.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn s3b_headless_shutdown_answers_before_releasing_held_payload() {
+        let mut server = test_headless_server();
+        server.app.state.workspaces = vec![crate::workspace::Workspace::test_new("write-ack")];
+        server.app.state.ensure_test_terminals();
+        let pane = server.app.state.workspaces[0].tabs[0].root_pane;
+        let public = server.app.state.public_pane_id(0, pane).unwrap();
+        let (runtime, mut bytes) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        let now = Instant::now();
+        assert!(runtime.begin_injection_lease("held", now + Duration::from_secs(2), now));
+        server.app.state.workspaces[0].tabs[0]
+            .runtimes
+            .insert(pane, runtime);
+        let (respond_to, response) = std::sync::mpsc::channel();
+        server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+            scope: None,
+            request: serde_json::from_value(serde_json::json!({"id":"held","method":"pane.write_input","params":{"pane_id":public,"text":"never","raw":true}})).unwrap(),
+            respond_to, peer_pid:Some(std::process::id()), peer_birth:crate::platform::process_start_time(std::process::id()), peer_uid:Some(crate::platform::peer::effective_uid()),
+        }).await;
+        assert!(matches!(
+            response.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        server.initiate_shutdown();
+        let value: serde_json::Value = serde_json::from_str(&response.try_recv().unwrap()).unwrap();
+        assert_eq!(value["error"]["data"]["input_write"]["reason"], "pane_gone");
+        assert_eq!(value["error"]["data"]["input_write"]["bytes_written"], 0);
+        assert!(bytes.try_recv().is_err());
+    }
+
+    #[cfg(feature = "web")]
+    #[tokio::test]
+    async fn fatal_client_accept_keeps_the_server_loop_and_shell_pty_alive() {
+        async fn request(
+            tx: &api::ApiRequestSender,
+            method: &str,
+            params: serde_json::Value,
+        ) -> serde_json::Value {
+            let (respond_to, response) = std::sync::mpsc::channel();
+            tx.send(api::ApiRequestMessage {
+                scope: None,
+                request: serde_json::from_value(
+                    serde_json::json!({"id":"listener-survival","method":method,"params":params}),
+                )
+                .unwrap(),
+                respond_to,
+                peer_pid: Some(std::process::id()),
+                peer_birth: crate::platform::process_start_time(std::process::id()),
+                peer_uid: Some(crate::platform::peer::effective_uid()),
+            })
+            .unwrap();
+            let response = tokio::task::spawn_blocking(move || {
+                response
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("headless request producer disappeared or stayed silent")
+            })
+            .await
+            .unwrap();
+            let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+            assert!(value.get("error").is_none(), "{value}");
+            value
+        }
+        let (data, failed) = crate::web::client_listener::tests::failed_listener().await;
+        let health = failed.health.clone();
+        let mut server = test_headless_server();
+        server.app.state.default_shell = "/bin/sh".into();
+        server.app.state.config.terminal.default_shell = "/bin/sh".into();
+        server.app.state.config.checks.enable = false;
+        server.app.next_auto_update_check = None;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        server.app.api_rx = rx;
+        server.client_wire_health = health.clone();
+        server.client_wire = Some(failed);
+        let quit = server.should_quit.clone();
+        let wake = server.server_event_tx.clone();
+        let exercise = async {
+            assert_eq!(
+                health.status(),
+                Some(crate::api::client_listener::Status::Failed)
+            );
+            let created = request(
+                &tx,
+                "workspace.create",
+                serde_json::json!({"cwd":data.path(),"focus":true}),
+            )
+            .await;
+            let pane = created["result"]["root_pane"]["pane_id"]
+                .as_str()
+                .expect("live shell pane");
+            request(&tx,"pane.write_input",serde_json::json!({"pane_id":pane,"text":"printf '%s%s\\n' listener- survived\n","raw":true})).await;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let read = request(
+                        &tx,
+                        "pane.read",
+                        serde_json::json!({"pane_id":pane,"source":"recent","format":"text"}),
+                    )
+                    .await;
+                    if read.to_string().contains("listener-survived") {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("shell producer stayed silent after listener failure");
+            quit.store(true, Ordering::Release);
+            wake.send(ServerEvent::QuitSignal)
+                .await
+                .expect("owned server shutdown wake");
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(15), async {
+            tokio::join!(server.run(), exercise)
+        })
+        .await
+        .expect("headless loop did not finish after explicit owned shutdown");
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn headless_loop_publishes_directory_removal_without_an_api_request() {
+        use crate::app::directory::loop_tests::{changes, prepare, wait};
+        let mut server = test_headless_server();
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        server.app.api_rx = api_rx;
+        let (hub, after) = prepare(&mut server.app);
+        let observer_hub = hub.clone();
+        let quit = server.should_quit.clone();
+        let wake = server.server_event_tx.clone();
+        let exercise = async move {
+            let found = tokio::task::spawn_blocking(move || wait(observer_hub, after)).await;
+            // Always stop the owned loop, including when the mutant stayed silent.
+            quit.store(true, Ordering::Release);
+            wake.send(ServerEvent::QuitSignal).await.unwrap();
+            found.expect("directory observer panicked")
+        };
+        let (result, observed) = tokio::time::timeout(Duration::from_secs(8), async {
+            tokio::join!(server.run(), exercise)
+        })
+        .await
+        .expect("owned headless loop or observer stalled");
+        result.unwrap();
+        assert!(
+            server.app.state.workspaces.is_empty(),
+            "the loop must process pane death"
+        );
+        assert_eq!(
+            observed.len(),
+            1,
+            "headless loop did not publish the removal"
+        );
+        assert_eq!(changes(&hub, after).len(), 1);
+    }
+
+    pub(super) fn test_headless_server() -> HeadlessServer {
         let config = crate::config::Config::default();
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = crate::app::App::new(&config, true, None, api_rx, api::EventHub::default());
@@ -4015,6 +5622,7 @@ mod tests {
         let socket_path = dir.join("client.sock");
         let _ = fs::remove_file(&socket_path);
         let listener = UnixListener::bind(&socket_path).expect("bind test listener");
+        let client_socket_owner = crate::ipc::SocketOwner::acquire(&socket_path).unwrap();
         let client_socket_identity =
             socket_file_identity(&socket_path).expect("test listener socket identity");
         listener
@@ -4027,9 +5635,13 @@ mod tests {
             app,
             api_tx: None,
             api_server: None,
+            client_wire_health: Default::default(),
             client_listener: listener,
+            #[cfg(feature = "web")]
+            client_wire: None,
             client_socket_path: socket_path,
             client_socket_identity,
+            client_socket_owner,
             clients: HashMap::new(),
             next_client_id: 1,
             foreground_client_id: None,
@@ -4043,6 +5655,8 @@ mod tests {
             last_client_size: None,
             shutting_down: false,
             handoff_in_progress: false,
+            handoff_completed: false,
+            handoff_skipped_undrained: Vec::new(),
             pending_handoff_repaint_nudge: false,
             should_quit: Arc::new(AtomicBool::new(false)),
             server_event_rx,
@@ -4082,8 +5696,150 @@ mod tests {
         }
     }
 
+    fn relay_operator_headless(method: &str) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (_guard, _scrub) = crate::config::test_config_env_guard();
+        let root = crate::test_support::TempDir::socket();
+        let config = root.path().join("config.toml");
+        fs::write(
+            &config,
+            "[terminal]\ndefault_shell = \"relay-test-shell\"\n",
+        )
+        .unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &config);
+        let mut violations = Vec::new();
+        {
+            for enrolled in [None, Some(true), Some(false)] {
+                let mut server = test_headless_server();
+                server.app.runtime_config.uid_policy = crate::structured::identity::UidPolicy {
+                    operator: 7,
+                    dedicated: Ok(None).into(),
+                };
+                if let Some(enrolled) = enrolled {
+                    server.app.test_attach_relay(enrolled);
+                }
+                let shell = server.app.state.default_shell.clone();
+                let params = match method {
+                    "server.live_handoff" => {
+                        serde_json::json!({"import_exe":root.path().join("absent-importer")})
+                    }
+                    "agent.stop" | "agent.fork" => {
+                        serde_json::json!({"target":"missing-fixture-agent"})
+                    }
+                    _ => serde_json::json!({}),
+                };
+                let (respond_to, response) = std::sync::mpsc::channel();
+                runtime.block_on(server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+                    scope: None,
+                    request: serde_json::from_value(
+                        serde_json::json!({"id":"relay-headless","method":method,"params":params}),
+                    )
+                    .unwrap(),
+                    respond_to,
+                    peer_pid: Some(std::process::id()),
+                    peer_birth: crate::platform::process_start_time(std::process::id()),
+                    peer_uid: Some(7),
+                }));
+                let result: serde_json::Value =
+                    serde_json::from_str(&response.recv_timeout(Duration::from_secs(1)).unwrap())
+                        .unwrap();
+                if enrolled.is_some() {
+                    if result["error"]["code"] != "operator_only" {
+                        violations.push(format!("{method}, {enrolled:?}: {result}"));
+                        continue;
+                    }
+                    assert_eq!(server.app.state.default_shell, shell);
+                    assert!(!server.app.take_config_reloaded_from_disk());
+                    assert!(!server.app.state.should_quit);
+                    assert!(!server.shutting_down);
+                    assert!(server.handoff_skipped_undrained.is_empty());
+                } else {
+                    assert_ne!(
+                        result["error"]["code"], "operator_only",
+                        "{method}: {result}"
+                    );
+                    if method == "server.reload_config" {
+                        assert_eq!(server.app.state.default_shell, "relay-test-shell");
+                        assert!(result.get("result").is_some(), "{result}");
+                    } else if method == "server.live_handoff" {
+                        assert_eq!(
+                            result["error"]["code"], "server_executable_unresolved",
+                            "{result}"
+                        );
+                    } else if method == "server.stop" {
+                        assert!(server.app.state.should_quit);
+                    }
+                }
+                assert!(server.app.current_api_peer_uid.is_none());
+            }
+        }
+        assert!(violations.is_empty(), "{violations:#?}");
+    }
+
     #[test]
-    fn headless_api_request_drains_all_pending_internal_events_before_reading_state() {
+    fn relay_operator_headless_reload_config() {
+        relay_operator_headless("server.reload_config");
+    }
+    #[test]
+    fn relay_operator_headless_live_handoff() {
+        relay_operator_headless("server.live_handoff");
+    }
+    #[test]
+    fn relay_operator_headless_stop() {
+        relay_operator_headless("server.stop");
+    }
+    #[test]
+    fn relay_operator_headless_agent_stop() {
+        relay_operator_headless("agent.stop");
+    }
+    #[test]
+    fn relay_operator_headless_agent_fork() {
+        relay_operator_headless("agent.fork");
+    }
+
+    #[tokio::test]
+    async fn headless_uid_boundary_precedes_live_handoff_fast_path() {
+        let mut server = test_headless_server();
+        server.app.runtime_config.uid_policy = crate::structured::identity::UidPolicy {
+            operator: 7,
+            dedicated: Ok(Some(42)).into(),
+        };
+        let root =
+            crate::structured::launch::SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+        let (respond_to, response) = std::sync::mpsc::channel();
+        let changed = server
+            .handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+                scope: None,
+                request: api::schema::Request {
+                    id: "uid-handoff".into(),
+                    method: api::schema::Method::ServerLiveHandoff(
+                        api::schema::ServerLiveHandoffParams {
+                            import_exe: Some(
+                                root.path().join("absent-importer").display().to_string(),
+                            ),
+                            ..Default::default()
+                        },
+                    ),
+                },
+                peer_pid: Some(std::process::id()),
+                peer_birth: crate::platform::process_start_time(std::process::id()),
+                peer_uid: Some(42),
+                respond_to,
+            })
+            .await;
+        let response: serde_json::Value =
+            serde_json::from_str(&response.recv_timeout(Duration::from_secs(1)).unwrap()).unwrap();
+        assert!(!changed);
+        assert_eq!(response["error"]["code"], "operator_only", "{response}");
+        assert!(server.app.current_api_peer_uid.is_none());
+        assert!(!server.app.state.should_quit);
+    }
+
+    #[tokio::test]
+    async fn headless_api_request_drains_all_pending_internal_events_before_reading_state() {
         let mut server = test_headless_server();
         for i in 0..=crate::app::APP_EVENT_DRAIN_LIMIT {
             server
@@ -4099,13 +5855,16 @@ mod tests {
         let (respond_to, response_rx) = std::sync::mpsc::channel();
         assert!(
             server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+                scope: None,
                 request: api::schema::Request {
                     id: "headless_stop_after_events".into(),
                     method: api::schema::Method::ServerStop(api::schema::EmptyParams::default()),
                 },
                 respond_to,
-                peer_pid: None,
-            })
+                peer_pid: Some(std::process::id()),
+                peer_birth: crate::platform::process_start_time(std::process::id()),
+                peer_uid: Some(crate::platform::peer::effective_uid()),
+            }).await
         );
         let response = response_rx
             .recv_timeout(Duration::from_millis(100))
@@ -4123,13 +5882,15 @@ mod tests {
 
     fn test_client_writer() -> (
         ClientWriter,
-        std::sync::mpsc::Receiver<Vec<u8>>,
+        crate::server::client_transport::ControlReceiver,
         std::sync::mpsc::Receiver<Vec<u8>>,
     ) {
-        let (control_tx, control_rx) = std::sync::mpsc::channel();
+        let (control_tx, control_rx) =
+            crate::server::client_transport::ObserverControl::channel(None, 0);
         let (render_tx, render_rx) = std::sync::mpsc::sync_channel(1);
         (
             ClientWriter {
+                peer: Default::default(),
                 control: control_tx,
                 render: render_tx,
             },
@@ -4226,6 +5987,165 @@ mod tests {
         assert_eq!(server.detached_size(), (MIN_COLS, MIN_ROWS));
     }
 
+    #[tokio::test]
+    async fn detach_refreshes_spawn_geometry_without_resizing_live_ptys() {
+        for cols in [15, 200] {
+            let mut server = test_headless_server();
+            let mut workspace = crate::workspace::Workspace::test_new("geometry");
+            let pane = workspace.focused_pane_id().unwrap();
+            workspace.insert_test_runtime(
+                pane,
+                crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b""),
+            );
+            let hidden = workspace.test_add_tab(Some("hidden"));
+            let hidden_pane = workspace.tabs[hidden].root_pane;
+            workspace.tabs[hidden].runtimes.insert(
+                hidden_pane,
+                crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b""),
+            );
+            server.app.state.workspaces = vec![workspace];
+            server.app.state.active = Some(0);
+            server.app.state.selected = 0;
+            server.app.state.mode = crate::app::Mode::Terminal;
+            let (writer, _control_rx, _render_rx) = test_client_writer();
+            server.clients.insert(
+                1,
+                ClientConnection::new(
+                    (cols, 40),
+                    crate::kitty_graphics::HostCellSize::default(),
+                    crate::terminal_theme::TerminalTheme::default(),
+                    None,
+                    1,
+                    RenderEncoding::SemanticFrame,
+                    Some(writer),
+                ),
+            );
+            server.foreground_client_id = Some(1);
+            server.sync_foreground_client_state();
+            server.resize_shared_runtime_to_effective_size();
+            let attached_pty = server
+                .app
+                .state
+                .runtime_for_pane(&server.app.terminal_runtimes, pane)
+                .unwrap()
+                .current_size();
+            let hidden_pty = server
+                .app
+                .state
+                .runtime_for_pane(&server.app.terminal_runtimes, hidden_pane)
+                .unwrap()
+                .current_size();
+            assert!(server.handle_server_event(ServerEvent::ClientDetach { client_id: 1 }));
+            assert_eq!(server.effective_size, (cols.max(MIN_COLS), 40));
+            let detached_estimate = server.app.state.estimate_pane_size();
+            let (width, height) = server.effective_size;
+            crate::ui::compute_view_without_resizing_panes(
+                &mut server.app.state,
+                &server.app.terminal_runtimes,
+                Rect::new(0, 0, width, height),
+            );
+            assert_eq!(
+                detached_estimate,
+                server.app.state.estimate_pane_size(),
+                "detach must refresh geometry before the next spawn for client width {cols}"
+            );
+            assert_eq!(
+                server
+                    .app
+                    .state
+                    .runtime_for_pane(&server.app.terminal_runtimes, pane)
+                    .unwrap()
+                    .current_size(),
+                attached_pty,
+                "detaching must preserve already-running PTYs"
+            );
+            assert_eq!(
+                server
+                    .app
+                    .state
+                    .runtime_for_pane(&server.app.terminal_runtimes, hidden_pane)
+                    .unwrap()
+                    .current_size(),
+                hidden_pty,
+                "detaching must also preserve hidden-tab PTYs"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn detached_geometry_refresh_preserves_first_runtime_resize() {
+        let mut server = test_headless_server();
+        let mut workspace = crate::workspace::Workspace::test_new("bootstrap");
+        let pane = workspace.focused_pane_id().unwrap();
+        workspace.insert_test_runtime(
+            pane,
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b""),
+        );
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+        assert!(server.app.state.view.pane_infos.is_empty());
+        server.resize_shared_runtime_to_effective_size();
+        assert!(
+            server.app.state.view.pane_infos.is_empty(),
+            "the first unattended render must still establish runtime geometry"
+        );
+        server.render_and_stream();
+        let rect = server
+            .app
+            .state
+            .view
+            .pane_infos
+            .iter()
+            .find(|info| info.id == pane)
+            .unwrap()
+            .inner_rect;
+        assert_eq!(
+            server
+                .app
+                .state
+                .runtime_for_pane(&server.app.terminal_runtimes, pane)
+                .unwrap()
+                .current_size(),
+            (rect.height, rect.width),
+            "first render must resize the initial runtime"
+        );
+    }
+
+    #[test]
+    fn detach_without_active_workspace_refreshes_allocations() {
+        let mut server = test_headless_server();
+        server.app.state.workspaces.clear();
+        server.app.state.active = None;
+        server.app.state.mode = crate::app::Mode::Terminal;
+        let (writer, _control_rx, _render_rx) = test_client_writer();
+        server.clients.insert(
+            1,
+            ClientConnection::new(
+                (15, 40),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                1,
+                RenderEncoding::SemanticFrame,
+                Some(writer),
+            ),
+        );
+        server.foreground_client_id = Some(1);
+        server.sync_foreground_client_state();
+        server.resize_shared_runtime_to_effective_size();
+        assert_eq!(server.app.state.estimate_pane_size().1, 13);
+        assert!(server.app.state.view.pane_infos.is_empty());
+        assert!(server.handle_server_event(ServerEvent::ClientDetach { client_id: 1 }));
+        assert_eq!(server.effective_size, (80, 40));
+        assert_eq!(server.app.state.estimate_pane_size().1, 52);
+        assert!(
+            server.app.state.view.pane_infos.is_empty(),
+            "new workspaces still need a first resizing render"
+        );
+    }
+
     fn assert_frame_data_eq(actual: &FrameData, expected: &FrameData) {
         assert_eq!(
             (actual.width, actual.height),
@@ -4261,6 +6181,7 @@ mod tests {
         let fleet = protocol::FleetSnapshot {
             origin: "hopper".to_string(),
             peers: vec![protocol::FleetPeer {
+                node_id: None,
                 name: "kiln".to_string(),
                 ssh_target: "operator@kiln".to_string(),
                 host: Some("kiln".to_string()),
@@ -4888,6 +6809,31 @@ next_tab = ""
         );
     }
 
+    #[test]
+    fn headless_no_viewer_gate_reaches_the_summary_as_idle() {
+        let mut server = test_headless_server();
+        server
+            .app
+            .state
+            .workspaces
+            .push(crate::workspace::Workspace::test_new("git-health"));
+        server
+            .app
+            .git_refresh_health
+            .mark_success(Instant::now() - Duration::from_secs(29_656));
+        server.handle_scheduled_tasks_headless(Instant::now(), false);
+        assert!(!server.app.git_refresh_in_flight);
+        let response = server.app.handle_api_request(crate::api::schema::Request {
+            id: "idle-health".into(),
+            method: crate::api::schema::Method::PeersSummary(crate::api::schema::EmptyParams {}),
+        });
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        let row = &value["result"]["pollers"]["git_refresh"];
+        assert_eq!(row["status"], "idle");
+        assert_eq!(row["reason"], "no_viewer");
+        assert_eq!(row["consecutive_failures"], 0);
+    }
+
     fn app_client_marks_git_refresh_due_on_first_attach(render_encoding: RenderEncoding) {
         let mut server = test_headless_server();
         server
@@ -5256,9 +7202,14 @@ next_tab = ""
                 agent: Some(crate::detect::Agent::Codex),
                 state,
                 activity: None,
+                provider_limit: None,
                 visible_blocker: false,
                 visible_idle: false,
                 visible_working: false,
+                settled_with_background_shells: false,
+                background_tasks: None,
+                needs_human: None,
+                question: None,
                 process_exited: false,
                 observed_at: Instant::now(),
             });
@@ -5267,7 +7218,7 @@ next_tab = ""
         let done_in_hub = server
             .app
             .event_hub
-            .events_after(0)
+            .ring_snapshot_after(0)
             .iter()
             .any(|(_, event)| {
                 matches!(
@@ -5359,7 +7310,7 @@ next_tab = ""
         assert!(server
             .app
             .event_hub
-            .events_after(0)
+            .ring_snapshot_after(0)
             .iter()
             .any(|(_, event)| {
                 event.event == crate::api::schema::EventKind::PaneAgentStatusChanged
@@ -6648,16 +8599,21 @@ next_tab = ""
 
         let (respond_to, response_rx) = std::sync::mpsc::channel();
         assert!(
-            server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
-                request: api::schema::Request {
-                    id: "focus_b".into(),
-                    method: api::schema::Method::WorkspaceFocus(api::schema::WorkspaceTarget {
-                        workspace_id: ws_b_public_id,
-                    },),
-                },
-                respond_to,
-                peer_pid: None,
-            })
+            server
+                .handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+                    scope: None,
+                    request: api::schema::Request {
+                        id: "focus_b".into(),
+                        method: api::schema::Method::WorkspaceFocus(api::schema::WorkspaceTarget {
+                            workspace_id: ws_b_public_id,
+                        },),
+                    },
+                    respond_to,
+                    peer_pid: Some(std::process::id()),
+                    peer_birth: crate::platform::process_start_time(std::process::id()),
+                    peer_uid: Some(crate::platform::peer::effective_uid()),
+                })
+                .await
         );
         let _ = response_rx
             .recv_timeout(Duration::from_millis(100))
@@ -7685,7 +9641,7 @@ next_tab = ""
     /// client whose control channel the test can read.
     fn window_title_test_server() -> (
         HeadlessServer,
-        std::sync::mpsc::Receiver<Vec<u8>>,
+        crate::server::client_transport::ControlReceiver,
         std::sync::mpsc::Receiver<Vec<u8>>,
     ) {
         let mut server = test_headless_server();
@@ -7730,7 +9686,9 @@ next_tab = ""
             .set_detected_state(Some(crate::detect::Agent::Codex), state);
     }
 
-    fn published_titles(control_rx: &std::sync::mpsc::Receiver<Vec<u8>>) -> Vec<String> {
+    fn published_titles(
+        control_rx: &crate::server::client_transport::ControlReceiver,
+    ) -> Vec<String> {
         let mut titles = Vec::new();
         while let Ok(bytes) = control_rx.try_recv() {
             if let ServerMessage::SetWindowTitle { title } = read_server_message(bytes) {
@@ -8130,9 +10088,14 @@ next_tab = ""
             agent: Some(crate::detect::Agent::Pi),
             state: crate::detect::AgentState::Blocked,
             activity: None,
+            provider_limit: None,
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
+            settled_with_background_shells: false,
+            background_tasks: None,
+            needs_human: None,
+            question: None,
             process_exited: false,
             observed_at: Instant::now(),
         });
@@ -8192,9 +10155,14 @@ next_tab = ""
             agent: Some(crate::detect::Agent::Pi),
             state: crate::detect::AgentState::Blocked,
             activity: None,
+            provider_limit: None,
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
+            settled_with_background_shells: false,
+            background_tasks: None,
+            needs_human: None,
+            question: None,
             process_exited: false,
             observed_at: Instant::now(),
         });
@@ -8210,15 +10178,15 @@ next_tab = ""
             server
                 .app
                 .event_hub
-                .events_after(0)
+                .ring_snapshot_after(0)
                 .iter()
                 .any(|(_, event)| { event.event == api::schema::EventKind::NotificationFiled }),
             "the projection is only as durable as the event it queued"
         );
     }
 
-    #[test]
-    fn stale_api_agent_report_does_not_forward_done_sound() {
+    #[tokio::test]
+    async fn stale_api_agent_report_does_not_forward_done_sound() {
         let mut server = test_headless_server();
         let background = crate::workspace::Workspace::test_new("background");
         let pane_id = background.tabs[0].root_pane;
@@ -8265,24 +10233,31 @@ next_tab = ""
         server.sync_foreground_client_state();
 
         let (respond_to, response_rx) = std::sync::mpsc::channel();
-        let changed = server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
-            request: api::schema::Request {
-                id: "stale".into(),
-                method: api::schema::Method::PaneReportAgent(api::schema::PaneReportAgentParams {
-                    pane_id: public_pane_id,
-                    source: "flock:pi".into(),
-                    agent: "pi".into(),
-                    state: api::schema::PaneAgentState::Idle,
-                    message: None,
-                    custom_status: None,
-                    seq: Some(19),
-                    agent_session_id: None,
-                    agent_session_path: None,
-                }),
-            },
-            respond_to,
-            peer_pid: None,
-        });
+        let changed = server
+            .handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+                scope: None,
+                request: api::schema::Request {
+                    id: "stale".into(),
+                    method: api::schema::Method::PaneReportAgent(
+                        api::schema::PaneReportAgentParams {
+                            pane_id: public_pane_id,
+                            source: "flock:pi".into(),
+                            agent: "pi".into(),
+                            state: api::schema::PaneAgentState::Idle,
+                            message: None,
+                            custom_status: None,
+                            seq: Some(19),
+                            agent_session_id: None,
+                            agent_session_path: None,
+                        },
+                    ),
+                },
+                respond_to,
+                peer_pid: Some(std::process::id()),
+                peer_birth: crate::platform::process_start_time(std::process::id()),
+                peer_uid: Some(crate::platform::peer::effective_uid()),
+            })
+            .await;
 
         assert!(changed);
         assert!(response_rx.recv_timeout(Duration::from_millis(100)).is_ok());
@@ -8354,3 +10329,9 @@ next_tab = ""
         );
     }
 }
+
+#[cfg(all(test, feature = "web"))]
+mod native_handoff_tests;
+
+#[cfg(test)]
+mod native_permissions;

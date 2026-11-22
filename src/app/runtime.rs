@@ -57,15 +57,25 @@ impl App {
         changed
     }
 
-    pub(super) fn handle_api_request_message(
+    /// Dispatch one socket request with its captured credentials and response owner.
+    pub(crate) fn handle_api_request_message(
         &mut self,
         msg: crate::api::ApiRequestMessage,
     ) -> bool {
+        if self.respond_scope_probe(&msg) {
+            return false;
+        }
         let previous_mode = self.state.mode;
         let changed = crate::api::request_changes_ui(&msg.request);
+        self.current_api_scope = msg.scope;
         self.current_api_peer_pid = msg.peer_pid;
+        self.current_api_peer_birth = Some(msg.peer_birth);
+        self.current_api_peer_uid = Some(msg.peer_uid);
         let response = self.handle_api_request(msg.request);
+        self.current_api_scope = None;
         self.current_api_peer_pid = None;
+        self.current_api_peer_birth = None;
+        self.current_api_peer_uid = None;
         self.respond_or_park(msg.respond_to, response);
         self.sync_prefix_input_source(previous_mode);
         changed
@@ -207,10 +217,30 @@ impl App {
         true
     }
 
+    /// Drain structured facts on an owner wake or exact reducer boundary.
+    pub(crate) fn service_structured_workers(&mut self, now: Instant) -> bool {
+        let changed = self.structured_workers.poll(
+            &mut self.state.structured_agents,
+            now,
+            crate::app::notifications::now_ms(),
+        );
+        let published = self.queue_events.poll(
+            &self.structured_workers,
+            &self.state.structured_agents,
+            &self.event_hub,
+            &mut self.structured_sends,
+        );
+        self.finish_structured_messages(changed || published, now);
+        self.sync_structured_views() || published || changed
+    }
+
     pub(crate) fn handle_scheduled_tasks(&mut self, now: Instant, geometry_dirty: bool) -> bool {
         let mut changed = false;
         let mut resized = false;
+        changed |= self.service_structured_workers(now);
 
+        self.input_writes.service_due(now);
+        self.start_ready_pastes();
         self.sync_animation_timer(now);
         changed |= self.refresh_session_health(now);
 
@@ -283,12 +313,23 @@ impl App {
         // #175 M1: queued messages deliver at dwell-settled Idle boundaries —
         // mirrored in the headless loop (the #25 dual-loop lesson).
         self.expire_undeliverable_messages();
-        self.expire_uplink();
+        self.tick_mesh_routes();
+        self.tick_mesh_collections();
+        self.expire_relayed_entries();
         // ADR-0018 §2: mail that became wakeable since it was queued.
         self.tick_idle_wakes(now);
+        // ADR-0028 §5: a registered wait past its deadline, mirrored in the
+        // headless loop (#25).
+        self.tick_waits(now);
+        // ADR-0028 §2: derived agent events, mirrored in the headless loop (#25).
+        self.tick_agent_phases(now);
         // #540: an armed self-compaction's turn boundary, its Enter, or its
         // timeout — mirrored in the headless loop (#25).
         self.tick_self_compacts(now);
+        // #850: an injection lease past its bound replays what it held —
+        // mirrored in the headless loop (#25).
+        changed |= self.tick_injection_leases(now);
+        changed |= self.tick_agent_restarts(now);
         for update in &settled {
             self.emit_pane_state_update(update);
         }
@@ -613,10 +654,12 @@ impl App {
         let workspaces = self.workspace_git_refresh_items();
 
         if workspaces.is_empty() {
+            self.git_refresh_idle = Some(crate::api::schema::PollerReason::NoEligibleWorkspaces);
             self.last_git_remote_status_refresh = now;
             return;
         }
 
+        self.git_refresh_idle = None;
         self.git_refresh_in_flight = true;
         self.git_refresh_health.mark_started(now);
         let event_tx = self.event_tx.clone();
@@ -631,6 +674,7 @@ impl App {
     }
 
     pub(crate) fn mark_git_status_refresh_due(&mut self, now: Instant) {
+        self.git_refresh_idle = None;
         if self.git_refresh_in_flight {
             self.git_refresh_due_after_in_flight = true;
             return;
@@ -704,9 +748,27 @@ impl App {
             // ADR-0018 §2: a settle, quiet window or mute that lifts, or the
             // Enter of a typed idle wake, must not wait for unrelated traffic.
             self.idle_wake.next_deadline(),
+            // ADR-0028 §5: a wait expires on time in a quiet loop.
+            self.waits.next_deadline(),
+            self.input_writes.next_deadline(),
+            (!self.fleet_pause.paused)
+                .then(|| self.structured_sends.recovery_deadline(now))
+                .flatten(),
+            self.structured_workers
+                .next_deadline(&self.state.structured_agents),
             // #540: the same, for an armed self-compaction — the Enter of a
             // typed write, a settle that lifts, or a timeout coming due.
             self.self_compact_deadline,
+            // ADR-0028 §2: a touched agent, or the close of a pending
+            // phase's settle window. None while nothing is pending.
+            self.agent_phases.next_deadline(now),
+            // #850: a lease ends on its bound even in a quiet loop, so held
+            // keystrokes never wait for unrelated traffic.
+            self.next_injection_lease_deadline(),
+            self.restarts
+                .next_deadline(&self.state.config.session, Instant::now()),
+            (!self.state.agent_restarts.is_empty())
+                .then(|| Instant::now() + Duration::from_millis(250)),
             // #36: a notification held behind `[ui.toast] delay_seconds` must
             // wake an otherwise quiet loop, or it lands only on the next
             // unrelated tick.
@@ -731,6 +793,9 @@ impl App {
             .filter_map(|ws| {
                 let cwd =
                     ws.resolved_identity_cwd_from(&self.state.terminals, &self.terminal_runtimes)?;
+                if cwd.as_os_str().is_empty() {
+                    return None;
+                }
                 let git_key = crate::workspace::git_status_cache_key(&cwd);
                 let cache_key = git_key.unwrap_or_else(|| cwd.clone());
                 Some(WorkspaceGitRefreshItem {
@@ -777,6 +842,30 @@ impl App {
     /// `handle_scheduled_tasks` (TUI) and `handle_scheduled_tasks_headless`
     /// (headless).
     pub(crate) fn dispatch_due_script_checks(&mut self, now: Instant) -> bool {
+        self.dispatch_due_script_checks_with(now, |check| {
+            let (outcome, output) = crate::checks::run_script(check);
+            (
+                outcome,
+                crate::checks::script::CaptureNotes {
+                    stdout: output.stdout_note,
+                    stderr: output.stderr_note,
+                },
+            )
+        })
+    }
+
+    /// Dispatch due checks using the supplied executor. Execution stays on a
+    /// worker, while completion is routed through the ordinary App event path.
+    fn dispatch_due_script_checks_with(
+        &mut self,
+        now: Instant,
+        execute: impl Fn(
+                &crate::checks::config::ScriptCheck,
+            ) -> (crate::checks::Outcome, crate::checks::script::CaptureNotes)
+            + Clone
+            + Send
+            + 'static,
+    ) -> bool {
         // Health (#295): stamp the tick BEFORE the pause early-return, so
         // "paused" does not look identical to "the loop stopped waking".
         // The runner tick is the app loop's checks branch — its liveness is
@@ -806,14 +895,16 @@ impl App {
             let runnable = self.checks_runner.next_runnable(now);
             for job in runnable {
                 let event_tx = self.event_tx.clone();
+                let execute = execute.clone();
                 std::thread::spawn(move || {
                     let start = Instant::now();
-                    let (outcome, _output) = crate::checks::run_script(&job.check);
+                    let (outcome, capture_notes) = execute(&job.check);
                     let duration_ms = start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
                     let _ = event_tx.blocking_send(crate::events::AppEvent::CheckCompleted {
                         name: job.name,
                         outcome,
                         duration_ms,
+                        capture_notes,
                     });
                 });
                 changed = true;
@@ -873,7 +964,15 @@ impl App {
         name: String,
         outcome: crate::checks::Outcome,
         duration_ms: u64,
+        capture_notes: crate::checks::script::CaptureNotes,
     ) {
+        if self.checks_runner.capture_warning(&name, &capture_notes) {
+            crate::logging::check_capture_failed(
+                &name,
+                capture_notes.stdout.as_deref(),
+                capture_notes.stderr.as_deref(),
+            );
+        }
         self.checks_run_count = self.checks_run_count.saturating_add(1);
         let outcome_label = match &outcome {
             crate::checks::Outcome::Fire => "fire",
@@ -910,6 +1009,7 @@ impl App {
                 data: crate::api::schema::EventData::CheckFired {
                     name: decision.name.clone(),
                     episode: decision.episode.clone(),
+                    detail: None,
                 },
             });
             self.dispatch_check_action(&decision);
@@ -1100,7 +1200,17 @@ impl App {
             let is_operator_focused = Some(idx) == active_ws_idx;
             let mut panes = Vec::new();
             for detail in ws.pane_details(&self.state.terminals) {
-                let status = super::api_helpers::pane_agent_status(detail.state, detail.seen);
+                let Some(terminal) = ws
+                    .pane_state(detail.pane_id)
+                    .and_then(|pane| self.state.terminals.get(&pane.attached_terminal_id))
+                else {
+                    continue;
+                };
+                let status = super::api_helpers::pane_agent_status_from_terminal(
+                    terminal,
+                    detail.seen,
+                    self.terminal_runtimes.get(&terminal.id).is_some(),
+                );
                 panes.push(crate::checks::ReapPaneSnapshot {
                     status,
                     seen: detail.seen,
@@ -1109,12 +1219,22 @@ impl App {
             }
             let branch = crate::worktree::checkout_branch_name(&space.checkout_path);
             let dirty = crate::worktree::checkout_is_dirty(&space.checkout_path);
-            let merged = branch.as_deref().map(|b| {
-                matches!(
-                    crate::worktree::branch_merge_gate(&space.repo_root, &space.checkout_path, b),
-                    crate::worktree::WorktreeMergeGate::Merged { .. }
+            let gate = branch.as_deref().map(|b| {
+                crate::worktree::branch_merge_gate(
+                    &self.runtime_config.merge_gate,
+                    &space.repo_root,
+                    &space.checkout_path,
+                    b,
+                    &self.state.config.worktrees.integration_branches,
                 )
             });
+            let merged = gate
+                .as_ref()
+                .map(|gate| matches!(gate, crate::worktree::WorktreeMergeGate::Merged { .. }));
+            // #1278: an open PR or an unanswerable PR question is never reaped.
+            let live = gate
+                .as_ref()
+                .is_some_and(crate::worktree::WorktreeMergeGate::is_live);
             out.push(crate::checks::ReapWorkspaceSnapshot {
                 workspace_id: ws.id.clone(),
                 is_linked_worktree: true,
@@ -1124,6 +1244,7 @@ impl App {
                 branch,
                 dirty,
                 merged,
+                live,
                 panes,
             });
         }
@@ -1165,6 +1286,7 @@ impl App {
                             data: crate::api::schema::EventData::CheckFired {
                                 name: crate::checks::REAP_CHECK_NAME.to_string(),
                                 episode,
+                                detail: None,
                             },
                         });
                     }
@@ -1246,7 +1368,7 @@ impl App {
     }
 
     /// Snapshot every live pane's blocked-alert relevant fields, and hand
-    /// them to the [`BlockedAlertFold`]. Any fires are dispatched through
+    /// them to the [`crate::checks::BlockedAlertFold`]. Any fires are dispatched through
     /// the same Notify + `CheckFired` path used by script checks so the
     /// `[ui.toast]` policy applies uniformly and one code path emits the
     /// durable event.
@@ -1268,6 +1390,7 @@ impl App {
                 data: crate::api::schema::EventData::CheckFired {
                     name: crate::checks::BLOCKED_ALERT_CHECK_NAME.to_string(),
                     episode: fire.episode.clone(),
+                    detail: self.provider_limit_detail(fire.pane_id),
                 },
             });
             self.dispatch_blocked_alert_notify(&fire);
@@ -1285,7 +1408,17 @@ impl App {
         let mut out = Vec::new();
         for (ws_idx, ws) in self.state.workspaces.iter().enumerate() {
             for detail in ws.pane_details(&self.state.terminals) {
-                let status = super::api_helpers::pane_agent_status(detail.state, detail.seen);
+                let Some(terminal) = ws
+                    .pane_state(detail.pane_id)
+                    .and_then(|pane| self.state.terminals.get(&pane.attached_terminal_id))
+                else {
+                    continue;
+                };
+                let status = super::api_helpers::pane_agent_status_from_terminal(
+                    terminal,
+                    detail.seen,
+                    self.terminal_runtimes.get(&terminal.id).is_some(),
+                );
                 let Some(public_pane_id) = self.public_pane_id(ws_idx, detail.pane_id) else {
                     continue;
                 };
@@ -1358,11 +1491,14 @@ impl App {
                 let pane_state = ws.pane_state(detail.pane_id);
                 let terminal =
                     pane_state.and_then(|p| self.state.terminals.get(&p.attached_terminal_id));
-                let already_hibernated =
-                    terminal.is_some_and(|t| t.hibernated_resume_plan.is_some());
+                let Some(terminal) = terminal else {
+                    continue;
+                };
+                let already_hibernated = terminal.hibernated_resume_plan.is_some();
                 let status = super::api_helpers::pane_agent_status_from_terminal(
-                    terminal.expect("terminal for live pane"),
+                    terminal,
                     detail.seen,
+                    self.terminal_runtimes.get(&terminal.id).is_some(),
                 );
                 out.push(crate::checks::HibernationPaneSnapshot {
                     pane_id: detail.pane_id,
@@ -1542,10 +1678,24 @@ impl App {
         }
     }
 
+    fn provider_limit_detail(&self, pane_id: crate::layout::PaneId) -> Option<String> {
+        self.state
+            .workspaces
+            .iter()
+            .find_map(|ws| ws.pane_state(pane_id))
+            .and_then(|pane| self.state.terminals.get(&pane.attached_terminal_id))
+            .filter(|terminal| terminal.state == crate::detect::AgentState::Blocked)
+            .and_then(|terminal| terminal.provider_limit.as_ref())
+            .map(|wait| wait.description())
+    }
+
     fn dispatch_blocked_alert_notify(&mut self, fire: &crate::checks::BlockedAlertFire) {
         use crate::api::schema::{NotificationShowParams, NotificationShowSound};
         let duration = crate::checks::format_blocked_duration(fire.duration_secs);
-        let title = format!("agent blocked {duration}: {}", fire.label);
+        let title = match self.provider_limit_detail(fire.pane_id) {
+            Some(detail) => format!("{} {detail}", fire.label),
+            None => format!("agent blocked {duration}: {}", fire.label),
+        };
         let params = NotificationShowParams {
             title,
             body: Some(format!(
@@ -1801,6 +1951,73 @@ mod tests {
         assert!(app.collect_reap_snapshots().is_empty());
     }
 
+    #[test]
+    fn reap_preserves_a_cold_restored_resumable_binding() {
+        let mut app = super::super::App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            tokio::sync::mpsc::unbounded_channel().1,
+            crate::api::EventHub::default(),
+        );
+        let mut ws = Workspace::test_new("reap-deferred");
+        let checkout = std::env::temp_dir().join(format!(
+            "flock-1423-reap-{}",
+            super::super::notifications::mint_notification_id()
+        ));
+        ws.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: checkout.display().to_string(),
+            label: "fixture".into(),
+            repo_root: checkout.clone(),
+            checkout_path: checkout,
+            is_linked_worktree: true,
+        });
+        app.state.workspaces.push(ws);
+        app.state.ensure_test_terminals();
+        let now = Instant::now();
+        let terminal = app.state.terminals.values_mut().next().unwrap();
+        terminal.set_detected_state(
+            Some(crate::detect::Agent::OpenCode),
+            crate::detect::AgentState::Idle,
+        );
+        terminal.state_changed_at = Some(now - Duration::from_secs(120));
+        let session = crate::agent_resume::AgentSessionRef::id("reap-saved-session").unwrap();
+        terminal.pending_agent_resume_plan =
+            Some(crate::agent_resume::plan("flock:opencode", "opencode", &session).unwrap());
+        for pane in app.state.workspaces[0].tabs[0].panes.values_mut() {
+            pane.seen = true;
+        }
+        let mut snapshots = app.collect_reap_snapshots();
+        assert_eq!(snapshots.len(), 1);
+        // Isolate lifecycle protection from the independent git and focus gates.
+        snapshots[0].is_operator_focused = false;
+        snapshots[0].dirty = Some(false);
+        snapshots[0].merged = Some(true);
+        snapshots[0].live = false;
+        let config = crate::checks::config::ReapConfig {
+            enable: true,
+            idle_threshold_secs: 1,
+            ..Default::default()
+        };
+        let mut reap = crate::checks::ReapFold::default();
+        assert!(
+            reap.evaluate(now, &config, &snapshots).is_empty(),
+            "a deferred binding must never be reaped: {snapshots:?}"
+        );
+        assert_eq!(
+            snapshots[0].panes[0].status,
+            crate::api::schema::AgentStatus::Offline
+        );
+        assert!(app
+            .state
+            .terminals
+            .values()
+            .next()
+            .unwrap()
+            .pending_agent_resume_plan
+            .is_some());
+    }
+
     // ---- session health projection (#426) ----
     //
     // The primitive is proven against a real unreachable passwd database in
@@ -2045,9 +2262,14 @@ mod tests {
                 agent: Some(crate::detect::Agent::Pi),
                 state: crate::detect::AgentState::Blocked,
                 activity: None,
+                provider_limit: None,
                 visible_blocker: false,
                 visible_idle: false,
                 visible_working: false,
+                settled_with_background_shells: false,
+                background_tasks: None,
+                needs_human: None,
+                question: None,
                 process_exited: false,
                 observed_at: Instant::now(),
             });
@@ -2337,37 +2559,79 @@ mod tests {
         assert!(app.pending_agent_resume_deadline.is_none());
     }
 
-    /// #175 phase 4 end-to-end: a `[[checks.script]]` fixture wired through
-    /// the App tick emits `CheckRan { outcome = "fire" }` and (with
+    #[tokio::test]
+    async fn capture_warnings_follow_worker_completion_state_changes() {
+        use crate::checks::script::CaptureNotes;
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut config = crate::config::Config::default();
+        config.checks.min_tick_secs = 1;
+        config.checks.scripts = vec![crate::checks::config::ScriptCheck {
+            name: "capture-e2e".into(),
+            program: std::env::temp_dir().join("unused-capture-executor"),
+            debounce: 1,
+            ..crate::checks::config::ScriptCheck::default()
+        }];
+        let mut app =
+            super::super::App::new(&config, true, None, api_rx, crate::api::EventHub::default());
+        for (stdout, stderr, warnings) in [
+            (Some("held pipe"), Some("held pipe"), 1),
+            (Some("held pipe"), Some("held pipe"), 0),
+            (Some("held pipe"), Some("reader failed"), 1),
+            (None, None, 0),
+            (Some("held pipe"), Some("held pipe"), 1),
+        ] {
+            let notes = CaptureNotes {
+                stdout: stdout.map(str::to_owned),
+                stderr: stderr.map(str::to_owned),
+            };
+            app.checks_runner.force_due("capture-e2e", Instant::now());
+            app.checks_next_deadline = Some(Instant::now());
+            assert!(
+                app.dispatch_due_script_checks_with(Instant::now(), move |_| {
+                    (crate::checks::Outcome::Fire, notes.clone())
+                })
+            );
+            let event = tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    let event = app.event_rx.recv().await.expect("worker channel closed");
+                    if matches!(&event, crate::events::AppEvent::CheckCompleted { name, .. } if name == "capture-e2e") {
+                        break event;
+                    }
+                    app.handle_internal_event(event);
+                }
+            }).await.expect("capture worker did not complete");
+            let logs = crate::logging::capture_logs(|| app.handle_internal_event(event));
+            assert_eq!(
+                logs.matches("check.capture.failed").count(),
+                warnings,
+                "{logs}"
+            );
+            if warnings != 0 {
+                assert!(
+                    logs.contains("stdout_reason") && logs.contains("stderr_reason"),
+                    "{logs}"
+                );
+            }
+        }
+        assert_eq!(app.checks_run_count, 5);
+        assert_eq!(
+            app.checks_error_count, 0,
+            "capture must not reclassify the script"
+        );
+    }
+
+    /// #175 phase 4: a dispatched check completion wired through the App
+    /// tick emits `CheckRan { outcome = "fire" }` and (with
     /// `debounce = 1`) a `CheckFired` on the event hub.
     #[tokio::test]
     async fn check_runner_ticks_emit_ran_and_fired_events_on_hub() {
-        use std::os::unix::fs::PermissionsExt;
-
-        // Fixture script: exit 0 → Fire on the runner's classification.
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let dir = std::env::temp_dir().join(format!(
-            "flock-checks-runtime-{}-{}",
-            std::process::id(),
-            nanos
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let script_path = dir.join("fire.sh");
-        std::fs::write(&script_path, "#!/bin/sh\nexit 0\n").unwrap();
-        let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&script_path, perms).unwrap();
-
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut config = crate::config::Config::default();
         config.checks.min_tick_secs = 1;
         config.checks.heartbeat_secs = 3600;
         config.checks.scripts = vec![crate::checks::config::ScriptCheck {
             name: "e2e".into(),
-            program: script_path.clone(),
+            program: std::env::temp_dir().join("unused-check-executor"),
             interval_secs: 1,
             timeout_secs: 5,
             debounce: 1,
@@ -2384,33 +2648,41 @@ mod tests {
             .force_due("e2e", Instant::now() - Duration::from_millis(1));
         app.checks_next_deadline = Some(Instant::now() - Duration::from_millis(1));
 
-        // Tick: dispatches the check on a worker thread.
-        assert!(app.dispatch_due_script_checks(Instant::now()));
-
-        // Wait for the worker's `AppEvent::CheckCompleted` (fixture script
-        // is `exit 0` — should return within a few hundred ms). We poll the
-        // App's event channel and hand each event to the shared handler,
-        // stopping once the hub carries the CheckRan event.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline {
-            if let Ok(ev) = app.event_rx.try_recv() {
-                app.handle_internal_event(ev);
-            }
-            let events = app.event_hub.events_after(0);
-            let has_ran = events.iter().any(|(_, envelope)| {
-                matches!(
-                    &envelope.data,
-                    crate::api::schema::EventData::CheckRan { name, outcome, .. }
-                        if name == "e2e" && outcome == "fire"
+        // Hold completion until dispatch has returned. Executor mechanics are
+        // covered in checks::script, independently of the App event routing.
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = std::sync::Arc::new(std::sync::Mutex::new(release_rx));
+        assert!(
+            app.dispatch_due_script_checks_with(Instant::now(), move |check| {
+                assert_eq!(check.name, "e2e");
+                release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(30))
+                    .expect("test must release the check executor");
+                (
+                    crate::checks::Outcome::Fire,
+                    crate::checks::script::CaptureNotes::default(),
                 )
-            });
-            if has_ran {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+            })
+        );
+        assert_eq!(app.checks_run_count, 0);
+        release_tx.send(()).unwrap();
 
-        let events = app.event_hub.events_after(0);
+        // Consume completion directly, without spending a scheduling interval
+        // on each unrelated App event. A silent live worker still fails.
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let event = app.event_rx.recv().await.expect("check event channel closed");
+                let completed = matches!(&event, crate::events::AppEvent::CheckCompleted { name, .. } if name == "e2e");
+                app.handle_internal_event(event);
+                if completed {
+                    break;
+                }
+            }
+        }).await.expect("check worker did not complete");
+
+        let events = app.event_hub.ring_snapshot_after(0);
         assert!(
             events.iter().any(|(_, envelope)| matches!(
                 &envelope.data,
@@ -2430,8 +2702,6 @@ mod tests {
         );
         assert_eq!(app.checks_run_count, 1);
         assert_eq!(app.checks_error_count, 0);
-
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Heartbeat: when the window elapses, `ChecksHeartbeat` lands on the
@@ -2447,7 +2717,7 @@ mod tests {
         app.force_checks_heartbeat_now();
         assert!(app.dispatch_due_script_checks(Instant::now()));
 
-        let events = app.event_hub.events_after(0);
+        let events = app.event_hub.ring_snapshot_after(0);
         assert!(
             events.iter().any(|(_, envelope)| matches!(
                 &envelope.data,
@@ -2488,7 +2758,7 @@ mod tests {
         assert!(app.evaluate_blocked_alert(now));
         let fires_after_first: Vec<_> = app
             .event_hub
-            .events_after(0)
+            .ring_snapshot_after(0)
             .into_iter()
             .filter(|(_, envelope)| {
                 matches!(
@@ -2504,7 +2774,7 @@ mod tests {
         assert!(!app.evaluate_blocked_alert(now + Duration::from_secs(1)));
         let fires_after_second: Vec<_> = app
             .event_hub
-            .events_after(0)
+            .ring_snapshot_after(0)
             .into_iter()
             .filter(|(_, envelope)| {
                 matches!(
@@ -2533,7 +2803,7 @@ mod tests {
         assert!(app.evaluate_blocked_alert(later));
         let fires_after_reblock: Vec<_> = app
             .event_hub
-            .events_after(0)
+            .ring_snapshot_after(0)
             .into_iter()
             .filter(|(_, envelope)| {
                 matches!(
@@ -2551,6 +2821,59 @@ mod tests {
     }
 
     /// A pane whose Blocked age hasn't crossed the threshold does not fire.
+    #[test]
+    fn blocked_alert_provider_reason_reaches_digest() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut config = crate::config::Config::default();
+        config.checks.blocked_alert.threshold_secs = 1;
+        let mut app =
+            super::super::App::new(&config, true, None, api_rx, crate::api::EventHub::default());
+        app.state.workspaces.push(Workspace::test_new("provider"));
+        app.state.ensure_test_terminals();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let detection = crate::detect::detect_agent(
+            Some(crate::detect::Agent::OpenCode),
+            "■■⬝⬝⬝⬝⬝⬝ rate limit [retrying in 46m 15s attempt #1] esc interrupt",
+        );
+        let now = Instant::now();
+        app.state
+            .handle_app_event(crate::events::AppEvent::StateChanged {
+                pane_id,
+                agent: Some(crate::detect::Agent::OpenCode),
+                state: detection.state,
+                activity: detection.activity,
+                provider_limit: detection.provider_limit,
+                visible_blocker: true,
+                visible_idle: false,
+                visible_working: false,
+                settled_with_background_shells: false,
+                background_tasks: None,
+                needs_human: None,
+                question: None,
+                process_exited: false,
+                observed_at: now,
+            });
+        let terminal_id = app.state.workspaces[0]
+            .terminal_id(pane_id)
+            .cloned()
+            .unwrap();
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .state_changed_at = Some(now - Duration::from_secs(2));
+        assert!(app.evaluate_blocked_alert(now));
+        let events = app.event_hub.ring_snapshot_after(0);
+        let options = crate::digest::RenderOptions {
+            since_ms: 0,
+            generated_for_date: "2026-10-08",
+            since_label: "epoch",
+        };
+        let html =
+            crate::digest::render(events.iter().map(|(seq, event)| (*seq, 0, event)), &options);
+        assert!(html.contains("rate-limited, retry in 46m 15s"), "{html}");
+    }
+
     #[test]
     fn blocked_alert_below_threshold_never_fires_via_app() {
         use crate::detect::{Agent, AgentState};
@@ -2604,13 +2927,13 @@ mod tests {
         app.fleet_pause.paused = true;
         app.checks_next_deadline = Some(Instant::now());
         app.checks_heartbeat_deadline = Some(Instant::now());
-        let before = app.event_hub.events_after(0).len();
+        let before = app.event_hub.ring_snapshot_after(0).len();
         assert!(
             !app.dispatch_due_script_checks(Instant::now()),
             "paused fleet must not tick the check runner"
         );
         assert_eq!(
-            app.event_hub.events_after(0).len(),
+            app.event_hub.ring_snapshot_after(0).len(),
             before,
             "paused tick must not emit a heartbeat"
         );

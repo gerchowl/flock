@@ -561,12 +561,15 @@ impl PollerStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GitRefreshErrorKind {
     Timeout,
+    /// The owned round has not completed within its existing sixty-second bound.
+    Stalled,
 }
 
 impl GitRefreshErrorKind {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Timeout => "timeout",
+            Self::Stalled => "round_stalled",
         }
     }
 }

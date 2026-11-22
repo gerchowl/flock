@@ -19,12 +19,15 @@
 // TracedCommand funnel polices flock's own subprocesses, not the harness's.
 #![allow(clippy::disallowed_methods)]
 
+mod support;
+
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use support::environment::Command;
 
 /// Every verb that allocates something, so a regression in any one of them
 /// shows up here rather than in someone's repository.
@@ -38,6 +41,9 @@ const ALLOCATING_VERBS: &[&[&str]] = &[
     &["workspace", "create"],
     &["tab", "create"],
     &["pane", "split"],
+    &["delegate", "start"],
+    &["delegate", "send"],
+    &["delegate", "reap"],
 ];
 
 /// Identity and config overrides for every git call this file makes.
@@ -176,7 +182,8 @@ fn the_stand_in_really_allocates() {
         stderr_of(&output)
     );
 
-    assert_eq!(env.server.requests(), 1, "the server was asked");
+    // The protocol check (#868), then the create.
+    assert_eq!(env.server.requests(), 2, "the server was asked");
     assert_eq!(
         env.repo.worktrees().len(),
         2,
@@ -269,9 +276,16 @@ impl StandInServer {
                 counter.fetch_add(1, Ordering::SeqCst);
                 let response = if line.contains("worktree.create") {
                     allocate_worktree(&repo);
-                    r#"{"id":"stand-in","result":{"type":"worktree_created"}}"#
+                    r#"{"id":"stand-in","result":{"type":"worktree_created"}}"#.to_owned()
+                } else if line.contains(r#""method":"ping""#) {
+                    // A state-changing verb checks the server protocol first (#868).
+                    format!(
+                        r#"{{"id":"stand-in","result":{{"type":"pong","version":"stand-in","protocol":{}}}}}"#,
+                        support::PROTOCOL_VERSION
+                    )
                 } else {
                     r#"{"id":"stand-in","error":{"code":"not_implemented","message":"stand-in"}}"#
+                        .to_owned()
                 };
                 let _ = stream.write_all(response.as_bytes());
                 let _ = stream.write_all(b"\n");
@@ -369,5 +383,39 @@ impl TempRepo {
 impl Drop for TempRepo {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.base);
+    }
+}
+
+#[test]
+fn agent_history_help_and_invalid_arguments() {
+    let env = Env::new();
+    for flag in ["--help", "-h"] {
+        let output = env.flk(&["agent", "history", flag]);
+        assert_eq!(output.status.code(), Some(0));
+        assert!(stdout_of(&output).contains("--detail reply|collapsed|full"));
+        assert!(stdout_of(&output).contains("--cursor N"));
+        assert!(stdout_of(&output).contains("--limit N"));
+    }
+    for args in [
+        vec!["agent", "history"],
+        vec!["agent", "history", "reviewer", "--detail", "invalid"],
+        vec!["agent", "history", "reviewer", "--cursor", "-1"],
+        vec!["agent", "history", "reviewer", "--limit", "4294967296"],
+        vec!["agent", "history", "reviewer", "--limit"],
+        vec!["agent", "history", "reviewer", "--unknown"],
+    ] {
+        let output = env.flk(&args);
+        assert_eq!(output.status.code(), Some(2), "{}", stderr_of(&output));
+        assert!(!stderr_of(&output).is_empty());
+    }
+}
+
+#[test]
+fn native_inbox_help_describes_the_attested_structured_surface() {
+    let env = Env::new();
+    for verb in ["list", "read"] {
+        let output = env.flk(&["msg", verb, "--help"]);
+        assert_eq!(output.status.code(), Some(0));
+        assert!(stdout_of(&output).contains("structured inbox"));
     }
 }

@@ -43,6 +43,11 @@ pub fn session_processes(_child_pid: u32) -> Vec<u32> {
 }
 
 /// Unsupported platform stub.
+pub fn process_session_id(_pid: u32) -> Option<i32> {
+    None
+}
+
+/// Unsupported platform stub.
 pub fn process_name(_pid: u32) -> Option<String> {
     None
 }
@@ -76,7 +81,7 @@ pub fn write_clipboard(_bytes: &[u8]) -> bool {
 }
 
 /// Unsupported platform stub.
-pub fn open_url(_url: &str) -> std::io::Result<()> {
+pub(super) fn open_validated_url(_url: &str) -> std::io::Result<()> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "opening URLs is not supported on this platform",
@@ -95,4 +100,16 @@ pub fn show_desktop_notification(_title: &str, _body: Option<&str>) -> std::io::
 
 pub(crate) fn ssh_agent_rescan_roots() -> &'static [&'static str] {
     &[]
+}
+
+pub(crate) fn machine_identity() -> std::io::Result<String> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "node identity machine binding is unsupported on this platform",
+    ))
+}
+
+/// Unsupported process evidence never authorizes scoped requests.
+pub fn live_process_facts(_pid: u32) -> Option<(u32, u64)> {
+    None
 }

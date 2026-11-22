@@ -1,0 +1,6 @@
+Accessing workspace: …/.flock/worktrees/fixture-project/fixture-task
+⚠ This folder pre-approves 17 tool permissions in .claude/settings.json:
+  Bash(git status*), Bash(git diff*), … and 9 more
+❯ No, exit
+  Yes, I trust this folder
+Enter to confirm · Esc to cancel

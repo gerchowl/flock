@@ -22,7 +22,7 @@ pub(super) trait FlockCall {
 }
 
 /// Production wire: talks to the local flock socket via [`ApiClient`].
-pub(super) struct LocalApi;
+pub(super) struct LocalApi(pub(super) ApiClient);
 
 impl FlockCall for LocalApi {
     fn call(&self, method: Method) -> Result<Value, ApiClientError> {
@@ -30,7 +30,7 @@ impl FlockCall for LocalApi {
             id: format!("mcp:{}", crate::mcp::next_call_seq()),
             method,
         };
-        ApiClient::local().request_value(&request)
+        self.0.request_value(&request)
     }
 }
 
@@ -115,8 +115,40 @@ fn resources_read<F: FlockCall>(params: Value, flock: &F) -> Result<Value, McpEr
 /// Send one flock method and unwrap its envelope. Shared by the tool and
 /// resource paths so a flock refusal translates identically on both.
 fn call_flock<F: FlockCall>(method: Method, flock: &F) -> Result<Value, McpError> {
+    // The verbs the CLI reports through `print_send_response`: their `later`
+    // refusals exit `REFUSED` there, so `data.exit` says 10 here too.
+    let send_like = matches!(
+        method,
+        Method::PaneSubmit(_) | Method::MsgSend(_) | Method::MsgReply(_) | Method::AgentRestart(_)
+    );
+    let message_send = matches!(method, Method::MsgSend(_));
     let raw = flock.call(method).map_err(McpError::transport)?;
-    extract_flock_result(raw)
+    let has_target_details = message_send
+        || matches!(
+            raw.pointer("/error/code")
+                .and_then(Value::as_str)
+                .and_then(crate::api::error_code::ErrorCode::from_code),
+            Some(
+                crate::api::error_code::ErrorCode::MsgTargetNotFound
+                    | crate::api::error_code::ErrorCode::MsgTargetAmbiguous
+            )
+        );
+    let target_data = has_target_details
+        .then(|| raw.pointer("/error/data").cloned())
+        .flatten();
+    extract_flock_result(raw, send_like).map_err(|mut error| {
+        if let (Some(data), Some(detail)) = (
+            error.data.as_mut().and_then(Value::as_object_mut),
+            target_data.and_then(|v| v.as_object().cloned()),
+        ) {
+            for key in ["kind", "expected", "candidates"] {
+                if let Some(value) = detail.get(key) {
+                    data.insert(key.into(), value.clone());
+                }
+            }
+        }
+        error
+    })
 }
 
 fn tools_call<F: FlockCall>(params: Value, flock: &F) -> Result<Value, McpError> {
@@ -134,7 +166,97 @@ fn tools_call<F: FlockCall>(params: Value, flock: &F) -> Result<Value, McpError>
     };
 
     let method = (tool.build)(arguments.clone())?;
-    let flock_result = tools::annotate(name, &arguments, call_flock(method, flock)?);
+    if matches!(&method, Method::AgentSpawn(p)
+        if p.runtime == crate::api::schema::AgentRuntime::Structured)
+    {
+        let pong = flock
+            .call(Method::Ping(crate::api::schema::PingParams::default()))
+            .map_err(McpError::transport)?;
+        if !crate::api::compatibility::advertises_structured(&pong) {
+            return Err(McpError::from_flock_error(
+                crate::api::compatibility::ERROR_CODE,
+                "structured admission requires a newer server",
+                crate::api::compatibility::EXIT_CODE,
+            ));
+        }
+    }
+    // #1179 / #868: an older server would drop `questions` without a word and
+    // start the child with no policy. An agent cannot read a stderr note, so
+    // the call is refused before anything starts, and says why.
+    let asks_questions = matches!(
+        &method,
+        Method::AgentSpawn(crate::api::schema::AgentSpawnParams {
+            questions: Some(_),
+            ..
+        }) | Method::AgentFork(crate::api::schema::AgentForkParams {
+            questions: Some(_),
+            ..
+        })
+    );
+    if asks_questions && !server_takes_questions(flock) {
+        return Err(McpError::from_flock_error(
+            crate::api::compatibility::ERROR_CODE,
+            "the server does not record a question policy (it predates #1179): hand it off \
+             with `flk server live-handoff`, or call again without `questions`",
+            crate::api::compatibility::EXIT_CODE,
+        ));
+    }
+    let pane = match &method {
+        Method::PaneArmSelfCompact(params) if params.instructions.is_some() => {
+            Some(params.pane.clone())
+        }
+        _ => None,
+    };
+    let well_formed_agent_target = matches!(&method, Method::MsgSend(params)
+        if params.to.is_well_formed_agent_id());
+    let flock_result = call_flock(method, flock).map_err(|mut error| {
+        if name == "flock_msg_send" {
+            if let Some(data) = error.data.as_mut() {
+                // Branch on stable socket codes, never diagnostic wording.
+                use crate::api::error_code::ErrorCode;
+                if matches!(
+                    data["refusal"].as_str().and_then(ErrorCode::from_code),
+                    Some(ErrorCode::MsgTargetNotFound | ErrorCode::MsgTargetAmbiguous)
+                ) {
+                    data["kind"] = data["refusal"].clone();
+                    if data.get("expected").is_none() {
+                        data["expected"] = crate::api::schema::MessageTarget::expected_shapes();
+                        if !well_formed_agent_target {
+                            error.message.push_str(&format!(
+                                "; expected {}",
+                                crate::api::schema::MESSAGE_TARGET_EXPECTED
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        error
+    })?;
+    let flock_result = tools::annotate(name, &arguments, flock_result);
+    // #854: an older server ignores `instructions` and arms a plain `/compact`.
+    // Undo that arming rather than report a success that lost them.
+    if let Some(pane) = pane {
+        if crate::agent_self_compact::instructions_dropped(true, &flock_result) {
+            // A failed abort must not replace the explanation with a bare
+            // transport error: the agent still needs to know why, and that
+            // the plain arming is still there to drop.
+            let message =
+                match call_flock(crate::agent_self_compact::abort_dropped_arming(pane), flock) {
+                    Ok(_) => crate::agent_self_compact::INSTRUCTIONS_DROPPED.to_string(),
+                    Err(err) => format!(
+                        "{} ({})",
+                        crate::agent_self_compact::INSTRUCTIONS_DROPPED_ABORT_FAILED,
+                        err.message
+                    ),
+                };
+            return Err(McpError::from_flock_error(
+                crate::api::compatibility::ERROR_CODE,
+                &message,
+                crate::api::compatibility::EXIT_CODE,
+            ));
+        }
+    }
 
     // MCP's tool-call result shape: `content` is an array of blocks. We JSON-
     // encode the flock result and hand it back as a single text block so the
@@ -142,31 +264,83 @@ fn tools_call<F: FlockCall>(params: Value, flock: &F) -> Result<Value, McpError>
     let text = serde_json::to_string(&flock_result).map_err(|e| McpError {
         code: -32000,
         message: format!("failed to serialize flock result: {e}"),
-        data: Some(json!({ "refusal": "serialize_error" })),
+        data: Some(super::framing::refusal(
+            "serialize_error",
+            crate::cli::exit::FAILURE,
+        )),
     })?;
     Ok(json!({
         "content": [ { "type": "text", "text": text } ]
     }))
 }
 
+/// Does the server advertise `agent_questions`? A ping that fails reads as no.
+fn server_takes_questions<F: FlockCall>(flock: &F) -> bool {
+    flock
+        .call(Method::Ping(crate::api::schema::PingParams::default()))
+        .is_ok_and(|pong| crate::cli::questions::advertises_questions(&pong))
+}
+
 /// Unwrap the raw flock socket response — an already-parsed JSON envelope
 /// with either a `result` field (success) or an `error: {code, message}`
 /// field (failure). The failure branch translates to an MCP refusal so the
 /// flock error code lands in `data.refusal`.
-fn extract_flock_result(mut raw: Value) -> Result<Value, McpError> {
+fn extract_flock_result(mut raw: Value, send_like: bool) -> Result<Value, McpError> {
     if let Some(error) = raw.get("error") {
         let code = error.get("code").and_then(Value::as_str).unwrap_or("error");
         let message = error
             .get("message")
             .and_then(Value::as_str)
             .unwrap_or("flock refused the request");
-        return Err(McpError::from_flock_error(code, message));
+        let exit = crate::cli::error_code_exit(code, send_like);
+        let mut refusal = McpError::from_flock_error(code, message, exit);
+        use crate::api::error_code::ErrorCode;
+        if matches!(
+            ErrorCode::from_code(code),
+            Some(
+                ErrorCode::InputNotEmpty
+                    | ErrorCode::InputWriteCancelled
+                    | ErrorCode::InputWriteFailed
+                    | ErrorCode::InputWriteUnknown
+            )
+        ) {
+            if let (Some(detail), Some(data)) = (
+                error.get("data").and_then(Value::as_object),
+                refusal.data.as_mut().and_then(Value::as_object_mut),
+            ) {
+                for (key, value) in detail {
+                    if !matches!(key.as_str(), "refusal" | "retry" | "exit") {
+                        data.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+        }
+        return Err(refusal);
     }
     // Take() rather than clone() — the raw envelope isn't needed again.
     let result = raw
         .get_mut("result")
         .map(Value::take)
         .unwrap_or(Value::Null);
+    if let Some(code) = crate::api::effect_exit_code(&result) {
+        let message = result
+            .get("outcome")
+            .or_else(|| result.get("type"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let mut data = result;
+        if let Some(fields) = data.as_object_mut() {
+            let retry = crate::cli::output::exit_retry(code).as_str();
+            fields.insert("retry".into(), retry.into());
+            fields.insert("exit".into(), code.into());
+        }
+        return Err(McpError {
+            code,
+            message,
+            data: Some(data),
+        });
+    }
     Ok(result)
 }
 
@@ -197,6 +371,443 @@ mod tests {
             self.calls.borrow_mut().push(method);
             Ok(self.response.clone())
         }
+    }
+
+    #[tokio::test]
+    async fn message_targets_reach_the_real_app_inbox() {
+        struct AppApi(RefCell<crate::app::App>);
+        impl FlockCall for AppApi {
+            fn call(&self, method: Method) -> Result<Value, ApiClientError> {
+                let raw = self.0.borrow_mut().handle_api_request(Request {
+                    id: "mcp-test".into(),
+                    method,
+                });
+                Ok(serde_json::from_str(&raw).unwrap())
+            }
+        }
+        let _store = crate::mesh::runtime_store::TestStore::new();
+        let (_, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = crate::app::App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        app.state.workspaces = crate::workspace::Workspace::test_in_spaces(&["recipient"]);
+        app.state.ensure_test_terminals();
+        let ws = &app.state.workspaces[0];
+        let pane = ws.focused_pane_id().unwrap();
+        let pane_id = app.state.public_pane_id(0, pane).unwrap();
+        let terminal_id = ws.tabs[0].panes[&pane].attached_terminal_id.clone();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_agent_name("reviewer".into()).unwrap();
+        let agent_id = terminal.agent_id.to_string();
+        let api = AppApi(RefCell::new(app));
+        let unresolved_inbox = route(
+            "tools/call",
+            json!({"name":"flock_msg_read","arguments":{}}),
+            &api,
+            &ChannelOptions::off(),
+        )
+        .unwrap_err();
+        let inbox_data = unresolved_inbox.data.unwrap();
+        assert_eq!(inbox_data["kind"], "msg_target_not_found");
+        assert_eq!(
+            inbox_data["expected"],
+            crate::api::schema::MessageTarget::expected_shapes()
+        );
+        for (index, to) in [
+            json!(pane_id),
+            json!(terminal_id),
+            json!("reviewer"),
+            json!(agent_id),
+            json!({"type":"pane","pane":pane_id}),
+            json!({"type":"agent","agent":agent_id}),
+            json!({"type":"repo_pane","repo":"recipient","pane":"reviewer"}),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let result = route(
+                "tools/call",
+                json!({"name":"flock_msg_send", "arguments":{
+                "to":to,"body":"hello","intent":"fyi","correlation_id":format!("shape-{index}")}}),
+                &api,
+                &ChannelOptions::off(),
+            )
+            .unwrap();
+            let queued: Value =
+                serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+            assert_eq!(queued["state"], "queued");
+        }
+        crate::test_support::attest_pane_caller(&mut api.0.borrow_mut(), pane);
+        let listed = route(
+            "tools/call",
+            json!({"name":"flock_msg_list", "arguments":{}}),
+            &api,
+            &ChannelOptions::off(),
+        )
+        .unwrap();
+        let listed: Value =
+            serde_json::from_str(listed["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(listed["messages"].as_array().unwrap().len(), 7);
+        let read = api
+            .call(Method::MsgRead(crate::api::schema::MsgReadParams {
+                pane: Some(pane_id.clone()),
+            }))
+            .unwrap();
+        assert_eq!(read["result"]["messages"].as_array().unwrap().len(), 7);
+        let unknown = route(
+            "tools/call",
+            json!({"name":"flock_msg_send", "arguments":{
+            "to":"missing-recipient","body":"x","intent":"fyi"}}),
+            &api,
+            &ChannelOptions::off(),
+        )
+        .unwrap_err();
+        assert_eq!(unknown.data.unwrap()["kind"], "msg_target_not_found");
+        {
+            let mut app = api.0.borrow_mut();
+            app.state
+                .workspaces
+                .extend(crate::workspace::Workspace::test_in_spaces(&["recipient"]));
+            app.state.ensure_test_terminals();
+            let other = app.state.workspaces[1].tabs[0]
+                .panes
+                .values()
+                .next()
+                .unwrap()
+                .attached_terminal_id
+                .clone();
+            app.state
+                .terminals
+                .get_mut(&other)
+                .unwrap()
+                .set_agent_name("reviewer".into())
+                .unwrap();
+        }
+        for to in [
+            json!("reviewer"),
+            json!({"type":"repo_pane","repo":"recipient","pane":"reviewer"}),
+        ] {
+            let ambiguous = route(
+                "tools/call",
+                json!({"name":"flock_msg_send", "arguments":{
+                "to":to,"body":"x","intent":"fyi"}}),
+                &api,
+                &ChannelOptions::off(),
+            )
+            .unwrap_err();
+            let data = ambiguous.data.unwrap();
+            assert_eq!(data["kind"], "msg_target_ambiguous");
+            let candidates = data["candidates"].as_array().expect("typed candidates");
+            assert_eq!(candidates.len(), 2);
+            for candidate in candidates {
+                assert_eq!(candidate.as_object().unwrap().len(), 6);
+                for key in [
+                    "terminal_id",
+                    "pane_id",
+                    "workspace_id",
+                    "tab_id",
+                    "agent_status",
+                ] {
+                    assert!(candidate[key].is_string(), "{candidate}");
+                }
+                assert!(candidate["cwd"].is_null() || candidate["cwd"].is_string());
+            }
+            assert!(candidates
+                .iter()
+                .any(|c| c["pane_id"] == pane_id && c["terminal_id"] == terminal_id.to_string()));
+            let target = if to.is_string() {
+                crate::api::schema::MessageTarget::Pane {
+                    pane: "reviewer".into(),
+                }
+            } else {
+                serde_json::from_value(to).unwrap()
+            };
+            let raw = api
+                .call(Method::MsgSend(crate::api::schema::MsgSendParams {
+                    to: target,
+                    body: "x".into(),
+                    intent: crate::api::schema::MsgIntent::Fyi,
+                    correlation_id: None,
+                    in_reply_to: None,
+                    from_agent: None,
+                }))
+                .unwrap();
+            assert_eq!(raw["error"]["data"]["candidates"], data["candidates"]);
+            let legacy: crate::api::schema::ErrorResponse = serde_json::from_value(raw).unwrap();
+            assert_eq!(legacy.error.code, "msg_target_ambiguous");
+        }
+    }
+
+    #[test]
+    fn s4_mcp_propagates_actual_client_unknown_effect() {
+        let peer = crate::test_support::ScriptedApi::new(vec![
+            (
+                "ping",
+                Some(
+                    json!({"result":{"version":"fixture","protocol":crate::protocol::PROTOCOL_VERSION,"capabilities":{"pane_input_write_ack":true}}}),
+                ),
+            ),
+            ("pane.submit", None),
+        ]);
+        struct Client(ApiClient);
+        impl FlockCall for Client {
+            fn call(&self, method: Method) -> Result<Value, ApiClientError> {
+                self.0.request_value(&Request {
+                    id: "mcp-fixture".into(),
+                    method,
+                })
+            }
+        }
+        let method: Method = serde_json::from_value(
+            json!({"method":"pane.submit","params":{"pane_id":"p_fixture","text":"hello"}}),
+        )
+        .unwrap();
+        let error = call_flock(method, &Client(peer.client())).unwrap_err();
+        let data = error.data.unwrap();
+        assert_eq!(data["refusal"], "input_write_unknown");
+        assert_eq!(data["exit"], crate::cli::exit::UNCONFIRMED);
+        assert_eq!(data["retry"], "after_inspecting");
+        assert_eq!(data["input_write"]["bytes_written"], Value::Null);
+        assert_eq!(data["input_write"]["remainder_discarded"], false);
+        assert_eq!(peer.finish().len(), 2);
+    }
+    #[test]
+    fn message_target_resolution_errors_keep_typed_kinds_and_shapes() {
+        for (kind, exit) in [
+            ("msg_target_not_found", crate::cli::exit::FAILURE),
+            ("msg_target_ambiguous", crate::cli::exit::FAILURE),
+        ] {
+            let flock = MockApi::ok(
+                json!({"error":{"code":kind,"message":"diagnostic wording is irrelevant"}}),
+            );
+            let err = route(
+                "tools/call",
+                json!({"name":"flock_msg_send",
+                "arguments":{"to":"reviewer","body":"x","intent":"fyi"}}),
+                &flock,
+                &ChannelOptions::off(),
+            )
+            .unwrap_err();
+            let data = err.data.unwrap();
+            assert_eq!(data["kind"], kind);
+            assert_eq!(data["refusal"], kind);
+            assert_eq!(data["exit"], exit);
+            assert!(data["expected"].is_array());
+            assert!(err.message.contains("pane id"));
+        }
+    }
+
+    #[test]
+    fn unknown_agent_id_from_older_server_has_no_shape_hint() {
+        for to in [
+            json!("agent_nodea_123abc"),
+            json!({"type":"agent","agent":"agent_nodea_123abc"}),
+            json!({"type":"pane","pane":"agent_nodea_123abc"}),
+        ] {
+            let flock = MockApi::ok(json!({"error": {
+                "code":"msg_target_not_found", "message":"agent does not exist"
+            }}));
+            let err = route(
+                "tools/call",
+                json!({"name":"flock_msg_send", "arguments": {
+                    "to":to, "body":"x", "intent":"fyi"
+                }}),
+                &flock,
+                &ChannelOptions::off(),
+            )
+            .unwrap_err();
+            assert_eq!(err.message, "agent does not exist");
+            assert_eq!(err.data.as_ref().unwrap()["kind"], "msg_target_not_found");
+            assert!(err.data.as_ref().unwrap()["expected"].is_array());
+        }
+    }
+
+    #[test]
+    fn draft_refusal_preserves_the_server_remedy_and_registered_exit() {
+        let detail = json!({"composer":{"visible_bytes":12},"remedy":{
+            "retry_when":"composer_empty","follow_up_issue":1586,"commands":[]},
+            "exit":999,"retry":"unsafe","refusal":"wrong"});
+        let flock = MockApi::ok(json!({"error":{"code":"input_not_empty",
+            "message":"clear or submit the existing draft in the agent UI","data":detail}}));
+        let err = route(
+            "tools/call",
+            json!({"name":"flock_pane_submit","arguments":{
+            "pane_id":"w1:p1","text":"next task"}}),
+            &flock,
+            &ChannelOptions::off(),
+        )
+        .unwrap_err();
+        let data = err.data.unwrap();
+        assert_eq!(data["composer"], detail["composer"]);
+        assert_eq!(data["remedy"], detail["remedy"]);
+        assert_eq!(data["exit"], crate::cli::exit::REFUSED);
+        assert_eq!(data["retry"], "later");
+        assert_eq!(data["refusal"], "input_not_empty");
+        assert!(err.message.contains("agent UI"));
+    }
+
+    #[test]
+    fn send_outcomes_match_cli_and_mcp_with_evidence() {
+        for (outcome, code) in [
+            ("delivered", 0),
+            ("accepted", 0),
+            ("observed_accepted", 0),
+            ("unconfirmed", 8),
+            ("abandoned", 9),
+        ] {
+            let result = json!({"type":"guarded_submit", "outcome":outcome,
+                "reason":"test_evidence", "attempt":{"state":outcome}});
+            let raw = json!({"result":result});
+            assert_eq!(crate::cli::print_response(&raw).unwrap(), code);
+            let flock = MockApi::ok(raw);
+            let response = route(
+                "tools/call",
+                json!({"name":"flock_pane_submit",
+                "arguments":{"pane_id":"1-1","text":"hello"}}),
+                &flock,
+                &ChannelOptions::off(),
+            );
+            if code == 0 {
+                let response = response.unwrap();
+                let content: Value =
+                    serde_json::from_str(response["content"][0]["text"].as_str().unwrap()).unwrap();
+                assert_eq!(content, result);
+            } else {
+                let error = response.unwrap_err();
+                assert_eq!(error.code, code);
+                assert_eq!(error.message, outcome);
+                let retry = if code == 8 { "after_inspecting" } else { "yes" };
+                let mut data = result.clone();
+                data["retry"] = json!(retry);
+                data["exit"] = json!(code);
+                assert_eq!(error.data, Some(data));
+            }
+        }
+    }
+
+    /// #854: an older server ignores `instructions`, answers `armed` without
+    /// the flag, and would compact without them. The bridge aborts that
+    /// arming and says why instead of reporting success.
+    #[test]
+    fn self_compact_instructions_an_older_server_dropped_are_aborted() {
+        let old = MockApi::ok(json!({"result": {
+            "type": "pane_self_compact", "pane": "1-1", "state": "armed", "detail": "armed."
+        }}));
+        let err = route(
+            "tools/call",
+            json!({"name": "flock_self_compact", "arguments": {
+                "continuation": "carry on", "instructions": "keep GOAL.md"}}),
+            &old,
+            &ChannelOptions::off(),
+        )
+        .expect_err("a dropped arming is not a success");
+        assert_eq!(
+            err.data,
+            Some(json!({"refusal": crate::api::compatibility::ERROR_CODE,
+                        "retry": "after_handoff", "exit": 78}))
+        );
+        let calls = old.calls.borrow();
+        assert_eq!(calls.len(), 2, "the arming, then its abort");
+        assert!(matches!(&calls[1], Method::PaneArmSelfCompact(p) if p.abort));
+        drop(calls);
+
+        // The same answer without instructions sent is just a plain arming.
+        let route_ok = route(
+            "tools/call",
+            json!({"name": "flock_self_compact", "arguments": {"continuation": "carry on"}}),
+            &old,
+            &ChannelOptions::off(),
+        );
+        assert!(route_ok.is_ok());
+        assert_eq!(old.calls.borrow().len(), 3, "no abort for a bare arming");
+
+        let current = MockApi::ok(json!({"result": {
+            "type": "pane_self_compact", "pane": "1-1", "state": "armed",
+            "detail": "armed.", "instructions": true
+        }}));
+        route(
+            "tools/call",
+            json!({"name": "flock_self_compact", "arguments": {
+                "continuation": "carry on", "instructions": "keep GOAL.md"}}),
+            &current,
+            &ChannelOptions::off(),
+        )
+        .expect("a server that stored them is a success");
+        assert_eq!(current.calls.borrow().len(), 1);
+    }
+
+    /// #1179 / #868: `questions` goes only to a server that advertises it. An
+    /// older one gets nothing started, and the agent is told why.
+    #[test]
+    fn a_question_policy_is_never_sent_to_a_server_that_does_not_advertise_it() {
+        let fork = json!({"name": "flock_agent_fork",
+                          "arguments": {"target": "w1:p1", "questions": "deny"}});
+        let older = MockApi::ok(json!({"result": {"type": "pong", "capabilities": {
+            "live_handoff": true, "agent_start_label": true
+        }}}));
+        let err = route("tools/call", fork.clone(), &older, &ChannelOptions::off())
+            .expect_err("an older server must not get the start");
+        assert_eq!(
+            err.data,
+            Some(json!({"refusal": crate::api::compatibility::ERROR_CODE,
+                        "retry": "after_handoff", "exit": 78}))
+        );
+        let calls = older.calls.borrow();
+        assert_eq!(calls.len(), 1, "only the ping");
+        assert!(matches!(calls[0], Method::Ping(_)));
+        drop(calls);
+
+        let current = MockApi::ok(json!({"result": {"type": "pong", "capabilities": {
+            "agent_questions": true
+        }}}));
+        let _ = route("tools/call", fork, &current, &ChannelOptions::off());
+        let calls = current.calls.borrow();
+        assert!(
+            matches!(&calls[1], Method::AgentFork(p) if p.questions == Some(crate::api::schema::QuestionPolicy::Deny)),
+            "{calls:?}"
+        );
+    }
+
+    /// An older server whose abort then fails: the explanation survives, and
+    /// says the plain arming is still there to drop.
+    #[test]
+    fn a_failed_abort_keeps_the_dropped_instructions_explanation() {
+        struct AbortFails;
+        impl FlockCall for AbortFails {
+            fn call(&self, method: Method) -> Result<Value, ApiClientError> {
+                match method {
+                    Method::PaneArmSelfCompact(params) if params.abort => Ok(json!({
+                        "error": {"code": "internal", "message": "socket closed"}
+                    })),
+                    _ => Ok(json!({"result": {
+                        "type": "pane_self_compact", "pane": "1-1",
+                        "state": "armed", "detail": "armed."
+                    }})),
+                }
+            }
+        }
+        let err = route(
+            "tools/call",
+            json!({"name": "flock_self_compact", "arguments": {
+                "continuation": "carry on", "instructions": "keep GOAL.md"}}),
+            &AbortFails,
+            &ChannelOptions::off(),
+        )
+        .expect_err("a dropped arming is not a success");
+        assert_eq!(
+            err.data,
+            Some(json!({"refusal": crate::api::compatibility::ERROR_CODE,
+                        "retry": "after_handoff", "exit": 78}))
+        );
+        assert!(
+            err.message.contains("still armed") && err.message.contains("socket closed"),
+            "{}",
+            err.message
+        );
     }
 
     #[test]
@@ -300,6 +911,94 @@ mod tests {
         assert!(matches!(flock.calls.borrow()[0], Method::AgentList(_)));
     }
 
+    /// #960: the MCP tool and `flk delegate list` send the same request for
+    /// the same scope and return the same rows for the same answer.
+    #[test]
+    fn flock_delegate_list_and_the_cli_return_the_same_rows() {
+        let row = crate::api::schema::DelegateRow {
+            architect: "agent_lead".into(),
+            delegate: "agent_worker".into(),
+            name: Some("bunny-614".into()),
+            via: crate::api::schema::DelegationVia::Start,
+            state: "closed, not merged".into(),
+            label: Some("#614".into()),
+            harness: Some("claude".into()),
+            agent_status: Some(crate::api::schema::AgentStatus::Idle),
+            status_age_secs: Some(12),
+            edge_age_secs: 300,
+            workspace_id: "w2".into(),
+            pane_id: Some("2:p1".into()),
+            worktree: None,
+            branch: Some("feat/614".into()),
+            repo: None,
+            pr: Some(crate::api::schema::PrInfo {
+                number: 624,
+                state: "closed".into(),
+            }),
+            questions: Some(crate::api::schema::QuestionPolicy::Route),
+        };
+        let raw =
+            json!({"id": "mcp:1", "result": {"type": "delegate_list", "delegates": [row.clone()]}});
+        for (cli, mcp) in [
+            (
+                vec!["--all", "--branch", "feat/614"],
+                json!({"architect": "all", "branch": "feat/614"}),
+            ),
+            (vec!["--mine"], json!({})),
+            (
+                vec!["--architect", "agent_lead"],
+                json!({"architect": "agent_lead"}),
+            ),
+        ] {
+            let flock = MockApi::ok(raw.clone());
+            let result = route(
+                "tools/call",
+                json!({"name": "flock_delegate_list", "arguments": mcp}),
+                &flock,
+                &ChannelOptions::off(),
+            )
+            .unwrap();
+            let text = result["content"][0]["text"].as_str().unwrap();
+            let mcp_result: Value = serde_json::from_str(text).unwrap();
+            let mcp_rows = crate::cli::delegate_list::rows(&mcp_result).expect("mcp rows");
+            let cli_rows =
+                crate::cli::delegate_list::rows(&crate::cli::delegate_list::json_output(&raw))
+                    .expect("cli rows");
+            assert_eq!(mcp_rows, cli_rows);
+            assert_eq!(cli_rows, std::slice::from_ref(&row));
+
+            let words: Vec<String> = cli.iter().map(|word| word.to_string()).collect();
+            let (params, _) = crate::cli::delegate_list::parse_list_args(&words).unwrap();
+            assert_eq!(
+                serde_json::to_value(&flock.calls.borrow()[0]).unwrap(),
+                serde_json::to_value(Method::DelegateList(params)).unwrap(),
+                "{cli:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn flock_msg_status_routes_correlation_and_preserves_attempt_evidence() {
+        let payload = json!({"type": "msg_status", "correlation_id": "mail-1", "state": "queued",
+            "attempts": [{"attempt_id": "attempt-1", "pane": "fixture-pane", "state": "unconfirmed",
+                "correlation_ids": ["mail-1"], "reason": "confirm_timeout"}]});
+        let flock = MockApi::ok(json!({"id": "mcp:1", "result": payload}));
+        let result = route(
+            "tools/call",
+            json!({"name": "flock_msg_status",
+            "arguments": {"correlation_id": "mail-1"}}),
+            &flock,
+            &ChannelOptions::off(),
+        )
+        .unwrap();
+        let inner: Value =
+            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(inner, payload);
+        assert!(
+            matches!(&flock.calls.borrow()[0], Method::MsgStatus(params) if params.correlation_id == "mail-1")
+        );
+    }
+
     #[test]
     fn tools_call_unknown_name_refuses_not_exposed() {
         // pane.close-shaped name — the design's canary for the hidden verbs.
@@ -317,6 +1016,40 @@ mod tests {
             Some(&json!("not_exposed_via_mcp"))
         );
         assert!(flock.calls.borrow().is_empty(), "refusal short-circuits");
+    }
+
+    #[test]
+    fn message_tools_preserve_unresolved_caller_diagnosis_and_remedy() {
+        let message = "the candidate pane has no process-birth evidence; ask the operator to migrate (#3066) or run flk msg read --pane <id>";
+        for (tool, arguments) in [
+            ("flock_msg_read", json!({})),
+            ("flock_msg_list", json!({})),
+            (
+                "flock_msg_send",
+                json!({"to": "p_1", "body": "fixture", "intent": "fyi"}),
+            ),
+            (
+                "flock_msg_reply",
+                json!({"correlation_id": "fixture", "body": "fixture"}),
+            ),
+        ] {
+            let flock = MockApi::ok(json!({"error": {
+                "code": "caller_pane_unresolved", "message": message,
+            }}));
+            let err = route(
+                "tools/call",
+                json!({"name": tool, "arguments": arguments}),
+                &flock,
+                &ChannelOptions::off(),
+            )
+            .unwrap_err();
+            assert_eq!(err.code, -32000);
+            assert_eq!(err.message, message);
+            assert_eq!(
+                err.data,
+                Some(json!({"refusal": "caller_pane_unresolved", "retry": "never", "exit": 1}))
+            );
+        }
     }
 
     #[test]
@@ -438,6 +1171,58 @@ mod tests {
         assert!(flock.calls.borrow().is_empty(), "refusal short-circuits");
     }
 
+    /// ADR-0029 §2 (#1024): every tool error carries the retry class and the
+    /// exit status the CLI returns for the same failure.
+    #[test]
+    fn tool_errors_carry_retry_and_exit_from_the_registries() {
+        let call = |tool: &str, arguments: Value, code: &str| {
+            let flock = MockApi::ok(json!({"error": {"code": code, "message": "m"}}));
+            let request = json!({"name": tool, "arguments": arguments});
+            route("tools/call", request, &flock, &ChannelOptions::off())
+                .unwrap_err()
+                .data
+        };
+        let get = || json!({"target": "nosuch"});
+        let submit = || json!({"pane_id": "1-1", "text": "hello"});
+        assert_eq!(
+            call("flock_agent_get", get(), "agent_not_found"),
+            Some(json!({"refusal": "agent_not_found", "retry": "never", "exit": 1}))
+        );
+        // A `later` refusal exits 10 on a send-like tool, as `pane run` does,
+        // and 1 on a read, as `agent get` does.
+        assert_eq!(
+            call("flock_pane_submit", submit(), "not_settled"),
+            Some(json!({"refusal": "not_settled", "retry": "later", "exit": 10}))
+        );
+        assert_eq!(
+            call("flock_agent_get", get(), "not_settled"),
+            Some(json!({"refusal": "not_settled", "retry": "later", "exit": 1}))
+        );
+        assert_eq!(
+            call("flock_agent_get", get(), "server_version_gap"),
+            Some(json!({"refusal": "server_version_gap", "retry": "after_handoff", "exit": 78}))
+        );
+
+        struct Down;
+        impl FlockCall for Down {
+            fn call(&self, _: Method) -> Result<Value, ApiClientError> {
+                Err(ApiClientError::Io(std::io::ErrorKind::NotFound.into()))
+            }
+        }
+        let request = json!({"name": "flock_agent_get", "arguments": get()});
+        let err = route("tools/call", request, &Down, &ChannelOptions::off()).unwrap_err();
+        assert_eq!(
+            err.data,
+            Some(json!({"refusal": "transport_error", "retry": "maybe", "exit": 1}))
+        );
+        let hidden = json!({"name": "pane.close", "arguments": {}});
+        let err = route("tools/call", hidden, &Down, &ChannelOptions::off()).unwrap_err();
+        assert_eq!(
+            err.data,
+            Some(json!({"refusal": "not_exposed_via_mcp", "retry": "never", "exit": 2}))
+        );
+    }
+
     #[test]
     fn tools_call_missing_arguments_is_invalid_params() {
         let flock = MockApi::ok(json!({}));
@@ -450,5 +1235,86 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.code, -32602);
         assert!(flock.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn s3a_mcp_preserves_input_write_evidence_without_overriding_retry_metadata() {
+        let raw = serde_json::json!({"id":"write","error": {
+            "code":"input_write_failed","message":"inspect the pane",
+            "data":{"input_write":{"bytes_written":2,"bytes_total":5,
+                "reason":"writer_broken","remainder_discarded":true},
+                "retry":"yes","exit":0,"refusal":"success"}
+        }});
+        for send_like in [false, true] {
+            let error = extract_flock_result(raw.clone(), send_like).unwrap_err();
+            let data = error.data.unwrap();
+            assert_eq!(data["input_write"], raw["error"]["data"]["input_write"]);
+            assert_eq!(data["refusal"], "input_write_failed");
+            assert_eq!(data["retry"], "after_inspecting");
+            assert_eq!(data["exit"], 8);
+        }
+    }
+
+    #[test]
+    fn structured_start_never_sends_a_selector_to_an_old_server() {
+        for capability in [false, true] {
+            let api = MockApi::ok(
+                json!({"result":{"type":"pong","capabilities":{"structured_agents":capability}}}),
+            );
+            let result = route(
+                "tools/call",
+                json!({"name":"flock_agent_start","arguments":{
+                "runtime":"structured","agent":"claude","prompt":"review",
+                "location":{"kind":"workspace_id","workspace_id":"ws_fixture"}}}),
+                &api,
+                &ChannelOptions::off(),
+            );
+            assert_eq!(
+                api.calls
+                    .borrow()
+                    .iter()
+                    .filter(|m| matches!(m, Method::AgentSpawn(_)))
+                    .count(),
+                usize::from(capability)
+            );
+            if !capability {
+                assert_eq!(
+                    result.unwrap_err().data.unwrap()["refusal"],
+                    "server_version_gap"
+                );
+            } else {
+                assert!(result.is_ok());
+            }
+        }
+    }
+    #[test]
+    fn structured_list_rows_are_mirrored_without_pty_placement() {
+        let row = json!({"runtime":"structured","agent_id":"agent_atlas_fixture","name":"worker"});
+        let api = MockApi::ok(
+            json!({"result":{"type":"agent_list","agents":[],"structured_agents":[row.clone()]}}),
+        );
+        let result = route(
+            "tools/call",
+            json!({"name":"flock_agent_list","arguments":{}}),
+            &api,
+            &ChannelOptions::off(),
+        )
+        .unwrap();
+        let result: Value =
+            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(result["agents"], json!([]));
+        assert_eq!(result["structured_agents"], json!([row]));
+        assert!(result["structured_agents"][0].get("pane_id").is_none());
+    }
+    #[test]
+    fn admitted_unplaced_start_keeps_its_identity_in_mcp_failure() {
+        let result = json!({"type":"structured_agent_started_unplaced", "agent_id":"fixture-agent", "generation":4, "placement_error":{"code":"internal_error", "message":"placement failed"}});
+        let error = extract_flock_result(json!({"result":result}), false).unwrap_err();
+        assert_eq!(error.code, crate::cli::exit::FAILURE);
+        assert_eq!(error.message, "structured_agent_started_unplaced");
+        let data = error.data.unwrap();
+        assert_eq!(data["agent_id"], "fixture-agent");
+        assert_eq!(data["generation"], 4);
+        assert_eq!(data["placement_error"]["code"], "internal_error");
     }
 }

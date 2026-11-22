@@ -45,6 +45,14 @@ const START_OUTPUT_TAIL_LINES: usize = 40;
 
 impl App {
     pub(super) fn collect_agent_infos(&self) -> Vec<crate::api::schema::AgentInfo> {
+        self.collect_agent_infos_at(Instant::now())
+    }
+
+    /// Observe local agents with one instant for their state ages.
+    pub(super) fn collect_agent_infos_at(
+        &self,
+        now: Instant,
+    ) -> Vec<crate::api::schema::AgentInfo> {
         self.state
             .workspaces
             .iter()
@@ -54,7 +62,7 @@ impl App {
                     tab.layout
                         .pane_ids()
                         .into_iter()
-                        .filter_map(move |pane_id| self.agent_info(ws_idx, pane_id))
+                        .filter_map(move |pane_id| self.agent_info_at(ws_idx, pane_id, now))
                 })
             })
             .collect()
@@ -106,6 +114,12 @@ impl App {
         let resolved = self
             .resolve_terminal_target(target)
             .map_err(AgentRenameError::Target)?;
+        if name
+            .as_deref()
+            .is_some_and(|name| crate::terminal::agent_name::validate(name).is_err())
+        {
+            return Err(AgentRenameError::InvalidName);
+        }
         let normalized_name = name.and_then(|name| {
             let trimmed = name.trim().to_string();
             (!trimmed.is_empty()).then_some(trimmed)
@@ -133,8 +147,12 @@ impl App {
         };
         match normalized_name {
             Some(name) => {
-                terminal.set_agent_name(name.clone());
-                terminal.set_manual_label(name);
+                terminal
+                    .set_agent_name(name.clone())
+                    .map_err(|_| AgentRenameError::InvalidName)?;
+                terminal
+                    .set_manual_label(name)
+                    .map_err(|_| AgentRenameError::InvalidName)?;
             }
             None => terminal.clear_agent_name(),
         }
@@ -400,12 +418,131 @@ impl App {
         Ok((ws_idx, tab_idx, pane_id))
     }
 
+    fn targeted_agent_placement(
+        &self,
+        ws_idx: usize,
+        tab_idx: usize,
+        split: Option<SplitDirection>,
+        whole_workspace: bool,
+    ) -> StartPlacement {
+        let ws = &self.state.workspaces[ws_idx];
+        let tab = &ws.tabs[tab_idx];
+        if let Some(direction) = split {
+            return StartPlacement::Split(ws_idx, tab.layout.focused(), direction);
+        }
+        let untouched = (!whole_workspace || ws.tabs.len() == 1)
+            && tab.panes.len() == 1
+            && tab.panes.get(&tab.root_pane).is_some_and(|pane| {
+                pane.created_as_root_shell
+                    && self
+                        .terminal_runtimes
+                        .get(&pane.attached_terminal_id)
+                        .is_some_and(|runtime| {
+                            runtime.was_spawned_with_default_shell()
+                                && !runtime.has_received_input()
+                        })
+            });
+        if untouched {
+            StartPlacement::Replace(ws_idx, tab_idx)
+        } else {
+            StartPlacement::Workspace(self.public_workspace_id(ws_idx))
+        }
+    }
+
+    fn replace_agent_root_shell(
+        &mut self,
+        ws_idx: usize,
+        tab_idx: usize,
+        cwd: PathBuf,
+        argv: &[String],
+        focus: bool,
+    ) -> Result<(usize, usize, crate::layout::PaneId), AgentStartError> {
+        self.replace_agent_root_shell_with_start_check(
+            ws_idx,
+            tab_idx,
+            cwd,
+            argv,
+            focus,
+            |app, terminal_id, _| app.agent_exited_at_start(terminal_id),
+        )
+    }
+
+    /// Stage and commit a root replacement using the supplied start check.
+    /// The check runs before the existing shell or visible tab is changed.
+    fn replace_agent_root_shell_with_start_check(
+        &mut self,
+        ws_idx: usize,
+        tab_idx: usize,
+        cwd: PathBuf,
+        argv: &[String],
+        focus: bool,
+        check_start: impl FnOnce(
+            &mut Self,
+            &TerminalId,
+            crate::layout::PaneId,
+        ) -> Option<AgentExitedAtStart>,
+    ) -> Result<(usize, usize, crate::layout::PaneId), AgentStartError> {
+        let old_tab = &self.state.workspaces[ws_idx].tabs[tab_idx];
+        let old_pane = old_tab.root_pane;
+        let old_terminal = old_tab.panes[&old_pane].attached_terminal_id.clone();
+        let (rows, cols) = self.state.estimate_pane_size();
+        // Stage the replacement before changing the visible tab. A fresh raw
+        // pane id keeps the old shell's queued events away from the agent.
+        let (tab, terminal, runtime) = crate::workspace::Tab::new_argv_command(
+            old_tab.number,
+            cwd,
+            rows,
+            cols,
+            argv,
+            self.state.pane_scrollback_limit_bytes,
+            self.state.host_terminal_theme,
+            self.event_tx.clone(),
+            self.render_notify.clone(),
+            self.render_dirty.clone(),
+        )
+        .map_err(|err| AgentStartError::SpawnFailed(err.to_string()))?;
+        let pane_id = tab.root_pane;
+        let terminal_id = terminal.id.clone();
+        self.terminal_runtimes.insert(terminal_id.clone(), runtime);
+        if let Some(exit) = check_start(self, &terminal_id, pane_id) {
+            if let Some(runtime) = self.terminal_runtimes.remove(&terminal_id) {
+                runtime.shutdown();
+            }
+            return Err(AgentStartError::ExitedAtStart(exit));
+        }
+        let ws = &mut self.state.workspaces[ws_idx];
+        if let Some(number) = ws.public_pane_numbers.remove(&old_pane) {
+            ws.public_pane_numbers.insert(pane_id, number);
+        }
+        // Keep the existing tab and replace only its pane tree, preserving
+        // its metadata and any fields added to Tab in the future.
+        let existing = &mut ws.tabs[tab_idx];
+        existing.root_pane = tab.root_pane;
+        existing.layout = tab.layout;
+        existing.panes = tab.panes;
+        self.state.terminals.insert(terminal_id, terminal);
+        self.state.terminals.remove(&old_terminal);
+        if let Some(runtime) = self.terminal_runtimes.remove(&old_terminal) {
+            runtime.shutdown();
+        }
+        self.state.remove_alias_shadowed_by_new_pane(pane_id);
+        if focus {
+            self.state.switch_workspace_tab(ws_idx, tab_idx);
+            self.state.mode = Mode::Terminal;
+        }
+        self.schedule_session_save();
+        Ok((ws_idx, tab_idx, pane_id))
+    }
+
     pub(super) fn start_agent(
         &mut self,
         params: AgentStartParams,
         caller: &SpawnCaller,
-    ) -> Result<(crate::api::schema::AgentInfo, Vec<String>), AgentStartError> {
-        let name = params.name.trim().to_string();
+        questions: crate::api::schema::QuestionPolicy,
+    ) -> Result<crate::api::schema::ResponseResult, AgentStartError> {
+        let name = crate::terminal::agent_name::validate(&params.name)
+            .map_err(|_| AgentStartError::InvalidName)?
+            .to_string();
         if name.is_empty() {
             return Err(AgentStartError::InvalidName);
         }
@@ -423,6 +560,7 @@ impl App {
         let explicit_cwd = params.cwd.map(PathBuf::from);
         let argv = params.argv;
         let focus = params.focus;
+        let label = params.label;
         let (rows, cols) = self.state.estimate_pane_size();
 
         // #359: `flk agent start` execs argv directly, so the profile selector
@@ -434,7 +572,8 @@ impl App {
         let spawn_env = self
             .resolve_spawn_env(&argv, self.current_api_peer_pid, None)
             .map_err(AgentStartError::ProfileUnresolved)?;
-        let _spawn_env_guard = crate::integration::set_pending_spawn_env(spawn_env);
+        let _spawn_env_guard = crate::integration::set_pending_spawn_env(spawn_env.clone());
+        let _questions_guard = crate::integration::set_pending_questions(questions);
 
         // #398: two PLACEMENTS named at once is refused rather than resolved.
         // Silently preferring one is how a caller ends up reasoning about a
@@ -490,7 +629,7 @@ impl App {
             return Err(AgentStartError::NoActiveWorkspace);
         }
 
-        let (ws_idx, tab_idx, pane_id) = if let Some(tab_id) = params.tab_id {
+        let (cwd, placement) = if let Some(tab_id) = params.tab_id {
             let (ws_idx, tab_idx) =
                 self.parse_tab_id(&tab_id)
                     .ok_or_else(|| AgentStartError::TargetNotFound {
@@ -510,14 +649,10 @@ impl App {
             }
             let target_pane = self.state.workspaces[ws_idx].tabs[tab_idx].layout.focused();
             let cwd = self.agent_start_cwd(explicit_cwd, Some((ws_idx, target_pane)));
-            self.spawn_agent_split(
-                ws_idx,
-                target_pane,
-                params.split.unwrap_or(SplitDirection::Right),
+            (
                 cwd,
-                &argv,
-                focus,
-            )?
+                self.targeted_agent_placement(ws_idx, tab_idx, params.split, false),
+            )
         } else if let Some(workspace_id) = params.workspace_id {
             let ws_idx = self.parse_workspace_id(&workspace_id).ok_or_else(|| {
                 AgentStartError::TargetNotFound {
@@ -527,14 +662,10 @@ impl App {
             let tab_idx = self.state.workspaces[ws_idx].active_tab;
             let target_pane = self.state.workspaces[ws_idx].tabs[tab_idx].layout.focused();
             let cwd = self.agent_start_cwd(explicit_cwd, Some((ws_idx, target_pane)));
-            self.spawn_agent_split(
-                ws_idx,
-                target_pane,
-                params.split.unwrap_or(SplitDirection::Right),
+            (
                 cwd,
-                &argv,
-                focus,
-            )?
+                self.targeted_agent_placement(ws_idx, tab_idx, params.split, true),
+            )
         } else if let Some(ws_idx) = named_workspace {
             // #398: the placement was asked for by name, so it is reached from
             // any caller — including one flock cannot place, which is the whole
@@ -544,9 +675,7 @@ impl App {
             let target_pane = self.state.workspaces[ws_idx].tabs[tab_idx].layout.focused();
             let cwd = self.agent_start_cwd(explicit_cwd, Some((ws_idx, target_pane)));
             match params.split {
-                Some(split) => {
-                    self.spawn_agent_split(ws_idx, target_pane, split, cwd, &argv, focus)?
-                }
+                Some(split) => (cwd, StartPlacement::Split(ws_idx, target_pane, split)),
                 // Without `--split` this is a placement, not a pane gesture, so
                 // it takes the shape `--workspace` does for #364: the agent is
                 // the only pane of a tab nobody else is in. Under
@@ -557,7 +686,7 @@ impl App {
                 // rather than "a tab in it".
                 None => {
                     let workspace_id = self.public_workspace_id(ws_idx);
-                    self.spawn_agent_in_workspace(&workspace_id, cwd, rows, cols, &argv, focus)?
+                    (cwd, StartPlacement::Workspace(workspace_id))
                 }
             }
         } else if let Some(split) = params.split {
@@ -594,12 +723,12 @@ impl App {
                 // spaces open there is no active workspace to guess at, so a
                 // fresh node still starts an agent from a script.
                 let cwd = self.agent_start_cwd(explicit_cwd, None);
-                self.spawn_agent_workspace(cwd, rows, cols, &argv, focus)?
+                (cwd, StartPlacement::NewWorkspace)
             } else if let Some(ws_idx) = matched.filter(|idx| *idx < self.state.workspaces.len()) {
                 let tab_idx = self.state.workspaces[ws_idx].active_tab;
                 let target_pane = self.state.workspaces[ws_idx].tabs[tab_idx].layout.focused();
                 let cwd = self.agent_start_cwd(explicit_cwd, Some((ws_idx, target_pane)));
-                self.spawn_agent_split(ws_idx, target_pane, split, cwd, &argv, focus)?
+                (cwd, StartPlacement::Split(ws_idx, target_pane, split))
             } else {
                 // A split needs an existing space to split. An unmatched cwd
                 // is placement ENOUGH on the untargeted arm below — flock
@@ -635,14 +764,11 @@ impl App {
             // to listen. Only a matched cwd changes anything — an unmatched one
             // takes the #364 path unchanged.
             //
-            // Splitting is still reachable, but only by asking: name a
-            // `workspace_id`/`tab_id`, pass `split`, or pass `--active`.
+            // Splitting is reachable only by explicitly passing `--split`.
             let requested_cwd = explicit_cwd.clone();
             let cwd = self.agent_start_cwd(explicit_cwd, None);
             match self.agent_cwd_workspace_id(requested_cwd.as_deref()) {
-                Some(workspace_id) => {
-                    self.spawn_agent_in_workspace(&workspace_id, cwd, rows, cols, &argv, focus)?
-                }
+                Some(workspace_id) => (cwd, StartPlacement::Workspace(workspace_id)),
                 // A `--cwd` that names a real directory is placement ENOUGH,
                 // even though it matches no open space: flock mints the space
                 // at it, and a dispatcher pointing at a checkout this server
@@ -651,7 +777,7 @@ impl App {
                 // a new repo from a script, with no flag left that expresses
                 // it.
                 None if requested_cwd.as_deref().is_some_and(|path| path.is_dir()) => {
-                    self.spawn_agent_workspace(cwd, rows, cols, &argv, focus)?
+                    (cwd, StartPlacement::NewWorkspace)
                 }
                 // What is left gave flock nothing to place: no `--cwd` at all,
                 // or one that is not a directory. The untargeted path then
@@ -660,10 +786,56 @@ impl App {
                 // trust prompt, reached without anybody asking for it. So a
                 // caller flock cannot place is refused (#398), and an operator
                 // in a pane keeps the behaviour they have today.
-                None if caller.may_default_to_active() => {
-                    self.spawn_agent_workspace(cwd, rows, cols, &argv, focus)?
-                }
+                None if caller.may_default_to_active() => (cwd, StartPlacement::NewWorkspace),
                 None => return Err(AgentStartError::PlacementRequired),
+            }
+        };
+
+        if params.dry_run {
+            let (kind, workspace_id, target_pane_id, direction) = match &placement {
+                StartPlacement::Split(ws, pane, direction) => (
+                    "split",
+                    Some(self.public_workspace_id(*ws)),
+                    self.public_pane_id(*ws, *pane),
+                    Some(direction.clone()),
+                ),
+                StartPlacement::Workspace(ws) => (
+                    if self.state.tab_mode == crate::config::TabModeConfig::Workspace {
+                        "sibling_workspace"
+                    } else {
+                        "tab"
+                    },
+                    Some(ws.clone()),
+                    None,
+                    None,
+                ),
+                StartPlacement::Replace(ws, tab) => (
+                    "replace",
+                    Some(self.public_workspace_id(*ws)),
+                    self.public_pane_id(*ws, self.state.workspaces[*ws].tabs[*tab].root_pane),
+                    None,
+                ),
+                StartPlacement::NewWorkspace => ("workspace", None, None, None),
+            };
+            return Ok(crate::api::schema::ResponseResult::AllocationPlan {
+                operation: "agent.start".into(),
+                plan: serde_json::json!({"name": name, "cwd": cwd, "argv": argv, "focus": focus,
+                    "placement": kind, "workspace_id": workspace_id, "target_pane_id": target_pane_id, "direction": direction}),
+            });
+        }
+        self.pretrust_claude_worktree(&argv, &cwd, &spawn_env);
+        let (ws_idx, tab_idx, pane_id) = match placement {
+            StartPlacement::Replace(ws, tab) => {
+                self.replace_agent_root_shell(ws, tab, cwd, &argv, focus)?
+            }
+            StartPlacement::Split(ws, pane, direction) => {
+                self.spawn_agent_split(ws, pane, direction, cwd, &argv, focus)?
+            }
+            StartPlacement::Workspace(ws) => {
+                self.spawn_agent_in_workspace(&ws, cwd, rows, cols, &argv, focus)?
+            }
+            StartPlacement::NewWorkspace => {
+                self.spawn_agent_workspace(cwd, rows, cols, &argv, focus)?
             }
         };
 
@@ -677,15 +849,32 @@ impl App {
         let Some(terminal) = self.state.terminals.get_mut(&terminal_id) else {
             return Err(AgentStartError::SpawnFailed("terminal disappeared".into()));
         };
-        terminal.set_agent_name(name.clone());
-        terminal.set_manual_label(name);
+        terminal.launch_env = spawn_env;
+        terminal.questions = questions;
+        terminal
+            .set_agent_name(name.clone())
+            .map_err(|_| AgentStartError::InvalidName)?;
+        terminal
+            .set_manual_label(name)
+            .map_err(|_| AgentStartError::InvalidName)?;
         self.state.mark_session_dirty();
 
         let agent = self
             .agent_info(ws_idx, pane_id)
             .ok_or_else(|| AgentStartError::SpawnFailed("agent disappeared".into()))?;
         debug_assert_eq!(agent.tab_id, self.public_tab_id(ws_idx, tab_idx).unwrap());
-        Ok((agent, argv))
+        let edge = self.record_delegation(
+            caller,
+            crate::api::schema::DelegationVia::Start,
+            ws_idx,
+            pane_id,
+            label,
+        );
+        Ok(crate::api::schema::ResponseResult::AgentStarted {
+            agent,
+            argv,
+            edge: Some(edge),
+        })
     }
 
     pub(super) fn agent_start_error_body(
@@ -694,22 +883,27 @@ impl App {
     ) -> crate::api::schema::ErrorBody {
         match err {
             AgentStartError::InvalidName => crate::api::schema::ErrorBody {
+                data: None,
                 code: "invalid_agent_name".into(),
-                message: "agent name must not be empty".into(),
+                message: format!("{}; a new agent name must not be empty", crate::terminal::agent_name::POLICY),
             },
             AgentStartError::EmptyArgv => crate::api::schema::ErrorBody {
+                data: None,
                 code: "invalid_agent_argv".into(),
                 message: "agent start argv must not be empty".into(),
             },
             AgentStartError::TargetNotFound { target } => crate::api::schema::ErrorBody {
+                data: None,
                 code: "agent_placement_not_found".into(),
                 message: format!("agent placement target {target} not found"),
             },
             AgentStartError::PlacementConflict(reason) => crate::api::schema::ErrorBody {
+                data: None,
                 code: "agent_placement_conflict".into(),
                 message: reason,
             },
             AgentStartError::PlacementRequired => crate::api::schema::ErrorBody {
+                data: None,
                 code: "agent_placement_required".into(),
                 // #398: naming the remedy is the whole point. A refusal that
                 // only said "no placement" turns a misplacement into a mystery,
@@ -726,12 +920,14 @@ impl App {
                     .into(),
             },
             AgentStartError::NoActiveWorkspace => crate::api::schema::ErrorBody {
+                data: None,
                 code: "agent_no_active_workspace".into(),
                 message: "--active was passed and no workspace is focused; name a placement \
                           with --workspace or --tab"
                     .into(),
             },
             AgentStartError::NoCallerPane => crate::api::schema::ErrorBody {
+                data: None,
                 code: "agent_here_unavailable".into(),
                 // Names the alternatives, because "there is no here" is not an
                 // answer a caller can act on — it is the refusal that would
@@ -743,18 +939,22 @@ impl App {
                     .into(),
             },
             AgentStartError::SpawnFailed(message) => crate::api::schema::ErrorBody {
+                data: None,
                 code: "agent_start_failed".into(),
                 message,
             },
             AgentStartError::ExitedAtStart(exit) => crate::api::schema::ErrorBody {
+                data: None,
                 code: "agent_exited_at_start".into(),
                 message: exit.message(),
             },
             AgentStartError::ProfileUnresolved(unresolved) => crate::api::schema::ErrorBody {
+                data: None,
                 code: unresolved.code().into(),
                 message: unresolved.message(),
             },
             AgentStartError::DuplicateName { name, candidates } => crate::api::schema::ErrorBody {
+                data: None,
                 code: "agent_name_taken".into(),
                 message: format!(
                     "agent name {name} is already used; candidates: {}",
@@ -781,12 +981,23 @@ impl App {
         err: TerminalTargetError,
     ) -> crate::api::schema::ErrorBody {
         match err {
+            TerminalTargetError::RuntimeUnsupported { target } => {
+                crate::api::schema::ErrorBody {
+                    data: None,
+                    code: crate::api::error_code::ErrorCode::RuntimeUnsupported.as_str().into(),
+                    message: format!(
+                        "agent {target} has no PTY placement; this operation requires a pane"
+                    ),
+                }
+            }
             TerminalTargetError::NotFound { target } => crate::api::schema::ErrorBody {
+                data: None,
                 code: "agent_not_found".into(),
                 message: format!("agent target {target} not found"),
             },
             TerminalTargetError::Ambiguous { target, candidates } => {
                 crate::api::schema::ErrorBody {
+                    data: None,
                     code: "agent_target_ambiguous".into(),
                     message: format!(
                         "agent target {target} is ambiguous; candidates: {}",
@@ -815,7 +1026,9 @@ impl App {
     ) -> crate::api::schema::ErrorBody {
         match err {
             AgentRenameError::Target(err) => self.agent_target_error_body(err),
+            AgentRenameError::InvalidName => crate::terminal::agent_name::refusal(),
             AgentRenameError::DuplicateName { name, candidates } => crate::api::schema::ErrorBody {
+                data: None,
                 code: "agent_name_taken".into(),
                 message: format!(
                     "agent name {name} is already used; candidates: {}",
@@ -885,6 +1098,24 @@ impl App {
             }
             other => other,
         })
+    }
+
+    /// Mark `cwd` trusted for Claude Code before an argv spawn execs `claude`
+    /// there, when it is a linked worktree of an already-trusted repository
+    /// (#605). Shared by every spawn door, so a delegate, a dispatch and a
+    /// fork all start past the trust dialog for the same reason.
+    pub(crate) fn pretrust_claude_worktree(
+        &self,
+        argv: &[String],
+        cwd: &std::path::Path,
+        spawn_env: &[(String, String)],
+    ) {
+        crate::integration::claude_trust::pretrust_for_launch(
+            self.state.config.worktrees.pretrust_claude,
+            argv,
+            cwd,
+            spawn_env,
+        );
     }
 
     pub(super) fn spawn_agent_workspace(
@@ -1024,10 +1255,95 @@ impl App {
         Ok((ws_idx, result.0, result.1.pane_id))
     }
 
+    /// The `background` axis's count and source (ADR-0028 §1, #1022).
+    /// Claude counts its tasks on screen. Codex and opencode do not, so their
+    /// pane's process tree is read, and only once the turn is idle: during a
+    /// turn the phase is `working` whatever runs, and the walk lists every
+    /// process on the host.
+    fn agent_background(
+        &self,
+        terminal: &crate::terminal::TerminalState,
+        status: crate::api::schema::AgentStatus,
+    ) -> Option<(u32, crate::api::agent_state::StateSource)> {
+        use crate::api::agent_state::StateSource;
+        use crate::api::schema::AgentStatus;
+        use crate::detect::Agent;
+        match terminal.effective_known_agent()? {
+            Agent::Claude => Some((terminal.background_tasks?, StateSource::Screen)),
+            Agent::Codex | Agent::OpenCode
+                if matches!(status, AgentStatus::Idle | AgentStatus::Done) =>
+            {
+                let root = self.terminal_runtimes.get(&terminal.id)?.child_pid()?;
+                Some((
+                    super::background_jobs::pane_background_jobs(root)?,
+                    StateSource::ProcessTree,
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    /// The agent in a pane and its ADR-0028 `state`, as `agent.get` reports
+    /// it, without the rest of `pane_info`. `None` when the pane runs no agent.
+    pub(super) fn agent_state_of(
+        &self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+    ) -> Option<(String, crate::api::agent_state::AgentState)> {
+        self.agent_state_of_at(ws_idx, pane_id, Instant::now())
+    }
+
+    /// Derive the state age at the observation's sampled instant.
+    fn agent_state_of_at(
+        &self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+        now: Instant,
+    ) -> Option<(String, crate::api::agent_state::AgentState)> {
+        let pane_state = self.state.workspaces.get(ws_idx)?.pane_state(pane_id)?;
+        let terminal = self.state.terminals.get(&pane_state.attached_terminal_id)?;
+        if !terminal.is_agent_terminal() {
+            return None;
+        }
+        let status = super::api_helpers::pane_agent_status_from_terminal(
+            terminal,
+            pane_state.seen,
+            self.terminal_runtimes.get(&terminal.id).is_some(),
+        );
+        let provider_wait = (status == crate::api::schema::AgentStatus::Blocked)
+            .then_some(terminal.provider_limit.as_ref())
+            .flatten();
+        let state = super::api_helpers::agent_state(
+            status,
+            terminal.last_state_authority(),
+            terminal.effective_known_agent(),
+            terminal
+                .state_changed_at
+                .map(|changed| now.saturating_duration_since(changed).as_millis() as u64),
+            self.agent_background(terminal, status),
+            super::api_helpers::screen_attention(
+                provider_wait,
+                terminal.needs_human,
+                terminal.question.as_ref(),
+            ),
+            self.waits.waiting(&terminal.agent_id.to_string()),
+        );
+        Some((terminal.agent_id.to_string(), state))
+    }
+
     pub(super) fn agent_info(
         &self,
         ws_idx: usize,
         pane_id: crate::layout::PaneId,
+    ) -> Option<crate::api::schema::AgentInfo> {
+        self.agent_info_at(ws_idx, pane_id, Instant::now())
+    }
+
+    fn agent_info_at(
+        &self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+        now: Instant,
     ) -> Option<crate::api::schema::AgentInfo> {
         let ws = self.state.workspaces.get(ws_idx)?;
         let pane_state = ws.pane_state(pane_id)?;
@@ -1036,14 +1352,33 @@ impl App {
             return None;
         }
         let pane = self.pane_info(ws_idx, pane_id)?;
+        let provider_wait = (pane.agent_status == crate::api::schema::AgentStatus::Blocked)
+            .then_some(terminal.provider_limit.as_ref())
+            .flatten();
         Some(crate::api::schema::AgentInfo {
             agent_id: terminal.agent_id.to_string(),
             terminal_id: pane.terminal_id,
-            name: terminal.agent_name.clone(),
+            name: terminal.agent_name().map(str::to_owned),
             agent: pane.agent,
             title: pane.title,
             display_agent: pane.display_agent,
+            // The detector's bit only describes a settled agent: a status
+            // that has since moved on (a hook reporting work) outranks it.
+            settled_with_background_shells: terminal.settled_with_background_shells
+                && matches!(
+                    pane.agent_status,
+                    crate::api::schema::AgentStatus::Idle | crate::api::schema::AgentStatus::Done
+                ),
+            state: self
+                .agent_state_of_at(ws_idx, pane_id, now)
+                .map(|(_, state)| state),
             agent_status: pane.agent_status,
+            blocked_reason: if terminal.resume_failed {
+                Some("resume_failed".into())
+            } else {
+                provider_wait.as_ref().map(|_| "provider_limit".into())
+            },
+            retry_after_ms: provider_wait.and_then(|wait| wait.retry_after_ms),
             custom_status: pane.custom_status,
             state_labels: pane.state_labels,
             agent_session: pane.agent_session,
@@ -1056,12 +1391,16 @@ impl App {
             seen: pane.seen,
             status_age_secs: pane.status_age_secs,
             run_id: terminal.run_id.clone(),
+            questions: Some(terminal.questions),
             turn_cursor: pane.turn_cursor,
+            resumable: terminal.hibernated_resume_plan.is_some()
+                || (terminal.pending_agent_resume_plan.is_some()
+                    && self.terminal_runtimes.get(&terminal.id).is_none()),
             revision: pane.revision,
         })
     }
 
-    fn agent_name_conflicts(
+    pub(super) fn agent_name_conflicts(
         &self,
         name: &str,
         except_terminal_id: &str,
@@ -1176,6 +1515,7 @@ fn last_non_empty_line(text: &str) -> Option<String> {
 }
 
 pub(super) enum AgentRenameError {
+    InvalidName,
     Target(TerminalTargetError),
     DuplicateName {
         name: String,
@@ -1183,9 +1523,194 @@ pub(super) enum AgentRenameError {
     },
 }
 
+enum StartPlacement {
+    Replace(usize, usize),
+    Split(usize, crate::layout::PaneId, SplitDirection),
+    Workspace(String),
+    NewWorkspace,
+}
+
 #[cfg(test)]
 mod tests {
     use crate::api::schema::{AgentStartParams, Method, Request};
+
+    #[test]
+    fn deferred_restore_without_runtime_is_offline_and_resumable() {
+        use crate::api::agent_state::{Lifecycle, Phase, Turn};
+        use crate::api::schema::AgentStatus;
+        let (mut app, _) = app_with_workspace("deferred-restore", None);
+        let pane = app.state.workspaces[0].focused_pane_id().unwrap();
+        let terminal_id = app.state.workspaces[0].terminal_id(pane).unwrap().clone();
+        let session = crate::agent_resume::AgentSessionRef::id("saved-session").unwrap();
+        let plan = crate::agent_resume::plan("flock:opencode", "opencode", &session).unwrap();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_detected_state(
+            Some(crate::detect::Agent::OpenCode),
+            crate::detect::AgentState::Idle,
+        );
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "flock:opencode".into(),
+            agent: "opencode".into(),
+            session_ref: session,
+        });
+        terminal.pending_agent_resume_plan = Some(plan.clone());
+        assert_eq!(
+            crate::app::api_helpers::pane_agent_status_from_terminal(terminal, true, true),
+            AgentStatus::Idle,
+            "a pending flag must not hide a live runtime"
+        );
+        assert!(app.terminal_runtimes.get(&terminal_id).is_none());
+        let info = app.agent_info(0, pane).unwrap();
+        assert_eq!(info.agent_status, AgentStatus::Offline);
+        assert!(info.resumable);
+        let state = info.state.unwrap();
+        assert_eq!(
+            (state.lifecycle, state.phase, state.turn),
+            (Lifecycle::Offline, Phase::Offline, Turn::Unknown)
+        );
+        assert_eq!(
+            app.pane_info(0, pane).unwrap().agent_status,
+            AgentStatus::Offline
+        );
+        assert_eq!(
+            app.collect_agent_infos()[0].agent_status,
+            AgentStatus::Offline
+        );
+        assert_eq!(
+            app.tab_info(0, 0).unwrap().agent_status,
+            AgentStatus::Offline
+        );
+        assert_eq!(app.workspace_info(0).agent_status, AgentStatus::Offline);
+        assert_eq!(
+            app.terminal_target_candidate(0, pane).unwrap().agent_status,
+            AgentStatus::Offline
+        );
+        let target = app.public_pane_id(0, pane).unwrap();
+        let refusal = app
+            .queue_agent_restart(
+                crate::api::schema::AgentRestartParams {
+                    target,
+                    reason: "fixture restart".into(),
+                    continue_with: None,
+                    when: "after_turn".into(),
+                },
+                std::time::Instant::now(),
+            )
+            .unwrap_err();
+        assert_eq!(refusal.code, "parked");
+        assert!(refusal.message.contains("agent resume"));
+        let terminal = app.state.terminals.get(&terminal_id).unwrap();
+        let presentation = terminal.effective_presentation();
+        let sequence = app.event_hub.current_sequence();
+        app.emit_pane_state_update(&crate::app::actions::PaneStateUpdate {
+            pane_id: pane,
+            ws_idx: 0,
+            previous_agent_label: Some("opencode".into()),
+            previous_known_agent: Some(crate::detect::Agent::OpenCode),
+            previous_state: crate::detect::AgentState::Working,
+            previous_seen: true,
+            previous_presentation: presentation.clone(),
+            agent_label: Some("opencode".into()),
+            known_agent: Some(crate::detect::Agent::OpenCode),
+            state: crate::detect::AgentState::Idle,
+            seen: true,
+            presentation,
+        });
+        assert!(
+            app.event_hub
+                .ring_snapshot_after(sequence)
+                .iter()
+                .all(|(_, event)| !matches!(
+                    event.data,
+                    crate::api::schema::EventData::PaneAgentStatusChanged { .. }
+                )),
+            "a stored turn transition cannot emit a live status for an offline binding"
+        );
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        assert_eq!(terminal.pending_agent_resume_plan, Some(plan.clone()));
+        terminal.pending_agent_resume_plan = None;
+        terminal.set_hibernated_resume_plan(Some(plan));
+        let info = app.agent_info(0, pane).unwrap();
+        assert_eq!(info.agent_status, AgentStatus::Hibernated);
+        assert!(info.resumable);
+        let refusal = app
+            .queue_agent_restart(
+                crate::api::schema::AgentRestartParams {
+                    target: app.public_pane_id(0, pane).unwrap(),
+                    reason: "fixture restart".into(),
+                    continue_with: None,
+                    when: "after_turn".into(),
+                },
+                std::time::Instant::now(),
+            )
+            .unwrap_err();
+        assert_eq!(refusal.code, "parked");
+        assert!(refusal.message.contains("agent resume"));
+    }
+
+    /// Wait for the watcher's publication, with a failure ceiling for a child
+    /// that never exits. A successful wait depends only on the event.
+    fn wait_for_replacement_exit(
+        mut events: tokio::sync::mpsc::Receiver<crate::events::AppEvent>,
+    ) -> Result<crate::layout::PaneId, &'static str> {
+        // The synchronous start check runs inside Tokio. Use a separate runtime
+        // for the bounded receive so it also works on a multi-thread runtime.
+        std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .expect("exit observer runtime")
+                .block_on(async {
+                    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                        while let Some(event) = events.recv().await {
+                            if let crate::events::AppEvent::PaneDied { pane_id } = event {
+                                return Ok(pane_id);
+                            }
+                        }
+                        Err("replacement watcher channel closed before PaneDied")
+                    })
+                    .await
+                    .unwrap_or(Err("replacement did not report PaneDied within 30 s"))
+                })
+        })
+        .join()
+        .expect("exit observer thread")
+    }
+
+    #[tokio::test]
+    async fn security_agent_name_api_boundaries_refuse_before_side_effects() {
+        let mut failures = Vec::new();
+        for method in ["agent.rename", "agent.start", "agent.spawn"] {
+            for (case, name) in crate::test_support::hostile_agent_names() {
+                let mut app = test_app();
+                app.state.config.fleet.agent_spawn_enabled = true;
+                app.state.workspaces = vec![crate::workspace::Workspace::test_new("name-security")];
+                app.state.ensure_test_terminals();
+                let terminal = app.state.terminals.values_mut().next().unwrap();
+                terminal.set_agent_name("safe".into()).unwrap();
+                let target = terminal.id.to_string();
+                let params = match method {
+                    "agent.rename" => serde_json::json!({"target":target,"name":name}),
+                    "agent.start" => serde_json::json!({"name":name,"argv":[]}),
+                    "agent.spawn" => {
+                        serde_json::json!({"name":name,"agent":"codex","prompt":"fixture task","location":{"kind":"workspace_id","workspace_id":"workspace-fixture"}})
+                    }
+                    _ => unreachable!(),
+                };
+                let request = serde_json::from_value(
+                    serde_json::json!({"id":"security-name","method":method,"params":params}),
+                )
+                .unwrap();
+                let response = app.handle_api_request(request);
+                let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+                if value["error"]["code"] != "invalid_agent_name" {
+                    failures.push((method, case));
+                }
+                assert_eq!(app.state.terminals.len(), 1);
+            }
+        }
+        assert!(failures.is_empty(), "unrefused name cases: {failures:?}");
+    }
 
     fn test_app() -> crate::app::App {
         let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1243,6 +1768,10 @@ mod tests {
         Request {
             id: "req_agent_start_cwd".into(),
             method: Method::AgentStart(AgentStartParams {
+                runtime: Default::default(),
+                model: None,
+                label: None,
+                dry_run: false,
                 name: "worker".into(),
                 cwd,
                 workspace_id: Some(workspace_id.to_string()),
@@ -1254,6 +1783,8 @@ mod tests {
                 // #178/#374: a start whose child is already gone is a failed
                 // start, so these need a pane that is still there afterwards.
                 argv: vec![crate::test_support::live_program()],
+                questions: None,
+                unattended: false,
             }),
         }
     }
@@ -1262,6 +1793,10 @@ mod tests {
         Request {
             id: "req_agent_start_profile".into(),
             method: Method::AgentStart(AgentStartParams {
+                runtime: Default::default(),
+                model: None,
+                label: None,
+                dry_run: false,
                 name: "worker".into(),
                 cwd: Some("/".into()),
                 workspace_id: None,
@@ -1271,6 +1806,8 @@ mod tests {
                 here: false,
                 focus: false,
                 argv: vec![program.to_string()],
+                questions: None,
+                unattended: false,
             }),
         }
     }
@@ -1324,6 +1861,67 @@ mod tests {
             before,
             "a refused start must create nothing"
         );
+    }
+
+    /// #605: the trust write has to happen on the real `agent.start` path,
+    /// not only in the helper, or a delegate still parks on Claude's trust
+    /// dialog. Driven through the API with a `claude` argv (a live shell under
+    /// that name) launched in a linked worktree of a repo the profile trusts.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_claude_start_in_a_worktree_of_a_trusted_repo_pretrusts_it() {
+        use crate::test_support::{create_committed_repo, run_git, unique_temp_path};
+        let _env = crate::integration::integration_env_lock();
+        let repo = std::fs::canonicalize(create_committed_repo("agent-pretrust")).unwrap();
+        let base = unique_temp_path("agent-pretrust-base");
+        std::fs::create_dir_all(base.join("bin")).unwrap();
+        std::fs::create_dir_all(base.join("profile")).unwrap();
+        let base = std::fs::canonicalize(base).unwrap();
+        let worktree = base.join("wt");
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "feature",
+                worktree.to_str().unwrap(),
+            ],
+        );
+        let claude = base.join("bin/claude");
+        std::os::unix::fs::symlink(crate::test_support::live_program(), &claude).unwrap();
+        let config = base.join("profile/.claude.json");
+        let trusted = serde_json::json!({"projects": {
+            repo.to_str().unwrap(): {"hasTrustDialogAccepted": true}
+        }});
+        std::fs::write(&config, trusted.to_string()).unwrap();
+        let previous = std::env::var_os("CLAUDE_CONFIG_DIR");
+        std::env::set_var("CLAUDE_CONFIG_DIR", base.join("profile"));
+
+        let mut app = test_app();
+        app.state.config.worktrees.pretrust_claude = true;
+        let mut request = start_request(claude.to_str().unwrap());
+        if let Method::AgentStart(params) = &mut request.method {
+            params.cwd = Some(worktree.to_string_lossy().into_owned());
+        }
+        let raw = app.handle_api_request(request);
+        match previous {
+            Some(value) => std::env::set_var("CLAUDE_CONFIG_DIR", value),
+            None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+        }
+        let response: serde_json::Value = serde_json::from_str(&raw).expect("json");
+        assert_eq!(response["result"]["type"], "agent_started", "{response}");
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
+        assert_eq!(
+            written["projects"][worktree.to_str().unwrap()]["hasTrustDialogAccepted"],
+            true,
+            "{written}"
+        );
+        shutdown(app);
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&repo);
     }
 
     /// The refusal is scoped to agents flock knows to have shell-supplied
@@ -1452,6 +2050,283 @@ mod tests {
         .message();
         assert!(message.contains("exit code 0"), "{message}");
         assert!(message.contains("No conversation found"), "{message}");
+    }
+
+    async fn created_root_shell() -> (crate::app::App, String, crate::layout::PaneId) {
+        let mut app = test_app();
+        app.state.default_shell = "/bin/sh".into();
+        app.state.shell_mode = crate::config::ShellModeConfig::NonLogin;
+        app.state.tab_mode = crate::config::TabModeConfig::Tabs;
+        let request = serde_json::from_value(serde_json::json!({
+            "id": "create", "method": "workspace.create",
+            "params": {"cwd": std::env::temp_dir(), "focus": true}
+        }))
+        .expect("workspace request");
+        let response = app.handle_api_request(request);
+        let response: serde_json::Value = serde_json::from_str(&response).expect("response");
+        assert_eq!(
+            response["result"]["type"], "workspace_created",
+            "{response}"
+        );
+        let ws = app.state.workspaces.len() - 1;
+        let pane = app.state.workspaces[ws].tabs[0].root_pane;
+        let workspace = app.public_workspace_id(ws);
+        (app, workspace, pane)
+    }
+
+    #[tokio::test]
+    async fn agent_start_replaces_created_root_shell_at_p1() {
+        for target_tab in [false, true] {
+            let (mut app, workspace, old_pane) = created_root_shell().await;
+            let old_terminal = app.state.workspaces[0]
+                .terminal_id(old_pane)
+                .unwrap()
+                .clone();
+            let old_tab = app.public_tab_id(0, 0).unwrap();
+            app.state.workspaces[0].tabs[0].custom_name = Some("keep this tab".into());
+            app.state.workspaces[0].tabs[0].zoomed = true;
+            let mut request = targeted_start_request(&workspace, None);
+            if let Method::AgentStart(params) = &mut request.method {
+                if target_tab {
+                    params.tab_id = Some(old_tab.clone());
+                    params.workspace_id = None;
+                }
+            }
+            let raw = app.handle_api_request(request);
+            let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(response["result"]["type"], "agent_started", "{response}");
+            assert_eq!(
+                response["result"]["agent"]["pane_id"],
+                format!("{workspace}:p1")
+            );
+            assert_eq!(response["result"]["agent"]["tab_id"], old_tab);
+            assert_eq!(
+                app.state.workspaces[0].tabs[0].custom_name.as_deref(),
+                Some("keep this tab")
+            );
+            assert!(app.state.workspaces[0].tabs[0].zoomed);
+            assert_eq!(app.state.workspaces[0].tabs.len(), 1);
+            assert_eq!(app.state.workspaces[0].tabs[0].panes.len(), 1);
+            assert!(!app.state.terminals.contains_key(&old_terminal));
+            assert!(app.terminal_runtimes.get(&old_terminal).is_none());
+            // A queued death from the retired shell cannot remove the new agent.
+            app.handle_internal_event(crate::events::AppEvent::PaneDied { pane_id: old_pane });
+            assert_eq!(app.collect_agent_infos().len(), 1);
+            shutdown(app);
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_start_typed_root_shell_gets_new_tab() {
+        for target_tab in [false, true] {
+            let (mut app, workspace, pane) = created_root_shell().await;
+            let request = serde_json::from_value(serde_json::json!({
+                "id": "type", "method": "pane.send_text",
+                "params": {"pane_id": format!("{workspace}:p1"), "text": " "}
+            }))
+            .expect("input request");
+            let (event_tx, mut events) = tokio::sync::mpsc::channel(8);
+            app.event_tx = event_tx;
+            let raw = app.handle_api_request(request);
+            let (sender, receiver) = std::sync::mpsc::channel();
+            app.respond_or_park(sender, raw);
+            let response = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                loop {
+                    if let Ok(raw) = receiver.try_recv() { break serde_json::from_str::<serde_json::Value>(&raw).unwrap(); }
+                    tokio::select! {
+                        _ = app.input_writes.notify.notified() => app.service_input_writes(),
+                        event = events.recv() => {
+                            let crate::events::AppEvent::PasteConfirm { mut paste, respond_to } = event.expect("observation producer") else { panic!("expected paste observation") };
+                            // This fixture checks placement after typing, not screen confirmation.
+                            paste.deadline = std::time::Instant::now();
+                            app.advance_paste(paste, respond_to);
+                        }
+                    }
+                }
+            }).await.expect("completed write and bounded paste observation");
+            assert!(response.get("error").is_none(), "{response}");
+            let mut request = targeted_start_request(&workspace, None);
+            if let Method::AgentStart(params) = &mut request.method {
+                if target_tab {
+                    params.tab_id = app.public_tab_id(0, 0);
+                    params.workspace_id = None;
+                }
+            }
+            let raw = app.handle_api_request(request);
+            let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(response["result"]["type"], "agent_started", "{response}");
+            assert_eq!(app.state.workspaces[0].tabs.len(), 2);
+            assert_eq!(app.state.workspaces[0].tabs[0].root_pane, pane);
+            assert_eq!(app.state.workspaces[0].tabs[1].panes.len(), 1);
+            shutdown(app);
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_start_never_replaces_custom_argv_root() {
+        let (mut app, workspace, _) = created_root_shell().await;
+        let first = app.handle_api_request(targeted_start_request(&workspace, None));
+        let first: serde_json::Value = serde_json::from_str(&first).unwrap();
+        assert_eq!(first["result"]["type"], "agent_started", "{first}");
+        let first_pane = app.state.workspaces[0].tabs[0].root_pane;
+        let mut request = targeted_start_request(&workspace, None);
+        if let Method::AgentStart(params) = &mut request.method {
+            params.name = "second".into();
+        }
+        let raw = app.handle_api_request(request);
+        let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(response["result"]["type"], "agent_started", "{response}");
+        assert_eq!(app.state.workspaces[0].tabs.len(), 2);
+        assert_eq!(app.state.workspaces[0].tabs[0].root_pane, first_pane);
+        shutdown(app);
+    }
+
+    #[tokio::test]
+    async fn agent_start_keeps_custom_runtime_in_original_shell_root() {
+        let (mut app, workspace, pane) = created_root_shell().await;
+        let terminal = app.state.workspaces[0].terminal_id(pane).unwrap().clone();
+        // Restart paths can retain the pane while replacing its runtime.
+        let runtime = crate::terminal::TerminalRuntime::spawn_argv_command(
+            pane,
+            24,
+            80,
+            std::env::temp_dir(),
+            &[crate::test_support::live_program()],
+            app.state.pane_scrollback_limit_bytes,
+            app.state.host_terminal_theme,
+            app.event_tx.clone(),
+            app.render_notify.clone(),
+            app.render_dirty.clone(),
+        )
+        .unwrap();
+        assert!(!runtime.has_received_input());
+        assert!(!runtime.was_spawned_with_default_shell());
+        let old_runtime = app.terminal_runtimes.insert(terminal, runtime).unwrap();
+        let raw = app.handle_api_request(targeted_start_request(&workspace, None));
+        let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(response["result"]["type"], "agent_started", "{response}");
+        assert_eq!(app.state.workspaces[0].tabs.len(), 2);
+        assert_eq!(app.state.workspaces[0].tabs[0].root_pane, pane);
+        old_runtime.shutdown();
+        shutdown(app);
+    }
+
+    #[tokio::test]
+    async fn agent_start_explicit_split_preserves_root_shell() {
+        let (mut app, workspace, pane) = created_root_shell().await;
+        let mut request = targeted_start_request(&workspace, None);
+        if let Method::AgentStart(params) = &mut request.method {
+            params.split = Some(crate::api::schema::SplitDirection::Right);
+        }
+        let raw = app.handle_api_request(request);
+        let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(response["result"]["type"], "agent_started", "{response}");
+        assert_eq!(app.state.workspaces[0].tabs.len(), 1);
+        assert_eq!(app.state.workspaces[0].tabs[0].panes.len(), 2);
+        assert!(app.state.workspaces[0].tabs[0].panes.contains_key(&pane));
+        shutdown(app);
+    }
+
+    #[tokio::test]
+    async fn agent_start_unknown_root_provenance_gets_sibling_in_workspace_mode() {
+        let (mut app, workspace, pane) = created_root_shell().await;
+        app.state.tab_mode = crate::config::TabModeConfig::Workspace;
+        app.state.workspaces[0].tabs[0]
+            .panes
+            .get_mut(&pane)
+            .unwrap()
+            .created_as_root_shell = false;
+        let raw = app.handle_api_request(targeted_start_request(&workspace, None));
+        let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(response["result"]["type"], "agent_started", "{response}");
+        assert_eq!(app.state.workspaces.len(), 2);
+        assert_eq!(app.state.workspaces[0].tabs[0].root_pane, pane);
+        assert_eq!(app.state.workspaces[1].tabs.len(), 1);
+        shutdown(app);
+    }
+
+    #[tokio::test]
+    async fn agent_start_replacement_dry_run_preserves_shell() {
+        let (mut app, workspace, pane) = created_root_shell().await;
+        let mut request = targeted_start_request(&workspace, None);
+        if let Method::AgentStart(params) = &mut request.method {
+            params.dry_run = true;
+        }
+        let raw = app.handle_api_request(request);
+        let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            response["result"]["plan"]["placement"], "replace",
+            "{response}"
+        );
+        assert_eq!(app.state.workspaces[0].tabs[0].root_pane, pane);
+        assert_eq!(app.terminal_runtimes.len(), 1);
+        shutdown(app);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn agent_start_failed_replacement_keeps_shell() {
+        let (mut app, workspace, pane) = created_root_shell().await;
+        let terminal = app.state.workspaces[0].terminal_id(pane).unwrap().clone();
+        let mut request = targeted_start_request(&workspace, None);
+        if let Method::AgentStart(params) = &mut request.method {
+            params.argv = vec![std::env::temp_dir()
+                .join("flock-818-missing-program")
+                .to_string_lossy()
+                .into_owned()];
+        }
+        let raw = app.handle_api_request(request);
+        let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            response["error"]["code"], "agent_start_failed",
+            "{response}"
+        );
+        assert_root_shell_preserved(&app, pane, &terminal);
+
+        // Only the staged replacement uses this channel. The existing shell
+        // retains its sender, so its events cannot satisfy the wait.
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        app.event_tx = tx;
+        let result = app.replace_agent_root_shell_with_start_check(
+            0,
+            0,
+            std::env::temp_dir(),
+            &["/bin/sh".into(), "-c".into(), "exit 17".into()],
+            false,
+            move |app, terminal_id, pane_id| {
+                let observed = wait_for_replacement_exit(rx);
+                if observed != Ok(pane_id) {
+                    // Reap every fixture child before panicking, including a
+                    // replacement that stayed running past the failure ceiling.
+                    for (_, runtime) in app.terminal_runtimes.drain() {
+                        runtime.shutdown();
+                    }
+                    panic!("expected replacement {pane_id:?} exit event, got {observed:?}");
+                }
+                app.agent_exited_at_start(terminal_id)
+            },
+        );
+        let Err(super::AgentStartError::ExitedAtStart(exit)) = result else {
+            shutdown(app);
+            panic!("expected replacement to be refused with ExitedAtStart");
+        };
+        assert_eq!(exit.exit_code, Some(17));
+        assert_root_shell_preserved(&app, pane, &terminal);
+        shutdown(app);
+    }
+
+    fn assert_root_shell_preserved(
+        app: &crate::app::App,
+        pane: crate::layout::PaneId,
+        terminal: &crate::terminal::TerminalId,
+    ) {
+        assert_eq!(app.state.workspaces[0].tabs.len(), 1);
+        assert_eq!(app.state.workspaces[0].tabs[0].root_pane, pane);
+        assert!(!app
+            .terminal_runtimes
+            .get(terminal)
+            .unwrap()
+            .has_received_input());
+        assert_eq!(app.terminal_runtimes.len(), 1);
     }
 
     /// #365: `--workspace <id>` named where the PANE goes and nothing about

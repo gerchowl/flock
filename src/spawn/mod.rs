@@ -51,9 +51,9 @@ use serde::{Deserialize, Serialize};
 /// caller names an agent and flock assembles that agent's argv server-side
 /// from the reviewed arms below. It also means this enum is not where an
 /// argv reaches the environment — `allowlist::for_argv` and
-/// `env::agent_for_argv` resolve the child's agent from argv[0], so a kind
+/// `env::agent_for_argv` resolve the child's agent from `argv[0]`, so a kind
 /// only needs a variant here and its own argv to be fully wired, and
-/// `allowlist`'s tests fail the build if a variant assembles an argv[0]
+/// `allowlist`'s tests fail the build if a variant assembles an `argv[0]`
 /// `identify_agent` does not know.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -107,6 +107,10 @@ impl AgentKind {
 /// (ADR-0014 §8).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpawnRefusal {
+    /// Both live and published admission views are busy. Retry is safe.
+    RegistryBusy,
+    /// Structured process attribution is unresolved; it grants no operator exemption.
+    CallerUnknown,
     /// Retry is safe once something exits.
     AtCapacity { current: usize, limit: usize },
     /// Retry is safe once this parent's children exit.
@@ -127,6 +131,8 @@ impl SpawnRefusal {
     /// The stable `data.refusal` tag.
     pub fn code(&self) -> &'static str {
         match self {
+            Self::RegistryBusy => "session_busy",
+            Self::CallerUnknown => "spawn_caller_unknown",
             Self::AtCapacity { .. } => "at_agent_capacity",
             Self::AtFanout { .. } => "at_fanout_limit",
             Self::AtDepth { .. } => "at_lineage_depth",
@@ -141,8 +147,11 @@ impl SpawnRefusal {
     /// split exists to prevent.
     pub fn retryable(&self) -> bool {
         match self {
-            Self::AtCapacity { .. } | Self::AtFanout { .. } | Self::FleetPaused => true,
-            Self::AtDepth { .. } | Self::NotEnabled => false,
+            Self::RegistryBusy
+            | Self::AtCapacity { .. }
+            | Self::AtFanout { .. }
+            | Self::FleetPaused => true,
+            Self::AtDepth { .. } | Self::NotEnabled | Self::CallerUnknown => false,
             // Delegated rather than restated: whether a profile refusal can be
             // retried is a property of the profile failure, not of this enum.
             Self::ProfileUnresolved(unresolved) => unresolved.retryable(),
@@ -151,6 +160,8 @@ impl SpawnRefusal {
 
     pub fn message(&self) -> String {
         match self {
+            Self::RegistryBusy => "session admission registry is busy; retry the request".into(),
+            Self::CallerUnknown => "structured caller identity is unresolved".into(),
             Self::AtCapacity { current, limit } => format!(
                 "at agent capacity ({current}/{limit} agent-started agents live); retry when one exits"
             ),

@@ -129,6 +129,8 @@ pub struct TerminalStateMutation {
 /// metadata.
 pub struct TerminalState {
     pub id: TerminalId,
+    /// Transient runtime presence for pure local presentation; never persisted.
+    pub(crate) view_runtime_present: bool,
     /// Fleet-global, restart-stable identity for the agent in this pane.
     ///
     /// `id` (the `TerminalId`) survives a pane move but is RE-MINTED on every
@@ -139,9 +141,11 @@ pub struct TerminalState {
     /// say who sent it.
     ///
     /// This is minted once when the pane is created, persisted in the session
-    /// snapshot, and never rewritten. Address ≠ location: host and pane are
-    /// resolvable *metadata* about an agent, not its name.
+    /// snapshot, and replaced only after authoritative agent removal. Address ≠
+    /// location: host and pane are resolvable *metadata* about an agent, not its name.
     pub agent_id: AgentId,
+    /// Suppress duplicate teardown captures until the replacement shell is ready.
+    pub(crate) agent_identity_retired: bool,
     pub cwd: PathBuf,
     pub detected_agent: Option<Agent>,
     pub fallback_state: AgentState,
@@ -155,9 +159,10 @@ pub struct TerminalState {
     /// the byte-identical render path for the legacy single-prompt case is
     /// preserved).
     pub last_prompt: Option<String>,
+    pub(crate) prompt_report_generation: u64,
     /// Per-pane prompt + recap scrollback (issue #96). Chronological,
     /// timestamped entries; capped at
-    /// [`MAX_PROMPT_HISTORY_ENTRIES`] entries (drop oldest whole entries).
+    /// [`prompt_history::MAX_PROMPT_HISTORY_ENTRIES`] entries (drop oldest whole entries).
     /// Ephemeral by design — never persisted into session snapshots.
     pub prompt_history: Vec<PromptHistoryEntry>,
     /// Bumped on every `prompt_history` mutation.
@@ -195,12 +200,32 @@ pub struct TerminalState {
     /// (e.g. Claude's "Implementing the parser"). Cleared by the detector
     /// when the agent stops working.
     pub live_activity: Option<String>,
+    /// The detector last saw a Claude turn that ended (`done <time>`) with
+    /// background shells still running (#911, #922). Carried to `agent.get`
+    /// and `agent.result` so a supervisor on the socket can tell that settle
+    /// from one with nothing left running without reading the screen.
+    pub settled_with_background_shells: bool,
+    /// Background tasks the detector last counted on screen (#1022), `None`
+    /// when the agent's screen does not show them.
+    pub background_tasks: Option<u32>,
+    /// What the detector's last `Blocked` screen asked of a human (#1023).
+    pub needs_human: Option<crate::api::agent_state::HumanReason>,
+    /// The question that screen draws, with its `question_id` (#1038).
+    pub question: Option<crate::api::question::Question>,
+    pub provider_limit: Option<crate::detect::provider_limit::ProviderLimit>,
     stale_hook_idle_since: Option<Instant>,
     /// Which authority decided the current `state` (#309); surfaced on every
     /// change so the log names the source rather than only the outcome.
     last_state_authority: StateAuthority,
     pub hook_authority: Option<HookAuthority>,
     pub agent_metadata: HashMap<String, AgentMetadata>,
+    /// Failed resume retains identity and mail while the process is offline.
+    pub resume_failed: bool,
+    /// Latest accepted Codex report, still requiring local binding validation.
+    pub codex_session_start: Option<crate::agent_resume::CodexSessionStart>,
+    /// Unknown persisted pane runtime tag, retained across rollback saves.
+    /// It grants no agent resume authority.
+    pub(crate) persisted_runtime_tag: Option<serde_json::Value>,
     pub persisted_agent_session: Option<crate::agent_resume::PersistedAgentSession>,
     /// True when `persisted_agent_session` was established by a hook report
     /// from the process running in this pane, rather than restored from a
@@ -208,7 +233,7 @@ pub struct TerminalState {
     /// so it must not be used to pick a transcript to render (#328).
     session_ref_hook_confirmed: bool,
     pub manual_label: Option<String>,
-    pub agent_name: Option<String>,
+    agent_name: Option<String>,
     /// The `FLOCK_RUN_ID` this pane's agent was spawned under (#332).
     ///
     /// Minted per scheduler- or agent-initiated spawn, stamped into the
@@ -236,11 +261,25 @@ pub struct TerminalState {
     /// did. `None` for an operator-started pane. Read by the ceiling to count
     /// one parent's live children.
     pub spawned_by: Option<String>,
+    /// Where this agent's questions go (#1179, ADR-0034 §2). Set once at
+    /// start, spawn or fork, persisted in the session snapshot, and stamped
+    /// into the pane as `FLOCK_QUESTIONS` on every launch of the agent.
+    pub questions: crate::api::schema::QuestionPolicy,
     hook_report_sequences: HashMap<String, u64>,
     metadata_report_sequences: HashMap<String, u64>,
     pub state: AgentState,
     pub revision: u64,
     pub launch_argv: Option<Vec<String>>,
+    pub launch_env: Vec<(String, String)>,
+    /// The agent session whose profile selector was last read into
+    /// `launch_env` (#1010), so a hook that reports on every state change
+    /// reads the process environment once per session, not once per report.
+    /// Ephemeral: `launch_env` is what persists.
+    pub(crate) profile_env_session: Option<String>,
+    pub restart_in_progress: bool,
+    pub restart_stopped: bool,
+    pub(crate) restart_confirmation_pid: Option<u32>,
+    pub(crate) restart_retry: Option<crate::agent_restart::RestartRetry>,
     pub respawn_shell_on_exit: bool,
     pub pending_agent_resume_plan: Option<crate::agent_resume::AgentResumePlan>,
     /// #175 C3: stashed resume plan for a pane the operator (or the
@@ -308,6 +347,8 @@ impl TerminalState {
         Self {
             id,
             agent_id,
+            view_runtime_present: false,
+            agent_identity_retired: false,
             cwd,
             detected_agent: None,
             fallback_state: AgentState::Unknown,
@@ -316,6 +357,7 @@ impl TerminalState {
             fallback_visible_working: false,
             fallback_observed_at: None,
             last_prompt: None,
+            prompt_report_generation: 0,
             prompt_history: Vec::new(),
             prompt_history_generation: 0,
             hydrated_transcript: None,
@@ -326,22 +368,37 @@ impl TerminalState {
             header_reserved: false,
             state_changed_at: None,
             live_activity: None,
+            settled_with_background_shells: false,
+            background_tasks: None,
+            needs_human: None,
+            question: None,
+            provider_limit: None,
             stale_hook_idle_since: None,
             last_state_authority: StateAuthority::Screen,
             hook_authority: None,
             agent_metadata: HashMap::new(),
+            codex_session_start: None,
+            persisted_runtime_tag: None,
             persisted_agent_session: None,
+            resume_failed: false,
             session_ref_hook_confirmed: false,
             manual_label: None,
             agent_name: None,
             run_id: None,
             spawn_depth: 0,
             spawned_by: None,
+            questions: crate::api::schema::QuestionPolicy::AskHuman,
             hook_report_sequences: HashMap::new(),
             metadata_report_sequences: HashMap::new(),
             state: AgentState::Unknown,
             revision: 0,
             launch_argv: None,
+            launch_env: Vec::new(),
+            profile_env_session: None,
+            restart_in_progress: false,
+            restart_stopped: false,
+            restart_confirmation_pid: None,
+            restart_retry: None,
             respawn_shell_on_exit: false,
             pending_agent_resume_plan: None,
             hibernated_resume_plan: None,
@@ -371,6 +428,33 @@ impl TerminalState {
         self
     }
 
+    /// Take the question a detector screen draws (#1038): the open one is
+    /// kept while the screen asks the same, so a redraw keeps its id, and a
+    /// different form opens a new one at this turn cursor and the event log's
+    /// `log_sequence`. A question screen whose form did not read this frame (a
+    /// torn read, an overlay) keeps the open question. Only a screen that no
+    /// longer asks one closes it.
+    pub fn observe_question(
+        &mut self,
+        agent: Option<crate::detect::Agent>,
+        needs_human: Option<crate::api::agent_state::HumanReason>,
+        question: Option<crate::api::question::QuestionForm>,
+        log_sequence: u64,
+    ) {
+        let asking = needs_human == Some(crate::api::agent_state::HumanReason::Question);
+        self.question = match (agent, question) {
+            (Some(agent), Some(question)) => Some(question.carry(
+                self.question.as_ref(),
+                &self.agent_id.to_string(),
+                crate::detect::agent_label(agent),
+                &self.turn_cursor(),
+                log_sequence,
+            )),
+            _ if asking => self.question.take(),
+            _ => None,
+        };
+    }
+
     /// Update the scraped spinner activity, holding the last value through
     /// transient scrape misses while the agent is still working.
     ///
@@ -381,10 +465,10 @@ impl TerminalState {
     /// and the bare state label ("ours"). Hold the last activity until the
     /// agent actually leaves the working state.
     pub fn update_live_activity(&mut self, activity: Option<String>, detected_state: AgentState) {
-        if activity.is_some() {
-            self.live_activity = activity;
-        } else if detected_state != AgentState::Working {
+        if detected_state != AgentState::Working {
             self.live_activity = None;
+        } else if activity.is_some() {
+            self.live_activity = activity;
         }
     }
 
@@ -489,6 +573,7 @@ impl TerminalState {
             || detected_agent_changed_or_disappeared && persisted_agent_was_previously_detected
         {
             self.persisted_agent_session = None;
+            self.codex_session_start = None;
             self.session_ref_hook_confirmed = false;
         }
         self.update_stale_hook_idle_window(now);
@@ -574,6 +659,11 @@ impl TerminalState {
         seq: Option<u64>,
         now: Instant,
     ) -> Option<TerminalStateMutation> {
+        if super::agent_name::validate(&agent_label).is_err() {
+            crate::logging::agent_name_dropped("hook_identity");
+            return None;
+        }
+
         if !self.accept_hook_report(&source, seq) {
             return None;
         }
@@ -591,6 +681,7 @@ impl TerminalState {
                 .unwrap_or(session_ref)
         });
         self.persisted_agent_session = None;
+        self.codex_session_start = None;
         self.session_ref_hook_confirmed = false;
         self.header_reserved = true;
         let applied_session_ref = session_ref.clone();
@@ -701,6 +792,16 @@ impl TerminalState {
         })
     }
 
+    /// Which authority decided the current `state` (#309).
+    pub fn last_state_authority(&self) -> StateAuthority {
+        self.last_state_authority
+    }
+
+    pub(crate) fn submission_session_id(&self) -> Option<String> {
+        self.current_session_identity_for_persistence()
+            .map(|(_, _, _, value)| value)
+    }
+
     /// When the incoming `session_ref` came from a child terminal that
     /// inherited the owning pane's env (a nested agent session report), the
     /// child reports a different session id under the same source+agent. The
@@ -735,7 +836,13 @@ impl TerminalState {
         &mut self,
         session: crate::agent_resume::PersistedAgentSession,
     ) {
+        if super::agent_name::validate(&session.agent).is_err() {
+            crate::logging::agent_name_dropped("hook_identity");
+            return;
+        }
+
         self.persisted_agent_session = Some(session);
+        self.codex_session_start = None;
         self.session_ref_hook_confirmed = false;
     }
 
@@ -793,9 +900,15 @@ impl TerminalState {
         agent_label: &str,
         session_start_source: Option<&str>,
     ) -> bool {
-        source == CLAUDE_HOOK_SOURCE
+        (source == CLAUDE_HOOK_SOURCE
             && agent_label == "claude"
-            && matches!(session_start_source, Some("clear" | "resume" | "compact"))
+            && matches!(session_start_source, Some("clear" | "resume" | "compact")))
+            || (source == "flock:codex"
+                && agent_label == "codex"
+                && matches!(
+                    session_start_source,
+                    Some("clear" | "resume" | "compact" | "fork")
+                ))
     }
 
     pub fn set_agent_session_ref(
@@ -808,8 +921,8 @@ impl TerminalState {
         self.set_agent_session_ref_for_session_start(source, agent_label, session_ref, seq, None)
     }
 
-    /// Same as [`set_agent_session_ref`] but also honours the Claude Code
-    /// `SessionStart` `source` field. A startup-style report (no source, or
+    /// Same as [`Self::set_agent_session_ref`] but also honours harness
+    /// `SessionStart` sources, including Codex fork identity replacement. A startup-style report (no source, or
     /// `startup`) that would replace an existing restored Claude id is
     /// rejected — it's almost certainly a nested `claude -p` inheriting the
     /// pane environment. `clear`, `resume`, and `compact` are real identity
@@ -822,6 +935,11 @@ impl TerminalState {
         seq: Option<u64>,
         session_start_source: Option<String>,
     ) -> Option<TerminalStateMutation> {
+        if super::agent_name::validate(&agent_label).is_err() {
+            crate::logging::agent_name_dropped("hook_identity");
+            return None;
+        }
+
         self.header_reserved = true;
         let session_ref = session_ref?;
         if !self.accept_hook_report(&source, seq) {
@@ -841,6 +959,15 @@ impl TerminalState {
 
         let previous_session = self.current_session_identity_for_persistence();
         let applied_session_ref = session_ref.clone();
+        if source != "flock:codex"
+            || agent_label != "codex"
+            || self
+                .codex_session_start
+                .as_ref()
+                .is_some_and(|report| report.thread != session_ref.value)
+        {
+            self.codex_session_start = None;
+        }
         self.persisted_agent_session = Some(crate::agent_resume::PersistedAgentSession {
             source,
             agent: agent_label,
@@ -878,6 +1005,7 @@ impl TerminalState {
             .is_some_and(|session| &session.session_ref == session_ref)
         {
             self.persisted_agent_session = None;
+            self.codex_session_start = None;
             self.session_ref_hook_confirmed = false;
             changed = true;
         }
@@ -951,6 +1079,7 @@ impl TerminalState {
         self.hook_authority = None;
         self.stale_hook_idle_since = None;
         self.persisted_agent_session = None;
+        self.codex_session_start = None;
         Some(TerminalStateMutation {
             effective_state_change: self.recompute_effective_state(
                 previous_agent_label,
@@ -1009,9 +1138,14 @@ impl TerminalState {
         self.fallback_visible_idle = false;
         self.fallback_visible_working = false;
         self.fallback_observed_at = None;
+        self.settled_with_background_shells = false;
+        self.background_tasks = None;
+        self.needs_human = None;
+        self.question = None;
         self.hook_authority = None;
         self.stale_hook_idle_since = None;
         self.persisted_agent_session = None;
+        self.codex_session_start = None;
         Some(TerminalStateMutation {
             effective_state_change: self.recompute_effective_state(
                 previous_agent_label,
@@ -1036,12 +1170,18 @@ impl TerminalState {
     /// form the per-frame path needs; `pane_details` keeps the owned one
     /// because it hands the value to a `String` field.
     pub fn display_agent_label(&self) -> Option<Cow<'_, str>> {
-        self.effective_display_agent().map(Cow::Owned).or_else(|| {
-            self.agent_name
-                .as_deref()
-                .or_else(|| self.effective_agent_label())
-                .map(Cow::Borrowed)
-        })
+        self.effective_display_agent()
+            .map(Cow::Owned)
+            .or_else(|| {
+                self.agent_name
+                    .as_deref()
+                    .or_else(|| self.effective_agent_label())
+                    .map(Cow::Borrowed)
+            })
+            .map(|name| match name {
+                Cow::Borrowed(name) => super::agent_name::display(name),
+                Cow::Owned(name) => Cow::Owned(super::agent_name::display(&name).into_owned()),
+            })
     }
 
     pub fn effective_agent_label(&self) -> Option<&str> {
@@ -1176,6 +1316,30 @@ impl TerminalState {
         (!observed_recently).then_some("stale_screen")
     }
 
+    /// OpenCode has no detector idle flag. Its affirmative composer is checked
+    /// by the submit guard, while the detector timestamp still bounds freshness.
+    pub(crate) fn guarded_submit_blocker(
+        &self,
+        now: Instant,
+        settle: Duration,
+        fresh: Duration,
+    ) -> Option<&'static str> {
+        let blocker = self.idle_wake_blocker(now, settle, fresh);
+        if blocker == Some("not_idle") {
+            return Some("not_settled");
+        }
+        if matches!(blocker, Some("idle_not_visible" | "stale_hook"))
+            && self.effective_known_agent() == Some(crate::detect::Agent::OpenCode)
+        {
+            return self
+                .fallback_observed_at
+                .and_then(|at| now.checked_duration_since(at))
+                .is_none_or(|age| age > fresh)
+                .then_some("stale_screen");
+        }
+        blocker
+    }
+
     /// When the settle window of the current state ends, if the state has a
     /// known start — the moment an unsettled `Idle` becomes wakeable.
     pub(crate) fn state_settles_at(&self, settle: Duration) -> Option<Instant> {
@@ -1214,25 +1378,106 @@ impl TerminalState {
         }
     }
 
-    pub fn set_manual_label(&mut self, label: String) {
-        let label = label.trim().to_string();
+    /// Validate manual identity labels before trimming; refusal preserves the old label.
+    pub fn set_manual_label(
+        &mut self,
+        label: String,
+    ) -> Result<(), crate::api::error_code::ErrorCode> {
+        let label = super::agent_name::validate(&label)?.to_string();
         self.manual_label = (!label.is_empty()).then_some(label);
+        Ok(())
     }
 
     pub fn clear_manual_label(&mut self) {
         self.manual_label = None;
     }
 
-    pub fn set_agent_name(&mut self, name: String) {
-        let name = name.trim().to_string();
+    /// Reject unsafe or overlong raw names without changing identity (#317).
+    /// Empty, safe whitespace clears the name, preserving the rename contract.
+    pub fn set_agent_name(
+        &mut self,
+        name: String,
+    ) -> Result<(), crate::api::error_code::ErrorCode> {
+        let name = super::agent_name::validate(&name)?.to_string();
         self.agent_name = (!name.is_empty()).then_some(name);
+        Ok(())
+    }
+
+    /// Validated operator name, distinct from the detected harness label.
+    pub fn agent_name(&self) -> Option<&str> {
+        self.agent_name.as_deref()
     }
 
     pub fn clear_agent_name(&mut self) {
         self.agent_name = None;
     }
 
+    /// Invalidate evidence from the old execution while keeping its launch
+    /// settings and stable agent/session identities for restart verification.
+    pub(crate) fn prepare_restart_resume(&mut self) {
+        self.restart_retry = None;
+        self.restart_confirmation_pid = None;
+        self.session_ref_hook_confirmed = false;
+        self.hook_authority = None;
+        self.hook_report_sequences.clear();
+        self.detected_agent = None;
+        self.fallback_state = AgentState::Unknown;
+        self.fallback_visible_blocker = false;
+        self.fallback_visible_idle = false;
+        self.fallback_visible_working = false;
+        self.fallback_observed_at = None;
+        self.settled_with_background_shells = false;
+        self.background_tasks = None;
+        self.needs_human = None;
+        self.question = None;
+        self.stale_hook_idle_since = None;
+        self.state = AgentState::Unknown;
+        self.state_changed_at = None;
+    }
+
+    // OpenCode proves its composer in restart_ready, as in guarded submit.
+    // Its detector observation supplies freshness without a visible-idle flag.
+    pub(crate) fn restart_idle_observed_since(&self, since: Instant) -> bool {
+        self.state == AgentState::Idle
+            && ((self.fallback_visible_idle
+                || self.effective_known_agent() == Some(crate::detect::Agent::OpenCode))
+                && self.fallback_observed_at.is_some_and(|at| at >= since)
+                || self.hook_authority.as_ref().is_some_and(|hook| {
+                    hook.state == AgentState::Idle && hook.reported_at >= since
+                }))
+    }
+
+    /// True when the session the snapshot captures for this pane was named
+    /// by a hook from the live process, which is exactly what
+    /// `persist::capture` writes: the hook authority's ref when it has one,
+    /// else the persisted ref. A live handoff carries this so the importer can
+    /// keep the confirmation the exporter already held (#977).
+    pub(crate) fn agent_session_hook_confirmed(&self) -> bool {
+        self.restart_session_confirmed()
+    }
+
+    /// Live handoff only: the PTY and its process moved to this server intact,
+    /// so a session the exporter had hook-confirmed is still confirmed here.
+    /// A cold restore must keep using [`Self::set_persisted_agent_session`]
+    /// alone, because there the process may be gone (#328).
+    pub(crate) fn confirm_persisted_agent_session_after_handoff(&mut self) {
+        if self.persisted_agent_session.is_some() {
+            self.session_ref_hook_confirmed = true;
+        }
+    }
+
+    pub(crate) fn restart_session_confirmed(&self) -> bool {
+        self.session_ref_hook_confirmed
+            || self
+                .hook_authority
+                .as_ref()
+                .is_some_and(|hook| hook.session_ref.is_some())
+    }
+
     pub fn clear_agent_runtime_identity_after_respawn(&mut self) {
+        self.agent_identity_retired = false;
+        self.resume_failed = false;
+        self.restart_retry = None;
         self.detected_agent = None;
         self.fallback_state = AgentState::Unknown;
         self.fallback_visible_blocker = false;
@@ -1241,8 +1486,14 @@ impl TerminalState {
         self.fallback_observed_at = None;
         self.stale_hook_idle_since = None;
         self.live_activity = None;
+        self.settled_with_background_shells = false;
+        self.background_tasks = None;
+        self.needs_human = None;
+        self.question = None;
+        self.provider_limit = None;
         self.hook_authority = None;
         self.persisted_agent_session = None;
+        self.codex_session_start = None;
         self.agent_metadata.clear();
         self.state = AgentState::Unknown;
         self.launch_argv = None;
@@ -1275,6 +1526,10 @@ impl TerminalState {
         &mut self,
         plan: Option<crate::agent_resume::AgentResumePlan>,
     ) {
+        if plan.is_some() {
+            // A deliberate park supersedes any failed restart's deferred retry.
+            self.restart_retry = None;
+        }
         let flips = self.hibernated_resume_plan.is_some() != plan.is_some();
         self.hibernated_resume_plan = plan;
         if flips {
@@ -1609,6 +1864,7 @@ impl TerminalState {
     }
 
     pub fn record_prompt_at(&mut self, prompt: String, now: Instant) {
+        self.prompt_report_generation = self.prompt_report_generation.wrapping_add(1);
         self.last_prompt = Some(prompt.clone());
         // The agent just wrote a turn boundary, so the transcript on disk has
         // moved: mark hydration due so the panel re-reads the authoritative
@@ -2360,10 +2616,15 @@ mod tests {
             AgentDetection {
                 state: AgentState::Idle,
                 activity: None,
+                provider_limit: None,
                 skip_state_update: false,
                 visible_blocker: false,
                 visible_idle: false,
                 visible_working: false,
+                settled_with_background_shells: false,
+                background_tasks: None,
+                needs_human: None,
+                question: None,
             },
             true,
             now + std::time::Duration::from_millis(100),
@@ -2384,10 +2645,15 @@ mod tests {
             AgentDetection {
                 state: AgentState::Idle,
                 activity: None,
+                provider_limit: None,
                 skip_state_update: false,
                 visible_blocker: false,
                 visible_idle: true,
                 visible_working: false,
+                settled_with_background_shells: false,
+                background_tasks: None,
+                needs_human: None,
+                question: None,
             },
             false,
             now + std::time::Duration::from_millis(100),
@@ -2713,6 +2979,47 @@ mod tests {
         );
     }
 
+    /// #911 from the screen to the reported state: Claude's Stop hook says the
+    /// turn ended, and the completion line naming the shell it left running is
+    /// no longer working chrome that overrules it.
+    #[test]
+    fn claude_hook_idle_holds_over_a_done_turn_with_a_leftover_shell() {
+        let now = Instant::now();
+        let mut terminal = test_terminal();
+        terminal.set_hook_authority_with_custom_status_at(
+            "flock:claude".into(),
+            "claude".into(),
+            AgentState::Idle,
+            None,
+            None,
+            None,
+            None,
+            now,
+        );
+        let screen = concat!(
+            "\u{25cf} DONE: https://github.com/example/repo/pull/1\n\n",
+            "\u{273b} Crunched for 7m 41s \u{b7} done 4:32 PM \u{b7} 1 shell still running\n",
+            "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n",
+            "\u{276f} \n",
+            "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n",
+            "  \u{23f5}\u{23f5} auto mode on \u{b7} 1 shell \u{b7} \u{2193} to manage\n",
+        );
+        let detection = crate::detect::detect_agent(Some(Agent::Claude), screen);
+
+        terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Claude),
+            detection.state,
+            detection.visible_blocker,
+            detection.visible_idle,
+            detection.visible_working,
+            false,
+            now + Duration::from_millis(1),
+        );
+
+        assert!(!detection.visible_working);
+        assert_eq!(terminal.state, AgentState::Idle);
+    }
+
     #[test]
     fn recent_visible_working_holds_against_newer_claude_hook_idle() {
         let now = Instant::now();
@@ -2945,14 +3252,14 @@ mod tests {
         assert_eq!(terminal.border_label(false), None);
         assert_eq!(terminal.border_label(true).as_deref(), Some("claude"));
 
-        terminal.set_manual_label(" reviewer ".into());
+        terminal.set_manual_label(" reviewer ".into()).unwrap();
         assert_eq!(terminal.border_label(false).as_deref(), Some("reviewer"));
         assert_eq!(terminal.border_label(true).as_deref(), Some("reviewer"));
 
-        terminal.set_manual_label("   ".into());
+        terminal.set_manual_label("   ".into()).unwrap();
         assert_eq!(terminal.border_label(true).as_deref(), Some("claude"));
 
-        terminal.set_manual_label("reviewer".into());
+        terminal.set_manual_label("reviewer".into()).unwrap();
         terminal.clear_manual_label();
         assert_eq!(terminal.border_label(true).as_deref(), Some("claude"));
     }
@@ -3513,10 +3820,44 @@ mod tests {
     }
 
     #[test]
+    fn security_agent_name_setter_rejects_without_mutating() {
+        let mut failures = Vec::new();
+        for (case, name) in crate::test_support::hostile_agent_names() {
+            let mut terminal = test_terminal();
+            terminal.set_agent_name("safe".into()).unwrap();
+            let _ = terminal.set_agent_name(name);
+            if terminal.agent_name.as_deref() != Some("safe") {
+                failures.push(case);
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "accepted hostile name cases: {failures:?}"
+        );
+    }
+
+    #[test]
+    fn security_agent_name_legacy_display_is_bounded_and_escaped() {
+        let mut failures = Vec::new();
+        for (case, name) in crate::test_support::hostile_agent_names() {
+            let mut terminal = test_terminal();
+            // Fault injection: simulate a broken ingress without invoking the setter.
+            terminal.agent_name = Some(name.clone());
+            if terminal.display_agent_label().as_deref() == Some(name.as_str()) {
+                failures.push(case);
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "rendered hostile name cases: {failures:?}"
+        );
+    }
+
+    #[test]
     fn respawn_cleanup_resets_restored_agent_status() {
         let mut terminal = test_terminal();
         terminal.respawn_shell_on_exit = true;
-        terminal.set_agent_name("codex".into());
+        terminal.set_agent_name("codex".into()).unwrap();
         terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
             source: "flock:codex".into(),
             agent: "codex".into(),

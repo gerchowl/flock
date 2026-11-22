@@ -94,8 +94,9 @@ pub(super) struct ActiveEventSubscription {
 }
 
 /// A pane's inbox feed (#438). Hub-driven like [`ActiveEventSubscription`],
-/// filtered to one kind AND one recipient, and started at the hub's current
-/// sequence so it reports only mail that arrives after it attached.
+/// filtered to one kind AND one recipient, and started at the request's
+/// `after`, or at the hub's current sequence, so by default it reports only
+/// mail that arrives after it attached.
 pub(super) struct ActiveMsgQueuedSubscription {
     pane: String,
     last_sequence: u64,
@@ -113,73 +114,82 @@ impl ActiveSubscription {
         subscription: Subscription,
         request_id: &str,
         index: usize,
+        start: u64,
         api_tx: &ApiRequestSender,
         event_hub: &EventHub,
     ) -> Result<Self, ErrorResponse> {
         match subscription {
+            Subscription::MeshRoutesChanged {} => Ok(Self::Event(ActiveEventSubscription {
+                event_kind: crate::api::schema::EventKind::MeshRoutesChanged,
+                last_sequence: start,
+            })),
+            Subscription::MeshOutboundPending {} => Ok(Self::Event(ActiveEventSubscription {
+                event_kind: crate::api::schema::EventKind::MeshOutboundPending,
+                last_sequence: start,
+            })),
             Subscription::WorkspaceCreated {} => Ok(Self::Event(ActiveEventSubscription {
                 event_kind: crate::api::schema::EventKind::WorkspaceCreated,
-                last_sequence: 0,
+                last_sequence: start,
             })),
             Subscription::WorkspaceUpdated {} => Ok(Self::Event(ActiveEventSubscription {
                 event_kind: crate::api::schema::EventKind::WorkspaceUpdated,
-                last_sequence: 0,
+                last_sequence: start,
             })),
             Subscription::WorkspaceRenamed {} => Ok(Self::Event(ActiveEventSubscription {
                 event_kind: crate::api::schema::EventKind::WorkspaceRenamed,
-                last_sequence: 0,
+                last_sequence: start,
             })),
             Subscription::WorkspaceClosed {} => Ok(Self::Event(ActiveEventSubscription {
                 event_kind: crate::api::schema::EventKind::WorkspaceClosed,
-                last_sequence: 0,
+                last_sequence: start,
             })),
             Subscription::WorkspaceFocused {} => Ok(Self::Event(ActiveEventSubscription {
                 event_kind: crate::api::schema::EventKind::WorkspaceFocused,
-                last_sequence: 0,
+                last_sequence: start,
             })),
             Subscription::TabCreated {} => Ok(Self::Event(ActiveEventSubscription {
                 event_kind: crate::api::schema::EventKind::TabCreated,
-                last_sequence: 0,
+                last_sequence: start,
             })),
             Subscription::TabClosed {} => Ok(Self::Event(ActiveEventSubscription {
                 event_kind: crate::api::schema::EventKind::TabClosed,
-                last_sequence: 0,
+                last_sequence: start,
             })),
             Subscription::TabFocused {} => Ok(Self::Event(ActiveEventSubscription {
                 event_kind: crate::api::schema::EventKind::TabFocused,
-                last_sequence: 0,
+                last_sequence: start,
             })),
             Subscription::TabRenamed {} => Ok(Self::Event(ActiveEventSubscription {
                 event_kind: crate::api::schema::EventKind::TabRenamed,
-                last_sequence: 0,
+                last_sequence: start,
             })),
             Subscription::PaneCreated {} => Ok(Self::Event(ActiveEventSubscription {
                 event_kind: crate::api::schema::EventKind::PaneCreated,
-                last_sequence: 0,
+                last_sequence: start,
             })),
             Subscription::PaneClosed {} => Ok(Self::Event(ActiveEventSubscription {
                 event_kind: crate::api::schema::EventKind::PaneClosed,
-                last_sequence: 0,
+                last_sequence: start,
             })),
             Subscription::PaneFocused {} => Ok(Self::Event(ActiveEventSubscription {
                 event_kind: crate::api::schema::EventKind::PaneFocused,
-                last_sequence: 0,
+                last_sequence: start,
             })),
             Subscription::PaneMoved {} => Ok(Self::Event(ActiveEventSubscription {
                 event_kind: crate::api::schema::EventKind::PaneMoved,
-                last_sequence: 0,
+                last_sequence: start,
             })),
             Subscription::PaneExited {} => Ok(Self::Event(ActiveEventSubscription {
                 event_kind: crate::api::schema::EventKind::PaneExited,
-                last_sequence: 0,
+                last_sequence: start,
             })),
             Subscription::PaneAgentDetected {} => Ok(Self::Event(ActiveEventSubscription {
                 event_kind: crate::api::schema::EventKind::PaneAgentDetected,
-                last_sequence: 0,
+                last_sequence: start,
             })),
             Subscription::MsgQueued { pane } => Ok(Self::MsgQueued(ActiveMsgQueuedSubscription {
                 pane,
-                last_sequence: event_hub.current_sequence(),
+                last_sequence: start,
             })),
             Subscription::PaneOutputMatched {
                 pane_id,
@@ -195,6 +205,7 @@ impl ActiveSubscription {
                             return Err(ErrorResponse {
                                 id: request_id.to_string(),
                                 error: ErrorBody {
+                                    data: None,
                                     code: "invalid_regex".into(),
                                     message: err.to_string(),
                                 },
@@ -266,22 +277,52 @@ impl ActiveSubscription {
         api_tx: &ApiRequestSender,
         event_hub: &EventHub,
     ) -> Option<serde_json::Value> {
-        match self {
+        let mut event = match self {
             Self::Event(subscription) => subscription.poll(event_hub),
             Self::MsgQueued(subscription) => subscription.poll(event_hub),
             Self::OutputMatched(subscription) => {
                 serde_json::to_value(subscription.poll(api_tx)?).ok()
             }
-            Self::AgentStatusChanged(subscription) => {
-                serde_json::to_value(subscription.poll(api_tx, event_hub)?).ok()
-            }
+            Self::AgentStatusChanged(subscription) => subscription.poll(api_tx, event_hub),
+        }?;
+        if event.get("error").is_none() {
+            let sequence = match self {
+                Self::Event(s) => s.last_sequence,
+                Self::MsgQueued(s) => s.last_sequence,
+                Self::AgentStatusChanged(s) => s.last_sequence,
+                Self::OutputMatched(_) => event_hub.current_sequence(),
+            };
+            event["seq"] = sequence.into();
         }
+        Some(event)
     }
+}
+
+/// Loss is explicit; continue at the retained boundary after reporting it.
+fn subscription_events(
+    hub: &EventHub,
+    cursor: &mut u64,
+) -> Result<Vec<(u64, crate::api::schema::EventEnvelope)>, serde_json::Value> {
+    hub.events_after(*cursor).map_err(|error| {
+        if let Some(oldest) = error
+            .data
+            .as_ref()
+            .and_then(|data| data.extra.get("oldest_available_sequence"))
+            .and_then(serde_json::Value::as_u64)
+        {
+            *cursor = oldest.saturating_sub(1);
+        }
+        serde_json::json!({"error": error})
+    })
 }
 
 impl ActiveEventSubscription {
     fn poll(&mut self, event_hub: &EventHub) -> Option<serde_json::Value> {
-        for (sequence, event) in event_hub.events_after(self.last_sequence) {
+        let events = match subscription_events(event_hub, &mut self.last_sequence) {
+            Ok(events) => events,
+            Err(error) => return Some(error),
+        };
+        for (sequence, event) in events {
             self.last_sequence = sequence;
             if event.event == self.event_kind {
                 return serde_json::to_value(event).ok();
@@ -305,7 +346,11 @@ impl ActiveSubscription {
 
 impl ActiveMsgQueuedSubscription {
     fn poll(&mut self, event_hub: &EventHub) -> Option<serde_json::Value> {
-        for (sequence, event) in event_hub.events_after(self.last_sequence) {
+        let events = match subscription_events(event_hub, &mut self.last_sequence) {
+            Ok(events) => events,
+            Err(error) => return Some(error),
+        };
+        for (sequence, event) in events {
             self.last_sequence = sequence;
             if event.event != crate::api::schema::EventKind::MessageQueued {
                 continue;
@@ -362,9 +407,13 @@ impl ActiveAgentStatusChangedSubscription {
         &mut self,
         api_tx: &ApiRequestSender,
         event_hub: &EventHub,
-    ) -> Option<SubscriptionEventEnvelope> {
+    ) -> Option<serde_json::Value> {
         let mut saw_status_event = false;
-        for (sequence, event) in event_hub.events_after(self.last_sequence) {
+        let events = match subscription_events(event_hub, &mut self.last_sequence) {
+            Ok(events) => events,
+            Err(error) => return Some(error),
+        };
+        for (sequence, event) in events {
             self.last_sequence = sequence;
             let crate::api::schema::EventData::PaneAgentStatusChanged {
                 pane_id,
@@ -403,7 +452,7 @@ impl ActiveAgentStatusChangedSubscription {
             }
 
             self.initial_event = None;
-            return Some(SubscriptionEventEnvelope {
+            return serde_json::to_value(SubscriptionEventEnvelope {
                 event: SubscriptionEventKind::PaneAgentStatusChanged,
                 data: SubscriptionEventData::PaneAgentStatusChanged(PaneAgentStatusChangedEvent {
                     pane_id,
@@ -415,7 +464,8 @@ impl ActiveAgentStatusChangedSubscription {
                     custom_status,
                     state_labels,
                 }),
-            });
+            })
+            .ok();
         }
 
         if saw_status_event {
@@ -423,10 +473,11 @@ impl ActiveAgentStatusChangedSubscription {
         } else if event_hub.current_sequence() != self.last_sequence {
             return None;
         } else if let Some(event) = self.initial_event.take() {
-            return Some(SubscriptionEventEnvelope {
+            return serde_json::to_value(SubscriptionEventEnvelope {
                 event: SubscriptionEventKind::PaneAgentStatusChanged,
                 data: SubscriptionEventData::PaneAgentStatusChanged(event),
-            });
+            })
+            .ok();
         }
 
         let before_snapshot_sequence = self.last_sequence;
@@ -445,7 +496,7 @@ impl ActiveAgentStatusChangedSubscription {
         if event.is_some() {
             self.last_sequence = after_snapshot_sequence;
         }
-        event
+        serde_json::to_value(event?).ok()
     }
 
     fn event_from_snapshot(
@@ -507,27 +558,32 @@ fn pane_read(
         },
         api_tx,
         Some(APP_RESPONSE_TIMEOUT),
-        None,
+        Default::default(),
     );
     let value: serde_json::Value = serde_json::from_str(&response).map_err(|_| ErrorResponse {
         id: request_id.clone(),
         error: ErrorBody {
+            data: None,
             code: "internal_error".into(),
             message: "failed to decode pane read response".into(),
         },
     })?;
     if value.get("error").is_some() {
-        return serde_json::from_value(value).map_err(|_| ErrorResponse {
-            id: request_id,
-            error: ErrorBody {
-                code: "internal_error".into(),
-                message: "failed to decode pane read error".into(),
-            },
-        });
+        return Err(
+            serde_json::from_value::<ErrorResponse>(value).unwrap_or_else(|_| ErrorResponse {
+                id: request_id,
+                error: ErrorBody {
+                    data: None,
+                    code: "internal_error".into(),
+                    message: "failed to decode pane read error".into(),
+                },
+            }),
+        );
     }
     serde_json::from_value(value["result"]["read"].clone()).map_err(|_| ErrorResponse {
         id: request_id,
         error: ErrorBody {
+            data: None,
             code: "internal_error".into(),
             message: "failed to decode pane read result".into(),
         },
@@ -548,27 +604,32 @@ fn pane_get(
         },
         api_tx,
         Some(APP_RESPONSE_TIMEOUT),
-        None,
+        Default::default(),
     );
     let value: serde_json::Value = serde_json::from_str(&response).map_err(|_| ErrorResponse {
         id: request_id.clone(),
         error: ErrorBody {
+            data: None,
             code: "internal_error".into(),
             message: "failed to decode pane get response".into(),
         },
     })?;
     if value.get("error").is_some() {
-        return serde_json::from_value(value).map_err(|_| ErrorResponse {
-            id: request_id,
-            error: ErrorBody {
-                code: "internal_error".into(),
-                message: "failed to decode pane get error".into(),
-            },
-        });
+        return Err(
+            serde_json::from_value::<ErrorResponse>(value).unwrap_or_else(|_| ErrorResponse {
+                id: request_id,
+                error: ErrorBody {
+                    data: None,
+                    code: "internal_error".into(),
+                    message: "failed to decode pane get error".into(),
+                },
+            }),
+        );
     }
     serde_json::from_value(value["result"]["pane"].clone()).map_err(|_| ErrorResponse {
         id: request_id,
         error: ErrorBody {
+            data: None,
             code: "internal_error".into(),
             message: "failed to decode pane get result".into(),
         },
@@ -581,6 +642,108 @@ mod tests {
 
     use super::*;
     use crate::api::schema::{AgentStatus, EventData, EventEnvelope, EventKind};
+
+    #[test]
+    fn ordinary_event_subscription_reports_loss_then_retained_records() {
+        let hub = EventHub::default();
+        hub.set_ring_cap(2);
+        for label in ["one", "two", "three"] {
+            hub.push(crate::api::schema::EventEnvelope {
+                event: crate::api::schema::EventKind::WorkspaceClosed,
+                data: crate::api::schema::EventData::WorkspaceClosed {
+                    workspace_id: label.into(),
+                },
+            });
+        }
+        let tx = tokio::sync::mpsc::unbounded_channel().0;
+        let mut subscription =
+            ActiveSubscription::new(Subscription::WorkspaceClosed {}, "loss", 0, 0, &tx, &hub)
+                .unwrap();
+        let lost = subscription.poll(&tx, &hub).unwrap();
+        assert_eq!(lost["error"]["code"], "events_lost");
+        assert_eq!(
+            subscription.poll(&tx, &hub).unwrap()["data"]["workspace_id"],
+            "two"
+        );
+        assert_eq!(
+            subscription.poll(&tx, &hub).unwrap()["data"]["workspace_id"],
+            "three"
+        );
+        assert!(subscription.poll(&tx, &hub).is_none());
+    }
+
+    fn probe_error(read: bool, response: serde_json::Value) -> ErrorResponse {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::api::ApiRequestMessage>();
+        let responder = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap();
+            let message = runtime.block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv())
+                    .await
+                    .expect("probe request did not arrive")
+                    .expect("probe producer closed")
+            });
+            assert_eq!(message.request.id, "probe");
+            assert!(matches!(
+                (&message.request.method, read),
+                (Method::PaneRead(_), true) | (Method::PaneGet(_), false)
+            ));
+            message.respond_to.send(response.to_string()).unwrap();
+        });
+        let error = if read {
+            pane_read(
+                "probe".into(),
+                "pane_1",
+                crate::api::schema::ReadSource::Recent,
+                None,
+                true,
+                &tx,
+            )
+            .unwrap_err()
+        } else {
+            pane_get("probe".into(), "pane_1", &tx).unwrap_err()
+        };
+        responder.join().unwrap();
+        error
+    }
+
+    #[test]
+    fn pane_preflight_preserves_typed_errors() {
+        for read in [false, true] {
+            for code in ["pane_not_found", "invalid_params"] {
+                let expected = ErrorResponse {
+                    id: "probe".into(),
+                    error: ErrorBody {
+                        data: None,
+                        code: code.into(),
+                        message: "original diagnostic".into(),
+                    },
+                };
+                assert_eq!(
+                    probe_error(read, serde_json::to_value(&expected).unwrap()),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pane_preflight_rejects_malformed_errors() {
+        for read in [false, true] {
+            let error = probe_error(read, serde_json::json!({"id": "probe", "error": {}}));
+            assert_eq!(error.id, "probe");
+            assert_eq!(error.error.code, "internal_error");
+            assert_eq!(
+                error.error.message,
+                format!(
+                    "failed to decode pane {} error",
+                    if read { "read" } else { "get" }
+                )
+            );
+        }
+    }
 
     fn status_event(custom_status: Option<&str>) -> EventEnvelope {
         EventEnvelope {
@@ -622,6 +785,7 @@ mod tests {
         let set_event = subscription
             .poll(&tokio::sync::mpsc::unbounded_channel().0, &event_hub)
             .expect("set event");
+        let set_event: SubscriptionEventEnvelope = serde_json::from_value(set_event).unwrap();
         let SubscriptionEventData::PaneAgentStatusChanged(set_data) = set_event.data else {
             panic!("wrong event data");
         };
@@ -630,6 +794,7 @@ mod tests {
         let expiry_event = subscription
             .poll(&tokio::sync::mpsc::unbounded_channel().0, &event_hub)
             .expect("expiry event");
+        let expiry_event: SubscriptionEventEnvelope = serde_json::from_value(expiry_event).unwrap();
         let SubscriptionEventData::PaneAgentStatusChanged(expiry_data) = expiry_event.data else {
             panic!("wrong event data");
         };
@@ -669,6 +834,7 @@ mod tests {
         let set_event = subscription
             .poll(&tokio::sync::mpsc::unbounded_channel().0, &event_hub)
             .expect("set event");
+        let set_event: SubscriptionEventEnvelope = serde_json::from_value(set_event).unwrap();
         let SubscriptionEventData::PaneAgentStatusChanged(set_data) = set_event.data else {
             panic!("wrong event data");
         };
@@ -677,6 +843,7 @@ mod tests {
         let expiry_event = subscription
             .poll(&tokio::sync::mpsc::unbounded_channel().0, &event_hub)
             .expect("expiry event");
+        let expiry_event: SubscriptionEventEnvelope = serde_json::from_value(expiry_event).unwrap();
         let SubscriptionEventData::PaneAgentStatusChanged(expiry_data) = expiry_event.data else {
             panic!("wrong event data");
         };
@@ -715,6 +882,7 @@ mod tests {
         let event = subscription
             .poll(&tokio::sync::mpsc::unbounded_channel().0, &event_hub)
             .expect("setup-window event");
+        let event: SubscriptionEventEnvelope = serde_json::from_value(event).unwrap();
         let SubscriptionEventData::PaneAgentStatusChanged(data) = event.data else {
             panic!("wrong event data");
         };

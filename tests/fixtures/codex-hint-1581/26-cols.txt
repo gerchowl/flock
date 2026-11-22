@@ -1,0 +1,6 @@
+OpenAI Codex
+Selected model is at
+capacity
+FRAME-truncated:43839000
+› Ask Codex to do anythin
+  ? for shortcuts

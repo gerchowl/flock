@@ -1,0 +1,20 @@
+
+ ▐▛███▛█   Claude Code v2.1.296
+▝▜██████▀  Opus 5.5 · Claude Max
+ ▝▝   ▝▝   /fixture/paste-chip
+
+
+
+
+
+
+
+
+
+
+────────────────────────────────────────────────────
+❯ [Pasted text #1]
+────────────────────────────────────────────────────
+  ⚠ Transcript saving is off — inherited CLAUDE_C…
+  host · profile:fixture · Opus 5.5 · /private/…
+  ⏵⏵ bypass permissions on (shift+tab to cycle)

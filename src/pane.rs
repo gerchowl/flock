@@ -22,6 +22,8 @@ use crate::layout::PaneId;
 #[cfg(unix)]
 use crate::pty::actor::{PtyIoActor, PtyIoActorConfig, PtyIoActorHandle, PtyReadResult};
 
+mod injection_lease;
+pub(crate) use injection_lease::is_interrupt as is_input_interrupt;
 mod input;
 mod kitty_keyboard;
 mod osc;
@@ -57,6 +59,7 @@ struct PendingAgentRelease {
 
 #[derive(Clone, Copy, Default)]
 struct SpawnInitialState<'a> {
+    spawned_with_default_shell: bool,
     detected_agent: Option<Agent>,
     history_ansi: Option<&'a str>,
 }
@@ -83,9 +86,14 @@ async fn publish_state_changed_event(
     agent: Option<Agent>,
     state: AgentState,
     activity: Option<String>,
+    provider_limit: Option<crate::detect::provider_limit::ProviderLimit>,
     visible_blocker: bool,
     visible_idle: bool,
     visible_working: bool,
+    settled_with_background_shells: bool,
+    background_tasks: Option<u32>,
+    needs_human: Option<crate::api::agent_state::HumanReason>,
+    question: Option<crate::api::question::QuestionForm>,
     process_exited: bool,
     observed_at: std::time::Instant,
 ) {
@@ -98,9 +106,14 @@ async fn publish_state_changed_event(
             agent,
             state,
             activity,
+            provider_limit,
             visible_blocker,
             visible_idle,
             visible_working,
+            settled_with_background_shells,
+            background_tasks,
+            needs_human,
+            question,
             process_exited,
             observed_at,
         })
@@ -380,11 +393,22 @@ fn detection_update_for_publish(
         return Some(crate::detect::AgentDetection {
             state: AgentState::Idle,
             activity: None,
+            provider_limit: None,
             skip_state_update: false,
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
+            settled_with_background_shells: false,
+            background_tasks: None,
+            needs_human: None,
+            question: None,
         });
+    }
+
+    // Exec exposes the agent's argv before its runtime paints anything. A blank
+    // buffer cannot establish readiness, even for detectors that default to idle.
+    if content.trim().is_empty() {
+        return None;
     }
 
     let detection = crate::detect::detect_agent(agent, content);
@@ -418,6 +442,7 @@ fn spawn_basic_detection_task(
         let mut last_visible_blocker = false;
         let mut last_visible_idle = false;
         let mut last_visible_working = false;
+        let mut last_background_signal = (false, None, None, None);
         let mut last_visible_signal_refresh = None;
         let mut last_process_check = std::time::Instant::now();
         let mut last_foreground_pgid = None;
@@ -437,6 +462,7 @@ fn spawn_basic_detection_task(
                     last_visible_blocker = false;
                     last_visible_idle = false;
                     last_visible_working = false;
+                    last_background_signal = (false, None, None, None);
                     last_visible_signal_refresh = None;
                     last_process_check = std::time::Instant::now();
                     last_foreground_pgid = None;
@@ -538,6 +564,8 @@ fn spawn_basic_detection_task(
             let visible_blocker = detection.visible_blocker && new_state == AgentState::Blocked;
             let visible_idle = detection.visible_idle && new_state == AgentState::Idle;
             let visible_working = detection.visible_working && new_state == AgentState::Working;
+            let settled_with_background_shells =
+                detection.settled_with_background_shells && new_state == AgentState::Idle;
 
             let previous_publish = DetectionPublishState {
                 state,
@@ -566,11 +594,23 @@ fn spawn_basic_detection_task(
                 false,
                 stable_refresh_due,
             ) || activity_changed
+                || (
+                    settled_with_background_shells,
+                    detection.background_tasks,
+                    detection.needs_human,
+                    detection.question.clone(),
+                ) != last_background_signal
             {
                 state = new_state;
                 last_visible_blocker = visible_blocker;
                 last_visible_idle = visible_idle;
                 last_visible_working = visible_working;
+                last_background_signal = (
+                    settled_with_background_shells,
+                    detection.background_tasks,
+                    detection.needs_human,
+                    detection.question.clone(),
+                );
                 last_activity.clone_from(&detection.activity);
                 if visible_blocker || visible_idle || visible_working {
                     last_visible_signal_refresh = Some(now);
@@ -583,9 +623,14 @@ fn spawn_basic_detection_task(
                     agent,
                     new_state,
                     detection.activity.clone(),
+                    detection.provider_limit.clone(),
                     visible_blocker,
                     visible_idle,
                     visible_working,
+                    settled_with_background_shells,
+                    detection.background_tasks,
+                    detection.needs_human,
+                    detection.question.clone(),
                     false,
                     now,
                 )
@@ -660,6 +705,10 @@ impl PaneRuntime {
         (pid > 0).then_some(pid)
     }
 
+    /// Birth captured at spawn or carried by the owning handoff server.
+    pub(crate) fn child_birth(&self) -> Option<u64> {
+        self.child_birth
+    }
     /// The pane child's exit slot, for panes that own a watcher (#178). A
     /// pane adopted over a live handoff has none: its child was reaped by the
     /// process that spawned it, not by this one.
@@ -704,6 +753,7 @@ pub struct PaneRuntime {
     io: PaneRuntimeIo,
     current_size: Cell<(u16, u16, u32, u32)>,
     child_pid: Arc<AtomicU32>,
+    child_birth: Option<u64>,
     child_exit: Option<Arc<ChildExit>>,
     kitty_keyboard_flags: Arc<AtomicU16>,
     detect_reset_notify: Arc<Notify>,
@@ -712,6 +762,11 @@ pub struct PaneRuntime {
     /// When input last reached this pane from anyone but flock itself
     /// (ADR-0018 §2) — the idle wake's "flock does not type over a human".
     operator_input: OperatorInputClock,
+    /// Sticky input history for safe root-shell replacement.
+    has_been_typed_into: Cell<bool>,
+    /// Flock's hold on operator input during one guarded injection (#850).
+    injection_lease: injection_lease::InjectionLease,
+    spawned_with_default_shell: bool,
     // Task handles for deterministic shutdown
     detect_handle: tokio::task::AbortHandle,
 }
@@ -744,6 +799,36 @@ impl OperatorInputClock {
 
     fn last(&self) -> Option<std::time::Instant> {
         self.last.get()
+    }
+}
+
+/// What one retry of a pane's held-input backlog did (#850, #1011).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub(crate) struct HeldInputDrain {
+    /// Some held input still waits on a full channel.
+    pub still_waiting: bool,
+    /// Held bytes a closed pane or a broken writer refused. They are lost.
+    pub refused_bytes: usize,
+}
+
+/// A pane's handoff quiesce, started and not yet collected, so a handoff can
+/// drain every pane at once instead of one after another.
+#[cfg(unix)]
+pub(crate) enum PendingPaneHandoff {
+    Actor(crate::pty::actor::PendingHandoff),
+    #[cfg(test)]
+    Ready,
+}
+
+#[cfg(unix)]
+impl PendingPaneHandoff {
+    pub(crate) fn wait(self) -> std::io::Result<crate::pty::actor::HandoffQuiesce> {
+        match self {
+            PendingPaneHandoff::Actor(pending) => pending.wait(),
+            #[cfg(test)]
+            PendingPaneHandoff::Ready => Ok(crate::pty::actor::HandoffQuiesce::default()),
+        }
     }
 }
 
@@ -788,11 +873,26 @@ impl PaneRuntimeIo {
     }
 
     #[cfg(unix)]
-    fn begin_handoff(&self, timeout: std::time::Duration) -> std::io::Result<()> {
+    fn start_handoff(
+        &self,
+        timeout: std::time::Duration,
+        drop_undrained: bool,
+    ) -> std::io::Result<PendingPaneHandoff> {
         match self {
-            PaneRuntimeIo::Actor(actor) => actor.begin_handoff(timeout),
+            PaneRuntimeIo::Actor(actor) => actor
+                .start_handoff(timeout, drop_undrained)
+                .map(PendingPaneHandoff::Actor),
             #[cfg(test)]
-            PaneRuntimeIo::TestChannel { .. } => Ok(()),
+            PaneRuntimeIo::TestChannel { .. } => Ok(PendingPaneHandoff::Ready),
+        }
+    }
+
+    fn writer_broken(&self) -> bool {
+        match self {
+            #[cfg(unix)]
+            PaneRuntimeIo::Actor(actor) => actor.writer_broken(),
+            #[cfg(test)]
+            PaneRuntimeIo::TestChannel { .. } => false,
         }
     }
 
@@ -860,11 +960,103 @@ impl PaneRuntimeIo {
     }
 
     fn try_send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::TrySendError<Bytes>> {
+        self.try_send_with_receipt(bytes, false, None).map(|_| ())
+    }
+
+    fn write_failure(&self) -> crate::pty::write_receipt::WriteFailure {
+        use crate::pty::write_receipt::WriteFailure;
         match self {
             #[cfg(unix)]
-            PaneRuntimeIo::Actor(actor) => actor.try_write_user_input(bytes),
+            Self::Actor(actor) => actor.write_refusal().unwrap_or(WriteFailure::PaneGone),
             #[cfg(test)]
-            PaneRuntimeIo::TestChannel { sender, .. } => sender.try_send(bytes),
+            Self::TestChannel { .. } => WriteFailure::PaneGone,
+        }
+    }
+
+    fn try_send_input(
+        &self,
+        input: injection_lease::QueuedInput,
+    ) -> Result<(), mpsc::error::TrySendError<injection_lease::QueuedInput>> {
+        use injection_lease::QueuedInput;
+        match input {
+            QueuedInput::Operator(bytes) => self.try_send_bytes(bytes).map_err(|err| match err {
+                mpsc::error::TrySendError::Full(bytes) => {
+                    mpsc::error::TrySendError::Full(QueuedInput::Operator(bytes))
+                }
+                mpsc::error::TrySendError::Closed(bytes) => {
+                    mpsc::error::TrySendError::Closed(QueuedInput::Operator(bytes))
+                }
+            }),
+            QueuedInput::Tracked(ticket) => match self {
+                #[cfg(unix)]
+                Self::Actor(actor) => actor.try_write_ticket(ticket).map_err(|err| match err {
+                    mpsc::error::TrySendError::Full(ticket) => {
+                        mpsc::error::TrySendError::Full(QueuedInput::Tracked(ticket))
+                    }
+                    mpsc::error::TrySendError::Closed(ticket) => {
+                        mpsc::error::TrySendError::Closed(QueuedInput::Tracked(ticket))
+                    }
+                }),
+                #[cfg(test)]
+                Self::TestChannel { sender, .. } => {
+                    let result = ticket.write(|bytes| {
+                        sender
+                            .try_send(Bytes::copy_from_slice(bytes))
+                            .map(|_| bytes.len())
+                            .map_err(|err| {
+                                std::io::Error::from(match err {
+                                    mpsc::error::TrySendError::Full(_) => {
+                                        std::io::ErrorKind::WouldBlock
+                                    }
+                                    mpsc::error::TrySendError::Closed(_) => {
+                                        std::io::ErrorKind::BrokenPipe
+                                    }
+                                })
+                            })
+                    });
+                    match result {
+                        Some(Err(err)) if err.kind() == std::io::ErrorKind::WouldBlock => Err(
+                            mpsc::error::TrySendError::Full(QueuedInput::Tracked(ticket)),
+                        ),
+                        Some(Err(_)) => Err(mpsc::error::TrySendError::Closed(
+                            QueuedInput::Tracked(ticket),
+                        )),
+                        _ => Ok(()),
+                    }
+                }
+            },
+        }
+    }
+
+    fn try_send_with_receipt(
+        &self,
+        bytes: Bytes,
+        tracked: bool,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<Option<crate::pty::write_receipt::WriteReceipt>, mpsc::error::TrySendError<Bytes>>
+    {
+        match self {
+            #[cfg(unix)]
+            PaneRuntimeIo::Actor(actor) => {
+                if tracked {
+                    actor.try_write_tracked_input(bytes, deadline).map(Some)
+                } else {
+                    actor.try_write_user_input(bytes).map(|_| None)
+                }
+            }
+            #[cfg(test)]
+            PaneRuntimeIo::TestChannel { sender, .. } => {
+                sender.try_send(bytes.clone())?;
+                if tracked {
+                    // The test channel models a synchronous completed write.
+                    let (completion, receipt) =
+                        crate::pty::write_receipt::WriteReceipt::channel(bytes, deadline);
+                    let _ = completion.write(|chunk| Ok(chunk.len()));
+                    Ok(Some(receipt))
+                } else {
+                    Ok(None)
+                }
+            }
         }
     }
 }
@@ -881,6 +1073,9 @@ impl Drop for PaneRuntime {
         // Abort detection task immediately and terminate the owned session.
         // The PTY actor shuts down before the process/session policy runs.
         self.detect_handle.abort();
+        let _ = self
+            .injection_lease
+            .release_all(crate::pty::write_receipt::WriteFailure::PaneGone);
         self.io.shutdown();
         if !self.preserve_processes_on_drop {
             shutdown_pane_processes(
@@ -1096,6 +1291,9 @@ fn pane_shell_command_builder(shell_config: PaneShellConfig<'_>) -> io::Result<C
 impl PaneRuntime {
     pub fn shutdown(mut self) {
         self.detect_handle.abort();
+        let _ = self
+            .injection_lease
+            .release_all(crate::pty::write_receipt::WriteFailure::PaneGone);
         self.io.shutdown();
         shutdown_pane_processes(
             self.pane_id,
@@ -1105,6 +1303,87 @@ impl PaneRuntime {
         self.preserve_processes_on_drop = true;
     }
 
+    /// Stop a snapshotted agent tree off-loop and report whether it was reaped.
+    /// Runtime I/O and detection are detached before any signal is sent.
+    pub(crate) fn shutdown_for_restart(
+        mut self,
+        mut pids: Vec<u32>,
+        grace: std::time::Duration,
+    ) -> tokio::sync::oneshot::Receiver<bool> {
+        self.detect_handle.abort();
+        let _ = self
+            .injection_lease
+            .release_all(crate::pty::write_receipt::WriteFailure::PaneGone);
+        self.io.shutdown();
+        let child_pid = self.child_pid.load(Ordering::Acquire);
+        pids.extend(crate::platform::session_processes(child_pid));
+        pids.push(child_pid);
+        pids.retain(|pid| *pid > 1);
+        pids.sort_unstable();
+        pids.dedup();
+        let mut identities: Vec<_> = pids
+            .into_iter()
+            .map(|pid| (pid, crate::platform::process_start_time(pid)))
+            .collect();
+        let child_exit = self.child_exit.clone();
+        self.preserve_processes_on_drop = true;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let living = |identities: &[(u32, Option<u64>)]| {
+                identities
+                    .iter()
+                    .filter(|(pid, birth)| {
+                        crate::platform::process_start_time(*pid) == *birth
+                            && process_alive_for_shutdown(
+                                *pid,
+                                child_pid,
+                                child_exit.as_deref().is_some_and(ChildExit::is_reaped),
+                                crate::platform::process_exists,
+                            )
+                    })
+                    .map(|(pid, _)| *pid)
+                    .collect::<Vec<_>>()
+            };
+            crate::platform::signal_processes(
+                &living(&identities),
+                crate::platform::Signal::Terminate,
+            );
+            let deadline = std::time::Instant::now() + grace;
+            while !living(&identities).is_empty() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            // A TERM-resistant child can create descendants during the grace
+            // window. Expand from the still-matching process identities again
+            // before KILL so those children do not outlive the restart.
+            let mut active = living(&identities);
+            let processes: Vec<_> = crate::platform::all_process_ids()
+                .into_iter()
+                .map(|pid| (pid, crate::platform::process_parent_id(pid)))
+                .collect();
+            loop {
+                let before = active.len();
+                for (pid, parent) in &processes {
+                    if !active.contains(pid)
+                        && parent.is_some_and(|parent| active.contains(&parent))
+                    {
+                        active.push(*pid);
+                        identities.push((*pid, crate::platform::process_start_time(*pid)));
+                    }
+                }
+                if active.len() == before {
+                    break;
+                }
+            }
+            crate::platform::signal_processes(&living(&identities), crate::platform::Signal::Kill);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !living(&identities).is_empty() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            let _ = tx.send(living(&identities).is_empty());
+        });
+        rx
+    }
+
     #[cfg(unix)]
     pub fn duplicate_handoff_fd(&self) -> std::io::Result<std::os::fd::RawFd> {
         self.io.duplicate_handoff_fd()
@@ -1112,6 +1391,7 @@ impl PaneRuntime {
 
     #[cfg(unix)]
     pub fn preserve_for_handoff(mut self) {
+        self.end_all_injection_leases();
         if let Err(err) = self.io.release_after_commit() {
             crate::logging::pane_pty_release_after_handoff_failed(
                 self.pane_id.raw(),
@@ -1139,8 +1419,12 @@ impl PaneRuntime {
     }
 
     #[cfg(unix)]
-    pub fn pause_handoff_reader(&self, timeout: std::time::Duration) -> std::io::Result<()> {
-        self.io.begin_handoff(timeout)
+    pub fn start_handoff_pause(
+        &self,
+        timeout: std::time::Duration,
+        drop_undrained: bool,
+    ) -> std::io::Result<PendingPaneHandoff> {
+        self.io.start_handoff(timeout, drop_undrained)
     }
 
     #[cfg(unix)]
@@ -1153,6 +1437,7 @@ impl PaneRuntime {
         crate::handoff_runtime::HandoffRuntimeState {
             pane_id,
             child_pid,
+            child_birth: self.child_birth,
             rows,
             cols,
             cell_width_px,
@@ -1164,6 +1449,7 @@ impl PaneRuntime {
             keyboard_protocol_ansi: self.terminal.kitty_keyboard_state_ansi(),
             input_state: self.input_state(),
             initial_history_ansi: None,
+            agent_session_hook_confirmed: false,
         }
     }
 
@@ -1248,6 +1534,7 @@ impl PaneRuntime {
             cmd,
             "failed to spawn shell",
             SpawnInitialState {
+                spawned_with_default_shell: true,
                 detected_agent: None,
                 history_ansi: initial_history_ansi,
             },
@@ -1346,6 +1633,7 @@ impl PaneRuntime {
         let crate::handoff_runtime::HandoffRuntimeState {
             pane_id,
             child_pid,
+            child_birth,
             rows,
             cols,
             cell_width_px,
@@ -1354,6 +1642,7 @@ impl PaneRuntime {
             keyboard_protocol_ansi,
             input_state,
             initial_history_ansi,
+            agent_session_hook_confirmed: _,
         } = state;
         let pane_id = PaneId::from_raw(pane_id);
         use std::os::fd::FromRawFd;
@@ -1443,12 +1732,16 @@ impl PaneRuntime {
             io,
             current_size: Cell::new((rows, cols, cell_width_px, cell_height_px)),
             child_pid,
+            child_birth,
             child_exit: None,
             kitty_keyboard_flags,
             detect_reset_notify,
             pending_release,
             preserve_processes_on_drop: true,
             operator_input: OperatorInputClock::default(),
+            has_been_typed_into: Cell::new(true),
+            injection_lease: Default::default(),
+            spawned_with_default_shell: false,
             detect_handle,
         })
     }
@@ -1493,6 +1786,10 @@ impl PaneRuntime {
                 )
             })?;
 
+        let child_birth = spawned
+            .child
+            .process_id()
+            .and_then(crate::platform::process_start_time);
         // --- Child watcher task ---
         let child_pid = Arc::new(AtomicU32::new(0));
         let child_exit = Arc::new(ChildExit::default());
@@ -1611,6 +1908,8 @@ impl PaneRuntime {
                 let mut last_visible_blocker = false;
                 let mut last_visible_idle = false;
                 let mut last_visible_working = false;
+                let mut last_background_signal = (false, None, None, None);
+                let mut last_activity: Option<String> = None;
                 let mut last_visible_signal_refresh = None;
                 let mut last_detection_text = String::new();
 
@@ -1644,6 +1943,7 @@ impl PaneRuntime {
                             last_visible_blocker = false;
                             last_visible_idle = false;
                             last_visible_working = false;
+                            last_background_signal = (false, None, None, None);
                             last_visible_signal_refresh = None;
                             last_detection_text.clear();
                         }
@@ -1797,6 +2097,8 @@ impl PaneRuntime {
                     let visible_idle = detection.visible_idle && new_state == AgentState::Idle;
                     let visible_working =
                         detection.visible_working && new_state == AgentState::Working;
+                    let settled_with_background_shells =
+                        detection.settled_with_background_shells && new_state == AgentState::Idle;
 
                     let previous_publish = DetectionPublishState {
                         state,
@@ -1823,7 +2125,14 @@ impl PaneRuntime {
                         agent_changed,
                         process_exited,
                         stable_refresh_due,
-                    ) {
+                    ) || detection.activity != last_activity
+                        || (
+                            settled_with_background_shells,
+                            detection.background_tasks,
+                            detection.needs_human,
+                            detection.question.clone(),
+                        ) != last_background_signal
+                    {
                         debug!(
                             pane = pane_id.raw(),
                             ?state,
@@ -1836,6 +2145,13 @@ impl PaneRuntime {
                         last_visible_blocker = visible_blocker;
                         last_visible_idle = visible_idle;
                         last_visible_working = visible_working;
+                        last_background_signal = (
+                            settled_with_background_shells,
+                            detection.background_tasks,
+                            detection.needs_human,
+                            detection.question.clone(),
+                        );
+                        last_activity.clone_from(&detection.activity);
                         if visible_blocker || visible_idle || visible_working {
                             last_visible_signal_refresh = Some(now);
                         } else {
@@ -1847,9 +2163,14 @@ impl PaneRuntime {
                             agent,
                             new_state,
                             detection.activity.clone(),
+                            detection.provider_limit.clone(),
                             visible_blocker,
                             visible_idle,
                             visible_working,
+                            settled_with_background_shells,
+                            detection.background_tasks,
+                            detection.needs_human,
+                            detection.question.clone(),
                             process_exited,
                             now,
                         )
@@ -1869,12 +2190,16 @@ impl PaneRuntime {
             io,
             current_size: Cell::new((rows, cols, 0, 0)),
             child_pid,
+            child_birth,
             child_exit: Some(child_exit),
             kitty_keyboard_flags,
             detect_reset_notify,
             pending_release,
             preserve_processes_on_drop: false,
             operator_input: OperatorInputClock::default(),
+            has_been_typed_into: Cell::new(false),
+            injection_lease: Default::default(),
+            spawned_with_default_shell: initial_state.spawned_with_default_shell,
             detect_handle,
         })
     }
@@ -1966,6 +2291,18 @@ impl PaneRuntime {
         self.terminal.visible_ansi()
     }
 
+    pub fn detection_text(&self) -> String {
+        self.terminal.detection_text()
+    }
+
+    pub fn detection_ansi(&self) -> String {
+        self.terminal.detection_ansi()
+    }
+
+    pub fn detection_text_and_unfaint(&self) -> (String, String) {
+        self.terminal.detection_text_and_unfaint()
+    }
+
     pub fn recent_text(&self, lines: usize) -> String {
         self.terminal.recent_text(lines)
     }
@@ -1985,6 +2322,22 @@ impl PaneRuntime {
     pub fn snapshot_history(&self) -> Option<String> {
         let ansi = self.recent_unwrapped_ansi(usize::MAX);
         (!ansi.trim().is_empty()).then_some(ansi)
+    }
+
+    /// Capture or extend content identity under the parser lock (ADR-0040 §1).
+    pub fn pin_selection(
+        &self,
+        selection: &mut crate::selection::Selection,
+        drag: Option<(u16, u16, Rect)>,
+    ) {
+        self.terminal.pin_selection(selection, drag);
+    }
+    /// Resolve current endpoint coordinates, refusing discarded content.
+    pub fn resolve_selection(
+        &self,
+        selection: &crate::selection::Selection,
+    ) -> Option<crate::selection::Selection> {
+        self.terminal.resolve_selection(selection)
     }
 
     pub fn extract_selection(&self, selection: &crate::selection::Selection) -> Option<String> {
@@ -2030,14 +2383,219 @@ impl PaneRuntime {
             .encode_terminal_key(key, self.keyboard_protocol())
     }
 
-    pub async fn send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::SendError<Bytes>> {
-        self.operator_input.stamp();
-        self.io.send_bytes(bytes).await
+    pub(crate) fn was_spawned_with_default_shell(&self) -> bool {
+        self.spawned_with_default_shell
     }
 
-    pub fn try_send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::TrySendError<Bytes>> {
+    /// Whether the pane is a plain shell: it was spawned with the default
+    /// shell, and that shell's own process group holds the terminal, so no
+    /// agent, job or command runs in front of it. `None` when it cannot tell:
+    /// no live child, or an unreadable foreground group.
+    pub(crate) fn foreground_is_own_shell(&self) -> Option<bool> {
+        if !self.spawned_with_default_shell {
+            return Some(false);
+        }
+        let pid = self.child_pid()?;
+        #[cfg(unix)]
+        let foreground = self
+            .io
+            .foreground_process_group_id()
+            .or_else(|| crate::platform::foreground_process_group_id(pid));
+        #[cfg(not(unix))]
+        let foreground = crate::platform::foreground_process_group_id(pid);
+        foreground.map(|pgid| pgid == pid)
+    }
+
+    /// Sticky across all input writes, including flock-authored input.
+    /// Imported runtimes start touched because their input history is unknown.
+    pub(crate) fn has_received_input(&self) -> bool {
+        self.has_been_typed_into.get()
+    }
+
+    pub async fn send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::SendError<Bytes>> {
+        self.has_been_typed_into.set(true);
+        let Some(mut batch) = self
+            .injection_lease
+            .intercept(bytes, std::time::Instant::now())
+        else {
+            return Ok(());
+        };
         self.operator_input.stamp();
-        self.io.try_send_bytes(bytes)
+        if !self.injection_lease.has_backlog() && batch.len() == 1 {
+            if let Some(injection_lease::QueuedInput::Operator(bytes)) = batch.pop_front() {
+                return self.io.send_bytes(bytes).await;
+            }
+        }
+        self.write_in_order(batch)
+            .map_err(|(bytes, _)| mpsc::error::SendError(bytes))
+    }
+
+    /// Operator input retains FIFO order behind held or backlogged requests.
+    pub fn try_send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::TrySendError<Bytes>> {
+        self.has_been_typed_into.set(true);
+        let Some(mut batch) = self
+            .injection_lease
+            .intercept(bytes, std::time::Instant::now())
+        else {
+            return Ok(());
+        };
+        self.operator_input.stamp();
+        if !self.injection_lease.has_backlog() && batch.len() == 1 {
+            if let Some(injection_lease::QueuedInput::Operator(bytes)) = batch.pop_front() {
+                return self.io.try_send_bytes(bytes);
+            }
+        }
+        self.write_in_order(batch)
+            .map_err(|(bytes, _)| mpsc::error::TrySendError::Closed(bytes))
+    }
+
+    /// Queue a caller-owned request through the same operator lease/backlog path.
+    /// The returned receipt carries admission failure or later completion;
+    /// returning a ticket is never an acknowledgement of a completed write.
+    pub(crate) fn try_send_tracked(
+        &self,
+        bytes: Bytes,
+        deadline: std::time::Instant,
+        operator_interrupt: bool,
+    ) -> crate::pty::write_receipt::WriteReceipt {
+        let (mut ticket, receipt) =
+            crate::pty::write_receipt::WriteReceipt::channel(bytes, Some(deadline));
+        ticket.operator_interrupt = operator_interrupt;
+        self.has_been_typed_into.set(true);
+        if let Some(batch) = self.injection_lease.intercept(
+            injection_lease::QueuedInput::Tracked(ticket),
+            std::time::Instant::now(),
+        ) {
+            self.operator_input.stamp();
+            let _ = self.write_in_order(batch);
+        }
+        receipt
+    }
+
+    /// Hold this pane's operator input for `token`'s injection until `until`
+    /// (#850). False while another injection holds it.
+    pub(crate) fn begin_injection_lease(
+        &self,
+        token: &str,
+        until: std::time::Instant,
+        now: std::time::Instant,
+    ) -> bool {
+        match self.injection_lease.acquire(token, until, now) {
+            Ok(flush) => {
+                let _ = self.write_held_input(flush);
+                true
+            }
+            Err(()) => false,
+        }
+    }
+
+    /// End `token`'s lease and write what it held, in order. False when held
+    /// input could not be written (a closed pane or a broken writer), which
+    /// is also logged.
+    pub(crate) fn end_injection_lease(&self, token: &str) -> bool {
+        let held = self.injection_lease.release(token);
+        self.write_held_input(held)
+    }
+
+    /// End a lease past its bound. True when one ended.
+    pub(crate) fn expire_injection_lease(&self, now: std::time::Instant) -> bool {
+        let Some(held) = self.injection_lease.expire(now) else {
+            return false;
+        };
+        let _ = self.write_held_input(Some(held));
+        true
+    }
+
+    /// End any lease, for a server that is stopping or handing off.
+    pub(crate) fn end_all_injection_leases(&self) {
+        let held = self
+            .injection_lease
+            .release_all(crate::pty::write_receipt::WriteFailure::OwnerChanged);
+        let _ = self.write_held_input(held);
+    }
+
+    pub(crate) fn injection_lease_until(&self) -> Option<std::time::Instant> {
+        self.injection_lease.until()
+    }
+
+    pub(crate) fn holds_injection_lease(&self, token: &str, now: std::time::Instant) -> bool {
+        self.injection_lease.holds(token, now)
+    }
+
+    fn write_held_input(&self, held: Option<injection_lease::InputBatch>) -> bool {
+        let Some(mut batch) = held else {
+            return true;
+        };
+        batch.retain(injection_lease::QueuedInput::pending);
+        if batch.is_empty() {
+            return true;
+        }
+        self.operator_input.stamp();
+        self.write_in_order(batch).is_ok()
+    }
+
+    fn write_in_order(&self, batch: injection_lease::InputBatch) -> Result<(), (Bytes, usize)> {
+        use injection_lease::QueuedInput;
+        let mut batch = self.injection_lease.behind_backlog(batch);
+        while let Some(input) = batch.pop_front() {
+            if matches!(&input, QueuedInput::Tracked(ticket) if !ticket.is_pending()) {
+                continue;
+            }
+            let refused_count = input.len() + batch.iter().map(QueuedInput::len).sum::<usize>();
+            match self.io.try_send_input(input) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(input)) => {
+                    batch.push_front(input);
+                    if self.injection_lease.defer(batch) {
+                        crate::logging::pane_held_input_write_failed(
+                            "pane input backlog exceeds warning limit",
+                        );
+                    }
+                    return Ok(());
+                }
+                Err(mpsc::error::TrySendError::Closed(input)) => {
+                    batch.push_front(input);
+                    let bytes = batch
+                        .into_iter()
+                        .filter_map(|input| match input {
+                            QueuedInput::Operator(bytes) => Some(bytes),
+                            QueuedInput::Tracked(ticket) => {
+                                ticket.retire(self.io.write_failure());
+                                None
+                            }
+                        })
+                        .flatten()
+                        .collect::<Vec<u8>>();
+                    let reason = if self.io.writer_broken() {
+                        "pane writer accepts zero bytes"
+                    } else {
+                        "pane input channel closed"
+                    };
+                    crate::logging::pane_held_input_write_failed(&format!(
+                        "{reason}; {refused_count} held bytes not written"
+                    ));
+                    return Err((Bytes::from(bytes), refused_count));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn has_held_backlog(&self) -> bool {
+        self.injection_lease.has_backlog()
+    }
+
+    /// Retry held input a full channel refused.
+    pub(crate) fn drain_held_input(&self) -> HeldInputDrain {
+        let refused_bytes = self
+            .injection_lease
+            .take_backlog()
+            .and_then(|bytes| self.write_in_order(bytes).err())
+            .map_or(0, |(_, count)| count);
+        HeldInputDrain {
+            still_waiting: self.injection_lease.has_backlog(),
+            refused_bytes,
+        }
     }
 
     /// Write bytes flock authored on its own initiative, WITHOUT counting them
@@ -2047,7 +2605,19 @@ impl PaneRuntime {
         &self,
         bytes: Bytes,
     ) -> Result<(), mpsc::error::TrySendError<Bytes>> {
+        self.has_been_typed_into.set(true);
         self.io.try_send_bytes(bytes)
+    }
+
+    /// Queue a paste and retain the actor's final-write timestamp.
+    pub(crate) fn try_send_flock_authored_tracked(
+        &self,
+        bytes: Bytes,
+        deadline: std::time::Instant,
+    ) -> Result<Option<crate::pty::write_receipt::WriteReceipt>, mpsc::error::TrySendError<Bytes>>
+    {
+        self.has_been_typed_into.set(true);
+        self.io.try_send_with_receipt(bytes, true, Some(deadline))
     }
 
     /// When operator input last reached this pane, if it ever has.
@@ -2200,6 +2770,14 @@ impl PaneRuntime {
         Self::test_with_channel_and_scrollback_bytes(cols, rows, 0, &[], 4)
     }
 
+    /// A test runtime whose input goes to a real PTY actor.
+    #[cfg(unix)]
+    pub(crate) fn test_with_actor(actor: PtyIoActorHandle) -> Self {
+        let (mut runtime, _receiver) = Self::test_with_channel(80, 24);
+        runtime.io = PaneRuntimeIo::Actor(actor);
+        runtime
+    }
+
     pub(crate) fn test_with_channel_capacity(
         cols: u16,
         rows: u16,
@@ -2251,12 +2829,16 @@ impl PaneRuntime {
                 },
                 current_size: Cell::new((rows, cols, 0, 0)),
                 child_pid: Arc::new(AtomicU32::new(0)),
+                child_birth: None,
                 child_exit: None,
                 kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
                 detect_reset_notify: Arc::new(Notify::new()),
                 pending_release: Arc::new(Mutex::new(None)),
                 preserve_processes_on_drop: true,
                 operator_input: OperatorInputClock::default(),
+                has_been_typed_into: Cell::new(false),
+                injection_lease: Default::default(),
+                spawned_with_default_shell: false,
                 detect_handle: tokio::spawn(async {}).abort_handle(),
             },
             rx,
@@ -2267,6 +2849,174 @@ impl PaneRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn test_channel_receipts_follow_successful_tracked_writes() {
+        let (runtime, mut receiver) = PaneRuntime::test_with_channel_capacity(80, 24, 1);
+        assert!(runtime
+            .io
+            .try_send_with_receipt(Bytes::from_static(b"untracked"), false, None)
+            .unwrap()
+            .is_none());
+        assert!(
+            matches!(runtime.try_send_flock_authored_tracked(Bytes::from_static(b"full"), std::time::Instant::now() + std::time::Duration::from_secs(30)),
+            Err(mpsc::error::TrySendError::Full(bytes)) if bytes == Bytes::from_static(b"full"))
+        );
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            Bytes::from_static(b"untracked")
+        );
+        let before = std::time::Instant::now();
+        let receipt = runtime
+            .try_send_flock_authored_tracked(
+                Bytes::from_static(b"paste"),
+                std::time::Instant::now() + std::time::Duration::from_secs(30),
+            )
+            .unwrap()
+            .expect("test channel must return a tracked write receipt");
+        let completed = receipt
+            .try_completed()
+            .expect("successful synchronous write completes");
+        assert!(before <= completed && completed <= std::time::Instant::now());
+        assert_eq!(receiver.try_recv().unwrap(), Bytes::from_static(b"paste"));
+        drop(receiver);
+        assert!(
+            matches!(runtime.try_send_flock_authored_tracked(Bytes::from_static(b"closed"), std::time::Instant::now() + std::time::Duration::from_secs(30)),
+            Err(mpsc::error::TrySendError::Closed(bytes)) if bytes == Bytes::from_static(b"closed"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn held_input_replay_lands_on_a_healthy_writer() {
+        let (handle, mut peer) = PtyIoActorHandle::test_spawn_on_socket_pair();
+        let runtime = PaneRuntime::test_with_actor(handle.clone());
+        let now = std::time::Instant::now();
+        assert!(runtime.begin_injection_lease("t", now + std::time::Duration::from_secs(10), now));
+        runtime
+            .try_send_bytes(Bytes::from_static(b"held"))
+            .expect("held while leased");
+
+        assert!(runtime.end_injection_lease("t"));
+
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .expect("peer timeout");
+        let mut buf = [0u8; 4];
+        std::io::Read::read_exact(&mut peer, &mut buf).expect("held input replayed");
+        assert_eq!(&buf, b"held");
+        handle.shutdown();
+    }
+
+    /// Held keys `ab` wait in the backlog behind a full one-slot channel, and
+    /// only then does the writer break (#1011 review, round 2).
+    #[cfg(unix)]
+    fn runtime_with_backlog_then_broken_writer(
+    ) -> (PaneRuntime, PtyIoActorHandle, Box<dyn std::any::Any>) {
+        let (handle, guard) = PtyIoActorHandle::test_unserviced(1);
+        let runtime = PaneRuntime::test_with_actor(handle.clone());
+        let now = std::time::Instant::now();
+        assert!(runtime.begin_injection_lease("t", now + std::time::Duration::from_secs(10), now));
+        runtime
+            .try_send_bytes(Bytes::from_static(b"ab"))
+            .expect("held while leased");
+        runtime
+            .try_send_flock_authored(Bytes::from_static(b"fill"))
+            .expect("the one slot");
+        assert!(
+            runtime.end_injection_lease("t"),
+            "a full channel keeps the replay for later"
+        );
+        assert!(runtime.has_held_backlog());
+        handle.test_mark_writer_broken();
+        (runtime, handle, guard)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn input_behind_a_backlog_a_broken_writer_refuses_is_an_error() {
+        let (runtime, _handle, _guard) = runtime_with_backlog_then_broken_writer();
+
+        match runtime.try_send_bytes(Bytes::from_static(b"c")) {
+            Err(mpsc::error::TrySendError::Closed(refused)) => {
+                assert_eq!(refused, Bytes::from_static(b"abc"), "backlog and new bytes");
+            }
+            other => panic!("refused input must be an error, got {other:?}"),
+        }
+        assert!(!runtime.has_held_backlog());
+
+        let (runtime, _handle, _guard) = runtime_with_backlog_then_broken_writer();
+        let err = runtime
+            .send_bytes(Bytes::from_static(b"c"))
+            .await
+            .expect_err("the async path reports it too");
+        assert_eq!(err.0, Bytes::from_static(b"abc"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn draining_a_backlog_a_broken_writer_refuses_reports_the_loss() {
+        let (runtime, _handle, _guard) = runtime_with_backlog_then_broken_writer();
+
+        let drain = runtime.drain_held_input();
+
+        assert_eq!(
+            drain,
+            HeldInputDrain {
+                still_waiting: false,
+                refused_bytes: 2,
+            }
+        );
+    }
+
+    /// #1011 review: held keystrokes replayed into a broken writer (#850) are
+    /// reported as not written, never queued and silently dropped.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn held_input_replay_reports_a_broken_writer() {
+        let (handle, mut peer) = PtyIoActorHandle::test_spawn_on_socket_pair();
+        let runtime = PaneRuntime::test_with_actor(handle.clone());
+        let now = std::time::Instant::now();
+        assert!(runtime.begin_injection_lease("t", now + std::time::Duration::from_secs(10), now));
+        runtime
+            .try_send_bytes(Bytes::from_static(b"held"))
+            .expect("held while leased");
+        handle.test_mark_writer_broken();
+
+        assert!(
+            !runtime.end_injection_lease("t"),
+            "a replay into a broken writer reports failure"
+        );
+        assert!(
+            runtime.try_send_bytes(Bytes::from_static(b"x")).is_err(),
+            "direct input to a broken writer is an error too"
+        );
+        peer.set_read_timeout(Some(std::time::Duration::from_millis(150)))
+            .expect("peer timeout");
+        let mut buf = [0u8; 1];
+        assert!(
+            std::io::Read::read(&mut peer, &mut buf).is_err(),
+            "nothing reached the pane"
+        );
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn every_input_write_marks_root_shell_touched() {
+        for path in 0..3 {
+            let (runtime, mut receiver) =
+                PaneRuntime::test_with_channel_and_scrollback_bytes(80, 24, 1024, b"", 4);
+            assert!(!runtime.has_received_input());
+            let bytes = Bytes::from_static(b"x");
+            match path {
+                0 => runtime.send_bytes(bytes).await.unwrap(),
+                1 => runtime.try_send_bytes(bytes).unwrap(),
+                _ => runtime.try_send_flock_authored(bytes).unwrap(),
+            }
+            assert!(runtime.has_received_input());
+            assert_eq!(receiver.recv().await.unwrap(), Bytes::from_static(b"x"));
+            assert!(runtime.has_received_input());
+        }
+    }
 
     #[test]
     fn shutdown_liveness_treats_reaped_direct_child_as_gone() {
@@ -2582,12 +3332,16 @@ mod tests {
             },
             current_size: Cell::new((80, 24, 0, 0)),
             child_pid: Arc::new(AtomicU32::new(0)),
+            child_birth: None,
             child_exit: None,
             kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
             detect_reset_notify: Arc::new(Notify::new()),
             pending_release: Arc::new(Mutex::new(None)),
             preserve_processes_on_drop: true,
             operator_input: OperatorInputClock::default(),
+            has_been_typed_into: Cell::new(true),
+            injection_lease: Default::default(),
+            spawned_with_default_shell: false,
             detect_handle: tokio::spawn(async {}).abort_handle(),
         };
 
@@ -2611,12 +3365,16 @@ mod tests {
             },
             current_size: Cell::new((80, 24, 0, 0)),
             child_pid: Arc::new(AtomicU32::new(0)),
+            child_birth: None,
             child_exit: None,
             kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
             detect_reset_notify: Arc::new(Notify::new()),
             pending_release: Arc::new(Mutex::new(None)),
             preserve_processes_on_drop: true,
             operator_input: OperatorInputClock::default(),
+            has_been_typed_into: Cell::new(true),
+            injection_lease: Default::default(),
+            spawned_with_default_shell: false,
             detect_handle: tokio::spawn(async {}).abort_handle(),
         };
 
@@ -2661,6 +3419,61 @@ mod tests {
         let content = "/ T R A N S C R I P T /\n\n› yeah go ahead\n────────────────────────────────────────────────────────────────────────────────── 100% ─\n ↑/↓ to scroll   pgup/pgdn to page   home/end to jump\n q to quit   esc to edit prev";
 
         assert!(detection_update_for_publish(Some(Agent::Codex), content, true).is_none());
+    }
+
+    /// The server's own grid decides, with no client attached (#1264): a
+    /// 52x15 pane, the size an 80x24 client leaves behind on detach, holding
+    /// a real Claude frame whose activity label wraps, reads working, and the
+    /// turn ending on that same grid still reads idle.
+    #[tokio::test]
+    async fn a_wrapped_claude_spinner_on_a_headless_narrow_pane_reads_working() {
+        let frame =
+            include_str!("../tests/fixtures/claude-wrapped-spinner-1264/label-beside-glyph.txt")
+                .replace('\n', "\r\n");
+        let runtime = PaneRuntime::test_with_scrollback_bytes(52, 15, 1 << 20, frame.as_bytes());
+
+        let working =
+            detection_update_for_publish(Some(Agent::Claude), &runtime.detection_text(), false)
+                .expect("a painted frame publishes");
+        assert_eq!(working.state, AgentState::Working);
+        assert!(working.visible_working);
+        assert!(!working.visible_idle);
+
+        let rule = "\u{2500}".repeat(52);
+        runtime.test_process_pty_bytes(
+            format!(
+                "\x1b[2J\x1b[H\u{273b} Crunched for 3m 5s\r\n\r\n{rule}\r\n\u{276f} \r\n{rule}\r\n"
+            )
+            .as_bytes(),
+        );
+        let idle =
+            detection_update_for_publish(Some(Agent::Claude), &runtime.detection_text(), false)
+                .expect("a painted frame publishes");
+        assert_eq!(idle.state, AgentState::Idle);
+        assert!(idle.visible_idle);
+    }
+
+    #[test]
+    fn blank_startup_screen_does_not_publish_idle() {
+        for agent in [Agent::OpenCode, Agent::Codex, Agent::Pi] {
+            assert!(detection_update_for_publish(Some(agent), " \n", false).is_none());
+        }
+        assert_eq!(
+            detection_update_for_publish(Some(Agent::OpenCode), "opencode ready >", false)
+                .expect("painted prompt")
+                .state,
+            AgentState::Idle
+        );
+    }
+
+    #[test]
+    fn process_exit_with_a_blank_screen_still_reports_idle() {
+        assert_eq!(
+            detection_update_for_publish(Some(Agent::OpenCode), "", true)
+                .expect("process exit")
+                .state,
+            AgentState::Idle
+        );
     }
 
     #[test]
@@ -3167,9 +3980,14 @@ mod tests {
             Some(Agent::Pi),
             AgentState::Idle,
             None,
+            None,
             false,
             false,
             false,
+            false,
+            None,
+            None,
+            None,
             false,
             std::time::Instant::now(),
         );
@@ -3207,12 +4025,200 @@ mod tests {
                 agent: Some(Agent::Pi),
                 state: AgentState::Idle,
                 activity: None,
+                provider_limit: None,
                 visible_blocker: false,
                 visible_idle: false,
                 visible_working: false,
+                settled_with_background_shells: false,
+                background_tasks: None,
+                needs_human: None,
+                question: None,
                 process_exited: false,
                 observed_at: _,
             } if delivered_pane == pane_id
         ));
+    }
+    #[tokio::test]
+    async fn tracked_lease_deadline_removes_input_before_release() {
+        let (handle, mut peer) = PtyIoActorHandle::test_spawn_on_socket_pair();
+        let runtime = PaneRuntime::test_with_actor(handle);
+        let now = std::time::Instant::now();
+        let deadline = now + std::time::Duration::from_millis(200);
+        assert!(runtime.begin_injection_lease(
+            "ticket",
+            now + std::time::Duration::from_secs(30),
+            now
+        ));
+        let receipt = runtime.try_send_tracked(Bytes::from_static(b"expired"), deadline, false);
+        assert_eq!(
+            receipt.progress().failure,
+            None,
+            "admitted before its deadline"
+        );
+        // Expire the original request on the real clock while its lease stays held.
+        // This bounded receive covers that boundary without a product clock hook.
+        let (keep_alive, never_ready) = std::sync::mpsc::channel::<()>();
+        assert_eq!(
+            never_ready.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        );
+        drop(keep_alive);
+        runtime
+            .try_send_bytes(Bytes::from_static(b"after"))
+            .unwrap();
+        assert!(runtime.end_injection_lease("ticket"));
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(3)))
+            .unwrap();
+        let mut observed = [0; 5];
+        std::io::Read::read_exact(&mut peer, &mut observed).unwrap();
+        assert_eq!(&observed, b"after");
+        assert_eq!(receipt.progress().bytes_written, 0);
+        assert_eq!(
+            receipt.progress().failure,
+            Some(crate::pty::write_receipt::WriteFailure::Deadline)
+        );
+        assert!(receipt.progress().remainder_discarded);
+    }
+
+    #[tokio::test]
+    async fn tracked_backlog_preserves_ticket_counts_fifo_and_cancellation() {
+        let (runtime, mut receiver) = PaneRuntime::test_with_channel_capacity(80, 24, 1);
+        runtime.try_send_bytes(Bytes::from_static(b"fill")).unwrap();
+        let now = std::time::Instant::now();
+        let until = now + std::time::Duration::from_secs(30);
+        assert!(runtime.begin_injection_lease("ticket", until, now));
+        let cancelled = runtime.try_send_tracked(Bytes::from_static(b"cancelled"), until, false);
+        let first = runtime.try_send_tracked(Bytes::from_static(b"first"), until, false);
+        let second = runtime.try_send_tracked(Bytes::from_static(b"second"), until, false);
+        assert!(runtime.end_injection_lease("ticket"));
+        assert!(runtime.has_held_backlog());
+        assert_eq!(
+            cancelled.cancel(),
+            crate::pty::write_receipt::WriteDisposition::Cancelled
+        );
+        assert_eq!(receiver.try_recv().unwrap().as_ref(), b"fill");
+        let drain = runtime.drain_held_input();
+        assert_eq!(drain.refused_bytes, 0);
+        assert_eq!(receiver.try_recv().unwrap().as_ref(), b"first");
+        assert!(first.try_completed().is_ok());
+        assert_eq!(
+            (first.progress().bytes_written, first.progress().bytes_total),
+            (5, 5)
+        );
+        assert_eq!(second.progress().bytes_written, 0);
+        let drain = runtime.drain_held_input();
+        assert_eq!(drain.refused_bytes, 0);
+        assert_eq!(receiver.try_recv().unwrap().as_ref(), b"second");
+        assert!(second.try_completed().is_ok());
+        assert_eq!(
+            (
+                second.progress().bytes_written,
+                second.progress().bytes_total
+            ),
+            (6, 6)
+        );
+        assert_eq!(cancelled.progress().bytes_written, 0);
+        assert!(!runtime.has_held_backlog());
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn ownership_transition_cancels_held_and_backlogged_tickets() {
+        for backlogged in [false, true] {
+            let (runtime, mut receiver) = PaneRuntime::test_with_channel_capacity(80, 24, 1);
+            runtime.try_send_bytes(Bytes::from_static(b"fill")).unwrap();
+            let now = std::time::Instant::now();
+            let until = now + std::time::Duration::from_secs(30);
+            assert!(runtime.begin_injection_lease("ticket", until, now));
+            let receipt = runtime.try_send_tracked(Bytes::from_static(b"retired"), until, false);
+            runtime
+                .try_send_bytes(Bytes::from_static(b"operator"))
+                .unwrap();
+            if backlogged {
+                assert!(runtime.end_injection_lease("ticket"));
+            }
+            runtime.end_all_injection_leases();
+            assert_eq!(receipt.progress().bytes_written, 0);
+            assert_eq!(
+                receipt.progress().failure,
+                Some(crate::pty::write_receipt::WriteFailure::OwnerChanged)
+            );
+            assert!(receipt.progress().remainder_discarded);
+            assert_eq!(receiver.try_recv().unwrap().as_ref(), b"fill");
+            let drain = runtime.drain_held_input();
+            assert_eq!(drain.refused_bytes, 0);
+            assert!(!drain.still_waiting);
+            assert_eq!(receiver.try_recv().unwrap().as_ref(), b"operator");
+            assert!(receiver.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_retires_a_held_ticket_without_replaying_its_payload() {
+        let (runtime, mut receiver) = PaneRuntime::test_with_channel_capacity(80, 24, 1);
+        let now = std::time::Instant::now();
+        let until = now + std::time::Duration::from_secs(30);
+        assert!(runtime.begin_injection_lease("ticket", until, now));
+        let receipt = runtime.try_send_tracked(Bytes::from_static(b"retired"), until, false);
+        drop(runtime);
+        assert_eq!(receipt.progress().bytes_written, 0);
+        assert_eq!(
+            receipt.progress().failure,
+            Some(crate::pty::write_receipt::WriteFailure::PaneGone)
+        );
+        assert!(receipt.progress().remainder_discarded);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn tracked_runtime_partial_cancel_retains_native_prefix_evidence() {
+        let (handle, mut peer) = PtyIoActorHandle::test_spawn_on_socket_pair();
+        let runtime = PaneRuntime::test_with_actor(handle);
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(3)))
+            .unwrap();
+        let receipt = runtime.try_send_tracked(
+            Bytes::from(vec![b'p'; 16 * 1024 * 1024]),
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+            false,
+        );
+        let mut first = [0; 1];
+        std::io::Read::read_exact(&mut peer, &mut first).unwrap();
+        assert_eq!(first, [b'p']);
+        assert_eq!(
+            receipt.cancel(),
+            crate::pty::write_receipt::WriteDisposition::Partial
+        );
+        let count = receipt.progress().bytes_written;
+        assert!(count > 0 && count < receipt.progress().bytes_total);
+        runtime
+            .try_send_bytes(Bytes::from_static(b"after"))
+            .unwrap();
+        let mut rest = vec![0; count - 1 + 5];
+        std::io::Read::read_exact(&mut peer, &mut rest).unwrap();
+        assert!(rest[..count - 1].iter().all(|byte| *byte == b'p'));
+        assert_eq!(&rest[count - 1..], b"after");
+        assert_eq!(receipt.progress().bytes_written, count);
+        assert!(receipt.progress().remainder_discarded);
+    }
+    #[tokio::test]
+    async fn s3a_closed_actor_retires_every_held_ticket_as_pane_gone() {
+        use crate::pty::write_receipt::WriteFailure;
+        let (handle, guard) = PtyIoActorHandle::test_unserviced(1);
+        let runtime = PaneRuntime::test_with_actor(handle);
+        let now = std::time::Instant::now();
+        let until = now + std::time::Duration::from_secs(30);
+        assert!(runtime.begin_injection_lease("ticket", until, now));
+        runtime
+            .try_send_bytes(Bytes::from_static(b"operator"))
+            .unwrap();
+        let first = runtime.try_send_tracked(Bytes::from_static(b"first"), until, false);
+        let second = runtime.try_send_tracked(Bytes::from_static(b"second"), until, false);
+        drop(guard);
+        assert!(!runtime.end_injection_lease("ticket"));
+        for receipt in [first, second] {
+            assert_eq!(receipt.progress().failure, Some(WriteFailure::PaneGone));
+            assert_eq!(receipt.progress().bytes_written, 0);
+            assert!(receipt.progress().remainder_discarded);
+        }
     }
 }

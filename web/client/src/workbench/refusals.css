@@ -1,0 +1,43 @@
+/* The Details disclosure behind plain-language refusals (#2902). Tokens only; layout comes from the primitives. */
+
+.details {
+  color: var(--color-label-secondary);
+  font-size: var(--font-size-12);
+}
+
+.details__toggle {
+  min-block-size: var(--size-control);
+  min-inline-size: var(--size-control);
+  border-radius: var(--radius-small);
+  color: var(--color-link);
+  cursor: pointer;
+}
+
+.details__body {
+  padding-block: var(--space-1);
+}
+
+.details__code {
+  font-family: var(--font-family-mono);
+}
+
+.empty-state {
+  padding-block: var(--space-4);
+  color: var(--color-label-secondary);
+}
+
+.empty-state__title {
+  color: var(--color-label-primary);
+  font-weight: var(--font-weight-semibold);
+}
+
+.empty-state__retry {
+  min-block-size: var(--size-control);
+  padding-inline: var(--space-3);
+  border: var(--border-width-thin) solid var(--color-separator);
+  border-radius: var(--radius-small);
+  background: var(--color-background-window);
+  color: var(--color-label-primary);
+  font: inherit;
+  cursor: pointer;
+}

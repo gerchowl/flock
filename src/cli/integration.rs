@@ -12,6 +12,7 @@ pub(super) fn run_integration_command(args: &[String]) -> std::io::Result<i32> {
     };
 
     match subcommand {
+        "sync" => integration_sync(&args[1..]),
         "install" => integration_install(&args[1..]),
         "uninstall" => integration_uninstall(&args[1..]),
         "status" => integration_status(&args[1..]),
@@ -66,6 +67,42 @@ fn integration_verify(args: &[String]) -> std::io::Result<i32> {
     }
 }
 
+fn integration_sync(args: &[String]) -> std::io::Result<i32> {
+    if args.iter().any(|arg| arg != "--dry-run" && arg != "--json")
+        || args
+            .iter()
+            .filter(|arg| arg.as_str() == "--dry-run")
+            .count()
+            > 1
+        || args.iter().filter(|arg| arg.as_str() == "--json").count() > 1
+    {
+        eprintln!("usage: flk integration sync [--dry-run] [--json]");
+        return Ok(2);
+    }
+    let dry_run = args.iter().any(|arg| arg == "--dry-run");
+    let json = super::output::json();
+    let report = crate::integration::sync::run(dry_run);
+    let failed = report.outcomes.iter().any(|outcome| outcome.failed);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(i32::from(failed));
+    }
+    if let Some(path) = &report.launch_path {
+        println!("MCP launch path: {}", path.display());
+    } else if let Some(error) = &report.launch_error {
+        println!("MCP launch path: unavailable ({error})");
+    }
+    for outcome in report.outcomes {
+        println!("{}", outcome.message);
+    }
+    if let Err(err) = super::status::run_status_command(&[]) {
+        eprintln!("server drift: unknown ({err}); check `flk status`");
+    }
+    println!("Running agents need `flk agent restart` or an MCP reconnect to pick up changes.");
+    println!("Check `flk status` for server drift; use `flk server live-handoff` if needed. Sync never hands off or stops sessions.");
+    Ok(i32::from(failed))
+}
+
 fn integration_status(args: &[String]) -> std::io::Result<i32> {
     let outdated_only = match args {
         [] => false,
@@ -77,8 +114,15 @@ fn integration_status(args: &[String]) -> std::io::Result<i32> {
     };
 
     if outdated_only {
+        for notice in crate::integration::pinned_path_notices() {
+            eprintln!("  ! {notice}");
+        }
         crate::integration::print_outdated_update_notice();
         return Ok(0);
+    }
+
+    for notice in crate::integration::pinned_path_notices() {
+        println!("  ! {notice}");
     }
 
     for status in crate::integration::installed_integration_statuses() {
@@ -107,6 +151,10 @@ fn integration_status(args: &[String]) -> std::io::Result<i32> {
             status.state,
             crate::integration::IntegrationStatusKind::NotInstalled
         ) {
+            // ADR-0034 §4: a question entry that fails open says so.
+            for note in crate::integration::question_hook_notes(status.target) {
+                println!("  ! {note}");
+            }
             if let Some(details) = crate::integration::settings_drift_details(status.target) {
                 for detail in details {
                     println!("  ! {detail}");
@@ -120,7 +168,7 @@ fn integration_status(args: &[String]) -> std::io::Result<i32> {
 }
 
 fn integration_manifest(args: &[String]) -> std::io::Result<i32> {
-    let json = args.iter().any(|arg| arg == "--json");
+    let json = super::output::json();
     let rest: Vec<String> = args
         .iter()
         .filter(|arg| arg.as_str() != "--json")
@@ -177,11 +225,25 @@ fn print_integration_manifest_summary(manifest: &serde_json::Value) {
 }
 
 fn integration_install(args: &[String]) -> std::io::Result<i32> {
-    let Some(target) = parse_integration_target(args, "install")? else {
+    let trust_hooks = !args.iter().any(|arg| arg == "--no-trust-hooks");
+    let rest: Vec<String> = args
+        .iter()
+        .filter(|arg| arg.as_str() != "--no-trust-hooks")
+        .cloned()
+        .collect();
+    let Some(target) = parse_integration_target(&rest, "install")? else {
         return Ok(2);
     };
 
-    match crate::integration::install_target(target) {
+    if !trust_hooks && target != IntegrationTarget::Codex {
+        eprintln!("--no-trust-hooks is only supported for codex");
+        return Ok(2);
+    }
+    match crate::integration::install_target_with_hook_trust(
+        target,
+        trust_hooks,
+        crate::integration::ClaudeQuestionHook::detect,
+    ) {
         Ok(messages) => {
             print_integration_messages(messages);
             Ok(0)
@@ -260,7 +322,7 @@ fn print_integration_help() {
     eprintln!("  flk integration install pi");
     eprintln!("  flk integration install omp");
     eprintln!("  flk integration install claude");
-    eprintln!("  flk integration install codex");
+    eprintln!("  flk integration install codex [--no-trust-hooks]");
     eprintln!("  flk integration install copilot");
     eprintln!("  flk integration install kimi");
     eprintln!("  flk integration install opencode");
@@ -275,7 +337,19 @@ fn print_integration_help() {
     eprintln!("  flk integration uninstall opencode");
     eprintln!("  flk integration uninstall hermes");
     eprintln!("  flk integration uninstall qodercli");
+    eprintln!("  flk integration sync [--dry-run] [--json]");
     eprintln!("  flk integration status [--outdated-only]");
     eprintln!("  flk integration manifest <target> [--json]");
     eprintln!("  flk integration verify");
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn hook_trust_opt_out_is_rejected_for_other_integrations() {
+        assert_eq!(
+            super::integration_install(&["claude".into(), "--no-trust-hooks".into()]).unwrap(),
+            2
+        );
+    }
 }

@@ -10,7 +10,6 @@
 mod support;
 
 use std::fs;
-use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -28,40 +27,6 @@ use support::{
 /// ServerMessage bincode variant indices (declaration order in wire.rs).
 const VARIANT_FRAME: u32 = 1;
 const VARIANT_SWITCH_SERVER: u32 = 9;
-
-/// The origin host label the binary pins at slot 0, computed the same way as
-/// `app::api::peers::short_host_name` (macOS `scutil` LocalHostName, else the
-/// `hostname` base). Keeps the home-row assertion portable across dev machines
-/// and CI runners — it was previously hardcoded to one machine's own hostname.
-fn local_short_host() -> String {
-    if let Ok(name) = std::env::var("FLOCK_HOST_NAME") {
-        let name = name.trim();
-        if !name.is_empty() {
-            return name.to_string();
-        }
-    }
-    #[cfg(target_os = "macos")]
-    {
-        if let Ok(out) = std::process::Command::new("/usr/sbin/scutil")
-            .args(["--get", "LocalHostName"])
-            .output()
-        {
-            if out.status.success() {
-                let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if !name.is_empty() {
-                    return name;
-                }
-            }
-        }
-    }
-    std::process::Command::new("hostname")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|h| h.trim().split('.').next().unwrap_or("").to_string())
-        .filter(|h| !h.is_empty())
-        .unwrap_or_else(|| "unknown".to_string())
-}
 
 fn unique_test_dir() -> PathBuf {
     let nanos = SystemTime::now()
@@ -81,6 +46,7 @@ struct SpawnedFlock {
 
 impl Drop for SpawnedFlock {
     fn drop(&mut self) {
+        let _timing = support::timing::phase(support::timing::Phase::Teardown);
         let pid = self.child.process_id();
         let _ = self.child.kill();
         if let Some(pid) = pid {
@@ -128,19 +94,12 @@ fn create_workspace(api_socket: &Path, cwd: &Path) {
 /// correctly refuses it with `pane_not_found` — so the id has to come from the
 /// API rather than be composed.
 fn create_workspace_reporting_pane(api_socket: &Path, cwd: &Path) -> String {
-    let mut stream = UnixStream::connect(api_socket).expect("API socket should connect");
     let request = format!(
         "{{\"id\":\"test:ws\",\"method\":\"workspace.create\",\"params\":{{\"cwd\":\"{}\",\"focus\":true}}}}\n",
         cwd.display()
     );
-    stream.write_all(request.as_bytes()).unwrap();
-    stream.flush().unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .unwrap();
-    let mut reader = std::io::BufReader::new(stream);
-    let mut response = String::new();
-    std::io::BufRead::read_line(&mut reader, &mut response).unwrap();
+    let response = support::json_api::request(api_socket, &request, Duration::from_secs(10))
+        .expect("API exchange should complete");
     assert!(
         response.contains("\"result\""),
         "workspace.create failed: {response}"
@@ -158,8 +117,9 @@ fn create_workspace_reporting_pane(api_socket: &Path, cwd: &Path) -> String {
 }
 
 fn write_config(config_home: &Path, contents: &str) {
-    // Debug builds read the flock-dev app dir; release builds read flock.
-    for app_dir in ["flock", "flock-dev"] {
+    // Seed only the namespace used by the compiled CLI.
+    {
+        let app_dir = support::paths::app_dir_name();
         let dir = config_home.join(app_dir);
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("config.toml"), contents).unwrap();
@@ -174,6 +134,7 @@ fn spawn_server(
     cwd: &Path,
     extra_path: Option<&Path>,
 ) -> SpawnedFlock {
+    let _timing = support::timing::phase(support::timing::Phase::Spawn);
     fs::create_dir_all(runtime_dir).unwrap();
     register_runtime_dir(runtime_dir);
 
@@ -189,8 +150,13 @@ fn spawn_server(
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flk"));
     cmd.arg("server");
     cmd.cwd(cwd);
-    cmd.env("XDG_CONFIG_HOME", config_home);
-    cmd.env("XDG_RUNTIME_DIR", runtime_dir);
+    // Each simulated node owns its identity and pins, like the shared fleet fixture.
+    cmd.env("XDG_DATA_HOME", config_home.join("data"));
+    cmd.env("XDG_CACHE_HOME", config_home.join("cache"));
+    cmd.env("FLOCK_TEST_RELAY_ANCESTOR", "flk");
+    for (key, value) in support::environment::isolated_env(config_home, runtime_dir) {
+        cmd.env(key, value);
+    }
     cmd.env("FLOCK_SOCKET_PATH", api_socket_path);
     cmd.env_remove("FLOCK_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", "/bin/sh");
@@ -201,7 +167,8 @@ fn spawn_server(
         cmd.env("PATH", format!("{}:{}", extra.display(), path));
     }
 
-    let child = pair.slave.spawn_command(cmd).unwrap();
+    support::environment::assert_pty_isolated(&cmd);
+    let child = support::environment::spawn_pty(pair.slave.as_ref(), cmd).unwrap();
     register_spawned_flock_pid(child.process_id());
     drop(pair.slave);
 
@@ -642,7 +609,12 @@ fn switch_snapshot_renders_home_row_on_spoke_and_home_switches_back() {
     let config_home_b = base.join("config-b");
     let runtime_b = base.join("runtime-b");
     let socket_b = base.join("flock-b.sock");
-    write_config(&config_home_b, "onboarding = false\n");
+    // Reserve room for the unverified badge and the complete project label.
+    // This probe checks Home routing; narrow badge layout has unit coverage.
+    write_config(
+        &config_home_b,
+        "onboarding = false\n\n[ui]\nsidebar_width = 64\n",
+    );
     let server_b = spawn_server(&config_home_b, &runtime_b, &socket_b, &repo_b, None);
     wait_for_socket(&socket_b, Duration::from_secs(10));
     create_workspace(&socket_b, &repo_b);
@@ -672,7 +644,7 @@ fn switch_snapshot_renders_home_row_on_spoke_and_home_switches_back() {
     let socket_a = base.join("flock-a.sock");
     write_config(
         &config_home_a,
-        "onboarding = false\n\n[[peers]]\nname = \"peerb\"\n\n[[peers]]\nname = \"ghost\"\n",
+        "onboarding = false\n\n[ui]\nsidebar_width = 64\n\n[[peers]]\nname = \"peerb\"\n\n[[peers]]\nname = \"ghost\"\n",
     );
     let server_a = spawn_server(
         &config_home_a,
@@ -693,7 +665,7 @@ fn switch_snapshot_renders_home_row_on_spoke_and_home_switches_back() {
     // below the fold and only a scrollbar shows. Taller frame keeps the
     // whole list on screen; the folding itself is covered by unit tests.
     let mut stream = UnixStream::connect(&client_socket_a).expect("client socket should connect");
-    let (_, error) = client_handshake(&mut stream, support::PROTOCOL_VERSION, 90, 45)
+    let (_, error) = client_handshake(&mut stream, support::PROTOCOL_VERSION, 120, 45)
         .expect("handshake should complete");
     assert!(error.is_none(), "handshake rejected: {error:?}");
     // Owner/repo identity on the remote-only project leader (#62/#27).
@@ -733,24 +705,24 @@ fn switch_snapshot_renders_home_row_on_spoke_and_home_switches_back() {
     let mut stream_b =
         UnixStream::connect(&client_socket_b).expect("spoke client socket should connect");
     let fleet_only = strip_focus_suffix(&fleet_bytes);
-    let (_, error) =
-        client_handshake_with_fleet(&mut stream_b, support::PROTOCOL_VERSION, 90, 45, fleet_only)
-            .expect("spoke handshake should complete");
+    let (_, error) = client_handshake_with_fleet(
+        &mut stream_b,
+        support::PROTOCOL_VERSION,
+        120,
+        45,
+        fleet_only,
+    )
+    .expect("spoke handshake should complete");
     assert!(error.is_none(), "spoke handshake rejected: {error:?}");
 
-    // The spoke renders the carried fleet in one frame: the pinned home
-    // row plus the carried (render-only) ghost row. Post-#84 the home row
-    // carries no arrow or suffix -- its pinned slot-0 position is the label,
-    // so the FIRST band row naming the origin is home.
+    // Carried names are unverified and may be escaped or truncated. Select
+    // the reserved Home affordance, never infer the endpoint from a name.
     let rows = wait_for_frame_matching(&mut stream_b, &["ghost"], Duration::from_secs(30))
         .expect("snapshot peer should render on the spoke");
-    let host = local_short_host();
     let home_row = rows
         .iter()
-        // The row leads with the fixed 2-cell server-icon slot (#164, blank
-        // here — no icon configured), so match the host after trimming it.
-        .position(|row| row.trim_start().starts_with(host.as_str()))
-        .expect("home (origin) row present in slot 0");
+        .position(|row| row.contains('\u{f02dc}'))
+        .expect("home (origin) row carries its Home affordance");
 
     // --- #66: the hub's OWN workspace (alpha) folds into the spoke's spaces
     // list as a remote-only project row. Clicking it lands HOME (the spoke
@@ -889,7 +861,6 @@ fn the_agent_field_reaches_a_real_frame_in_both_sections_and_all_three_modes() {
 /// Tell a sandboxed server that `pane_id` is running `agent`, through the same
 /// socket verb a hook integration uses.
 fn report_agent(api_socket: &Path, pane_id: &str, agent: &str) {
-    let mut stream = UnixStream::connect(api_socket).expect("API socket should connect");
     // The source is DELIBERATELY not `flock:claude`. That spelling is a RESERVED
     // native source — `is_reserved_native_state_source` matches it — and a
     // report under a reserved source is routed to the session-reference store,
@@ -901,14 +872,8 @@ fn report_agent(api_socket: &Path, pane_id: &str, agent: &str) {
          \"pane_id\":\"{pane_id}\",\"source\":\"test:agent-field\",\"agent\":\"{agent}\",\
          \"state\":\"working\"}}}}\n"
     );
-    stream.write_all(request.as_bytes()).unwrap();
-    stream.flush().unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .unwrap();
-    let mut reader = std::io::BufReader::new(stream);
-    let mut response = String::new();
-    std::io::BufRead::read_line(&mut reader, &mut response).unwrap();
+    let response = support::json_api::request(api_socket, &request, Duration::from_secs(10))
+        .expect("API exchange should complete");
     assert!(
         response.contains("\"result\""),
         "pane.report_agent failed: {response}"

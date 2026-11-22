@@ -1,0 +1,4 @@
+[test]
+# Unit and DOM tests; the browser tests in e2e/ run from just client-check.
+root = "./tests"
+preload = ["./tests/setup.ts"]

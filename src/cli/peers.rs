@@ -17,6 +17,7 @@ pub(super) fn run_peers_command(args: &[String]) -> std::io::Result<i32> {
 
     match subcommand {
         "status" => peers_status(&args[1..]),
+        "enroll" => peers_enroll(&args[1..]),
         "summary" => peers_summary(&args[1..]),
         "checkout-prepare" => peers_checkout_prepare(&args[1..]),
         "logs" => peers_logs(&args[1..]),
@@ -30,6 +31,122 @@ pub(super) fn run_peers_command(args: &[String]) -> std::io::Result<i32> {
             Ok(2)
         }
     }
+}
+
+fn peers_enroll(args: &[String]) -> std::io::Result<i32> {
+    use crate::mesh::store::PinSource;
+    let (peer, source) = match args
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
+        ["--reset", peer] => ((*peer).to_owned(), PinSource::Configured),
+        ["--reset", peer, "--direction", "configured"] => {
+            ((*peer).to_owned(), PinSource::Configured)
+        }
+        ["--reset", peer, "--direction", "inbound"] => ((*peer).to_owned(), PinSource::Inbound),
+        _ => {
+            eprintln!("usage: flk peers enroll --reset <peer> [--direction configured|inbound]");
+            return Ok(2);
+        }
+    };
+    let mut params = crate::api::schema::PeersEnrollResetParams {
+        peer,
+        source,
+        preview: true,
+        expected_node_id: None,
+    };
+    let preview = super::send_request(&Request {
+        id: "cli:peers:enroll:preview".into(),
+        method: Method::PeersEnrollReset(params.clone()),
+    })?;
+    if preview.get("error").is_some() {
+        return super::print_response(&preview);
+    }
+    let result = preview
+        .get("result")
+        .ok_or_else(|| std::io::Error::other("missing reset preview"))?;
+    params.expected_node_id = result["node_id"].as_str().map(str::to_owned);
+    eprintln!(
+        "clearing {} pin for {}: node {}",
+        source.as_str(),
+        printable(&params.peer),
+        params.expected_node_id.as_deref().unwrap_or("none")
+    );
+    params.preview = false;
+    super::print_response(&super::send_request(&Request {
+        id: "cli:peers:enroll".into(),
+        method: Method::PeersEnrollReset(params),
+    })?)
+}
+
+pub(super) const ENROLLMENT_UNKNOWN: &str =
+    "enrollment: unknown (server predates mesh; restart needed)";
+
+pub(super) fn read_enrollment() -> (Vec<crate::mesh::hello::Enrollment>, Option<String>) {
+    let response = super::send_request(&Request {
+        id: "cli:peers:enrollment".into(),
+        method: Method::PeersEnrollment(EmptyParams {}),
+    })
+    .ok()
+    .filter(|response| response.get("error").is_none());
+    if let Some(response) = response {
+        if let Ok(peers) = serde_json::from_value(response["result"]["peers"].clone()) {
+            let mut warning = response["result"]["mesh_suspended_reason"]
+                .as_str()
+                .map(|reason| {
+                    if reason == crate::mesh::runtime_store::RECOVERING_REASON {
+                        format!("mesh: {reason}")
+                    } else {
+                        format!("mesh: suspended: {} (retrying recovery)", printable(reason))
+                    }
+                });
+            if let Some(count) = response["result"]["mesh_quarantined"]
+                .as_u64()
+                .filter(|n| *n > 0)
+            {
+                let quarantine = format!("mesh quarantined: {count}");
+                warning = Some(match warning {
+                    Some(reason) => format!("{reason}; {quarantine}"),
+                    None => quarantine,
+                });
+            }
+            return (peers, warning);
+        }
+    }
+    (Vec::new(), Some(ENROLLMENT_UNKNOWN.into()))
+}
+
+pub(super) fn enrollment_line(status: &crate::mesh::hello::Enrollment) -> String {
+    let node = status
+        .node_id
+        .as_deref()
+        .unwrap_or("unknown")
+        .chars()
+        .take(12)
+        .collect::<String>();
+    let mut line = format!(
+        "{} ({})  node {}  {}",
+        printable(&status.peer),
+        status.source.as_str(),
+        printable(&node),
+        printable(&status.state)
+    );
+    if status.node_id.is_some() {
+        line.push_str(match status.pin_origin {
+            crate::mesh::store::PinOrigin::InboundFirstContact => " (first contact inbound)",
+            crate::mesh::store::PinOrigin::Dialed => " (dialed)",
+            crate::mesh::store::PinOrigin::Unknown => " (pin origin unknown)",
+        });
+    }
+    if let Some(version) = status.negotiated {
+        line.push_str(&format!("  mesh {version}"));
+    }
+    if let Some(reason) = &status.reason {
+        line.push_str(&format!(": {}", printable(reason)));
+    }
+    line
 }
 
 /// Default and max tail size for `peers logs`. The cap bounds the over-SSH wire
@@ -73,7 +190,7 @@ struct LogsArgs {
 /// so the flag handling is testable without touching logs or ssh.
 fn parse_logs_args(args: &[String]) -> Result<LogsArgs, String> {
     let mut parsed = LogsArgs {
-        json: false,
+        json: super::output::json(),
         all: false,
         lines: DEFAULT_LOG_LINES,
     };
@@ -206,7 +323,7 @@ fn peers_summary(args: &[String]) -> std::io::Result<i32> {
 /// the classified reason, for how long, and whether a relay stream is held
 /// (#418). Read from `peers.summary`, the same report a hub serves the fleet.
 fn peers_status(args: &[String]) -> std::io::Result<i32> {
-    let mut json = false;
+    let mut json = super::output::json();
     for arg in args {
         match arg.as_str() {
             "--json" => json = true,
@@ -229,19 +346,66 @@ fn peers_status(args: &[String]) -> std::io::Result<i32> {
         .cloned()
         .and_then(|rows| serde_json::from_value(rows).ok())
         .unwrap_or_default();
+    let (enrollment, warning) = read_enrollment();
     if json {
-        println!(
-            "{}",
-            serde_json::to_string(&rows).unwrap_or_else(|_| "[]".into())
-        );
+        let route_response = super::send_request(&Request {
+            id: "cli:peers:routes".into(),
+            method: Method::PeersEnrollment(EmptyParams {}),
+        })?;
+        let routes = route_response["result"]["routes"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let mut values: Vec<serde_json::Value> = rows
+            .iter()
+            .map(serde_json::to_value)
+            .collect::<Result<_, _>>()
+            .map_err(std::io::Error::other)?;
+        for status in &enrollment {
+            let index = values.iter().position(|v| {
+                v["name"].as_str() == Some(&status.peer)
+                    && status.source == crate::mesh::store::PinSource::Configured
+            });
+            let row = if let Some(index) = index {
+                &mut values[index]
+            } else {
+                values.push(serde_json::json!({"name": status.peer}));
+                values
+                    .last_mut()
+                    .ok_or_else(|| std::io::Error::other("missing peer row"))?
+            };
+            row["routes"] = serde_json::json!(routes
+                .iter()
+                .filter(|route| route["next_hop"].as_str() == status.node_id.as_deref())
+                .collect::<Vec<_>>());
+            row["source"] = serde_json::json!(status.source);
+            row["pin_origin"] = serde_json::json!(status.pin_origin);
+            row["node_id"] = serde_json::json!(status.node_id);
+            row["negotiated"] = serde_json::json!(status.negotiated);
+            row["enrollment"] = serde_json::json!(status.state);
+            row["enrollment_reason"] = serde_json::json!(status.reason);
+        }
+        if let Some(warning) = warning {
+            eprintln!("{warning}");
+            for row in &mut values {
+                row["enrollment"] = serde_json::json!("unknown");
+                row["enrollment_reason"] = serde_json::json!(warning);
+            }
+        }
+        println!("{}", serde_json::to_string(&values)?);
         return Ok(0);
     }
-    if rows.is_empty() {
+    if let Some(warning) = warning {
+        println!("{warning}");
+    }
+    if rows.is_empty() && enrollment.is_empty() {
         println!("no peers configured");
-        return Ok(0);
     }
     for line in status_table(&rows) {
         println!("{line}");
+    }
+    for status in &enrollment {
+        println!("{}", enrollment_line(status));
     }
     Ok(0)
 }
@@ -385,10 +549,11 @@ fn peers_relay(args: &[String]) -> std::io::Result<i32> {
     crate::logging::peer_relay_started(pushing);
     if pushing {
         start_summary_push(socket.clone());
-        start_uplink_pull(socket.clone());
+        start_mesh_wake_push(socket.clone());
     }
     let stdin = std::io::stdin();
     let mut line = String::new();
+    let mut checked_server = None;
     loop {
         line.clear();
         if stdin.lock().read_line(&mut line)? == 0 {
@@ -400,7 +565,7 @@ fn peers_relay(args: &[String]) -> std::io::Result<i32> {
         }
         // A closed stdout means the hub hung up. That is the ordinary way
         // this process ends, not a failure worth a message nobody can read.
-        match relay_one_request(&socket, request) {
+        match relay_one_request(&socket, request, &mut checked_server) {
             Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => return Ok(0),
             other => other?,
         }
@@ -417,6 +582,28 @@ fn relay_refusal(request: &str) -> Option<(String, &'static str, String)> {
         .unwrap_or_default()
         .to_string();
     let method = parsed.get("method").and_then(|method| method.as_str())?;
+    if matches!(method, "agent.rename" | "agent.start" | "agent.spawn")
+        && parsed
+            .get("params")
+            .and_then(|p| p.get("name"))
+            .and_then(|n| n.as_str())
+            .is_some_and(|name| crate::terminal::agent_name::validate(name).is_err())
+    {
+        return Some((
+            id,
+            "invalid_agent_name",
+            crate::terminal::agent_name::POLICY.into(),
+        ));
+    }
+    if matches!(method, "agent.start" | "agent.spawn")
+        && parsed.pointer("/params/runtime").and_then(|v| v.as_str()) == Some("structured")
+    {
+        return Some((
+            id,
+            "operator_only",
+            "structured starts require local caller attribution".into(),
+        ));
+    }
     STREAMING_METHODS.contains(&method).then(|| {
         (
             id,
@@ -459,7 +646,7 @@ fn start_summary_push(socket: std::path::PathBuf) {
             "params": { "subscriptions": PUSH_SUBSCRIPTIONS
                 .iter()
                 .map(|kind| serde_json::json!({ "type": kind }))
-                .collect::<Vec<_>>() },
+                .collect::<Vec<_>>(), "after": REPLAY_FROM },
         });
         if writeln!(stream, "{subscribe}").is_err() {
             return;
@@ -495,15 +682,35 @@ fn start_summary_push(socket: std::path::PathBuf) {
         // has expired with an event still owed.
         let debounce = PushDebounce::default();
         let reader_debounce = debounce.clone();
+        let route_wake = PushDebounce::default();
+        let reader_route_wake = route_wake.clone();
         std::thread::spawn(move || {
-            for _ in reader.lines().map_while(Result::ok) {
-                reader_debounce.note_event();
+            for line in reader.lines().map_while(Result::ok) {
+                if serde_json::from_str::<serde_json::Value>(&line)
+                    .is_ok_and(|event| event["event"] == "mesh_routes_changed")
+                {
+                    reader_route_wake.note_event();
+                } else {
+                    reader_debounce.note_event();
+                }
             }
             reader_debounce.note_closed();
+            reader_route_wake.note_closed();
         });
 
         loop {
             std::thread::sleep(SUMMARY_PUSH_DEBOUNCE);
+            if route_wake.take_due().is_some() {
+                let stdout = std::io::stdout();
+                let mut out = stdout.lock();
+                if out
+                    .write_all(b"{\"push\":\"mesh.routes_changed\"}\n")
+                    .is_err()
+                    || out.flush().is_err()
+                {
+                    return;
+                }
+            }
             let Some(coalesced) = debounce.take_due() else {
                 if debounce.is_finished() {
                     return;
@@ -537,7 +744,8 @@ fn start_summary_push(socket: std::path::PathBuf) {
             let push = serde_json::json!({ "push": "peers.summary", "result": result });
             let stdout = std::io::stdout();
             let mut out = stdout.lock();
-            if writeln!(out, "{push}").is_err() || out.flush().is_err() {
+            let line = format!("{push}\n");
+            if out.write_all(line.as_bytes()).is_err() || out.flush().is_err() {
                 return;
             }
             drop(out);
@@ -546,137 +754,105 @@ fn start_summary_push(socket: std::path::PathBuf) {
     });
 }
 
-/// Carry messages this node hands UP to the hub that holds this relay (#410).
-///
-/// A spoke has no `[[peers]]`, so this relay — the hub's ssh edge into it — is
-/// the only way a message for another host can leave. The pull long-polls the
-/// local server's `msg.uplink_take`: the server parks the request until a
-/// frame is due or its heartbeat window passes, so an idle node costs one
-/// request per window and a message leaves the moment it is sent. The asking
-/// is also how the server knows a hub is attached at all.
-///
-/// Its own thread and its own push kind, separate from the summary pusher:
-/// a message must never wait behind the summary debounce, and must never be
-/// coalesced away the way a superseded summary safely is (pitfall 4). Frames
-/// are acknowledged on the NEXT take, only after they are written, so a relay
-/// that dies mid-write leaves them to be re-offered rather than lost.
-fn start_uplink_pull(socket: std::path::PathBuf) {
+/// Wake failures are confined to this worker, never the request relay.
+fn start_mesh_wake_push(socket: std::path::PathBuf) {
     std::thread::spawn(move || {
-        let mut ack: Vec<String> = Vec::new();
-        if !attach_relay(&socket) {
-            return;
-        }
-        loop {
-            let request = serde_json::json!({
-                "id": "relay-uplink",
-                "method": "msg.uplink_take",
-                "params": { "ack": ack },
-            });
-            let line = match relay_local_request(&socket, &request) {
-                Ok(line) => line,
-                // No server right now (restarting, not yet up): ask again
-                // later, keeping the acks owed.
-                Err(_) => {
-                    std::thread::sleep(UPLINK_RETRY);
-                    continue;
-                }
-            };
-            let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
-                std::thread::sleep(UPLINK_RETRY);
-                continue;
-            };
-            if let Some(error) = value.get("error") {
-                // The binding was lost — the server restarted, say. Bind
-                // again rather than give up on a node that is still here.
-                if error.get("code").and_then(|code| code.as_str()) == Some("not_the_relay") {
-                    if !attach_relay(&socket) {
-                        return;
-                    }
-                    continue;
-                }
-                // Anything else is an older build without the method. It will
-                // say no forever, so stop and say so once.
-                crate::logging::uplink_pull_stopped(&error.to_string());
-                return;
-            }
-            ack.clear();
-            let frames = value
-                .get("result")
-                .and_then(|result| result.get("frames"))
-                .and_then(|frames| frames.as_array())
-                .cloned()
-                .unwrap_or_default();
-            for frame in frames {
-                let Some(uplink_id) = frame
-                    .get("uplink_id")
-                    .and_then(|id| id.as_str())
-                    .map(str::to_string)
-                else {
-                    continue;
-                };
-                let push = serde_json::json!({
-                    "push": crate::peer_stream::UPLINK_PUSH,
-                    "frame": frame,
-                });
-                let stdout = std::io::stdout();
-                let mut out = stdout.lock();
-                // The hub hung up: this relay is ending, and the frame stays
-                // unacked for the next one to carry.
-                if writeln!(out, "{push}").is_err() || out.flush().is_err() {
-                    return;
-                }
-                ack.push(uplink_id);
-            }
-        }
+        retry_mesh_wake_push(&socket, || {
+            let stdout = std::io::stdout();
+            let mut out = stdout.lock();
+            out.write_all(b"{\"push\":\"mesh.wake\"}\n")?;
+            out.flush()
+        });
     });
 }
 
-/// Bind this relay to the local server's uplink (`peers.relay_attach`), so the
-/// relay methods it and the hub use are accepted from this process and no
-/// other. Retried while an older relay that is still alive holds the binding
-/// — the hub's previous connection winding down — or while no server is up.
-/// `false` when the server refuses for good: a build that predates binding.
-fn attach_relay(socket: &std::path::Path) -> bool {
-    let request = serde_json::json!({
-        "id": "relay-attach",
-        "method": "peers.relay_attach",
-        "params": {},
-    });
-    let mut blocked_attempts: u64 = 0;
-    loop {
-        let Ok(line) = relay_local_request(socket, &request) else {
-            std::thread::sleep(UPLINK_RETRY);
-            continue;
-        };
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
-            std::thread::sleep(UPLINK_RETRY);
-            continue;
-        };
-        let Some(error) = value.get("error") else {
-            return true;
-        };
-        if error.get("code").and_then(|code| code.as_str()) == Some("relay_already_attached") {
-            // Never silently: another process holding the binding for long is
-            // either the hub's previous connection failing to die or a
-            // squatter, and either wants an operator's eyes. Logged on
-            // attempts 1, 2, 4, 8, … so a long hold stays a few lines.
-            blocked_attempts += 1;
-            if blocked_attempts.is_power_of_two() {
-                crate::logging::relay_attach_blocked(&error.to_string(), blocked_attempts);
-            }
-            std::thread::sleep(UPLINK_RETRY);
-            continue;
-        }
-        crate::logging::uplink_pull_stopped(&error.to_string());
-        return false;
+#[derive(Default)]
+struct WakeRetry {
+    outage: bool,
+    seconds: u64,
+}
+
+impl WakeRetry {
+    fn connected(&mut self) {
+        *self = Self::default();
+    }
+
+    fn failed(&mut self) -> (bool, std::time::Duration) {
+        let log = !self.outage;
+        self.outage = true;
+        self.seconds = self.seconds.saturating_mul(2).clamp(1, 30);
+        (log, std::time::Duration::from_secs(self.seconds))
     }
 }
 
-/// How long the uplink pull waits before asking a local server that did not
-/// answer. Not configurable, for the reason `SUMMARY_PUSH_DEBOUNCE` is not: it
-/// only paces retries against a server that is not there, and the server's own
-/// heartbeat (`[msg] uplink_heartbeat_secs`) is what decides liveness.
-const UPLINK_RETRY: std::time::Duration = std::time::Duration::from_secs(2);
+fn retry_mesh_wake_push(socket: &std::path::Path, mut emit: impl FnMut() -> std::io::Result<()>) {
+    let mut retry = WakeRetry::default();
+    loop {
+        let mut output_failed = false;
+        let error = match mesh_wake_push(socket, || retry.connected(), &mut || {
+            let result = emit();
+            output_failed = result.is_err();
+            result
+        }) {
+            Ok(()) => return,
+            Err(error) => error,
+        };
+        let (log, delay) = retry.failed();
+        if log {
+            crate::logging::peer_mesh_wake_failed("subscription", &error.to_string());
+        }
+        if output_failed {
+            return;
+        }
+        std::thread::sleep(delay);
+    }
+}
+
+fn mesh_wake_push(
+    socket: &std::path::Path,
+    connected: impl FnOnce(),
+    emit: &mut impl FnMut() -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let mut stream = std::os::unix::net::UnixStream::connect(socket)?;
+    writeln!(
+        stream,
+        "{}",
+        serde_json::json!({
+            "id":"relay-wake", "method":"events.subscribe",
+            "params":{"subscriptions":[{"type":"mesh.outbound_pending"}], "after": REPLAY_FROM}
+        })
+    )?;
+    let mut reader = std::io::BufReader::new(stream);
+    let mut ack = String::new();
+    if reader.read_line(&mut ack)? == 0 || ack.contains("\"error\"") {
+        return Err(std::io::Error::other(format!(
+            "mesh wake subscription refused: {ack}"
+        )));
+    }
+    connected();
+    let debounce = PushDebounce::default();
+    let events = debounce.clone();
+    std::thread::spawn(move || {
+        for line in reader.lines() {
+            match line {
+                Ok(_) => events.note_event(),
+                Err(_) => break,
+            }
+        }
+        events.note_closed();
+    });
+    loop {
+        std::thread::sleep(SUMMARY_PUSH_DEBOUNCE);
+        if debounce.take_due().is_some() {
+            emit()?;
+        } else if debounce.is_finished() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "mesh wake subscription closed",
+            ));
+        }
+    }
+}
 
 /// One request to this node's own socket, answered by one line.
 fn relay_local_request(
@@ -769,7 +945,17 @@ const SUMMARY_PUSH_DEBOUNCE: std::time::Duration = std::time::Duration::from_sec
 /// `events.subscribe` invalid — the server rejects it, this thread exits, and
 /// pushes silently never arrive, indistinguishable from a quiet node. That is
 /// only caught at runtime, against a live server.
-const PUSH_SUBSCRIPTIONS: [&str; 7] = [
+/// Where the mesh push and wake subscriptions start (#1030). A subscription
+/// now starts at now by default, but these must see what happened while
+/// they were down: mail queued during a 1-30 s resubscribe backoff, and the
+/// change that should make the first push on connect. Stream lines carry no
+/// `seq` to resume from, so they replay what the server still holds, as every
+/// subscription did before; past its retention they get a loss notice (`events_lost` on a capable server), which
+/// wakes them the same way.
+const REPLAY_FROM: u64 = 0;
+
+const PUSH_SUBSCRIPTIONS: [&str; 8] = [
+    "mesh.routes_changed",
     "workspace.created",
     "workspace.updated",
     "workspace.closed",
@@ -788,7 +974,11 @@ const PUSH_SUBSCRIPTIONS: [&str; 7] = [
 /// this seam.
 const STREAMING_METHODS: [&str; 2] = ["events.subscribe", "pane.wait_for_output"];
 
-fn relay_one_request(socket: &std::path::Path, request: &str) -> std::io::Result<()> {
+fn relay_one_request(
+    socket: &std::path::Path,
+    request: &str,
+    checked_server: &mut Option<(u32, u64)>,
+) -> std::io::Result<()> {
     if let Some((id, code, message)) = relay_refusal(request) {
         return write_relay_error(&id, code, &message);
     }
@@ -814,6 +1004,20 @@ fn relay_one_request(socket: &std::path::Path, request: &str) -> std::io::Result
             );
         }
     };
+    let server = crate::api::socket_peer_pid(&stream)
+        .and_then(|pid| crate::platform::process_start_time(pid).map(|started| (pid, started)));
+    let parsed = serde_json::from_str::<serde_json::Value>(request).ok();
+    if parsed.as_ref().and_then(|v| v["method"].as_str()) == Some("mesh.hello") {
+        *checked_server = None;
+    } else if server.is_none() || *checked_server != server {
+        let check = serde_json::json!({"id":"relay-check", "method":"mesh.hello", "params":{"phase":"check"}});
+        let answer: serde_json::Value = serde_json::from_str(&relay_local_request(socket, &check)?)
+            .map_err(std::io::Error::other)?;
+        if answer.get("result").is_none() || answer.get("error").is_some() {
+            return write_relay_error(&id, "mesh_not_enrolled", &answer.to_string());
+        }
+        *checked_server = server;
+    }
     stream.write_all(request.as_bytes())?;
     stream.write_all(b"\n")?;
     stream.flush()?;
@@ -849,6 +1053,7 @@ fn write_relay_error(id: &str, code: &str, message: &str) -> std::io::Result<()>
 fn print_peers_help() {
     eprintln!("usage: flk peers [status] [--json]");
     eprintln!("       flk peers summary [--json]");
+    eprintln!("       flk peers enroll --reset <peer> [--direction configured|inbound]  (local operator only)");
     eprintln!("       flk peers checkout-prepare --workspace <id> [--push] [--json]");
     eprintln!("       flk peers logs [--all] [--lines N] [--json]");
     eprintln!(
@@ -860,12 +1065,111 @@ fn print_peers_help() {
 mod tests {
     use super::PushDebounce;
 
+    #[test]
+    fn security_agent_name_relay_refuses_before_forwarding() {
+        let mut failures = Vec::new();
+        for method in ["agent.rename", "agent.start", "agent.spawn"] {
+            for (case, name) in crate::test_support::hostile_agent_names() {
+                let request = serde_json::json!({"id":"name-relay","method":method,"params":{"target":"agent-fixture","name":name}}).to_string();
+                if relay_refusal(&request).map(|(_, code, _)| code) != Some("invalid_agent_name") {
+                    failures.push((method, case));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "forwarded hostile names: {failures:?}");
+    }
+
+    #[test]
+    fn wake_subscription_retry_is_bounded_and_logs_once_per_outage() {
+        let mut retry = super::WakeRetry::default();
+        for (index, seconds) in [1, 2, 4, 8, 16, 30, 30].into_iter().enumerate() {
+            let (log, delay) = retry.failed();
+            assert_eq!(log, index == 0);
+            assert_eq!(delay.as_secs(), seconds);
+        }
+        retry.connected();
+        assert_eq!(retry.failed(), (true, std::time::Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn wake_worker_resubscribes_after_local_subscription_drops() {
+        use std::io::{BufRead, Write};
+        let socket = std::env::temp_dir().join(format!("wake-{}.sock", std::process::id()));
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut line = String::new();
+                std::io::BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut line)
+                    .unwrap();
+                assert!(line.contains("mesh.outbound_pending"));
+                // #1030: it replays what it missed while it was down.
+                let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(request["params"]["after"], 0, "{line}");
+                writeln!(stream, "{{\"result\":{{}}}}").unwrap();
+                writeln!(stream, "{{\"event\":\"mesh_outbound_pending\"}}").unwrap();
+            }
+        });
+        let mut wakes = 0;
+        super::retry_mesh_wake_push(&socket, || {
+            wakes += 1;
+            if wakes == 2 {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "test consumer closed",
+                ))
+            } else {
+                Ok(())
+            }
+        });
+        server.join().unwrap();
+        std::fs::remove_file(socket).unwrap();
+        assert_eq!(wakes, 2);
+    }
+
+    #[test]
+    fn wake_debounce_coalesces_a_burst_and_ships_the_last() {
+        let wake = PushDebounce::default();
+        let summary = PushDebounce::default();
+        for _ in 0..100 {
+            wake.note_event();
+        }
+        assert_eq!(wake.take_due(), Some(99));
+        assert_eq!(summary.take_due(), None);
+        assert_eq!(wake.take_due(), None);
+        wake.note_event();
+        wake.note_closed();
+        assert_eq!(wake.take_due(), Some(0));
+        assert_eq!(wake.take_due(), None);
+        assert!(wake.is_finished());
+    }
+
+    #[test]
+    fn enrollment_origin_labels_and_older_server_default() {
+        use crate::mesh::store::PinOrigin;
+        let mut status: crate::mesh::hello::Enrollment = serde_json::from_value(
+            serde_json::json!({"peer":"peer.example", "node_id":"abc", "state":"pinned", "reason":null})
+        ).unwrap();
+        assert_eq!(status.pin_origin, PinOrigin::Unknown);
+        for (origin, label) in [
+            (PinOrigin::Unknown, "pin origin unknown"),
+            (PinOrigin::Dialed, "dialed"),
+            (PinOrigin::InboundFirstContact, "first contact inbound"),
+        ] {
+            status.pin_origin = origin;
+            assert!(super::enrollment_line(&status).ends_with(&format!("pinned ({label})")));
+        }
+    }
+
     /// #418 review: `error` is ssh's last stderr line from another host, and
     /// a shell rc on the far side can print escape sequences into it. The
     /// status view must never hand them to the operator's terminal.
     #[test]
     fn peer_status_strips_control_sequences_from_remote_text() {
         let row = crate::api::schema::RelayedFleetPeer {
+            structured_agents: Vec::new(),
+            node_id: None,
             dial: Some(crate::api::schema::PeerDialReport {
                 reason: Some("auth_refused".into()),
                 consecutive_failures: 3,
@@ -896,6 +1200,8 @@ mod tests {
 
     fn status_row(name: &str, error: Option<&str>) -> crate::api::schema::RelayedFleetPeer {
         crate::api::schema::RelayedFleetPeer {
+            structured_agents: Vec::new(),
+            node_id: None,
             dial: None,
             name: name.into(),
             ssh_target: "atlas".into(),
@@ -1094,5 +1400,18 @@ mod tests {
         assert!(parse_logs_args(&args(&["--lines"])).is_err());
         assert!(parse_logs_args(&args(&["--lines", "abc"])).is_err());
         assert!(parse_logs_args(&args(&["--bogus"])).is_err());
+    }
+}
+
+#[cfg(test)]
+mod structured_relay_tests {
+    #[test]
+    fn structured_start_and_spawn_cannot_cross_a_mesh_relay() {
+        for method in ["agent.start", "agent.spawn"] {
+            let request = serde_json::json!({"id":"resume", "method":method, "params":{"runtime":"structured", "name":"existing"}}).to_string();
+            let (_, code, _) =
+                super::relay_refusal(&request).expect("structured relay must refuse");
+            assert_eq!(code, "operator_only");
+        }
     }
 }

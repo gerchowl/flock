@@ -1,0 +1,420 @@
+#!/usr/bin/env python3
+"""Local ssh transport for fleet.rs, including directed partitions and faults.
+
+Fault modes alter handshake traffic or attempt an enrollment reset. Requests,
+summary pushes and custody collections traverse the real relay and enrollment gate.
+"""
+import json
+import os
+import signal
+from pathlib import Path
+import subprocess
+import sys
+import threading
+import time
+
+base = Path(__file__).resolve().parent.parent
+manifest = json.loads((base / "nodes.json").read_text())
+target, command = sys.argv[-2:]
+source = os.environ.get("FLOCK_FLEET_SOURCE", "probe")
+node = manifest["nodes"].get(target)
+if node is None:
+    sys.exit(255)
+if (base / f"refuse-ssh-{target}").exists() or (
+    base / f"refuse-edge-{source}-{target}"
+).exists():
+    sys.stderr.write(f"ssh: connect to host {target} port 22: Connection refused\n")
+    sys.exit(255)
+
+# Gate only message sends on this directed edge. Discovery and held relays
+# remain live, so a test can distinguish a blocked app loop from a slow hop.
+gate = base / f"gate-message-{source}-{target}"
+if "msg send" in command and gate.is_dir():
+    (gate / "entered").touch()
+    deadline = time.monotonic() + 30
+    while not (gate / "release").exists():
+        if not gate.is_dir() or time.monotonic() >= deadline:
+            sys.stderr.write("fake-ssh: message gate was not released before its deadline\n")
+            sys.exit(255)
+        time.sleep(0.01)
+
+# A topology cannot always start every pollee before its poller. Keep the
+# initial relay from reporting no_local_server and entering enrollment backoff
+# while the harness is still starting that target. Readiness markers survive
+# restarts, so this does not hide later outages or alter partition fault modes.
+ready = base / f"ready-{target}"
+if "peers relay" in command and not ready.exists():
+    (base / f"startup-wait-{source}-{target}").touch()
+    deadline = time.monotonic() + 10
+    while not ready.exists():
+        if time.monotonic() >= deadline:
+            sys.stderr.write(f"fake-ssh: initial server readiness timed out for {target}\n")
+            sys.exit(255)
+        time.sleep(0.01)
+
+# Start empty and admit only the process basics, then set sandbox paths.
+env = {
+    key: value for key, value in os.environ.items()
+    if key in {"PATH", "TMPDIR", "USER", "LANG", "CARGO_HOME", "RUSTUP_HOME"} or key.startswith("LC_")
+}
+env.update(
+    HOME=node["home"],
+    XDG_CONFIG_HOME=node["config"],
+    XDG_RUNTIME_DIR=node["runtime"],
+    XDG_DATA_HOME=str(Path(node["home"]) / "data"),
+    XDG_STATE_HOME=str(Path(node["home"]) / "state"),
+    XDG_CACHE_HOME=str(Path(node["home"]) / "cache"),
+    FLOCK_SOCKET_PATH=node["socket"],
+    FLOCK_FLEET_SOURCE=target,
+    PATH=manifest["bin"] + os.pathsep + os.environ["PATH"],
+)
+# A flk older than `peers relay` prints its peers usage and exits before any
+# request is read, as v0.11.0 does for an unknown peers subcommand.
+if "peers relay" in command and node["mesh"] == "pre_relay":
+    with (base / f"enrollment-attempts-{source}-{target}").open("a") as log:
+        log.write(str(time.monotonic()) + "\n")
+    sys.stdout.write("usage: flk peers [status] [--json]\n       flk peers summary [--json]\n")
+    sys.exit(0)
+if "peers relay" not in command:
+    if "msg send" in command:
+        (base / f"legacy-message-{source}-{target}").touch()
+    os.execve("/bin/sh", ["sh", "-c", command], env)
+
+# Killing this group closes both halves of the held edge, without touching
+# another node or any of the user's processes. The Rust owner checks argv
+# against this fixture's unique script path before using the pid file.
+os.setsid()
+pid_file = base / "edges" / f"{source}-{target}-{os.getpid()}"
+env["FLOCK_FLEET_EDGE"] = str(pid_file)
+child = subprocess.Popen(
+    ["/bin/sh", "-c", command], env=env, stdin=subprocess.PIPE,
+    stdout=subprocess.PIPE, text=True, bufsize=1, start_new_session=True,
+)
+# The shim must survive TERM long enough to reap its child. The relay gets
+# its own group so shells and their grandchildren are covered as well.
+def stop_edge(signum, frame):
+    raise SystemExit(128 + signum)
+
+
+signal.signal(signal.SIGTERM, stop_edge)
+lock = threading.Lock()
+deliveries = set()
+collections = set()
+outbound_collections = set()
+summary_probes = set()
+
+
+def emit(line):
+    with lock:
+        sys.stdout.write(line)
+        sys.stdout.flush()
+
+
+def wake_on_poll_release(gate):
+    deadline = time.monotonic() + 30
+    while True:
+        if not gate.is_dir():
+            reason = "poll gate removed before release"
+        elif child.poll() is not None:
+            reason = "relay exited before poll release"
+        elif (gate / "release").exists():
+            emit(json.dumps({"push": "mesh.wake"}) + "\n")
+            return
+        elif time.monotonic() >= deadline:
+            reason = "poll gate was not released at the 30 s ceiling"
+        else:
+            time.sleep(0.01)
+            continue
+        try:
+            sys.stderr.write(f"fake-ssh: {reason}\n")
+            sys.stderr.flush()
+            if gate.is_dir():
+                pending = gate / "failed.pending"
+                pending.write_text(reason)
+                pending.replace(gate / "failed")
+        finally:
+            # Interrupt the main loop even if writing the diagnostic fails.
+            # Its finally block owns reaping the relay and its descendants.
+            os.kill(os.getpid(), signal.SIGTERM)
+        return
+
+
+def forward_input():
+    try:
+        for line in sys.stdin:
+            try:
+                request = json.loads(line)
+            except ValueError:
+                request = None
+            if not isinstance(request, dict):
+                sys.stderr.write("fake-ssh: non-object JSON request forwarded unchanged\n")
+                sys.stderr.flush()
+                child.stdin.write(line)
+                child.stdin.flush()
+                continue
+            method = request.get("method", "")
+            mode = "disabled" if (base / f"old-peer-{target}").exists() else node["mesh"]
+            if method == "mesh.hello":
+                with (base / f"enrollment-attempts-{source}-{target}").open("a") as log:
+                    log.write(str(time.monotonic()) + "\n")
+            if method == "peers.summary" and (base / f"observe-summary-{source}-{target}").exists():
+                summary_probes.add(request.get("id"))
+            if method == "mesh.routes" and (base / "withhold-route-adverts").exists():
+                emit(json.dumps({"id": request["id"], "error": {
+                    "code": "routes_unavailable", "message": "route exchange withheld by fixture",
+                }}) + "\n")
+                continue
+            if method == "mesh.collect":
+                outbound = "outbound" in request.get("params", {})
+                kind = "outbound" if outbound else "collect"
+                if outbound:
+                    outbound_collections.add(request.get("id"))
+                    if request.get("params", {}).get("outbound", {}).get("receipts"):
+                        with (base / f"receipt-polls-{source}-{target}").open("a") as log:
+                            log.write(str(time.monotonic()) + "\n")
+                    with (base / f"outbound-polls-{source}-{target}").open("a") as log:
+                        log.write(str(time.monotonic()) + "\n")
+                    lose_ack = base / f"lose-outbound-ack-{source}-{target}"
+                    if lose_ack.exists() and request.get("params", {}).get("outbound", {}).get("ack"):
+                        lose_ack.rename(base / f"lost-outbound-ack-{source}-{target}")
+                        outbound_collections.discard(request.get("id"))
+                        emit(json.dumps({"id": request["id"], "result": {"answers": []}}) + "\n")
+                        continue
+                else:
+                    collections.add(request.get("id"))
+                hold = base / f"hold-{kind}-{source}-{target}"
+                if hold.is_dir():
+                    (hold / "entered").touch()
+                    deadline = time.monotonic() + 30
+                    while hold.is_dir() and not (hold / "release").exists():
+                        if time.monotonic() >= deadline:
+                            break
+                        time.sleep(0.01)
+                gate = base / f"gate-outbound-poll-{source}-{target}"
+                if outbound and gate.is_dir():
+                    if not (gate / "release").exists():
+                        # Inhibit leases without occupying the serialized stream,
+                        # so explicit topology withdrawals can still propagate.
+                        if not (gate / "entered").exists():
+                            (gate / "entered").touch()
+                            threading.Thread(target=wake_on_poll_release, args=(gate,), daemon=True).start()
+                        outbound_collections.discard(request.get("id"))
+                        emit(json.dumps({"id": request["id"], "result": {"answers": []}}) + "\n")
+                        continue
+                    (gate / "passed").touch()
+                replay = base / f"replay-{kind}-{source}-{target}"
+                if replay.exists():
+                    request["params"] = json.loads(replay.read_text())
+                    line = json.dumps(request) + "\n"
+                gate = base / f"gate-{kind}-ack-{source}-{target}"
+                if gate.is_dir() and request.get("params", {}).get("outbound", request.get("params", {})).get("ack"):
+                    (gate / "entered").touch()
+                    deadline = time.monotonic() + 30
+                    while not (gate / "release").exists() and gate.is_dir():
+                        if time.monotonic() >= deadline:
+                            break
+                        time.sleep(0.01)
+            if method == "mesh.deliver":
+                with (base / f"delivery-attempts-{source}-{target}").open("a") as log:
+                    log.write(request["params"]["envelope"]["correlation_id"] + "\n")
+                if (base / f"transient-delivery-{source}-{target}").exists():
+                    emit(json.dumps({"id": request["id"], "error": {
+                        "code": "mesh_delivery_refused", "message": "fleet_paused",
+                    }}) + "\n")
+                    continue
+                deliveries.add(request.get("id"))
+                tamper = base / f"tamper-delivery-{source}-{target}"
+                if tamper.exists():
+                    field = tamper.read_text().strip()
+                    params = request["params"]
+                    envelope = params["envelope"]
+                    if field == "origin":
+                        envelope["key"]["origin_node"] = "0" * 64
+                    elif field == "visited":
+                        params["visited"][-1] = envelope["key"]["origin_node"]
+                    elif field == "body":
+                        payload = json.loads(bytes(envelope["body"]))
+                        payload["message"]["body"] = "wire forgery"
+                        envelope["body"] = list(json.dumps(payload).encode())
+                    elif field == "signature":
+                        envelope["signature"] = [0] * 64
+                    elif field == "token":
+                        envelope["return_binding"]["collection_token"][0] ^= 1
+                    else:
+                        raise ValueError(f"unknown delivery tamper: {field}")
+                    line = json.dumps(request) + "\n"
+                    (base / f"tampered-delivery-{source}-{target}").write_text(line)
+                if (base / f"spoof-host-{source}-{target}").exists():
+                    envelope = request["params"]["envelope"]
+                    payload = json.loads(bytes(envelope["body"]))
+                    payload["message"]["from_host"] = "spoofed.example"
+                    envelope["body"] = list(json.dumps(payload).encode())
+                    line = json.dumps(request) + "\n"
+                capture = base / f"capture-delivery-{source}-{target}"
+                if capture.exists():
+                    capture.write_text(json.dumps(request["params"]))
+                    emit(json.dumps({"id": request.get("id"), "error": {
+                        "code": "held_by_test", "message": "captured before receiver import",
+                    }}) + "\n")
+                    continue
+                replay = base / f"replay-delivery-{source}-{target}"
+                if replay.exists():
+                    params = json.loads(replay.read_text())
+                    params["forwarded_by"] = request["params"]["envelope"]["key"]["origin_node"]
+                    request["params"] = params
+                    line = json.dumps(request) + "\n"
+                attack = base / f"forge-origin-{source}-{target}"
+                if attack.exists():
+                    params = request["params"]
+                    envelope = params["envelope"]
+                    params["forwarded_by"] = envelope["key"]["origin_node"]
+                    envelope["key"]["origin_node"] = "disallowed.example"
+                    envelope["return_binding"]["request"] = dict(envelope["key"])
+                    line = json.dumps(request) + "\n"
+                gate = base / f"gate-message-{source}-{target}"
+                if gate.is_dir():
+                    (gate / "entered").touch()
+                    deadline = time.monotonic() + 30
+                    while not (gate / "release").exists():
+                        if not gate.is_dir() or time.monotonic() >= deadline:
+                            break
+                        time.sleep(0.01)
+            if isinstance(method, str) and method.startswith("mesh.") and mode == "disabled":
+                # v0.11.0's exact reply: its server cannot parse the request, so the id is lost.
+                emit(json.dumps({"id": "", "error": {
+                    "code": "invalid_request",
+                    "message": f"invalid request: unknown variant `{method}`, expected one of `ping`, `server.stop`",
+                }}) + "\n")
+            else:
+                if mode == "forged_signature" and method == "mesh.hello" and request.get("params", {}).get("phase") == "finish":
+                    request["params"]["signature"] = [0] * 64
+                    line = json.dumps(request) + "\n"
+                if mode == "legacy_dialer" and method == "mesh.hello":
+                    request["method"] = "ping"
+                    request["params"] = {}
+                    line = json.dumps(request) + "\n"
+                if mode == "relay_reset" and method == "peers.summary":
+                    request["method"] = "peers.enroll_reset"
+                    request["params"] = {"peer": source, "source": "inbound"}
+                    line = json.dumps(request) + "\n"
+                child.stdin.write(line)
+                child.stdin.flush()
+    except (BrokenPipeError, ValueError):
+        pass
+    finally:
+        child.stdin.close()
+
+
+try:
+    # Publish only after the group and relay exist. Atomic rename avoids a
+    # partially written pid being mistaken for a stale record by the owner.
+    pending = pid_file.with_suffix(".pending")
+    pending.write_text(json.dumps({"shim": os.getpid(), "relay": child.pid}))
+    pending.replace(pid_file)
+    threading.Thread(target=forward_input, daemon=True).start()
+    for line in child.stdout:
+        response = json.loads(line)
+        if node["mesh"] == "forged_challenge":
+            challenge = response.get("result", {}).get("challenge")
+            if challenge:
+                challenge["signature"] = [0] * 64
+                line = json.dumps(response) + "\n"
+        if node["mesh"] == "relay_reset" and response.get("error", {}).get("code") == "operator_only":
+            (base / f"reset-refused-{target}").write_text(line)
+        # Leaves the summary as the only prompt to collect, as on an edge
+        # whose held stream is down and polls one-shot (#780).
+        if response.get("push") == "mesh.wake" and (base / f"drop-wakes-{source}-{target}").exists():
+            with (base / f"dropped-wakes-{source}-{target}").open("a") as log:
+                log.write(str(time.monotonic()) + "\n")
+            continue
+        # Leaves the hub's own wake as the only prompt to collect (#879).
+        result = response.get("result")
+        if (base / f"hide-pending-{source}-{target}").exists() and isinstance(result, dict) \
+                and result.get("outbound_pending"):
+            result["outbound_pending"] = False
+            line = json.dumps(response) + "\n"
+        summary_probe = base / f"observed-summary-{source}-{target}"
+        if response.get("event") == "mesh_outbound_pending":
+            summary_probe.unlink(missing_ok=True)
+        if response.get("id") in summary_probes:
+            summary_probes.discard(response.get("id"))
+            summary_probe.write_text(json.dumps({
+                "outbound_pending": response.get("result", {}).get("outbound_pending", True),
+            }))
+        if response.get("id") in outbound_collections:
+            outbound_collections.discard(response.get("id"))
+            answers = response.get("result", {}).get("answers", [])
+            # A held answer is offered on both lanes. A test that injects a
+            # fault into the collect lane withholds it from this one, or the
+            # outbound poll can win the race and bypass the fault (#948).
+            if answers and (base / f"withhold-outbound-answers-{source}-{target}").exists():
+                answers[:] = [a for a in answers if not a.get("envelope", {}).get("request_key")]
+                line = json.dumps(response) + "\n"
+            if answers:
+                with (base / f"outbound-offers-{source}-{target}").open("a") as log:
+                    log.write(json.dumps(answers) + "\n")
+                # The hub has already leased these rows, so dropping the reply
+                # leaves them unacked until their backoff expires (#879).
+                lose = base / f"lose-outbound-offer-{source}-{target}"
+                if lose.exists():
+                    how = lose.read_text().strip()
+                    lose.rename(base / f"lost-outbound-offer-{source}-{target}")
+                    if how == "error":
+                        response = {"id": response["id"], "error": {
+                            "code": "lost_offer", "message": "offer lost in transit",
+                        }}
+                    else:
+                        response = {"id": response["id"], "result": {"answers": []}}
+                    line = json.dumps(response) + "\n"
+                    answers = []
+                corrupt = base / f"corrupt-outbound-{source}-{target}"
+                if answers and corrupt.exists():
+                    answers[0]["remaining_ms"] = "undecodable"
+                    corrupt.unlink()
+                    line = json.dumps(response) + "\n"
+        if response.get("id") in collections:
+            answers = response.get("result", {}).get("answers", [])
+            if answers and (base / f"corrupt-collect-answer-{source}-{target}").exists():
+                answers[0]["envelope"]["request_key"]["message_id"] = "wrong-conversation"
+                line = json.dumps(response) + "\n"
+            collections.discard(response.get("id"))
+            if response.get("error"):
+                (base / f"collect-refused-{source}-{target}").write_text(line)
+        if response.get("id") in deliveries:
+            if (base / f"observe-delivery-{source}-{target}").exists():
+                (base / f"observed-result-{source}-{target}").write_text(line)
+            if (base / f"tamper-delivery-{source}-{target}").exists():
+                (base / f"tampered-result-{source}-{target}").write_text(line)
+            deliveries.discard(response.get("id"))
+            gate = base / f"gate-delivery-ack-{source}-{target}"
+            if gate.is_dir() and response.get("result", {}).get("state") in {"delivered", "duplicate"}:
+                (gate / "entered").touch()
+                deadline = time.monotonic() + 30
+                while gate.is_dir() and not (gate / "release").exists():
+                    if time.monotonic() >= deadline:
+                        break
+                    time.sleep(0.01)
+            gate = base / f"lose-receipt-{source}-{target}"
+            if gate.exists() and response.get("result", {}).get("state") == "delivered":
+                gate.rename(base / f"lost-receipt-{source}-{target}")
+                line = json.dumps({"id": response["id"], "error": {
+                    "code": "lost_receipt", "message": "receipt lost after inbox commit",
+                }}) + "\n"
+            elif response.get("result", {}).get("state") == "duplicate":
+                (base / f"delivered-receipt-{source}-{target}").touch()
+        emit(line)
+    sys.exit(child.wait())
+finally:
+    if child.poll() is None:
+        os.killpg(child.pid, signal.SIGTERM)
+        try:
+            child.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            os.killpg(child.pid, signal.SIGKILL)
+            child.wait()
+    # Even an exited shell can leave a descendant holding the output pipe.
+    try:
+        os.killpg(child.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    pid_file.unlink(missing_ok=True)

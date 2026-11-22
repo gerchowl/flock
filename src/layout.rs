@@ -73,9 +73,40 @@ pub enum Node {
     },
 }
 
+// One shared-borrow boundary makes layout traversal observable through every
+// accessor, including calls hidden behind helpers. Counters exist only in tests.
+struct Tree {
+    node: Node,
+    #[cfg(test)]
+    reads: std::sync::atomic::AtomicUsize,
+}
+impl From<Node> for Tree {
+    fn from(node: Node) -> Self {
+        Self {
+            node,
+            #[cfg(test)]
+            reads: Default::default(),
+        }
+    }
+}
+impl std::ops::Deref for Tree {
+    type Target = Node;
+    fn deref(&self) -> &Node {
+        #[cfg(test)]
+        self.reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        &self.node
+    }
+}
+impl std::ops::DerefMut for Tree {
+    fn deref_mut(&mut self) -> &mut Node {
+        &mut self.node
+    }
+}
+
 /// BSP tiling layout. Tracks a tree of splits and a focused pane.
 pub struct TileLayout {
-    root: Node,
+    root: Tree,
     focus: PaneId,
 }
 
@@ -86,11 +117,19 @@ impl TileLayout {
         let root_id = PaneId::alloc();
         (
             Self {
-                root: Node::Pane(root_id),
+                root: Node::Pane(root_id).into(),
                 focus: root_id,
             },
             root_id,
         )
+    }
+
+    /// Drain the instance-local shared-tree access counter for cost assertions.
+    #[cfg(test)]
+    pub(crate) fn take_tree_read_count(&self) -> usize {
+        self.root
+            .reads
+            .swap(0, std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn focused(&self) -> PaneId {
@@ -119,8 +158,8 @@ impl TileLayout {
     pub fn split_focused(&mut self, direction: Direction) -> PaneId {
         let new_id = PaneId::alloc();
         let placeholder = PaneId::from_raw(0);
-        let old = std::mem::replace(&mut self.root, Node::Pane(placeholder));
-        self.root = split_at(old, self.focus, direction, new_id);
+        let old = std::mem::replace(&mut self.root, Node::Pane(placeholder).into());
+        self.root = split_at(old.node, self.focus, direction, new_id).into();
         self.focus = new_id;
         new_id
     }
@@ -150,8 +189,8 @@ impl TileLayout {
             0.5
         };
         let placeholder = PaneId::from_raw(0);
-        let old = std::mem::replace(&mut self.root, Node::Pane(placeholder));
-        self.root = split_at_with_ratio(old, target, direction, moved, clamped);
+        let old = std::mem::replace(&mut self.root, Node::Pane(placeholder).into());
+        self.root = split_at_with_ratio(old.node, target, direction, moved, clamped).into();
         self.focus = moved;
         true
     }
@@ -170,9 +209,9 @@ impl TileLayout {
             ids[pos - 1]
         };
         let placeholder = PaneId::from_raw(0);
-        let old = std::mem::replace(&mut self.root, Node::Pane(placeholder));
-        if let Some(new_root) = remove_pane(old, target) {
-            self.root = new_root;
+        let old = std::mem::replace(&mut self.root, Node::Pane(placeholder).into());
+        if let Some(new_root) = remove_pane(old.node, target) {
+            self.root = new_root.into();
             self.focus = new_focus;
             true
         } else {
@@ -238,7 +277,10 @@ impl TileLayout {
     /// Reconstruct a layout from a saved tree.
     /// Reconstruct a layout from a saved tree.
     pub fn from_saved(root: Node, focus: PaneId) -> Self {
-        Self { root, focus }
+        Self {
+            root: root.into(),
+            focus,
+        }
     }
 }
 

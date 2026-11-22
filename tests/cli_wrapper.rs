@@ -12,13 +12,16 @@
 
 mod support;
 
+use support::paths::app_dir_name;
+
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use support::environment::Command;
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use support::{
@@ -205,14 +208,6 @@ fn spawn_flock_with_pane_history(
     )
 }
 
-fn app_dir_name() -> &'static str {
-    if cfg!(debug_assertions) {
-        "flock-dev"
-    } else {
-        "flock"
-    }
-}
-
 fn named_session_socket(config_home: &Path, session: &str) -> PathBuf {
     config_home
         .join(app_dir_name())
@@ -238,17 +233,22 @@ fn spawn_named_server(
     let mut command = Command::new(env!("CARGO_BIN_EXE_flk"));
     command
         .args(["--session", session, "server"])
-        .env("XDG_CONFIG_HOME", config_home)
-        .env("XDG_RUNTIME_DIR", runtime_dir)
+        .envs(support::environment::isolated_env(config_home, runtime_dir))
         .env_remove("FLOCK_SOCKET_PATH")
         .env_remove("FLOCK_CLIENT_SOCKET_PATH")
         .env_remove("FLOCK_ENV")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stderr(std::process::Stdio::piped());
 
-    let child = command.spawn().unwrap();
+    support::environment::assert_command_isolated(&command);
+    let mut child = command.spawn().unwrap();
     register_spawned_flock_pid(Some(child.id()));
+    support::readiness::read_announcement(
+        child.stderr.as_mut().expect("server startup output"),
+        &named_session_socket(config_home, session),
+    )
+    .expect("named server readiness announcement");
     SpawnedServerProcess { child }
 }
 
@@ -265,8 +265,7 @@ fn run_named_cli_with_socket_override(
     let mut command = Command::new(env!("CARGO_BIN_EXE_flk"));
     command
         .args(args)
-        .env("XDG_CONFIG_HOME", config_home)
-        .env("XDG_RUNTIME_DIR", runtime_dir)
+        .envs(support::environment::isolated_env(config_home, runtime_dir))
         .env_remove("FLOCK_CLIENT_SOCKET_PATH")
         .env_remove("FLOCK_ENV");
     if let Some(socket_override) = socket_override {
@@ -332,8 +331,9 @@ fn spawn_flock_with_config(
 
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flk"));
     cmd.arg("server");
-    cmd.env("XDG_CONFIG_HOME", config_home);
-    cmd.env("XDG_RUNTIME_DIR", runtime_dir);
+    for (key, value) in support::environment::isolated_env(config_home, runtime_dir) {
+        cmd.env(key, value);
+    }
     cmd.env("FLOCK_SOCKET_PATH", socket_path);
     cmd.env_remove("FLOCK_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", "/bin/sh");
@@ -347,8 +347,11 @@ fn spawn_flock_with_config(
         cmd.env("PATH", path);
     }
 
-    let child = pair.slave.spawn_command(cmd).unwrap();
+    support::environment::assert_pty_isolated(&cmd);
+    let child = support::environment::spawn_pty(pair.slave.as_ref(), cmd).unwrap();
     register_spawned_flock_pid(child.process_id());
+    drop(pair.slave);
+    support::readiness::wait_for_server(&*pair.master, socket_path);
     SpawnedFlock {
         _master: Some(pair.master),
         child,
@@ -589,39 +592,261 @@ fn run_copilot_hook(hook_input: &str) -> Option<serde_json::Value> {
     )
 }
 
+#[test]
+fn shell_hooks_report_unavailable_binary_per_call_only_inside_flock() {
+    let base = unique_test_dir();
+    fs::create_dir_all(&base).unwrap();
+    let non_executable = base.join("non-executable-flk");
+    fs::write(&non_executable, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(
+        &non_executable,
+        std::os::unix::fs::PermissionsExt::from_mode(0o644),
+    )
+    .unwrap();
+    for agent in ["claude", "codex", "copilot", "kimi", "qodercli"] {
+        let asset = Path::new(env!("CARGO_MANIFEST_DIR")).join(format!(
+            "src/integration/assets/{agent}/flock-agent-state.sh"
+        ));
+        for inside in [false, true] {
+            for binary in ["flk", "missing-flk", "non-executable-flk"] {
+                let mut command = Command::new("/bin/sh");
+                command
+                    .arg(&asset)
+                    .arg("session")
+                    .env("PATH", &base)
+                    .env("FLOCK_ENV", if inside { "1" } else { "0" })
+                    .env("FLOCK_PANE_ID", "p_test")
+                    .env("FLOCK_SOCKET_PATH", base.join("unused.sock"))
+                    .env_remove("FLOCK_BIN");
+                if binary != "flk" {
+                    command.env("FLOCK_BIN", base.join(binary));
+                }
+                let output = command.output().unwrap();
+                assert!(output.status.success(), "{agent}");
+                assert!(output.stdout.is_empty(), "{agent}");
+                let stderr = String::from_utf8(output.stderr).unwrap();
+                if inside {
+                    assert_eq!(stderr.lines().count(), 1, "{agent}: {stderr}");
+                    assert!(
+                        stderr.contains("flock hook: required binary"),
+                        "{agent}: {stderr}"
+                    );
+                    assert!(stderr.contains(binary));
+                } else {
+                    assert!(stderr.is_empty(), "{agent}: {stderr}");
+                }
+            }
+        }
+    }
+    cleanup_test_base(&base);
+}
+
+#[test]
+fn copilot_non_object_stdin_through_run_hook_command_reports_nothing() {
+    // The installed stub invokes the binary's run_hook_command dispatcher,
+    // exercising stdin parsing before Copilot's pure event planner runs.
+    for input in [
+        "null",
+        "[]",
+        r#"[{"toolName":"ask_user"}]"#,
+        "42",
+        r#""ask_user""#,
+    ] {
+        assert!(run_copilot_hook(input).is_none(), "{input}");
+    }
+}
+
+fn read_request_line(stream: &UnixStream) -> String {
+    // Accepted streams inherit the listener's nonblocking mode on macOS.
+    stream.set_nonblocking(false).unwrap();
+    let mut line = String::new();
+    BufReader::new(stream.try_clone().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    line
+}
+
+/// Answers the protocol check a state-changing verb sends first (#868) with
+/// this build's protocol and write capability, and says whether it was a ping.
+fn answer_protocol_check(stream: &mut UnixStream, line: &str) -> bool {
+    let request: serde_json::Value = serde_json::from_str(line).unwrap();
+    if request["method"] != "ping" {
+        return false;
+    }
+    let pong = serde_json::json!({"id":request["id"],"result":{
+        "type":"pong","version":"fixture","protocol":support::PROTOCOL_VERSION,
+        "capabilities":{"pane_input_write_ack":true,"live_handoff":false}
+    }});
+    writeln!(stream, "{pong}").unwrap();
+    true
+}
+
+#[test]
+fn stop_hook_inbox_authority_notice_is_once_and_never_blocks_the_real_cli() {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    let root = support::socket_dir::SocketDir::reserve("hka");
+    let socket = root.path().join("api.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let done = Arc::new(AtomicBool::new(false));
+    let server_done = done.clone();
+    let server = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut wakes = 0;
+        while !server_done.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < deadline,
+                "hook fixture exceeded its failure ceiling"
+            );
+            let mut stream = match listener.accept() {
+                Ok((stream, _)) => stream,
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(err) => panic!("accept: {err}"),
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let line = read_request_line(&stream);
+            if answer_protocol_check(&mut stream, &line) {
+                continue;
+            }
+            let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+            let response = if request["method"] == "msg.wake" {
+                wakes += 1;
+                if wakes == 3 {
+                    serde_json::json!({"id":request["id"], "result":{"type":"msg_wake", "count":2}})
+                } else {
+                    serde_json::json!({"id":request["id"], "error":{"code":"caller_pane_unresolved", "message":"caller pane authority unavailable"}})
+                }
+            } else {
+                serde_json::json!({"id":request["id"], "result":{"type":"ok"}})
+            };
+            writeln!(stream, "{response}").unwrap();
+        }
+        wakes
+    });
+    for turn in 0..4 {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_flk"))
+            .args(["hook", "claude", "stop"])
+            .envs(support::environment::isolated_env(root.path(), root.path()))
+            .env("FLOCK_ENV", "1")
+            .env("FLOCK_SOCKET_PATH", &socket)
+            .env("FLOCK_PANE_ID", "p_1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(
+                br#"{"session_id":"hook-authority-fixture","last_assistant_message":"done"}"#,
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("stop hook exceeded its failure ceiling");
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        if turn == 1 {
+            assert!(
+                output.stdout.is_empty(),
+                "a repeated refusal must stay silent"
+            );
+        } else {
+            let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            if turn == 2 {
+                assert_eq!(value["decision"], "block");
+                assert!(value["reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("2 unread messages"));
+            } else {
+                assert!(value.get("decision").is_none(), "{value}");
+                assert!(value["systemMessage"]
+                    .as_str()
+                    .unwrap()
+                    .contains("flk msg operator-read --pane"));
+            }
+        }
+    }
+    done.store(true, Ordering::Release);
+    assert_eq!(server.join().unwrap(), 4);
+}
+
+#[test]
+fn request_reader_waits_for_data_on_a_nonblocking_stream() {
+    let (server, mut client) = UnixStream::pair().unwrap();
+    server.set_nonblocking(true).unwrap();
+    server
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let (done, received) = std::sync::mpsc::channel();
+    let reader = thread::spawn(move || {
+        done.send(read_request_line(&server)).unwrap();
+    });
+    let before_write = received.recv_timeout(Duration::from_millis(25));
+    client.write_all(b"request\n").unwrap();
+    reader.join().unwrap();
+    assert_eq!(
+        before_write,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    );
+    assert_eq!(received.recv().unwrap(), "request\n");
+}
+
 fn run_shell_hook(asset_path: &str, args: &[&str], hook_input: &str) -> Option<serde_json::Value> {
     let base = unique_test_dir();
     fs::create_dir_all(&base).unwrap();
     let socket_path = base.join("flock.sock");
     let listener = UnixListener::bind(&socket_path).unwrap();
 
+    // Wait until the hook exits rather than racing binary startup against a
+    // short timer. Once it exits, no further reports can reach the listener.
+    let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let hook_finished = finished.clone();
     let server = thread::spawn(move || {
         listener.set_nonblocking(true).unwrap();
-        let deadline = Instant::now() + Duration::from_millis(700);
-        while Instant::now() < deadline {
+        loop {
+            let hook_exited = hook_finished.load(std::sync::atomic::Ordering::Acquire);
             match listener.accept() {
                 Ok((mut stream, _)) => {
-                    let mut line = String::new();
-                    let mut reader = BufReader::new(stream.try_clone().unwrap());
-                    reader.read_line(&mut line).unwrap();
+                    let line = read_request_line(&stream);
                     let _ = stream.write_all(br#"{"id":"test","result":{"type":"ok"}}"#);
                     let _ = stream.write_all(b"\n");
                     let _ = stream.flush();
                     return Some(line);
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    if hook_exited {
+                        return None;
+                    }
                     thread::sleep(Duration::from_millis(10));
                 }
                 Err(err) => panic!("accept failed: {err}"),
             }
         }
-        None
     });
 
     let hook_path = Path::new(env!("CARGO_MANIFEST_DIR")).join(asset_path);
-    let mut child = Command::new("bash")
+    let mut child = Command::new("/bin/sh")
         .arg(hook_path)
         .args(args)
+        .env("PATH", &base)
         .env("FLOCK_ENV", "1")
         .env("FLOCK_SOCKET_PATH", &socket_path)
         .env("FLOCK_PANE_ID", "p_test")
@@ -639,6 +864,7 @@ fn run_shell_hook(asset_path: &str, args: &[&str], hook_input: &str) -> Option<s
     drop(stdin);
 
     let output = child.wait_with_output().unwrap();
+    finished.store(true, std::sync::atomic::Ordering::Release);
     assert!(
         output.status.success(),
         "hook failed: status={:?} stderr={} stdout={}",
@@ -896,13 +1122,13 @@ fn pane_run_types_the_command_and_presses_enter_as_two_separated_requests() {
         while requests.len() < 2 && Instant::now() < deadline {
             match listener.accept() {
                 Ok((mut stream, _)) => {
-                    let mut line = String::new();
-                    let mut reader = BufReader::new(stream.try_clone().unwrap());
-                    reader.read_line(&mut line).unwrap();
-                    stream
-                        .write_all(br#"{"id":"cli:request","result":{"type":"ok"}}"#)
-                        .unwrap();
-                    stream.write_all(b"\n").unwrap();
+                    let line = read_request_line(&stream);
+                    if answer_protocol_check(&mut stream, &line) {
+                        continue;
+                    }
+                    let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                    let response = serde_json::json!({"id":request["id"],"result":{"type":"ok"}});
+                    writeln!(stream, "{response}").unwrap();
                     stream.flush().unwrap();
                     requests.push((line, Instant::now()));
                 }
@@ -931,7 +1157,7 @@ fn pane_run_types_the_command_and_presses_enter_as_two_separated_requests() {
     );
 
     let typed: serde_json::Value = serde_json::from_str(&requests[0].0).unwrap();
-    assert_eq!(typed["method"], "pane.send_input");
+    assert_eq!(typed["method"], "pane.write_input");
     assert_eq!(typed["params"]["pane_id"], "1-1");
     assert_eq!(typed["params"]["text"], "echo hello");
     // `keys` is skipped when empty, so its ABSENCE is the assertion: the
@@ -942,7 +1168,7 @@ fn pane_run_types_the_command_and_presses_enter_as_two_separated_requests() {
     );
 
     let submitted: serde_json::Value = serde_json::from_str(&requests[1].0).unwrap();
-    assert_eq!(submitted["method"], "pane.send_keys");
+    assert_eq!(submitted["method"], "pane.write_keys");
     assert_eq!(submitted["params"]["pane_id"], "1-1");
     assert_eq!(submitted["params"]["keys"], serde_json::json!(["Enter"]));
 
@@ -958,36 +1184,143 @@ fn pane_run_types_the_command_and_presses_enter_as_two_separated_requests() {
     cleanup_test_base(&base);
 }
 
-#[test]
-fn pane_report_metadata_sends_presentation_request() {
+/// Run `flk pane run` against a fake server that answers `pane.write_input`
+/// with `typed` and anything else with ok. Returns the exit code and the
+/// requests, in order.
+fn pane_run_requests(
+    args: &[&str],
+    typed: serde_json::Value,
+) -> (Option<i32>, Vec<serde_json::Value>) {
     let base = unique_test_dir();
     fs::create_dir_all(&base).unwrap();
     let socket_path = base.join("flock.sock");
     let listener = UnixListener::bind(&socket_path).unwrap();
-
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let finished = done.clone();
     let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        let mut line = String::new();
-        let mut reader = BufReader::new(stream.try_clone().unwrap());
-        reader.read_line(&mut line).unwrap();
-        stream
-            .write_all(br#"{"id":"cli:request","result":{"type":"ok"}}"#)
-            .unwrap();
-        stream.write_all(b"\n").unwrap();
-        stream.flush().unwrap();
-        line
+        let mut requests = Vec::new();
+        listener.set_nonblocking(true).unwrap();
+        // Serve until the CLI has exited: every request it made is in.
+        while !finished.load(std::sync::atomic::Ordering::SeqCst) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let line = read_request_line(&stream);
+                    if answer_protocol_check(&mut stream, &line) {
+                        continue;
+                    }
+                    let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                    let mut response = if request["method"] == "pane.write_input" {
+                        typed.clone()
+                    } else {
+                        serde_json::json!({"result": {"type": "ok"}})
+                    };
+                    response["id"] = request["id"].clone();
+                    writeln!(stream, "{response}").unwrap();
+                    requests.push(request);
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(err) => panic!("accept failed: {err}"),
+            }
+        }
+        requests
     });
+    let mut argv = vec!["pane", "run"];
+    argv.extend_from_slice(args);
+    let run = run_cli(&socket_path, &argv);
+    done.store(true, std::sync::atomic::Ordering::SeqCst);
+    let requests = server.join().unwrap();
+    cleanup_test_base(&base);
+    (run.status.code(), requests)
+}
 
-    let run = run_cli(
-        &socket_path,
-        &[
-            "pane",
-            "report-metadata",
-            "1-1",
+fn methods(requests: &[serde_json::Value]) -> Vec<&str> {
+    requests
+        .iter()
+        .map(|request| request["method"].as_str().unwrap())
+        .collect()
+}
+
+/// #1162: into an agent pane with an empty composer, `pane run` is what it
+/// always was: type, settle, Enter, exit 0. No idle requirement, no turn
+/// confirmation, no extra request.
+#[test]
+fn pane_run_into_an_empty_agent_composer_types_and_presses_enter_as_before() {
+    let (code, requests) = pane_run_requests(
+        &["1-1", "/compact"],
+        serde_json::json!({"result": {"type": "ok"}}),
+    );
+    assert_eq!(code, Some(0));
+    assert_eq!(methods(&requests), ["pane.write_input", "pane.write_keys"]);
+    assert_eq!(requests[0]["params"]["text"], "/compact");
+    assert!(
+        requests[0]["params"].get("raw").is_none(),
+        "the server's draft check applies: {}",
+        requests[0]
+    );
+    assert_eq!(requests[1]["params"]["keys"], serde_json::json!(["Enter"]));
+}
+
+/// #1162: a draft refusal ends `pane run` with exit 10 before its Enter, so
+/// nothing the operator typed is submitted.
+#[test]
+fn pane_run_refused_onto_a_draft_exits_10_and_presses_no_enter() {
+    let refused = serde_json::json!({"error": {"code": "input_not_empty", "message": "draft"}});
+    let (code, requests) = pane_run_requests(&["1-1", "echo hello"], refused);
+    assert_eq!(code, Some(10));
+    assert_eq!(methods(&requests), ["pane.write_input"]);
+}
+
+/// #1162: `--raw` tells the server to type onto whatever is there.
+#[test]
+fn pane_run_raw_asks_the_server_to_type_anyway() {
+    let (code, requests) = pane_run_requests(
+        &["--raw", "1-1", "echo hello"],
+        serde_json::json!({"result": {"type": "ok"}}),
+    );
+    assert_eq!(code, Some(0));
+    assert_eq!(methods(&requests), ["pane.write_input", "pane.write_keys"]);
+    assert_eq!(requests[0]["params"]["raw"], true);
+}
+
+#[test]
+fn pane_report_metadata_sends_presentation_request() {
+    for (pane_args, calling_pane, expected_pane) in [
+        (vec!["1-1"], Some("p_calling"), "1-1"),
+        (vec!["--pane", "1-2"], Some("p_calling"), "1-2"),
+        (vec![], Some("p_calling"), "p_calling"),
+        (vec![], None, ""),
+    ] {
+        let base = unique_test_dir();
+        fs::create_dir_all(&base).unwrap();
+        let socket_path = base.join("flock.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            reader.read_line(&mut line).unwrap();
+            stream
+                .write_all(br#"{"id":"cli:request","result":{"type":"ok"}}"#)
+                .unwrap();
+            stream.write_all(b"\n").unwrap();
+            stream.flush().unwrap();
+            line
+        });
+
+        let mut args = vec!["pane", "report-metadata"];
+        args.extend(pane_args);
+        args.extend_from_slice(&[
             "--source",
             "user:claude-title",
             "--agent",
             "claude",
+            "--applies-to-source",
+            "flock:claude",
+            "--seq",
+            "7",
             "--title",
             "Refactor auth",
             "--display-agent",
@@ -998,30 +1331,72 @@ fn pane_report_metadata_sends_presentation_request() {
             "working=deep in the mines",
             "--ttl-ms",
             "3600000",
-        ],
-    );
-    assert!(
-        run.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&run.stderr)
-    );
+        ]);
+        let mut command = Command::new(env!("CARGO_BIN_EXE_flk"));
+        command.args(args).env("FLOCK_SOCKET_PATH", &socket_path);
+        if let Some(pane) = calling_pane {
+            command.env("FLOCK_PANE_ID", pane);
+        } else {
+            command.env_remove("FLOCK_PANE_ID");
+        }
+        let run = command.output().unwrap();
+        assert!(
+            run.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
 
-    let line = server.join().unwrap();
-    let request: serde_json::Value = serde_json::from_str(&line).unwrap();
-    assert_eq!(request["method"], "pane.report_metadata");
-    assert_eq!(request["params"]["pane_id"], "1-1");
-    assert_eq!(request["params"]["source"], "user:claude-title");
-    assert_eq!(request["params"]["agent"], "claude");
-    assert!(request["params"]["applies_to_source"].is_null());
-    assert_eq!(request["params"]["title"], "Refactor auth");
-    assert_eq!(request["params"]["display_agent"], "Claude auth");
-    assert_eq!(request["params"]["custom_status"], "middleware");
-    assert_eq!(
-        request["params"]["state_labels"]["working"],
-        "deep in the mines"
-    );
-    assert_eq!(request["params"]["ttl_ms"], 3_600_000);
+        let line = server.join().unwrap();
+        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(request["method"], "pane.report_metadata");
+        assert_eq!(request["params"]["pane_id"], expected_pane);
+        assert_eq!(request["params"]["source"], "user:claude-title");
+        assert_eq!(request["params"]["agent"], "claude");
+        assert_eq!(request["params"]["applies_to_source"], "flock:claude");
+        assert_eq!(request["params"]["seq"], 7);
+        assert_eq!(request["params"]["title"], "Refactor auth");
+        assert_eq!(request["params"]["display_agent"], "Claude auth");
+        assert_eq!(request["params"]["custom_status"], "middleware");
+        assert_eq!(
+            request["params"]["state_labels"]["working"],
+            "deep in the mines"
+        );
+        assert_eq!(request["params"]["ttl_ms"], 3_600_000);
 
+        cleanup_test_base(&base);
+    }
+}
+
+#[test]
+fn pane_report_metadata_rejects_invalid_pane_arguments() {
+    let base = unique_test_dir();
+    fs::create_dir_all(&base).unwrap();
+    let socket_path = base.join("missing.sock");
+    for (args, expected) in [
+        (vec!["--pane"], "missing value for --pane"),
+        (
+            vec!["--pane", "--source", "user:title"],
+            "missing value for --pane",
+        ),
+        (
+            vec!["1-1", "--pane", "1-2"],
+            "the pane id was already given",
+        ),
+        (
+            vec!["--pane", "1-1", "--pane", "1-2"],
+            "the pane id was already given",
+        ),
+        (
+            vec!["--source", "user:title", "stray"],
+            "unknown option: stray",
+        ),
+    ] {
+        let mut command_args = vec!["pane", "report-metadata"];
+        command_args.extend(args);
+        let run = run_cli(&socket_path, &command_args);
+        assert_eq!(run.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&run.stderr).contains(expected));
+    }
     cleanup_test_base(&base);
 }
 
@@ -1119,7 +1494,7 @@ fn help_commands_exit_successfully() {
 }
 
 #[test]
-fn root_help_hides_explicit_client_command() {
+fn root_help_advertises_client_credentials_and_hides_internal_attachment() {
     let output = Command::new(env!("CARGO_BIN_EXE_flk"))
         .arg("--help")
         .output()
@@ -1127,9 +1502,12 @@ fn root_help_hides_explicit_client_command() {
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("flk client <token|open>"), "{stdout}");
     assert!(
-        !stdout.contains("flk client"),
-        "root help should not advertise the internal client command: {stdout}"
+        !stdout
+            .lines()
+            .any(|line| matches!(line.trim(), "flk client" | "client")),
+        "root help should not advertise the bare internal client command: {stdout}"
     );
 }
 
@@ -1383,6 +1761,11 @@ fn integration_commands_run_locally_when_server_is_missing() {
         .env("FLOCK_SOCKET_PATH", &missing_socket)
         .env("HOME", &home_dir)
         .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CODEX_HOME")
+        .env_remove("PI_CODING_AGENT_DIR")
+        .env_remove("COPILOT_HOME")
+        .env_remove("KIMI_CODE_HOME")
+        .env_remove("QODER_CONFIG_DIR")
         .output()
         .unwrap();
     assert_eq!(workspace_list.status.code(), Some(1));
@@ -1392,6 +1775,11 @@ fn integration_commands_run_locally_when_server_is_missing() {
         .env("FLOCK_SOCKET_PATH", &missing_socket)
         .env("HOME", &home_dir)
         .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CODEX_HOME")
+        .env_remove("PI_CODING_AGENT_DIR")
+        .env_remove("COPILOT_HOME")
+        .env_remove("KIMI_CODE_HOME")
+        .env_remove("QODER_CONFIG_DIR")
         .output()
         .unwrap();
     assert_eq!(integration_install.status.code(), Some(0));
@@ -1405,6 +1793,11 @@ fn integration_commands_run_locally_when_server_is_missing() {
         .env("FLOCK_SOCKET_PATH", &missing_socket)
         .env("HOME", &home_dir)
         .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CODEX_HOME")
+        .env_remove("PI_CODING_AGENT_DIR")
+        .env_remove("COPILOT_HOME")
+        .env_remove("KIMI_CODE_HOME")
+        .env_remove("QODER_CONFIG_DIR")
         .output()
         .unwrap();
     assert_eq!(integration_status.status.code(), Some(0));
@@ -1417,6 +1810,11 @@ fn integration_commands_run_locally_when_server_is_missing() {
         .env("FLOCK_SOCKET_PATH", &missing_socket)
         .env("HOME", &home_dir)
         .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CODEX_HOME")
+        .env_remove("PI_CODING_AGENT_DIR")
+        .env_remove("COPILOT_HOME")
+        .env_remove("KIMI_CODE_HOME")
+        .env_remove("QODER_CONFIG_DIR")
         .output()
         .unwrap();
     assert_eq!(integration_uninstall.status.code(), Some(0));
@@ -1449,6 +1847,12 @@ fn integration_status_outdated_only_prints_action_for_legacy_install() {
         .args(["integration", "status", "--outdated-only"])
         .env("FLOCK_SOCKET_PATH", &missing_socket)
         .env("HOME", &home_dir)
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CODEX_HOME")
+        .env_remove("PI_CODING_AGENT_DIR")
+        .env_remove("COPILOT_HOME")
+        .env_remove("KIMI_CODE_HOME")
+        .env_remove("QODER_CONFIG_DIR")
         .output()
         .unwrap();
 
@@ -1457,6 +1861,8 @@ fn integration_status_outdated_only_prints_action_for_legacy_install() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("installed flock integrations need updating"));
     assert!(stderr.contains("flk integration install pi"));
+    assert!(!stderr.contains("claude MCP:"));
+    assert!(!stderr.contains("codex MCP:"));
 
     cleanup_test_base(&base);
 }
@@ -1475,6 +1881,12 @@ fn integration_status_rejects_unknown_flags() {
         .args(["integration", "status", "--wat"])
         .env("FLOCK_SOCKET_PATH", &missing_socket)
         .env("HOME", &home_dir)
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CODEX_HOME")
+        .env_remove("PI_CODING_AGENT_DIR")
+        .env_remove("COPILOT_HOME")
+        .env_remove("KIMI_CODE_HOME")
+        .env_remove("QODER_CONFIG_DIR")
         .output()
         .unwrap();
 
@@ -1560,6 +1972,10 @@ fn status_commands_report_client_and_server_versions() {
     );
 
     let full_json = run_cli_json(&socket_path, &["status", "--json"]);
+    assert_eq!(full_json["installed"]["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(full_json["installed"]["client_drift"], false);
+    assert_eq!(full_json["installed"]["server_drift"], false);
+    assert!(full_json["installed"]["error"].is_null());
     assert_eq!(full_json["client"]["version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(full_json["client"]["protocol"], support::PROTOCOL_VERSION);
     assert_eq!(full_json["server"]["status"], "running");
@@ -1698,13 +2114,15 @@ fn server_stop_then_restart_restores_pane_history() {
         .to_string();
     let sent = run_cli(
         &socket_path,
-        &["pane", "send-text", &pane_id, &format!("echo {marker}\n")],
+        &["pane", "send-text", &pane_id, &format!("echo {marker}")],
     );
     assert!(
         sent.status.success(),
         "stderr: {}",
         String::from_utf8_lossy(&sent.stderr)
     );
+    let enter = run_cli(&socket_path, &["pane", "send-keys", &pane_id, "Enter"]);
+    assert!(enter.status.success());
     assert!(
         wait_until(Duration::from_secs(3), Duration::from_millis(25), || {
             pane_read_recent_contains(&socket_path, &pane_id, marker)
@@ -1854,6 +2272,75 @@ fn workspace_and_pane_management_commands_work() {
 }
 
 #[test]
+fn allocation_dry_run_cli_returns_plans_without_allocating() {
+    let base = unique_test_dir();
+    let socket_path = base.join("runtime/flock.sock");
+    let repo = base.join("repo");
+    create_committed_repo(&repo);
+    let flock = spawn_flock(&base.join("config"), &base.join("runtime"), &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+    let created = run_cli_json(
+        &socket_path,
+        &["workspace", "create", "--cwd", repo.to_str().unwrap()],
+    );
+    let ws = created["result"]["workspace"]["workspace_id"]
+        .as_str()
+        .unwrap();
+    let pane = created["result"]["root_pane"]["pane_id"].as_str().unwrap();
+    let before = run_cli_json(&socket_path, &["workspace", "list"]);
+    let commands = vec![
+        vec![
+            "workspace",
+            "create",
+            "--dry-run",
+            "--cwd",
+            repo.to_str().unwrap(),
+        ],
+        vec!["tab", "create", "--dry-run", "--workspace", ws],
+        vec!["pane", "split", pane, "--direction", "right", "--dry-run"],
+        vec![
+            "agent",
+            "start",
+            "preview",
+            "--workspace",
+            ws,
+            "--dry-run",
+            "--wait-ready",
+            "--",
+            "/bin/sh",
+            "-c",
+            "exit 99",
+        ],
+        vec![
+            "worktree",
+            "create",
+            "--cwd",
+            repo.to_str().unwrap(),
+            "--dry-run",
+        ],
+    ];
+    for command in commands {
+        let response = run_cli_json(&socket_path, &command);
+        assert_eq!(
+            response["result"]["type"], "allocation_plan",
+            "{command:?}: {response}"
+        );
+    }
+    let fork = run_cli(&socket_path, &["agent", "fork", pane, "--dry-run"]);
+    assert!(!fork.status.success());
+    let fork: serde_json::Value = serde_json::from_slice(&fork.stderr).unwrap();
+    assert_eq!(fork["error"]["code"], "no_agent_session");
+    let after = run_cli_json(&socket_path, &["workspace", "list"]);
+    assert_eq!(
+        before["result"]["workspaces"].as_array().unwrap().len(),
+        after["result"]["workspaces"].as_array().unwrap().len()
+    );
+    let panes = run_cli_json(&socket_path, &["pane", "list", "--workspace", ws]);
+    assert_eq!(panes["result"]["panes"].as_array().unwrap().len(), 1);
+    cleanup_spawned_flock(flock, base);
+}
+
+#[test]
 fn worktree_management_commands_work() {
     let base = unique_test_dir();
     let config_home = base.join("config");
@@ -1968,11 +2455,13 @@ fn worktree_management_commands_work() {
         ],
     );
     assert_eq!(safe_remove.status.code(), Some(1));
-    let safe_remove_json: serde_json::Value = serde_json::from_slice(&safe_remove.stderr).unwrap();
+    // Under `--json` the error envelope is the stdout document (ADR-0029 §4).
+    let safe_remove_json: serde_json::Value = serde_json::from_slice(&safe_remove.stdout).unwrap();
     assert_eq!(
         safe_remove_json["error"]["code"],
         "dirty_worktree_requires_force"
     );
+    assert_eq!(safe_remove_json["error"]["exit"], 1);
     assert!(checkout.exists());
 
     let force_removed = run_cli_json(
@@ -2162,7 +2651,13 @@ fn tab_management_commands_work() {
     let runtime_dir = base.join("runtime");
     let socket_path = runtime_dir.join("flock.sock");
 
-    let flock = spawn_flock(&config_home, &runtime_dir, &socket_path);
+    let flock = spawn_flock_with_config(
+        &config_home,
+        &runtime_dir,
+        &socket_path,
+        None,
+        "onboarding = false\n[ui]\ntab_mode = \"workspace\"\n",
+    );
     wait_for_socket(&socket_path, Duration::from_secs(5));
 
     let created = run_cli(
@@ -2182,7 +2677,17 @@ fn tab_management_commands_work() {
 
     let created_tab = run_cli(
         &socket_path,
-        &["tab", "create", "--workspace", &workspace_id],
+        &[
+            "tab",
+            "create",
+            "--workspace",
+            &workspace_id,
+            "--cwd",
+            config_home.to_str().unwrap(),
+            "--label",
+            "review",
+            "--no-focus",
+        ],
     );
     assert!(created_tab.status.success());
     let created_tab_json: serde_json::Value = serde_json::from_slice(&created_tab.stdout).unwrap();
@@ -2191,6 +2696,8 @@ fn tab_management_commands_work() {
         .unwrap()
         .to_string();
     assert_eq!(second_tab_id, format!("{workspace_id}:t2"));
+    assert_eq!(created_tab_json["result"]["tab"]["label"], "review");
+    assert_eq!(created_tab_json["result"]["tab"]["focused"], false);
 
     let listed_tabs = run_cli(&socket_path, &["tab", "list", "--workspace", &workspace_id]);
     assert!(listed_tabs.status.success());
@@ -2342,7 +2849,13 @@ fn agent_commands_work() {
 
     let sent = run_cli(
         &socket_path,
-        &["agent", "send", "worker", "echo cli-agent-ok\n"],
+        &[
+            "agent",
+            "send",
+            "--no-submit",
+            "worker",
+            "echo cli-agent-ok\n",
+        ],
     );
     assert!(sent.status.success());
 
@@ -3229,6 +3742,41 @@ fn needs_reply(socket_path: &Path, correlation_id: &str, body: &str) {
     assert_eq!(sent["result"]["correlation_id"], correlation_id, "{sent}");
 }
 
+#[test]
+fn operator_inbox_commands_peek_then_consume_a_named_pane() {
+    let (flock, base, socket_path) = spawn_recipient();
+    needs_reply(&socket_path, "operator-cli", "operator recovery body");
+    for _ in 0..2 {
+        let peek = run_cli_json(&socket_path, &["msg", "operator-list", "--pane", "1-1"]);
+        assert_eq!(
+            peek["result"]["messages"].as_array().unwrap().len(),
+            1,
+            "{peek}"
+        );
+        assert_eq!(
+            peek["result"]["messages"][0]["preview"],
+            "operator recovery body"
+        );
+    }
+    let read = run_cli_json(&socket_path, &["msg", "operator-read", "--pane", "1-1"]);
+    assert_eq!(
+        read["result"]["messages"].as_array().unwrap().len(),
+        1,
+        "{read}"
+    );
+    assert_eq!(
+        read["result"]["messages"][0]["body"],
+        "operator recovery body"
+    );
+    let empty = run_cli_json(&socket_path, &["msg", "operator-read", "--pane", "1-1"]);
+    assert_eq!(
+        empty["result"]["messages"],
+        serde_json::json!([]),
+        "{empty}"
+    );
+    cleanup_spawned_flock(flock, base);
+}
+
 /// #576: the recipient read a question from a sender with no inbox and
 /// answered it. The answer used to be refused (`no_reply_address`) and went
 /// nowhere; now it is held, and `flk wait reply` hands it to the waiter.
@@ -3426,7 +3974,7 @@ fn agent_result_and_history_read_an_opencode_session() {
     let config_home = base.join("config");
     let runtime_dir = base.join("runtime");
     let socket_path = runtime_dir.join("flock.sock");
-    let data_home = base.join("data");
+    let data_home = config_home.join("data");
     let db_dir = data_home.join("opencode");
     fs::create_dir_all(&db_dir).unwrap();
     let conn = rusqlite::Connection::open(db_dir.join("opencode-stable.db")).unwrap();
@@ -3443,8 +3991,7 @@ fn agent_result_and_history_read_an_opencode_session() {
     )
     .unwrap();
     drop(conn);
-    // Inherited by the server: nextest runs each test in its own process.
-    std::env::set_var("XDG_DATA_HOME", &data_home);
+    // Seed the data directory supplied by the shared isolation wrapper.
 
     let flock = spawn_flock(&config_home, &runtime_dir, &socket_path);
     wait_for_socket(&socket_path, Duration::from_secs(5));
@@ -3481,21 +4028,330 @@ fn agent_result_and_history_read_an_opencode_session() {
     assert_eq!(info["status_text"], "approve", "{json}");
 
     let history = run_cli(&socket_path, &["agent", "history", "1-1"]);
-    let history_json: serde_json::Value = if history.status.success() {
-        serde_json::from_slice(&history.stdout).unwrap()
-    } else {
-        // `flk agent history` is documented but not wired as a CLI verb;
-        // drive the socket method it would call.
-        send_request(
-            &socket_path,
-            r#"{"id":"req_575_history","method":"agent.history","params":{"target":"1-1"}}"#,
-        )
-    };
+    assert!(
+        history.status.success(),
+        "{}",
+        String::from_utf8_lossy(&history.stderr)
+    );
+    let history_json: serde_json::Value = serde_json::from_slice(&history.stdout).unwrap();
     let turns = history_json["result"]["history"]["turns"]
         .as_array()
         .unwrap_or_else(|| panic!("{history_json}"));
     assert_eq!(turns.len(), 2, "{history_json}");
     assert_eq!(turns[0]["text"], "review PR 12");
 
+    for detail in ["reply", "collapsed", "full"] {
+        let page = run_cli_json(
+            &socket_path,
+            &[
+                "agent", "history", "1-1", "--detail", detail, "--limit", "1",
+            ],
+        );
+        assert_eq!(page["result"]["history"]["detail"], detail, "{page}");
+        assert_eq!(
+            page["result"]["history"]["turns"].as_array().unwrap().len(),
+            1,
+            "{page}"
+        );
+        let cursor = page["result"]["history"]["next_cursor"]
+            .as_u64()
+            .unwrap()
+            .to_string();
+        let next = run_cli_json(
+            &socket_path,
+            &["agent", "history", "1-1", "--cursor", &cursor],
+        );
+        assert_eq!(
+            next["result"]["history"]["turns"],
+            serde_json::json!([]),
+            "{next}"
+        );
+    }
+
     cleanup_spawned_flock(flock, base);
+}
+
+/// #613: the real SessionStart hook routes a fake Codex session to its rollout.
+#[test]
+fn agent_result_reads_a_codex_rollout_after_session_start() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("flock.sock");
+    let codex_home = base.join("codex-home");
+    let sessions = codex_home.join("sessions/2026/01/01");
+    fs::create_dir_all(&sessions).unwrap();
+    fs::write(
+        sessions.join("rollout-2026-01-01T00-00-00-00000000-0000-4000-8000-000000000613.jsonl"),
+        include_str!("fixtures/codex/finished.jsonl"),
+    )
+    .unwrap();
+    // The hook's acknowledged completion, rather than process start, makes
+    // the session-to-rollout binding observable by agent result.
+    let report = base.join("hook-report");
+    assert!(Command::new("mkfifo")
+        .arg(&report)
+        .status()
+        .unwrap()
+        .success());
+    let report_owner = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&report)
+        .unwrap();
+    let mut reader = report_owner.try_clone().unwrap();
+    let (reported_tx, reported_rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        use std::io::Read;
+        let mut report = [0; 4];
+        let result = reader.read_exact(&mut report).map(|()| report);
+        let _ = reported_tx.send(result);
+    });
+    let fake = base.join("codex");
+    fs::write(
+        &fake,
+        concat!(
+            "#!/bin/sh\n",
+            "printf '%s\\n' '{\"hook_event_name\":\"SessionStart\",\"session_id\":\"00000000-0000-4000-8000-000000000613\"}' | \"$FLOCK_BIN\" hook codex session || exit $?\n",
+            "printf done > \"$FLOCK_TEST_HOOK_REPORT\"\n",
+            "printf 'OpenAI Codex (v0.160.1)\\n\\n› Ask Codex to do anything\\n'\n",
+            "while IFS= read -r line; do :; done\n"
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+    std::env::set_var("CODEX_HOME", &codex_home);
+    std::env::set_var("FLOCK_TEST_HOOK_REPORT", &report);
+    let flock = spawn_flock(&config_home, &runtime_dir, &socket_path);
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+    let started = run_cli(
+        &socket_path,
+        &[
+            "agent",
+            "start",
+            "codex-fixture",
+            "--cwd",
+            base.to_str().unwrap(),
+            "--no-focus",
+            "--",
+            fake.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let report = reported_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("Codex SessionStart hook did not report completion")
+        .expect("read Codex SessionStart completion");
+    assert_eq!(&report, b"done");
+    drop(report_owner);
+    let result = run_cli(&socket_path, &["agent", "result", "codex-fixture"]);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    let info = json["result"]["result"].clone();
+    assert_eq!(info["agent"], "codex", "{info}");
+    assert_eq!(info["session_id"], "00000000-0000-4000-8000-000000000613");
+    assert_eq!(info["finished"], true);
+    assert_eq!(info["text"], "The fixture is sound.\nDONE: checked");
+    assert_eq!(info["status"], "done");
+    assert_eq!(info["status_text"], "checked");
+    assert_eq!(info["at_ms"], 1_767_225_603_125_u64);
+    cleanup_spawned_flock(flock, base);
+    std::env::remove_var("CODEX_HOME");
+    std::env::remove_var("FLOCK_TEST_HOOK_REPORT");
+}
+
+#[test]
+fn integration_install_registers_stable_mcp_and_status_reports_existing_pins() {
+    use std::os::unix::fs::symlink;
+    let base = unique_test_dir();
+    let home = base.join("home");
+    let claude = home.join("profile");
+    let codex = home.join("codex");
+    let opencode = home.join(".config/opencode");
+    for dir in [&claude, &codex, &opencode] {
+        fs::create_dir_all(dir).unwrap();
+    }
+    let launch = base.join("flk");
+    symlink(env!("CARGO_BIN_EXE_flk"), &launch).unwrap();
+    let run = |args: &[&str]| {
+        Command::new(&launch)
+            .args(args)
+            .env("HOME", &home)
+            .env("CLAUDE_CONFIG_DIR", &claude)
+            .env("CODEX_HOME", &codex)
+            .env_remove("PI_CODING_AGENT_DIR")
+            .env_remove("COPILOT_HOME")
+            .env_remove("KIMI_CODE_HOME")
+            .env_remove("QODER_CONFIG_DIR")
+            .env_remove("FLOCK_BIN")
+            .env_remove("FLOCK_ENV")
+            .env("FLOCK_SOCKET_PATH", base.join("absent.sock"))
+            .output()
+            .unwrap()
+    };
+    for target in ["claude", "codex", "opencode"] {
+        let result = run(&["integration", "install", target]);
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+    let claude_config: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(claude.join(".claude.json")).unwrap()).unwrap();
+    assert_eq!(
+        claude_config["mcpServers"]["flock"]["command"],
+        launch.to_str().unwrap()
+    );
+    let codex_config: toml::Value =
+        toml::from_str(&fs::read_to_string(codex.join("config.toml")).unwrap()).unwrap();
+    assert_eq!(
+        codex_config["mcp_servers"]["flock"]["command"].as_str(),
+        launch.to_str()
+    );
+    let opencode_config: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(opencode.join("opencode.json")).unwrap()).unwrap();
+    assert_eq!(
+        opencode_config["mcp"]["flock"]["command"][0],
+        launch.to_str().unwrap()
+    );
+    let custom = serde_json::json!({"mcpServers":{"flock":{"command":"/nix/store/fixture-flock/bin/flk","args":["mcp","serve"],"env":{"KEEP":"yes"}}}}).to_string();
+    fs::write(claude.join(".claude.json"), &custom).unwrap();
+    assert!(run(&["integration", "install", "claude"]).status.success());
+    assert_eq!(
+        fs::read_to_string(claude.join(".claude.json")).unwrap(),
+        custom
+    );
+    for args in [
+        vec!["integration", "status"],
+        vec!["integration", "status", "--outdated-only"],
+    ] {
+        let status = run(&args);
+        assert!(status.status.success());
+        let output = if args.contains(&"--outdated-only") {
+            assert!(status.stdout.is_empty());
+            String::from_utf8_lossy(&status.stderr)
+        } else {
+            String::from_utf8_lossy(&status.stdout)
+        };
+        assert!(output.contains("claude MCP: pinned store path"), "{output}");
+    }
+    let owned = home.join("owned-opencode.json");
+    let owned_content = "{\"mcp\":{}}";
+    fs::write(&owned, owned_content).unwrap();
+    fs::remove_file(opencode.join("opencode.json")).unwrap();
+    symlink(&owned, opencode.join("opencode.json")).unwrap();
+    let result = run(&["integration", "install", "opencode"]);
+    assert!(result.status.success());
+    assert!(String::from_utf8_lossy(&result.stdout).contains("externally owned"));
+    assert_eq!(fs::read_to_string(&owned).unwrap(), owned_content);
+    assert!(fs::symlink_metadata(opencode.join("opencode.json"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    fs::remove_file(opencode.join("opencode.json")).unwrap();
+    fs::write(opencode.join("opencode.jsonc"), "{ // config owner keeps comments\n \"mcp\": {\"flock\": {\"command\": [\"/nix/store/fixture-flock/bin/flk\", \"mcp\", \"serve\",],},},}\n").unwrap();
+    let status = run(&["integration", "status"]);
+    assert!(String::from_utf8_lossy(&status.stdout).contains("opencode MCP: pinned store path"));
+    let owned_codex = home.join("owned-codex.toml");
+    let owned_codex_content = "model = 'fixture'\n";
+    fs::write(&owned_codex, owned_codex_content).unwrap();
+    fs::remove_file(codex.join("config.toml")).unwrap();
+    symlink(&owned_codex, codex.join("config.toml")).unwrap();
+    let result = run(&["integration", "install", "codex"]);
+    assert!(result.status.success());
+    assert!(String::from_utf8_lossy(&result.stdout).contains("externally owned"));
+    assert_eq!(
+        fs::read_to_string(&owned_codex).unwrap(),
+        owned_codex_content
+    );
+    let after_hooks: toml::Value =
+        toml::from_str(&fs::read_to_string(codex.join("config.toml")).unwrap()).unwrap();
+    assert!(after_hooks.get("mcp_servers").is_none());
+    fs::remove_file(opencode.join("opencode.jsonc")).unwrap();
+    let commented = "{ // owner keeps these comments\n \"mcp\": {} }";
+    fs::write(opencode.join("opencode.json"), commented).unwrap();
+    let result = run(&["integration", "install", "opencode"]);
+    assert!(result.status.success());
+    assert!(String::from_utf8_lossy(&result.stdout).contains("MCP registration deferred"));
+    assert_eq!(
+        fs::read_to_string(opencode.join("opencode.json")).unwrap(),
+        commented
+    );
+    assert!(opencode.join("plugins/flock-agent-state.js").is_file());
+    cleanup_test_base(&base);
+}
+
+/// A relative `--cwd` names a directory under the CALLER's cwd, so every verb
+/// that places a pane sends it absolute; the server would otherwise read it
+/// against its own directory (#898).
+#[test]
+fn relative_cwd_flags_reach_the_server_absolute() {
+    for (verb, method) in [
+        (
+            vec!["agent", "start", "a1", "--cwd", "sub", "--", "true"],
+            "agent.start",
+        ),
+        (
+            vec![
+                "pane",
+                "split",
+                "1-1",
+                "--direction",
+                "right",
+                "--cwd",
+                "sub",
+            ],
+            "pane.split",
+        ),
+        (vec!["tab", "create", "--cwd", "sub"], "tab.create"),
+        (
+            vec!["workspace", "create", "--cwd", "sub"],
+            "workspace.create",
+        ),
+    ] {
+        let base = unique_test_dir();
+        fs::create_dir_all(base.join("sub")).unwrap();
+        let socket_path = base.join("flock.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+
+        let server = thread::spawn(move || loop {
+            let (mut stream, _) = listener.accept().unwrap();
+            let line = read_request_line(&stream);
+            if answer_protocol_check(&mut stream, &line) {
+                continue;
+            }
+            stream
+                .write_all(br#"{"id":"cli:request","result":{"type":"ok"}}"#)
+                .unwrap();
+            stream.write_all(b"\n").unwrap();
+            stream.flush().unwrap();
+            break line;
+        });
+
+        let run = run_cli_in_dir(&socket_path, &verb, &base);
+        let line = server.join().unwrap();
+        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(request["method"], method, "stderr: {:?}", run.stderr);
+        // The caller's cwd as the process sees it: on macOS `/tmp` resolves to
+        // `/private/tmp`.
+        let caller = fs::canonicalize(&base).unwrap();
+        assert_eq!(
+            request["params"]["cwd"],
+            caller.join("sub").display().to_string(),
+            "{method} must send --cwd resolved against the caller"
+        );
+
+        cleanup_test_base(&base);
+    }
 }

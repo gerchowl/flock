@@ -18,8 +18,10 @@ pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
 
     match subcommand {
         "list" => agent_list(&args[1..]),
-        "get" => agent_get(&args[1..]),
+        "get" | "status" => agent_get(&args[1..]),
+        "stop" => agent_stop(&args[1..]),
         "read" => agent_read(&args[1..]),
+        "history" => agent_history(&args[1..]),
         "result" => agent_result(&args[1..]),
         "send" => agent_send(&args[1..]),
         "rename" => agent_rename(&args[1..]),
@@ -30,6 +32,7 @@ pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
         "fork" => agent_fork(&args[1..]),
         "hibernate" => agent_hibernate(&args[1..]),
         "resume" => agent_resume(&args[1..]),
+        "restart" => agent_restart(&args[1..]),
         "help" | "--help" | "-h" => {
             print_agent_help();
             Ok(0)
@@ -44,11 +47,19 @@ pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
 /// The usage lines live here rather than inside the parsers that print them,
 /// because `cli::help` answers `flk agent <verb> --help` from the same
 /// constants (#455) — one answer per verb, not two that can disagree.
+pub(super) const AGENT_SEND_USAGE: &str = "flk agent send [--no-submit [--raw]] <target> <text>\n  Send types the text (bracketed paste when enabled) and submits it: it requires a fresh idle agent and an empty composer, waits 120 ms, then sends Enter and confirms a new turn (one guarded Enter retry). It reports accepted, observed_accepted, unconfirmed (exit 8; reason typed_not_submitted when the text is still in the composer) or abandoned (exit 9).\n  A one-row draft in the composer is moved aside and typed back after the submit; a multi-row or pasted-chip draft is refused with input_not_empty (exit 10).\n  --no-submit types only: it observes delivery for 2 seconds and reports delivered or unconfirmed (exit 8). Into an agent composer holding a draft it refuses with input_not_empty (exit 10) before typing; --raw (only with --no-submit) types anyway. Use pane send-keys for control keys (C-c, Esc, dialog answers), not to submit: a plain agent send already pressed Enter.\n  --submit is still accepted and changes nothing. Use -- before the target to send text beginning with --submit or --no-submit literally.";
+
+pub(super) const AGENT_HISTORY_USAGE: &str =
+    "flk agent history <target> [--detail reply|collapsed|full] [--cursor N] [--limit N]";
+
 pub(super) const AGENT_RESULT_USAGE: &str =
     "flk agent result <target> [--max-chars N] [--offset N]";
-pub(super) const AGENT_START_USAGE: &str = "flk agent start <name> [--cwd PATH] [--workspace ID] [--tab ID] [--active|--here] [--split right|down] [--focus|--no-focus] [--wait-ready [--ready-timeout MS]] -- <argv...>";
+pub(super) const AGENT_START_USAGE: &str = "flk agent start <name> [--runtime pty|structured] [--model MODEL] [--cwd PATH] [--workspace ID] [--tab ID] [--active|--here] [--split right|down] [--focus|--no-focus] [--wait-ready [--ready-timeout MS]] [--questions ask_human|ask_operator|route|deny] [--unattended] [--dry-run] -- <argv...>";
 
-pub(super) const AGENT_FORK_USAGE: &str = "flk agent fork <target> [--branch NAME] [--base REF] [--path PATH] [--label LABEL] [--pivot TEXT|--no-pivot] [--focus|--no-focus]";
+pub(super) const AGENT_RESTART_USAGE: &str =
+    "flk agent restart self|<target> --reason TEXT [--continue-with TEXT|@FILE]";
+
+pub(super) const AGENT_FORK_USAGE: &str = "flk agent fork <target> [--branch NAME] [--base REF] [--path PATH] [--label LABEL] [--pivot TEXT|--no-pivot] [--focus|--no-focus] [--questions POLICY] [--unattended] [--dry-run]";
 
 pub(super) const AGENT_WAIT_USAGE: &str = concat!(
     "flk agent wait <target> --status <",
@@ -62,15 +73,18 @@ pub(super) const AGENT_WAIT_USAGE: &str = concat!(
     "           Without it any quiet counts: an agent already idle settles after one settle window.\n",
     "  --settle MS  how long that quiet must hold. Default 5000; --settle 0 settles on the sample\n",
     "           after the first qualifying one.\n",
-    "  --timeout MS  give up after this long. Absent means wait forever.\n",
+    "  --timeout MS  give up after this long. Absent means no deadline of your own, but 30 s with no\n",
+    "           answer from the server ends the wait anyway (exit 1). A --timeout keeps its own bound:\n",
+    "           the wait retries until that deadline and ends with 124.\n",
     "  prints one JSON line on stdout:\n",
     "           {\"status\":\"settled\"|\"blocked\"|\"gone\",\"pane_id\":…,\"agent_status\":…,\n",
     "            \"turn_cursor\":…,\"held_ms\":N}\n",
     "           a gone line adds \"reason\":\"closed\"|\"hibernated\"|\"restarted\".\n",
-    "  exit 0 settled · 3 blocked · 4 gone · 124 timeout · 2 usage error or refused cursor\n",
-    "           · 1 every other error. A timeout is 1 for the non-settled statuses above.\n",
+    "  exit 0 settled · 6 blocked (was 3) · 4 gone · 124 timeout · 2 usage error or refused cursor\n",
+    "           · 1 every other error, including a server unreachable for 30 s when no --timeout\n",
+    "           was given. A timeout is 1 for the non-settled statuses above.\n",
     "  settled is what flock OBSERVED, not proof that a turn produced a result: for the turn's\n",
-    "  output use `flk agent result` (once #575 lands). Native agents are read from the screen every\n",
+    "  output use `flk agent result`. Native agents are read from the screen every\n",
     "  300-500 ms, so a working phase shorter than one sample is never observed — a cursor taken\n",
     "  before one waits for the next turn instead. A turn cursor never satisfies a wait on another\n",
     "  terminal or another execution.",
@@ -85,6 +99,9 @@ pub(super) const AGENT_WAIT_USAGE: &str = concat!(
 /// into them never reaches the request.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct AgentStartFlags {
+    runtime: crate::api::schema::AgentRuntime,
+    model: Option<String>,
+    dry_run: bool,
     cwd: Option<String>,
     workspace_id: Option<String>,
     tab_id: Option<String>,
@@ -100,6 +117,8 @@ struct AgentStartFlags {
     focus: bool,
     wait_ready: bool,
     ready_timeout_ms: Option<u64>,
+    /// #1179: `--questions` and `--unattended`.
+    asked: super::questions::Asked,
 }
 
 /// Parse the flags before `--`. `separator` is the index of the terminator, so
@@ -122,6 +141,18 @@ fn parse_agent_start_flags(args: &[String], separator: usize) -> Result<AgentSta
                 .ok_or_else(|| format!("missing value for {flag}"))
         };
         match args[index].as_str() {
+            "--runtime" => {
+                flags.runtime = match value_for("--runtime")?.as_str() {
+                    "pty" => crate::api::schema::AgentRuntime::Pty,
+                    "structured" => crate::api::schema::AgentRuntime::Structured,
+                    _ => return Err("--runtime requires pty or structured".into()),
+                };
+                index += 2;
+            }
+            "--model" => {
+                flags.model = Some(value_for("--model")?);
+                index += 2;
+            }
             "--cwd" => {
                 flags.cwd = Some(value_for("--cwd")?);
                 index += 2;
@@ -166,8 +197,22 @@ fn parse_agent_start_flags(args: &[String], separator: usize) -> Result<AgentSta
                 flags.focus = false;
                 index += 1;
             }
+            "--dry-run" => {
+                flags.dry_run = true;
+                index += 1;
+            }
             "--wait-ready" => {
                 flags.wait_ready = true;
+                index += 1;
+            }
+            "--questions" => {
+                flags.asked.questions = Some(super::questions::parse_policy(
+                    args.get(index + 1).filter(|_| index + 1 < separator),
+                )?);
+                index += 2;
+            }
+            "--unattended" => {
+                flags.asked.unattended = true;
                 index += 1;
             }
             "--ready-timeout" => {
@@ -194,6 +239,12 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
         return Ok(2);
     };
 
+    if crate::terminal::agent_name::validate(name).is_err() {
+        return super::print_response(
+            &serde_json::json!({"ok": false, "error": crate::terminal::agent_name::refusal()}),
+        );
+    }
+
     let Some(separator) = args.iter().position(|arg| arg == "--") else {
         eprintln!("usage: {AGENT_START_USAGE}");
         return Ok(2);
@@ -211,6 +262,9 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
         }
     };
     let AgentStartFlags {
+        runtime,
+        model,
+        dry_run,
         cwd,
         workspace_id,
         tab_id,
@@ -220,11 +274,47 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
         focus,
         wait_ready,
         ready_timeout_ms,
+        asked,
     } = flags;
+    if runtime == crate::api::schema::AgentRuntime::Structured {
+        if wait_ready {
+            return Ok(super::output::error(
+                &serde_json::json!({"error":{
+                "code":"runtime_unsupported", "message":"structured sessions have no pane readiness"}}),
+                crate::cli::exit::USAGE,
+            ));
+        }
+        let pong = super::send_request(&Request {
+            id: "cli:ping:structured".into(),
+            method: Method::Ping(crate::api::schema::PingParams::default()),
+        })?;
+        if !crate::api::compatibility::advertises_structured(&pong) {
+            return Ok(super::output::error(
+                &serde_json::json!({"error":{
+                "code":crate::api::compatibility::ERROR_CODE,
+                "message":"structured admission requires a newer server"}}),
+                crate::cli::exit::PROTOCOL_GAP,
+            ));
+        }
+    }
+    let asked = asked.gate(
+        &format!("agent start {name}"),
+        super::questions::server_takes_questions,
+    );
+    // Resolved here rather than in the parser, which stays a pure function of
+    // `args`: the server would read a relative `--cwd` against its own
+    // directory (#898).
+    let cwd = cwd
+        .map(|cwd| super::worktree::normalize_path_arg(&cwd))
+        .transpose()?;
 
     let response = super::send_request(&Request {
         id: "cli:agent:start".into(),
         method: Method::AgentStart(AgentStartParams {
+            runtime,
+            model,
+            label: None,
+            dry_run,
             name: name.clone(),
             cwd,
             workspace_id,
@@ -234,9 +324,11 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
             here,
             focus,
             argv: args[separator + 1..].to_vec(),
+            questions: asked.questions,
+            unattended: asked.unattended,
         }),
     })?;
-    if !wait_ready || response.get("error").is_some() {
+    if dry_run || !wait_ready || response.get("error").is_some() {
         return super::print_response(&response);
     }
 
@@ -270,6 +362,8 @@ fn agent_fork(args: &[String]) -> std::io::Result<i32> {
     let mut label = None;
     let mut pivot = None;
     let mut focus = false;
+    let mut dry_run = false;
+    let mut asked = super::questions::Asked::default();
 
     let mut index = 1;
     while index < args.len() {
@@ -318,6 +412,24 @@ fn agent_fork(args: &[String]) -> std::io::Result<i32> {
                 pivot = Some(String::new());
                 index += 1;
             }
+            "--questions" => {
+                match super::questions::parse_policy(args.get(index + 1)) {
+                    Ok(policy) => asked.questions = Some(policy),
+                    Err(reason) => {
+                        eprintln!("{reason}");
+                        return Ok(super::exit::USAGE);
+                    }
+                }
+                index += 2;
+            }
+            "--unattended" => {
+                asked.unattended = true;
+                index += 1;
+            }
+            "--dry-run" => {
+                dry_run = true;
+                index += 1;
+            }
             "--focus" => {
                 focus = true;
                 index += 1;
@@ -333,9 +445,14 @@ fn agent_fork(args: &[String]) -> std::io::Result<i32> {
         }
     }
 
+    let asked = asked.gate(
+        &format!("agent fork {target}"),
+        super::questions::server_takes_questions,
+    );
     super::print_response(&super::send_request(&Request {
         id: "cli:agent:fork".into(),
         method: Method::AgentFork(AgentForkParams {
+            dry_run,
             target: target.clone(),
             branch,
             base,
@@ -343,20 +460,22 @@ fn agent_fork(args: &[String]) -> std::io::Result<i32> {
             label,
             pivot,
             focus,
+            questions: asked.questions,
+            unattended: asked.unattended,
         }),
     })?)
 }
 
-/// `flk agent hibernate <target>` — park the agent pane (#175 C3).
+/// `flk agent hibernate <target>|--all` — park the agent pane (#175 C3).
 /// Mirrors the socket verb; refusals surface with the wire's code+message.
 fn agent_hibernate(args: &[String]) -> std::io::Result<i32> {
-    let Some(target) = args.first() else {
-        eprintln!("usage: flk agent hibernate <target>");
+    let usage = "usage: flk agent hibernate <target>|--all";
+    let [target] = args else {
+        eprintln!("{usage}");
         return Ok(2);
     };
-    if args.len() != 1 {
-        eprintln!("usage: flk agent hibernate <target>");
-        return Ok(2);
+    if target == "--all" {
+        return agent_bulk(BulkVerb::Hibernate);
     }
     super::print_response(&super::send_request(&Request {
         id: "cli:agent:hibernate".into(),
@@ -366,16 +485,16 @@ fn agent_hibernate(args: &[String]) -> std::io::Result<i32> {
     })?)
 }
 
-/// `flk agent resume <target>` — spawn the hibernated pane's argv back
+/// `flk agent resume <target>|--all` — spawn the hibernated pane's argv back
 /// into the same terminal (#175 C3).
 fn agent_resume(args: &[String]) -> std::io::Result<i32> {
-    let Some(target) = args.first() else {
-        eprintln!("usage: flk agent resume <target>");
+    let usage = "usage: flk agent resume <target>|--all";
+    let [target] = args else {
+        eprintln!("{usage}");
         return Ok(2);
     };
-    if args.len() != 1 {
-        eprintln!("usage: flk agent resume <target>");
-        return Ok(2);
+    if target == "--all" {
+        return agent_bulk(BulkVerb::Resume);
     }
     super::print_response(&super::send_request(&Request {
         id: "cli:agent:resume".into(),
@@ -385,16 +504,232 @@ fn agent_resume(args: &[String]) -> std::io::Result<i32> {
     })?)
 }
 
-fn agent_list(args: &[String]) -> std::io::Result<i32> {
-    if !args.is_empty() {
-        eprintln!("usage: flk agent list");
-        return Ok(2);
+/// The two halves of the operator's restart path (#1010): park every agent
+/// before a server stop, bring every parked one back after the start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BulkVerb {
+    Hibernate,
+    Resume,
+}
+
+impl BulkVerb {
+    fn done(self) -> &'static str {
+        match self {
+            Self::Hibernate => "hibernated",
+            Self::Resume => "resumed",
+        }
     }
 
-    super::print_response(&super::send_request(&Request {
+    /// Whether this agent is one the verb applies to. Hibernate takes every
+    /// running agent with a resumable session; one without a session is
+    /// reported as skipped rather than refused one by one, because the
+    /// server would refuse to park it (it could never come back).
+    fn applies(self, agent: &serde_json::Value) -> Result<(), &'static str> {
+        let resumable = is_resumable(agent);
+        match self {
+            Self::Hibernate if resumable => Err("already_parked"),
+            Self::Hibernate if agent.get("agent_session").is_none() => Err("no_resumable_session"),
+            Self::Hibernate => Ok(()),
+            Self::Resume if resumable => Ok(()),
+            Self::Resume => Err("not_resumable"),
+        }
+    }
+
+    fn request(self, target: String) -> Request {
+        match self {
+            Self::Hibernate => Request {
+                id: "cli:agent:hibernate".into(),
+                method: Method::AgentHibernate(AgentTarget { target }),
+            },
+            Self::Resume => Request {
+                id: "cli:agent:resume".into(),
+                method: Method::AgentResume(AgentTarget { target }),
+            },
+        }
+    }
+}
+
+/// `resumable` from a current server; `hibernated` status from one that
+/// predates the field.
+fn is_resumable(agent: &serde_json::Value) -> bool {
+    agent
+        .get("resumable")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+        || agent
+            .get("agent_status")
+            .and_then(serde_json::Value::as_str)
+            == Some("hibernated")
+}
+
+fn local_agents(response: &serde_json::Value) -> Vec<serde_json::Value> {
+    response
+        .pointer("/result/agents")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Apply `verb` to every local agent it fits, by agent id, and report each
+/// one: `{"results":[{agent_id,name,pane_id,outcome,code?,message?}]}`.
+/// Exit 1 when any agent the verb applied to failed, so a rollout script
+/// can tell "everything came back" from "something did not".
+fn agent_bulk(verb: BulkVerb) -> std::io::Result<i32> {
+    let listed = super::send_request(&Request {
         id: "cli:agent:list".into(),
         method: Method::AgentList(EmptyParams::default()),
+    })?;
+    if listed.get("error").is_some() {
+        return super::print_response(&listed);
+    }
+    // The caller's own agent, when it runs in a pane. Hibernating it would
+    // kill this very process mid-loop: the rest of the fleet stays running and
+    // no summary or exit code ever arrives. A server that predates `self`
+    // answers not-found, and then nothing is skipped.
+    let caller = super::send_request(&Request {
+        id: "cli:agent:self".into(),
+        method: Method::AgentGet(AgentTarget {
+            target: "self".into(),
+        }),
+    })?
+    .pointer("/result/agent/agent_id")
+    .and_then(serde_json::Value::as_str)
+    .map(str::to_string);
+    let mut results = Vec::new();
+    let mut failed = false;
+    for agent in local_agents(&listed) {
+        let Some(agent_id) = agent.get("agent_id").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let mut row = serde_json::json!({
+            "agent_id": agent_id,
+            "name": agent.get("name"),
+            "pane_id": agent.get("pane_id"),
+        });
+        let applies = if caller.as_deref() == Some(agent_id) {
+            Err("caller")
+        } else {
+            verb.applies(&agent)
+        };
+        match applies {
+            Err(reason) => {
+                row["outcome"] = "skipped".into();
+                row["code"] = reason.into();
+            }
+            Ok(()) => {
+                let response = super::send_request(&verb.request(agent_id.to_string()))?;
+                if let Some(error) = response.get("error") {
+                    failed = true;
+                    row["outcome"] = "failed".into();
+                    row["code"] = error.get("code").cloned().unwrap_or_default();
+                    row["message"] = error.get("message").cloned().unwrap_or_default();
+                } else {
+                    row["outcome"] = verb.done().into();
+                    if let Some(pane) = response.pointer("/result/agent/pane_id") {
+                        row["pane_id"] = pane.clone();
+                    }
+                }
+            }
+        }
+        results.push(row);
+    }
+    println!("{}", serde_json::json!({ "results": results }));
+    Ok(i32::from(failed))
+}
+
+fn parse_agent_restart(args: &[String]) -> Result<crate::api::schema::AgentRestartParams, String> {
+    let target = args
+        .first()
+        .filter(|s| !s.starts_with('-'))
+        .ok_or("restart requires self or a target")?
+        .clone();
+    let mut reason = None;
+    let mut continue_with = None;
+    let mut index = 1;
+    while index < args.len() {
+        let key = &args[index];
+        let value = args
+            .get(index + 1)
+            .ok_or_else(|| format!("missing value for {key}"))?
+            .clone();
+        match key.as_str() {
+            "--reason" if reason.is_none() => reason = Some(value),
+            "--continue-with" if continue_with.is_none() => continue_with = Some(value),
+            _ => return Err(format!("unknown or repeated option {key}")),
+        }
+        index += 2;
+    }
+    let reason = reason
+        .filter(|s| !s.trim().is_empty())
+        .ok_or("--reason is required and cannot be empty")?;
+    Ok(crate::api::schema::AgentRestartParams {
+        target,
+        reason,
+        continue_with,
+        when: "after_turn".into(),
+    })
+}
+
+fn agent_restart(args: &[String]) -> std::io::Result<i32> {
+    let mut params = match parse_agent_restart(args) {
+        Ok(params) => params,
+        Err(err) => {
+            eprintln!("{err}\nusage: {AGENT_RESTART_USAGE}");
+            return Ok(2);
+        }
+    };
+    if let Some(file) = params
+        .continue_with
+        .as_deref()
+        .and_then(|s| s.strip_prefix('@'))
+    {
+        use std::io::Read;
+        let mut body = String::new();
+        std::fs::File::open(file)?
+            .take(16 * 1024 + 1)
+            .read_to_string(&mut body)?;
+        // A terminal newline in a handoff file is not part of the prompt.
+        params.continue_with = Some(body.trim_end_matches(['\r', '\n']).to_string());
+    }
+    // Guarded: a busy, rate-limited or drafted agent is refused before
+    // anything restarts, so that refusal exits 10 (#1025).
+    super::print_send_response(&super::send_request(&Request {
+        id: "cli:agent:restart".into(),
+        method: Method::AgentRestart(params),
     })?)
+}
+
+fn agent_list(args: &[String]) -> std::io::Result<i32> {
+    let resumable = match args {
+        [] => false,
+        [flag] if flag == "--resumable" => true,
+        _ => {
+            eprintln!("usage: flk agent list [--resumable]");
+            return Ok(2);
+        }
+    };
+
+    let mut response = super::send_request(&Request {
+        id: "cli:agent:list".into(),
+        method: Method::AgentList(EmptyParams::default()),
+    })?;
+    // #1010: after a restart, the agents `agent resume --all` would bring
+    // back. Local agents only: a fleet row is another server's to resume.
+    if resumable {
+        if let Some(agents) = response
+            .pointer_mut("/result/agents")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            agents.retain(is_resumable);
+        }
+        if let Some(result) = response
+            .get_mut("result")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            result.insert("fleet".into(), serde_json::Value::Array(Vec::new()));
+        }
+    }
+    super::print_response(&response)
 }
 
 fn agent_get(args: &[String]) -> std::io::Result<i32> {
@@ -410,6 +745,19 @@ fn agent_get(args: &[String]) -> std::io::Result<i32> {
     super::print_response(&super::send_request(&Request {
         id: "cli:agent:get".into(),
         method: Method::AgentGet(AgentTarget {
+            target: target.clone(),
+        }),
+    })?)
+}
+
+fn agent_stop(args: &[String]) -> std::io::Result<i32> {
+    let [target] = args else {
+        eprintln!("usage: flk agent stop <structured-agent>");
+        return Ok(super::exit::USAGE);
+    };
+    super::print_response(&super::send_request(&Request {
+        id: "cli:agent:stop".into(),
+        method: Method::AgentStop(AgentTarget {
             target: target.clone(),
         }),
     })?)
@@ -442,8 +790,7 @@ fn agent_attach(args: &[String]) -> std::io::Result<i32> {
 
     let response = resolve_agent_target(&target, "cli:agent:attach:resolve")?;
     if response.get("error").is_some() {
-        eprintln!("{}", serde_json::to_string(&response).unwrap());
-        return Ok(1);
+        return Ok(super::output::error(&response, super::exit::FAILURE));
     }
     let Some(terminal_id) = response["result"]["agent"]["terminal_id"].as_str() else {
         eprintln!("agent attach failed: response did not include terminal_id");
@@ -566,8 +913,7 @@ fn agent_wait(args: &[String]) -> std::io::Result<i32> {
     if ready {
         let response = resolve_agent_target(target, "cli:agent:wait:resolve")?;
         if response.get("error").is_some() {
-            eprintln!("{}", serde_json::to_string(&response).unwrap());
-            return Ok(1);
+            return Ok(super::output::error(&response, super::exit::FAILURE));
         }
         let Some(pane_id) = response["result"]["agent"]["pane_id"].as_str() else {
             eprintln!("agent wait failed: response did not include pane_id");
@@ -599,8 +945,7 @@ fn agent_wait(args: &[String]) -> std::io::Result<i32> {
 
     let response = resolve_agent_target(target, "cli:agent:wait:resolve")?;
     if response.get("error").is_some() {
-        eprintln!("{}", serde_json::to_string(&response).unwrap());
-        return Ok(1);
+        return Ok(super::output::error(&response, super::exit::FAILURE));
     }
     let Some(pane_id) = response["result"]["agent"]["pane_id"].as_str() else {
         eprintln!("agent wait failed: response did not include pane_id");
@@ -629,6 +974,8 @@ fn agent_wait(args: &[String]) -> std::io::Result<i32> {
         Request {
             id: "cli:agent:wait".into(),
             method: Method::EventsSubscribe(crate::api::schema::EventsSubscribeParams {
+                after: None,
+                after_sequence: None,
                 subscriptions,
             }),
         },
@@ -638,12 +985,26 @@ fn agent_wait(args: &[String]) -> std::io::Result<i32> {
 }
 
 fn resolve_agent_target(target: &str, request_id: &str) -> std::io::Result<serde_json::Value> {
-    super::send_request(&Request {
+    let response = super::send_request(&Request {
         id: request_id.into(),
         method: Method::AgentGet(AgentTarget {
             target: target.to_owned(),
         }),
-    })
+    })?;
+    if response
+        .pointer("/result/agent/runtime")
+        .and_then(serde_json::Value::as_str)
+        == Some("structured")
+    {
+        return Ok(serde_json::json!({
+            "id": request_id,
+            "error": {
+                "code": crate::api::error_code::ErrorCode::RuntimeUnsupported.as_str(),
+                "message": "this operation requires a PTY placement"
+            }
+        }));
+    }
+    Ok(response)
 }
 
 fn agent_rename(args: &[String]) -> std::io::Result<i32> {
@@ -661,6 +1022,12 @@ fn agent_rename(args: &[String]) -> std::io::Result<i32> {
         Some(args[1..].join(" "))
     };
 
+    if crate::terminal::agent_name::validate(name.as_deref().unwrap_or_default()).is_err() {
+        return super::print_response(
+            &serde_json::json!({"ok": false, "error": crate::terminal::agent_name::refusal()}),
+        );
+    }
+
     super::print_response(&super::send_request(&Request {
         id: "cli:agent:rename".into(),
         method: Method::AgentRename(AgentRenameParams {
@@ -670,19 +1037,62 @@ fn agent_rename(args: &[String]) -> std::io::Result<i32> {
     })?)
 }
 
-fn agent_send(args: &[String]) -> std::io::Result<i32> {
-    if args.len() < 2 {
-        eprintln!("usage: flk agent send <target> <text>");
-        return Ok(2);
+/// A send submits unless `--no-submit` says otherwise (#995). `--submit`, the
+/// old opt-in, is still accepted and changes nothing. `--raw` lets a
+/// `--no-submit` type onto a composer draft (#1162), and is refused with a
+/// submit, whose guard is the point of submitting through flock.
+fn parse_agent_send_args(args: &[String]) -> Option<AgentSendParams> {
+    let mut words = args;
+    let mut submit = true;
+    let mut raw = false;
+    let mut flag = |word: &str| match word {
+        "--submit" => true,
+        "--no-submit" => {
+            submit = false;
+            true
+        }
+        "--raw" => {
+            raw = true;
+            true
+        }
+        _ => false,
+    };
+    while words.first().is_some_and(|word| flag(word)) {
+        words = &words[1..];
     }
+    let literal = words.first().is_some_and(|word| word == "--");
+    if literal {
+        words = &words[1..];
+    }
+    let target = words.first()?.clone();
+    let mut text = &words[1..];
+    while !literal && text.first().is_some_and(|word| flag(word)) {
+        text = &text[1..];
+    }
+    if text.is_empty() || (raw && submit) {
+        return None;
+    }
+    Some(AgentSendParams {
+        item_id: None,
+        write_timeout_ms: None,
+        target,
+        text: text.join(" "),
+        submit,
+        raw,
+    })
+}
 
-    super::print_response(&super::send_request(&Request {
+fn agent_send(args: &[String]) -> std::io::Result<i32> {
+    let Some(params) = parse_agent_send_args(args) else {
+        eprintln!("usage: {AGENT_SEND_USAGE}");
+        return Ok(super::exit::USAGE);
+    };
+    let mut response = super::send_request(&Request {
         id: "cli:agent:send".into(),
-        method: Method::AgentSend(AgentSendParams {
-            target: args[0].clone(),
-            text: args[1..].join(" "),
-        }),
-    })?)
+        method: Method::AgentSend(params),
+    })?;
+    super::delegate::enrich_draft_refusal(&mut response);
+    super::print_send_response(&response)
 }
 
 fn agent_read(args: &[String]) -> std::io::Result<i32> {
@@ -748,6 +1158,68 @@ fn agent_read(args: &[String]) -> std::io::Result<i32> {
     })?)
 }
 
+fn agent_history(args: &[String]) -> std::io::Result<i32> {
+    use crate::agent_transcript::TranscriptDetail;
+
+    let Some(target) = args.first().filter(|arg| !arg.starts_with('-')) else {
+        eprintln!("usage: {AGENT_HISTORY_USAGE}");
+        return Ok(2);
+    };
+    let mut detail = TranscriptDetail::default();
+    let mut cursor = None;
+    let mut limit = None;
+    let mut index = 1;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        if !matches!(flag, "--detail" | "--cursor" | "--limit") {
+            eprintln!("unknown option: {flag}");
+            return Ok(2);
+        }
+        let Some(value) = args.get(index + 1) else {
+            eprintln!("missing value for {flag}");
+            return Ok(2);
+        };
+        match flag {
+            "--detail" => {
+                detail = match value.as_str() {
+                    "reply" => TranscriptDetail::Reply,
+                    "collapsed" => TranscriptDetail::Collapsed,
+                    "full" => TranscriptDetail::Full,
+                    _ => {
+                        eprintln!("invalid --detail: expected reply, collapsed, or full");
+                        return Ok(2);
+                    }
+                };
+            }
+            "--cursor" => match super::parse_u64_flag(flag, value) {
+                Ok(parsed) => cursor = Some(parsed),
+                Err(err) => {
+                    eprintln!("{err}");
+                    return Ok(2);
+                }
+            },
+            "--limit" => match super::parse_u32_flag(flag, value) {
+                Ok(parsed) => limit = Some(parsed),
+                Err(err) => {
+                    eprintln!("{err}");
+                    return Ok(2);
+                }
+            },
+            _ => unreachable!(),
+        }
+        index += 2;
+    }
+    super::print_response(&super::send_request(&Request {
+        id: "cli:agent:history".into(),
+        method: Method::AgentHistory(crate::api::schema::AgentHistoryParams {
+            target: target.clone(),
+            detail,
+            cursor,
+            limit,
+        }),
+    })?)
+}
+
 /// `flk agent result` (#575): the reply an agent's newest turn ended on, and
 /// the `DONE:` / `BLOCKED:` / `VERDICT:` line it ends with — Claude and
 /// opencode alike. `--offset` pages a long report by characters.
@@ -781,21 +1253,29 @@ fn agent_result(args: &[String]) -> std::io::Result<i32> {
             }
         }
     }
-    super::print_response(&super::send_request(&Request {
+    let response = super::send_request(&Request {
         id: "cli:agent:result".into(),
         method: Method::AgentResult(crate::api::schema::AgentResultParams {
             target: target.clone(),
             max_chars,
             offset,
         }),
-    })?)
+    })?;
+    if let Some(message) =
+        super::compatibility::capability_error_message(&response, "flk agent result")
+    {
+        return Err(std::io::Error::other(message));
+    }
+    super::print_response(&response)
 }
 
 fn print_agent_help() {
     eprintln!("flk agent commands:");
-    eprintln!("  flk agent list");
-    eprintln!("  flk agent get <target>");
+    eprintln!("  flk agent list [--resumable]");
+    eprintln!("  flk agent get|status <target>");
+    eprintln!("  flk agent stop <structured-agent>");
     eprintln!("  flk agent read <target> [--source visible|recent|recent-unwrapped] [--lines N] [--format text|ansi] [--ansi]");
+    eprintln!("  {AGENT_HISTORY_USAGE}");
     eprintln!("  {AGENT_RESULT_USAGE}");
     eprintln!(
         "    the reply the agent's newest turn ended on (claude or opencode), with the status of"
@@ -803,15 +1283,24 @@ fn print_agent_help() {
     eprintln!(
         "    a final DONE: / BLOCKED: / VERDICT: line; `finished` says whether that turn is over"
     );
-    eprintln!("  flk agent send <target> <text>");
+    eprintln!("  {AGENT_SEND_USAGE}");
     eprintln!("  flk agent rename <target> <name>|--clear");
     eprintln!("  flk agent focus <target>");
     eprintln!("  {AGENT_WAIT_USAGE}");
     eprintln!("  flk agent attach <target> [--takeover]");
     eprintln!("  {AGENT_START_USAGE}");
-    eprintln!("  flk agent fork <target> [--branch NAME] [--base REF] [--path PATH] [--label LABEL] [--pivot TEXT|--no-pivot] [--focus|--no-focus]");
-    eprintln!("  flk agent hibernate <target>");
-    eprintln!("  flk agent resume <target>");
+    eprintln!("  {AGENT_FORK_USAGE}");
+    eprintln!("  flk agent hibernate <target>|--all");
+    eprintln!("  flk agent resume <target>|--all");
+    eprintln!(
+        "    --all: every local agent; before a planned server stop hibernate --all, after the"
+    );
+    eprintln!(
+        "    start list --resumable and resume --all. Reports each agent; exit 1 if any failed"
+    );
+    eprintln!("  {AGENT_RESTART_USAGE}");
+    eprintln!("  --workspace/--tab replace an untouched lone root shell, otherwise open a new tab");
+    eprintln!("    (a sibling space in workspace tab mode). Only --split splits a pane.");
     eprintln!("  agent start without --cwd starts in the targeted workspace's checkout; with no target, in the server's cwd");
     eprintln!(
         "  --cwd also picks the SPACE: a cwd naming an already-open checkout joins that space"
@@ -838,7 +1327,7 @@ fn print_agent_help() {
     eprintln!("    pass --workspace/--tab/--cwd, or --active, instead of being placed at random;");
     eprintln!("  targets accept terminal ids, unique agent names, detected/reported agent labels, and legacy pane ids");
     eprintln!(
-        "  agent send writes literal text; use pane run when you want command text plus Enter"
+        "  agent send types and submits with a confirmed Enter; agent send --no-submit only types"
     );
     eprintln!("  --ready / --wait-ready block until the pane reports a status other than unknown:");
     eprintln!("    a TUI that has not painted yet is unknown, so ready is the first moment idle,");
@@ -850,15 +1339,70 @@ fn print_agent_help() {
         "    (`done` too: an unattended agent goes quiet as `done`, which is an effective idle)."
     );
     eprintln!("    `done` on its own means exactly that effective state, not a UI-only marker:");
-    eprintln!(
-        "    --status settled waits for the agent to go quiet; `flk agent result` (once #575 lands) is"
-    );
+    eprintln!("    --status settled waits for the agent to go quiet; `flk agent result` is");
     eprintln!("    the turn's output, which settled does not promise.");
 }
 
 #[cfg(test)]
 mod tests {
     use super::{parse_agent_start_flags, AGENT_START_USAGE};
+
+    #[test]
+    fn agent_send_submits_by_default_and_no_submit_types_only() {
+        let parse = |words: &[&str]| {
+            super::parse_agent_send_args(
+                &words
+                    .iter()
+                    .map(|word| word.to_string())
+                    .collect::<Vec<_>>(),
+            )
+            .expect("valid send")
+        };
+        let plain = parse(&["worker", "hello"]);
+        assert!(plain.submit, "a plain send submits (#995)");
+        let raw = parse(&["worker", "hello\nworld", "--no-submit"]);
+        assert!(raw.submit);
+        assert_eq!(raw.text, "hello\nworld --no-submit");
+        for words in [
+            vec!["--no-submit", "worker", "hello"],
+            vec!["worker", "--no-submit", "hello"],
+        ] {
+            let parsed = parse(&words);
+            assert!(!parsed.submit);
+            assert_eq!(parsed.target, "worker");
+            assert_eq!(parsed.text, "hello");
+        }
+        for words in [
+            vec!["--submit", "worker", "hello"],
+            vec!["worker", "--submit", "hello"],
+        ] {
+            let parsed = parse(&words);
+            assert!(parsed.submit, "--submit stays an accepted alias");
+            assert_eq!(parsed.text, "hello");
+        }
+        let literal = parse(&["--", "worker", "--no-submit", "hello"]);
+        assert!(literal.submit);
+        assert_eq!(literal.text, "--no-submit hello");
+        assert_eq!(parse(&["worker", "--", "hello"]).text, "-- hello");
+        assert!(super::parse_agent_send_args(&["worker".into(), "--no-submit".into()]).is_none());
+        assert!(super::AGENT_SEND_USAGE.contains("--no-submit types only"));
+        let raw = parse(&["--no-submit", "--raw", "worker", "hello"]);
+        assert!(!raw.submit && raw.raw, "#1162: --raw types onto a draft");
+        assert!(!parse(&["--no-submit", "worker", "hello"]).raw);
+        assert!(
+            super::parse_agent_send_args(&["--raw".into(), "worker".into(), "hello".into()])
+                .is_none(),
+            "--raw with a submit is refused: the submit's guard is the point"
+        );
+    }
+
+    #[test]
+    fn agent_send_socket_defaults_to_raw() {
+        let raw: crate::api::schema::AgentSendParams =
+            serde_json::from_value(serde_json::json!({"target": "worker", "text": "hello"}))
+                .expect("existing client request");
+        assert!(!raw.submit);
+    }
 
     /// `-- active` is the terminator in these tests, so the parser sees exactly
     /// what it would see on the command line before the child's argv.
@@ -961,4 +1505,45 @@ mod tests {
         assert!(AGENT_START_USAGE.contains("[--active|--here]"));
         assert!(AGENT_START_USAGE.contains("[--split"));
     }
+}
+
+#[cfg(test)]
+mod restart_tests {
+    use super::*;
+    #[test]
+    fn restart_cli_carries_target_reason_and_continuation() {
+        let words = [
+            "self",
+            "--reason",
+            "reload MCP config",
+            "--continue-with",
+            "finish the PR",
+        ]
+        .map(String::from);
+        let parsed = parse_agent_restart(&words).unwrap();
+        assert_eq!(parsed.target, "self");
+        assert_eq!(parsed.when, "after_turn");
+        assert_eq!(parsed.continue_with.as_deref(), Some("finish the PR"));
+        assert_eq!(parsed.reason, "reload MCP config");
+    }
+    #[test]
+    fn restart_cli_refuses_missing_reason_repeated_flags_and_unknown_options() {
+        for words in [
+            vec!["self"],
+            vec!["self", "--reason"],
+            vec!["self", "--reason", ""],
+            vec!["self", "--now", "yes"],
+            vec!["self", "--reason", "one", "--reason", "two"],
+        ] {
+            assert!(
+                parse_agent_restart(&words.into_iter().map(String::from).collect::<Vec<_>>())
+                    .is_err()
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_structured_start(args: &[String]) -> std::io::Result<i32> {
+    agent_start(args)
 }

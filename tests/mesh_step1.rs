@@ -1,0 +1,1693 @@
+// Fake SSH relay requires the debug-only ancestry override (#1715).
+#![cfg(debug_assertions)]
+
+//! Step-1 acceptance: real sandbox servers and agent CLI calls over one-hop edges.
+mod support;
+
+use serde_json::{json, Value};
+use std::time::{Duration, Instant};
+use support::fleet::{self, Fleet, Node, NodeSpec};
+
+const DEADLINE: Duration = Duration::from_secs(30);
+const DIRECT: &[NodeSpec] = &[
+    NodeSpec::new("nodea", "accept-origin", &["nodeb"]),
+    NodeSpec::new("nodeb", "accept-target", &[]),
+];
+const SPOKE: &[NodeSpec] = &[
+    NodeSpec::new("nodeb", "accept-hub", &["nodea"]),
+    NodeSpec::new("nodea", "accept-spoke", &[]),
+];
+
+fn api(node: &Node, method: &str, params: Value) -> Value {
+    let response: Value = serde_json::from_str(
+        &node.api(&json!({"id":"acceptance","method":method,"params":params}).to_string()),
+    )
+    .unwrap();
+    assert!(
+        response.get("error").is_none(),
+        "{} {method}: {response}",
+        node.name
+    );
+    response["result"].clone()
+}
+
+fn quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
+}
+
+struct Agent {
+    id: String,
+    pane: String,
+}
+
+impl Agent {
+    fn start(node: &Node) -> Self {
+        let started = api(
+            node,
+            "agent.start",
+            json!({
+                "name":"acceptance", "argv":["/bin/sh"], "cwd":node.repo
+            }),
+        );
+        Self {
+            id: started["agent"]["agent_id"].as_str().unwrap().into(),
+            pane: started["agent"]["pane_id"].as_str().unwrap().into(),
+        }
+    }
+
+    // Execute inside the real agent ancestry, including on an edge-less spoke.
+    fn cli(&self, node: &Node, args: &[&str]) -> Value {
+        self.result(node, &self.start_cli(node, args))
+    }
+
+    /// Wait for a command run in this pane; on timeout, name what the pane,
+    /// the node's edges and its logs showed, so a CI flake is diagnosable.
+    fn result(&self, node: &Node, output: &std::path::Path) -> Value {
+        let deadline = Instant::now() + DEADLINE;
+        loop {
+            let response = std::fs::read(output)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+            if let Some(response) = response {
+                assert!(response.get("error").is_none(), "{response}");
+                return response["result"].clone();
+            }
+            // A refused CLI writes its error to stderr and nothing to stdout.
+            if let Some(code) = std::fs::read_to_string(output.with_extension("status"))
+                .ok()
+                .and_then(|code| code.parse::<i32>().ok())
+            {
+                assert_eq!(
+                    code,
+                    0,
+                    "agent CLI failed on {}: {}",
+                    node.name,
+                    std::fs::read_to_string(output.with_extension("stderr")).unwrap_or_default()
+                );
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for agent CLI result on {}\n{}",
+                node.name,
+                diagnose_pane(node, &self.pane, output)
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    fn start_cli(&self, node: &Node, args: &[&str]) -> std::path::PathBuf {
+        let output = node.home.join("acceptance-cli.json");
+        for path in [
+            &output,
+            &output.with_extension("stderr"),
+            &output.with_extension("status"),
+        ] {
+            let _ = std::fs::remove_file(path);
+        }
+        let command = std::iter::once(env!("CARGO_BIN_EXE_flk"))
+            .chain(args.iter().copied())
+            .map(quote)
+            .collect::<Vec<_>>()
+            .join(" ");
+        node.run_in_pane(
+            &self.pane,
+            &format!(
+                "{command} >{} 2>{}; printf '%s' \"$?\" >{}",
+                quote(output.to_str().unwrap()),
+                quote(output.with_extension("stderr").to_str().unwrap()),
+                quote(output.with_extension("status").to_str().unwrap())
+            ),
+        );
+        output
+    }
+
+    fn shell_pid(&self, node: &Node) -> Value {
+        let output = node.home.join("acceptance-pid.json");
+        let _ = std::fs::remove_file(&output);
+        node.run_in_pane(
+            &self.pane,
+            &format!(
+                "printf '{{\"result\":{{\"pid\":%s}}}}\\n' \"$$\" >{}",
+                quote(output.to_str().unwrap())
+            ),
+        );
+        self.result(node, &output)["pid"].clone()
+    }
+}
+
+fn diagnose_pane(node: &Node, pane: &str, output: &std::path::Path) -> String {
+    let raw = |method: &str, params: Value| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            node.api(&json!({"id":"diagnose","method":method,"params":params}).to_string())
+        }))
+        .unwrap_or_else(|_| format!("{method}: no response"))
+    };
+    let mut report = format!(
+        "output file: {:?}\npane: {}\nenrollment: {}\n",
+        std::fs::read_to_string(output).ok(),
+        raw(
+            "pane.read",
+            json!({"pane_id":pane, "source":"recent", "lines":40})
+        ),
+        raw("peers.enrollment", json!({})),
+    );
+    for dir in [
+        node.config_home.join(support::paths::app_dir_name()),
+        node.home.join("data"),
+    ] {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for path in entries.filter_map(|e| e.ok().map(|e| e.path())) {
+            if path.extension().is_some_and(|ext| ext == "log") {
+                let text = std::fs::read_to_string(&path).unwrap_or_default();
+                let tail: Vec<_> = text.lines().rev().take(30).collect();
+                report.push_str(&format!("--- {}\n", path.display()));
+                for line in tail.into_iter().rev() {
+                    report.push_str(line);
+                    report.push('\n');
+                }
+            }
+        }
+    }
+    report
+}
+
+fn cli_result(output: &std::path::Path) -> Value {
+    let response: Value = fleet::wait_until("agent CLI result", DEADLINE, || {
+        serde_json::from_slice(&std::fs::read(output).ok()?).ok()
+    });
+    assert!(response.get("error").is_none(), "{response}");
+    response["result"].clone()
+}
+
+struct Conversation {
+    fleet: Fleet,
+    sender: Agent,
+    receiver: Agent,
+}
+
+impl Conversation {
+    fn new(specs: &[NodeSpec]) -> Self {
+        let fleet = fleet::spawn("s1", specs);
+        let sender = Agent::start(fleet.node("nodea"));
+        let receiver = Agent::start(fleet.node("nodeb"));
+        fleet::wait_until("recipient discovery", DEADLINE, || {
+            api(fleet.node("nodea"), "agent.list", json!({}))["fleet"]
+                .as_array()?
+                .iter()
+                .any(|entry| entry["agent_id"] == receiver.id)
+                .then_some(())
+        });
+        fleet.wait_route("nodea", "nodeb", true);
+        Self {
+            fleet,
+            sender,
+            receiver,
+        }
+    }
+
+    fn send(&self) -> Value {
+        self.sender.cli(
+            self.fleet.node("nodea"),
+            &[
+                "msg",
+                "send",
+                "--agent",
+                &self.receiver.id,
+                "--intent",
+                "needs-reply",
+                "--correlation-id",
+                "question",
+                "question body",
+            ],
+        )
+    }
+
+    fn reply(&self) -> Value {
+        self.receiver.cli(
+            self.fleet.node("nodeb"),
+            &["msg", "reply", "question", "answer body"],
+        )
+    }
+
+    fn read_question(&self) {
+        let messages = mail(self.fleet.node("nodeb"), &self.receiver.pane);
+        assert_eq!(messages.as_array().unwrap().len(), 1, "{messages}");
+        assert_eq!(messages[0]["body"], "question body");
+        assert_eq!(messages[0]["from_agent"], self.sender.id);
+        assert_eq!(messages[0]["reply_contract"], "durable_return_binding");
+        state(self.fleet.node("nodeb"), "question", "read");
+    }
+
+    fn answer_once(&self) {
+        let messages = mail(self.fleet.node("nodea"), &self.sender.pane);
+        assert_eq!(messages.as_array().unwrap().len(), 1, "{messages}");
+        assert_eq!(messages[0]["body"], "answer body");
+        assert_eq!(messages[0]["in_reply_to"], "question");
+        let answer = messages[0]["correlation_id"].as_str().unwrap();
+        state(self.fleet.node("nodea"), answer, "read");
+        let waited = api(
+            self.fleet.node("nodea"),
+            "msg.wait_reply",
+            json!({
+                "correlation_id":"question", "timeout_ms":0
+            }),
+        );
+        assert_eq!(waited["outcome"], "replied", "{waited}");
+        assert_eq!(waited["reply"]["body"], "answer body");
+        assert_eq!(read(self.fleet.node("nodea"), &self.sender.pane), json!([]));
+        assert_eq!(
+            read(self.fleet.node("nodeb"), &self.receiver.pane),
+            json!([])
+        );
+    }
+}
+
+fn status(node: &Node, correlation: &str) -> Value {
+    api(node, "msg.status", json!({"correlation_id":correlation}))
+}
+
+fn audit_event(node: &Node, event: &str, field: &str, correlation: &str) -> Value {
+    fleet::wait_until("server audit event", DEADLINE, || {
+        std::fs::read_to_string(
+            node.config_home
+                .join(support::paths::app_dir_name())
+                .join("event-log.jsonl"),
+        )
+        .ok()?
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|row| {
+            row["envelope"]["event"] == event && row["envelope"]["data"][field] == correlation
+        })
+    })
+}
+
+fn delivery_attempts(fleet: &Fleet, from: &str, to: &str, correlation: &str) -> usize {
+    std::fs::read_to_string(fleet.base.join(format!("delivery-attempts-{from}-{to}")))
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| *line == correlation)
+        .count()
+}
+
+fn state(node: &Node, correlation: &str, expected: &str) -> Value {
+    fleet::wait_until(
+        &format!("{} {correlation} becomes {expected}", node.name),
+        DEADLINE,
+        || {
+            let response: Value = serde_json::from_str(
+                &node.api(
+                    &json!({
+                        "id":"state", "method":"msg.status", "params":{"correlation_id":correlation}
+                    })
+                    .to_string(),
+                ),
+            )
+            .unwrap();
+            if response["error"]["code"] == "message_not_found" {
+                return None;
+            }
+            assert!(response.get("error").is_none(), "{response}");
+            let result = response["result"].clone();
+            (result["state"] == expected).then_some(result)
+        },
+    )
+}
+
+fn read(node: &Node, pane: &str) -> Value {
+    api(node, "msg.read", json!({"pane":pane}))["messages"].clone()
+}
+
+fn mail(node: &Node, pane: &str) -> Value {
+    fleet::wait_until("inbox delivery", DEADLINE, || {
+        let messages = read(node, pane);
+        (!messages.as_array()?.is_empty()).then_some(messages)
+    })
+}
+
+fn db(node: &Node) -> rusqlite::Connection {
+    let db = rusqlite::Connection::open(
+        node.home
+            .join("state")
+            .join(support::paths::app_dir_name())
+            .join("mesh-mail.sqlite"),
+    )
+    .unwrap();
+    db.busy_timeout(Duration::from_secs(5)).unwrap();
+    db
+}
+
+fn cut(fleet: &Fleet, from: &str, to: &str) {
+    fleet.refuse_edge(from, to);
+    fleet.kill_edge(from, to, Duration::from_secs(10));
+}
+
+fn reconnect(fleet: &Fleet, from: &str, to: &str) {
+    fleet.allow_edge(from, to);
+    fleet::wait_until("replacement edge enrolled", DEADLINE, || {
+        api(fleet.node(from), "peers.enrollment", json!({}))["peers"]
+            .as_array()?
+            .iter()
+            .any(|peer| peer["peer"] == to && peer["state"] == "pinned")
+            .then_some(())
+    });
+}
+
+// Advance fixture deadlines only after a deliberate partition. Production
+// backoff remains unchanged, and every delivery still crosses the real edge.
+fn due(node: &Node) {
+    db(node)
+        .execute("UPDATE envelopes SET collect_at=0,retry_at=0", [])
+        .unwrap();
+}
+
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
+#[test]
+fn incident_direct_held_collected_read_without_an_active_waiter() {
+    let conversation = Conversation::new(DIRECT);
+    assert_eq!(conversation.send()["state"], "delivered");
+    state(conversation.fleet.node("nodea"), "question", "delivered");
+    conversation.read_question();
+    let reply = conversation.reply();
+    assert_eq!(reply["state"], "held", "{reply}");
+    // The origin can collect the held answer before the first poll here, so
+    // a later state proves the held answer was stored as well.
+    let correlation = reply["correlation_id"].as_str().unwrap();
+    fleet::wait_until("nodeb answer held or collected", DEADLINE, || {
+        let status = api(
+            conversation.fleet.node("nodeb"),
+            "msg.status",
+            json!({"correlation_id":correlation}),
+        );
+        matches!(status["state"].as_str(), Some("held" | "collected")).then_some(())
+    });
+    conversation.answer_once();
+    state(
+        conversation.fleet.node("nodeb"),
+        reply["correlation_id"].as_str().unwrap(),
+        "collected",
+    );
+    state(conversation.fleet.node("nodea"), "question", "read");
+}
+
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
+#[test]
+fn incident_reverse_edge_pushes_within_two_seconds() {
+    let conversation = Conversation::new(&[
+        NodeSpec::new("nodea", "accept-origin", &["nodeb"]),
+        NodeSpec::new("nodeb", "accept-target", &["nodea"]),
+    ]);
+    fleet::wait_until("reverse enrollment", DEADLINE, || {
+        api(
+            conversation.fleet.node("nodeb"),
+            "peers.enrollment",
+            json!({}),
+        )["peers"]
+            .as_array()?
+            .iter()
+            .any(|p| p["source"] == "configured" && p["state"] == "pinned")
+            .then_some(())
+    });
+    conversation.send();
+    conversation.read_question();
+    // Disable collection so only the reverse push can satisfy the assertion.
+    db(conversation.fleet.node("nodea"))
+        .execute("UPDATE envelopes SET collect_at=999999999", [])
+        .unwrap();
+    let reply = conversation.reply();
+    conversation.answer_once();
+    let correlation = reply["correlation_id"].as_str().unwrap();
+    let accepted = audit_event(
+        conversation.fleet.node("nodeb"),
+        "message_replied",
+        "reply_correlation_id",
+        correlation,
+    );
+    let imported = audit_event(
+        conversation.fleet.node("nodea"),
+        "message_queued",
+        "correlation_id",
+        correlation,
+    );
+    assert!(
+        imported["ts_ms"]
+            .as_u64()
+            .unwrap()
+            .saturating_sub(accepted["ts_ms"].as_u64().unwrap())
+            < 2_000
+    );
+}
+
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
+#[test]
+fn incident_spoke_outbox_is_collected_and_answer_is_pushed_down() {
+    let conversation = Conversation::new(SPOKE);
+    cut(&conversation.fleet, "nodeb", "nodea");
+    assert_eq!(conversation.send()["state"], "queued");
+    state(conversation.fleet.node("nodea"), "question", "queued");
+    conversation.fleet.allow_edge("nodeb", "nodea");
+    state(conversation.fleet.node("nodea"), "question", "delivered");
+    conversation.read_question();
+    state(conversation.fleet.node("nodea"), "question", "read");
+    let reply = conversation.reply();
+    assert_eq!(reply["state"], "held");
+    let correlation = reply["correlation_id"].as_str().unwrap();
+    state(conversation.fleet.node("nodeb"), correlation, "collected");
+    fleet::wait_until("push-down inbox before read", DEADLINE, || {
+        api(
+            conversation.fleet.node("nodea"),
+            "msg.list",
+            json!({"pane":conversation.sender.pane}),
+        )["messages"]
+            .as_array()?
+            .iter()
+            .any(|m| m["correlation_id"] == correlation)
+            .then_some(())
+    });
+    conversation.answer_once();
+}
+
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
+#[test]
+fn failed_receipt_commit_backs_off_on_a_healthy_edge() {
+    let conversation = Conversation::new(SPOKE);
+    conversation.send();
+    state(conversation.fleet.node("nodea"), "question", "delivered");
+    let hub = db(conversation.fleet.node("nodeb"));
+    fleet::wait_until("initial delivery receipt committed", DEADLINE, || {
+        hub.query_row(
+            "SELECT receipt_sent='delivered' FROM envelopes WHERE correlation='question'",
+            [],
+            |r| r.get::<_, bool>(0),
+        )
+        .ok()?
+        .then_some(())
+    });
+    hub.execute_batch(
+        "CREATE TRIGGER fail_receipt BEFORE UPDATE OF receipt_sent ON envelopes
+        BEGIN SELECT RAISE(FAIL, 'receipt write fault'); END;",
+    )
+    .unwrap();
+    let polls = conversation.fleet.base.join("receipt-polls-nodeb-nodea");
+    let count = || {
+        std::fs::read_to_string(&polls)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+    let before = count();
+    conversation.read_question();
+    state(conversation.fleet.node("nodea"), "question", "read");
+    fleet::wait_until(
+        "receipt send despite local commit failure",
+        DEADLINE,
+        || (count() > before).then_some(()),
+    );
+    let after = count();
+    let started = Instant::now();
+    fleet::wait_until(
+        "failed receipt backoff across two worker ticks",
+        DEADLINE,
+        || {
+            assert_eq!(count(), after);
+            assert_eq!(
+                status(conversation.fleet.node("nodea"), "question")["state"],
+                "read"
+            );
+            (started.elapsed() >= Duration::from_secs(2)).then_some(())
+        },
+    );
+    assert_eq!(
+        hub.query_row(
+            "SELECT receipt_sent FROM envelopes WHERE correlation='question'",
+            [],
+            |r| r.get::<_, String>(0)
+        )
+        .unwrap(),
+        "delivered"
+    );
+    hub.execute_batch("DROP TRIGGER fail_receipt").unwrap();
+    conversation.reply();
+    conversation.answer_once();
+}
+
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
+#[test]
+fn queued_request_and_held_answer_survive_offline_reconnect() {
+    let mut conversation = Conversation::new(DIRECT);
+    cut(&conversation.fleet, "nodea", "nodeb");
+    assert_eq!(conversation.send()["state"], "queued");
+    state(conversation.fleet.node("nodea"), "question", "queued");
+    reconnect(&conversation.fleet, "nodea", "nodeb");
+    due(conversation.fleet.node("nodea"));
+    conversation.read_question();
+    cut(&conversation.fleet, "nodea", "nodeb");
+    let reply = conversation.reply();
+    assert_eq!(reply["state"], "held");
+    conversation.fleet.node_mut("nodeb").restart();
+    state(
+        conversation.fleet.node("nodeb"),
+        reply["correlation_id"].as_str().unwrap(),
+        "held",
+    );
+    reconnect(&conversation.fleet, "nodea", "nodeb");
+    due(conversation.fleet.node("nodea"));
+    conversation.answer_once();
+}
+
+fn restart_role(specs: &[NodeSpec], role: &str) {
+    let mut conversation = Conversation::new(specs);
+    conversation.send();
+    conversation.read_question();
+    conversation.fleet.node_mut(role).restart();
+    state(conversation.fleet.node("nodeb"), "question", "read");
+    // A cold restart restores the conversation, not the old CLI process.
+    api(
+        conversation.fleet.node("nodeb"),
+        "msg.reply",
+        json!({
+            "correlation_id":"question", "body":"answer body"
+        }),
+    );
+    due(conversation.fleet.node("nodea"));
+    conversation.answer_once();
+}
+
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
+#[test]
+fn cold_restart_sender_mid_conversation() {
+    restart_role(DIRECT, "nodea");
+}
+
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
+#[test]
+fn cold_restart_receiver_mid_conversation() {
+    restart_role(DIRECT, "nodeb");
+}
+
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
+#[test]
+fn cold_restart_hub_mid_conversation() {
+    restart_role(SPOKE, "nodeb");
+}
+
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
+#[test]
+fn lost_collect_ack_reimports_once_after_edge_is_killed() {
+    let mut conversation = Conversation::new(DIRECT);
+    conversation.send();
+    conversation.read_question();
+    let gate = conversation.fleet.base.join("gate-collect-ack-nodea-nodeb");
+    std::fs::create_dir(&gate).unwrap();
+    // The outbound poll offers the held answer too. Keep it on the gated
+    // collect lane, or a poll that wins the race skips the gate (#948).
+    std::fs::write(
+        conversation
+            .fleet
+            .base
+            .join("withhold-outbound-answers-nodea-nodeb"),
+        "",
+    )
+    .unwrap();
+    conversation.reply();
+    due(conversation.fleet.node("nodea"));
+    fleet::wait_until("collection ack after import", DEADLINE, || {
+        gate.join("entered").exists().then_some(())
+    });
+    cut(&conversation.fleet, "nodea", "nodeb");
+    conversation.answer_once();
+    std::fs::remove_dir_all(&gate).unwrap();
+    reconnect(&conversation.fleet, "nodea", "nodeb");
+    due(conversation.fleet.node("nodea"));
+    conversation.fleet.node_mut("nodea").restart();
+    let reply = status(conversation.fleet.node("nodea"), "question")["reply"]["correlation_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    state(conversation.fleet.node("nodeb"), &reply, "collected");
+    assert_eq!(
+        read(conversation.fleet.node("nodea"), &conversation.sender.pane),
+        json!([])
+    );
+}
+
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
+#[test]
+fn real_answer_supersedes_a_deferral() {
+    let conversation = Conversation::new(DIRECT);
+    conversation.send();
+    api(
+        conversation.fleet.node("nodeb"),
+        "msg.mute",
+        json!({
+            "pane":conversation.receiver.pane,"seconds":600,"reason":"busy"
+        }),
+    );
+    due(conversation.fleet.node("nodea"));
+    let deferred = mail(conversation.fleet.node("nodea"), &conversation.sender.pane);
+    assert_eq!(deferred.as_array().unwrap().len(), 1);
+    let waited = api(
+        conversation.fleet.node("nodea"),
+        "msg.wait_reply",
+        json!({"correlation_id":"question","timeout_ms":0}),
+    );
+    assert_eq!(waited["outcome"], "deferred", "{waited}");
+    conversation.read_question();
+    conversation.reply();
+    due(conversation.fleet.node("nodea"));
+    conversation.answer_once();
+}
+
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
+#[test]
+fn lost_delivery_ack_and_duplicate_imports_preserve_one_message() {
+    let conversation = Conversation::new(DIRECT);
+    let gate = conversation
+        .fleet
+        .base
+        .join("gate-delivery-ack-nodea-nodeb");
+    std::fs::create_dir(&gate).unwrap();
+    let output = conversation.sender.start_cli(
+        conversation.fleet.node("nodea"),
+        &[
+            "msg",
+            "send",
+            "--agent",
+            &conversation.receiver.id,
+            "--intent",
+            "needs-reply",
+            "--correlation-id",
+            "question",
+            "question body",
+        ],
+    );
+    fleet::wait_until("delivery ack after inbox commit", DEADLINE, || {
+        gate.join("entered").exists().then_some(())
+    });
+    conversation.read_question();
+    cut(&conversation.fleet, "nodea", "nodeb");
+    assert_eq!(cli_result(&output)["state"], "queued");
+    std::fs::remove_dir_all(gate).unwrap();
+    // The origin retries the committed key after the acknowledgement was lost.
+    reconnect(&conversation.fleet, "nodea", "nodeb");
+    due(conversation.fleet.node("nodea"));
+    // Replay must meet the already-read row without making it unread again.
+    // Genuine read evidence may overtake the lost delivery acknowledgement.
+    let duplicate = conversation
+        .fleet
+        .base
+        .join("delivered-receipt-nodea-nodeb");
+    fleet::wait_until("duplicate delivery acknowledged", DEADLINE, || {
+        api(conversation.fleet.node("nodeb"), "ping", json!({}));
+        if !duplicate.exists() {
+            return None;
+        }
+        let status = api(
+            conversation.fleet.node("nodea"),
+            "msg.status",
+            json!({
+                "correlation_id":"question"
+            }),
+        );
+        match status["state"].as_str() {
+            Some("queued") => None,
+            Some("delivered" | "read") => Some(()),
+            other => panic!("unexpected state after genuine read: {other:?}; {status}"),
+        }
+    });
+    state(conversation.fleet.node("nodea"), "question", "read");
+    let inbox: (i64, i64) = db(conversation.fleet.node("nodeb"))
+        .query_row(
+            "SELECT count(*),sum(state='read') FROM envelopes WHERE correlation='question'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(inbox, (1, 1), "replay must preserve one read import");
+    assert_eq!(
+        read(
+            conversation.fleet.node("nodeb"),
+            &conversation.receiver.pane
+        ),
+        json!([])
+    );
+    conversation.reply();
+    due(conversation.fleet.node("nodea"));
+    conversation.answer_once();
+}
+
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
+#[test]
+fn multihop_chain_is_delivered_once() {
+    let fleet = fleet::spawn(
+        "s1chain",
+        &[
+            NodeSpec::new("nodea", "accept-laptop", &["nodeb"]),
+            NodeSpec::new("nodeb", "accept-hub", &["nodec"]),
+            NodeSpec::new("nodec", "accept-spoke", &[]),
+        ],
+    );
+    let sender = Agent::start(fleet.node("nodea"));
+    let recipient = Agent::start(fleet.node("nodec"));
+    fleet::wait_until("two-hop recipient discovery", DEADLINE, || {
+        api(fleet.node("nodea"), "agent.list", json!({}))["fleet"]
+            .as_array()?
+            .iter()
+            .any(|a| a["agent_id"] == recipient.id)
+            .then_some(())
+    });
+    let sent = sender.cli(
+        fleet.node("nodea"),
+        &[
+            "msg",
+            "send",
+            "--agent",
+            &recipient.id,
+            "--intent",
+            "needs-reply",
+            "--correlation-id",
+            "too-far",
+            "not forwarded",
+        ],
+    );
+    assert!(
+        matches!(sent["state"].as_str(), Some("queued" | "delivered")),
+        "{sent}"
+    );
+    let messages = fleet::wait_until("forwarded request", DEADLINE, || {
+        let messages = read(fleet.node("nodec"), &recipient.pane);
+        (!messages.as_array()?.is_empty()).then_some(messages)
+    });
+    assert_eq!(messages.as_array().unwrap().len(), 1);
+    assert_eq!(messages[0]["correlation_id"], "too-far");
+    due(fleet.node("nodea"));
+    due(fleet.node("nodeb"));
+    assert_eq!(read(fleet.node("nodec"), &recipient.pane), json!([]));
+}
+
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
+#[test]
+fn old_mesh_version_retains_origin_custody_without_legacy_delivery() {
+    let mut conversation = Conversation::new(&[
+        NodeSpec::new("nodea", "version-origin", &["nodeb", "nodec"]),
+        NodeSpec::new("nodeb", "version-old", &[]),
+        NodeSpec::new("nodec", "version-healthy", &[]),
+    ]);
+    cut(&conversation.fleet, "nodea", "nodeb");
+    assert_eq!(conversation.send()["state"], "queued");
+
+    conversation
+        .fleet
+        .node_mut("nodeb")
+        .restart_with_mesh(fleet::MeshMode::VersionMismatch(4));
+    conversation.fleet.allow_edge("nodea", "nodeb");
+    fleet::wait_until("old protocol refused", DEADLINE, || {
+        api(
+            conversation.fleet.node("nodea"),
+            "peers.enrollment",
+            json!({}),
+        )["peers"]
+            .as_array()?
+            .iter()
+            .any(|peer| {
+                peer["reason"]
+                    .as_str()
+                    .is_some_and(|reason| reason.contains("upgrade flk on nodeb"))
+            })
+            .then_some(())
+    });
+    let origin = conversation.fleet.node("nodea");
+    let healthy = conversation.fleet.node("nodec");
+    let probe = Agent::start(healthy);
+    fleet::wait_until("healthy retry recipient discovered", DEADLINE, || {
+        api(origin, "agent.list", json!({}))["fleet"]
+            .as_array()?
+            .iter()
+            .any(|a| a["agent_id"] == probe.id)
+            .then_some(())
+    });
+    let capture = conversation.fleet.base.join("capture-delivery-nodea-nodec");
+    std::fs::write(&capture, "").unwrap();
+    let sent = conversation.sender.cli(
+        origin,
+        &[
+            "msg",
+            "send",
+            "--agent",
+            &probe.id,
+            "--correlation-id",
+            "retry-probe",
+            "--intent",
+            "fyi",
+            "worker probe",
+        ],
+    );
+    assert_eq!(sent["state"], "queued");
+    fleet::wait_until("probe delivery held and retry scheduled", DEADLINE, || {
+        let captured: Value = serde_json::from_slice(&std::fs::read(&capture).ok()?).ok()?;
+        let scheduled: bool = db(origin).query_row(
+            "SELECT retry_at>0 AND lease_until<=retry_at FROM envelopes WHERE correlation='retry-probe'",
+            [], |row| row.get(0)).ok()?;
+        (captured["envelope"]["correlation_id"] == "retry-probe" && scheduled).then_some(())
+    });
+    assert_eq!(
+        delivery_attempts(&conversation.fleet, "nodea", "nodec", "retry-probe"),
+        1
+    );
+    std::fs::remove_file(capture).unwrap();
+    due(origin);
+    // Only the message retry worker can deliver this already-queued probe.
+    // The incompatible edge itself is unpushable and must retain its custody.
+    state(origin, "retry-probe", "delivered");
+    assert_eq!(
+        delivery_attempts(&conversation.fleet, "nodea", "nodec", "retry-probe"),
+        2
+    );
+    assert_eq!(mail(healthy, &probe.pane)[0]["body"], "worker probe");
+    state(origin, "question", "queued");
+    let retained: String = db(origin)
+        .query_row(
+            "SELECT state FROM envelopes WHERE correlation='question'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(retained, "custody");
+
+    assert_eq!(
+        read(
+            conversation.fleet.node("nodeb"),
+            &conversation.receiver.pane
+        ),
+        json!([])
+    );
+    assert!(!conversation
+        .fleet
+        .base
+        .join("legacy-message-nodea-nodeb")
+        .exists());
+}
+
+struct Replacement(u32);
+
+impl Drop for Replacement {
+    fn drop(&mut self) {
+        unsafe {
+            libc::kill(self.0 as libc::pid_t, libc::SIGTERM);
+        }
+        support::unregister_spawned_flock_pid(Some(self.0));
+    }
+}
+
+fn handoff_role(specs: &[NodeSpec], role: &str) {
+    let conversation = Conversation::new(specs);
+    conversation.send();
+    conversation.read_question();
+    let node = conversation.fleet.node(role);
+    let before = api(node, "pane.list", json!({}));
+    let agent = if role == "nodea" {
+        &conversation.sender
+    } else {
+        &conversation.receiver
+    };
+    let shell_pid = agent.shell_pid(node);
+    let pane_identity = |panes: &Value| {
+        panes["panes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|pane| (pane["pane_id"].clone(), pane["workspace_id"].clone()))
+            .collect::<Vec<_>>()
+    };
+    api(node, "server.live_handoff", json!({}));
+    let replacement = fleet::wait_until("sandbox handoff replacement", DEADLINE, || {
+        support::flock_server_pids_for_runtime_dir(&node.runtime_dir)
+            .ok()?
+            .into_iter()
+            .find(|pid| *pid != node.process_id())
+    });
+    support::register_spawned_flock_pid(Some(replacement));
+    let _replacement = Replacement(replacement);
+    // Wait for the replacement's API rather than racing socket takeover.
+    fleet::wait_until("handoff API listener", DEADLINE, || {
+        use std::io::{BufRead, Write};
+        let mut stream = std::os::unix::net::UnixStream::connect(&node.api_socket).ok()?;
+        stream
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .ok()?;
+        writeln!(
+            stream,
+            "{}",
+            json!({"id":"ready","method":"ping","params":{}})
+        )
+        .ok()?;
+        let mut response = String::new();
+        std::io::BufReader::new(stream)
+            .read_line(&mut response)
+            .ok()?;
+        serde_json::from_str::<Value>(&response)
+            .ok()?
+            .get("result")
+            .map(|_| ())
+    });
+    assert_eq!(
+        pane_identity(&before),
+        pane_identity(&api(node, "pane.list", json!({})))
+    );
+    assert_eq!(
+        agent.shell_pid(node),
+        shell_pid,
+        "handoff must preserve the running pane process"
+    );
+    // Prove the retained terminal still runs CLI commands after writer transfer.
+    conversation.reply();
+    due(conversation.fleet.node("nodea"));
+    conversation.answer_once();
+}
+
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
+#[test]
+fn live_handoff_sender_keeps_panes_and_delivers_once() {
+    handoff_role(DIRECT, "nodea");
+}
+
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
+#[test]
+fn live_handoff_receiver_keeps_panes_and_delivers_once() {
+    handoff_role(DIRECT, "nodeb");
+}
+
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
+#[test]
+fn live_handoff_hub_keeps_panes_and_delivers_once() {
+    handoff_role(SPOKE, "nodeb");
+}
+
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
+#[test]
+fn audit_rotation_during_held_conversation_loses_nothing() {
+    use std::io::Write;
+    let mut conversation = Conversation::new(DIRECT);
+    conversation.send();
+    conversation.read_question();
+    cut(&conversation.fleet, "nodea", "nodeb");
+    assert_eq!(conversation.reply()["state"], "held");
+    conversation.fleet.node_mut("nodeb").stop();
+    let log = conversation
+        .fleet
+        .node("nodeb")
+        .config_home
+        .join(support::paths::app_dir_name())
+        .join("event-log.jsonl");
+    // ADR-0005 has fixed rotation bounds, not a configuration knob. JSON
+    // whitespace seeds the real byte threshold without inventing audit events.
+    let mut file = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+    // Extend the last valid JSON line, rather than adding a malformed record.
+    file.set_len(file.metadata().unwrap().len() - 1).unwrap();
+    file.write_all(&vec![b' '; 32 * 1024 * 1024]).unwrap();
+    file.write_all(b"\n").unwrap();
+    drop(file);
+    conversation.fleet.node_mut("nodeb").restart();
+    api(
+        conversation.fleet.node("nodeb"),
+        "workspace.create",
+        json!({"cwd":conversation.fleet.node("nodeb").repo}),
+    );
+    fleet::wait_until("real audit rotation", DEADLINE, || {
+        log.with_file_name("event-log.1.jsonl")
+            .exists()
+            .then_some(())
+    });
+    reconnect(&conversation.fleet, "nodea", "nodeb");
+    due(conversation.fleet.node("nodea"));
+    conversation.answer_once();
+}
+
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
+#[test]
+fn fleet_pause_freezes_retries_and_ttl_then_resumes() {
+    let mut conversation = Conversation::new(DIRECT);
+    conversation.send();
+    conversation.read_question();
+    cut(&conversation.fleet, "nodea", "nodeb");
+    let queued = conversation.sender.cli(
+        conversation.fleet.node("nodea"),
+        &[
+            "msg",
+            "send",
+            "--agent",
+            &conversation.receiver.id,
+            "--intent",
+            "fyi",
+            "--correlation-id",
+            "retry",
+            "retry body",
+        ],
+    );
+    assert_eq!(queued["state"], "queued");
+    api(conversation.fleet.node("nodea"), "fleet.pause", json!({}));
+    conversation.reply();
+    api(conversation.fleet.node("nodeb"), "fleet.pause", json!({}));
+    let held_db = db(conversation.fleet.node("nodeb"));
+    fleet::wait_until("receiver durable pause", DEADLINE, || {
+        held_db
+            .query_row("SELECT paused FROM clock", [], |row| row.get::<_, bool>(0))
+            .unwrap()
+            .then_some(())
+    });
+    let held_snapshot = || {
+        held_db
+            .query_row(
+                "SELECT elapsed,custody_deadline FROM clock,envelopes WHERE state='held'",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .unwrap()
+    };
+    let held_frozen = held_snapshot();
+    due(conversation.fleet.node("nodea"));
+    let database = db(conversation.fleet.node("nodea"));
+    fleet::wait_until("durable pause", DEADLINE, || {
+        database
+            .query_row("SELECT paused FROM clock", [], |row| row.get::<_, bool>(0))
+            .unwrap()
+            .then_some(())
+    });
+    let snapshot = || {
+        database.query_row(
+        "SELECT elapsed,sum(collect_attempts),sum(custody_deadline),sum(retry_at),sum(lease_until) FROM clock,envelopes",
+        [], |row| Ok((row.get::<_, i64>(0)?,row.get::<_, i64>(1)?,row.get::<_, i64>(2)?,row.get::<_, i64>(3)?,row.get::<_, i64>(4)?))
+    ).unwrap()
+    };
+    let frozen = snapshot();
+    conversation.fleet.allow_edge("nodea", "nodeb");
+    conversation.fleet.node_mut("nodea").restart();
+    let started = Instant::now();
+    fleet::wait_until("paused clock across two ticks", DEADLINE, || {
+        assert_eq!(snapshot(), frozen);
+        assert_eq!(held_snapshot(), held_frozen);
+        assert_eq!(
+            read(conversation.fleet.node("nodea"), &conversation.sender.pane),
+            json!([])
+        );
+        assert_eq!(
+            read(
+                conversation.fleet.node("nodeb"),
+                &conversation.receiver.pane
+            ),
+            json!([])
+        );
+        (started.elapsed() >= Duration::from_secs(2)).then_some(())
+    });
+    api(conversation.fleet.node("nodeb"), "fleet.resume", json!({}));
+    api(conversation.fleet.node("nodea"), "fleet.resume", json!({}));
+    let retried = mail(
+        conversation.fleet.node("nodeb"),
+        &conversation.receiver.pane,
+    );
+    assert_eq!(retried.as_array().unwrap().len(), 1);
+    assert_eq!(retried[0]["body"], "retry body");
+    conversation.answer_once();
+}
+
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
+#[test]
+fn spoke_read_receipt_reaches_origin_within_seconds() {
+    let conversation = Conversation::new(DIRECT);
+    conversation.send();
+    let origin = conversation.fleet.node("nodea");
+    // End request-scoped polling so only the edge wake can carry this read.
+    db(origin)
+        .execute("UPDATE envelopes SET collect_done=1", [])
+        .unwrap();
+    std::thread::sleep(Duration::from_secs(7));
+    let started = Instant::now();
+    conversation.read_question();
+    fleet::wait_until("wake carries read receipt", Duration::from_secs(4), || {
+        (status(origin, "question")["state"] == "read").then_some(())
+    });
+    assert!(started.elapsed() < Duration::from_secs(4));
+}
+
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
+#[test]
+fn follow_up_reply_after_final_answer_on_one_way_edge_is_collected() {
+    let conversation = Conversation::new(DIRECT);
+    conversation.send();
+    conversation.read_question();
+    conversation.reply();
+    conversation.answer_once();
+    // Let the idle outbound poll enter its long backoff after the final answer.
+    std::thread::sleep(Duration::from_secs(7));
+    let reply = conversation.receiver.cli(
+        conversation.fleet.node("nodeb"),
+        &["msg", "reply", "question", "follow-up body"],
+    );
+    let origin = conversation.fleet.node("nodea");
+    let messages = fleet::wait_until("follow-up wake collection", Duration::from_secs(4), || {
+        let messages = read(origin, &conversation.sender.pane);
+        (!messages.as_array()?.is_empty()).then_some(messages)
+    });
+    assert_eq!(messages[0]["body"], "follow-up body");
+    assert_eq!(messages[0]["correlation_id"], reply["correlation_id"]);
+    assert_eq!(read(origin, &conversation.sender.pane), json!([]));
+}
+
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
+#[test]
+fn failed_reply_push_on_pinned_edge_is_retried_without_reenrollment() {
+    let conversation = Conversation::new(SPOKE);
+    conversation.send();
+    conversation.read_question();
+    let fault = conversation
+        .fleet
+        .base
+        .join("transient-delivery-nodeb-nodea");
+    std::fs::write(&fault, b"").unwrap();
+    let reply = conversation.reply();
+    let correlation = reply["correlation_id"].as_str().unwrap();
+    fleet::wait_until("first reply push fails", DEADLINE, || {
+        (delivery_attempts(&conversation.fleet, "nodeb", "nodea", correlation) == 1).then_some(())
+    });
+    let hub = conversation.fleet.node("nodeb");
+    let enrollment = api(hub, "peers.enrollment", json!({}));
+    let store = db(hub);
+    // The reply is scheduled as soon as it is stored, so retry_at alone proves
+    // nothing. The failure handler reschedules and then returns the answer to
+    // held. Reset the deadline only after that, or it lands 60 s out (#948).
+    fleet::wait_until("failed reply returned to held", DEADLINE, || {
+        (store
+            .query_row(
+                "SELECT state FROM envelopes WHERE correlation=?1",
+                [correlation],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()?
+            == "held")
+            .then_some(())
+    });
+    std::fs::remove_file(fault).unwrap();
+    // Move the persisted deadline, not the edge's enrollment generation.
+    store
+        .execute(
+            "UPDATE envelopes SET retry_at=0,lease_until=0 WHERE correlation=?1",
+            [correlation],
+        )
+        .unwrap();
+    conversation.answer_once();
+    assert_eq!(api(hub, "peers.enrollment", json!({})), enrollment);
+    assert!(delivery_attempts(&conversation.fleet, "nodeb", "nodea", correlation) >= 2);
+}
+
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
+#[test]
+fn reply_push_in_flight_is_not_pushed_again_by_the_retry_scheduler() {
+    let conversation = Conversation::new(SPOKE);
+    conversation.send();
+    conversation.read_question();
+    let gate = conversation
+        .fleet
+        .base
+        .join("gate-delivery-ack-nodeb-nodea");
+    std::fs::create_dir(&gate).unwrap();
+    let reply = conversation.reply();
+    let correlation = reply["correlation_id"].as_str().unwrap();
+    fleet::wait_until("reply push in flight", DEADLINE, || {
+        gate.join("entered").exists().then_some(())
+    });
+    // Hold the relay's push across several one-second scheduler ticks. A
+    // second push for the same row queues behind it on the held edge (#948).
+    std::thread::sleep(Duration::from_secs(3));
+    std::fs::write(gate.join("release"), "").unwrap();
+    conversation.answer_once();
+    // A queued second push goes out once the first one's reply lands. Watch
+    // long enough for a loaded runner to log it.
+    let watched = std::time::Instant::now();
+    while watched.elapsed() < Duration::from_secs(5) {
+        assert_eq!(
+            delivery_attempts(&conversation.fleet, "nodeb", "nodea", correlation),
+            1,
+            "the retry scheduler pushed a reply its relay was already pushing"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
+#[test]
+fn idle_edge_emits_no_wakes_and_no_commits() {
+    use std::io::{BufRead, BufReader, Write};
+    let conversation = Conversation::new(DIRECT);
+    std::thread::sleep(Duration::from_secs(4));
+    let spoke = conversation.fleet.node("nodeb");
+    let mut stream = std::os::unix::net::UnixStream::connect(&spoke.api_socket).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    writeln!(
+        stream,
+        "{}",
+        json!({"id":"idle", "method":"events.subscribe", "params":{
+            "subscriptions":[{"type":"mesh.outbound_pending"}]
+        }})
+    )
+    .unwrap();
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    assert!(!line.contains("error"), "{line}");
+    let store = db(spoke);
+    let version = || {
+        store
+            .query_row("PRAGMA data_version", [], |row| row.get::<_, i64>(0))
+            .unwrap()
+    };
+    let before = version();
+    line.clear();
+    assert!(
+        reader.read_line(&mut line).is_err(),
+        "unexpected wake: {line}"
+    );
+    assert_eq!(version(), before);
+}
+
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
+#[test]
+fn hundred_held_answers_cause_bounded_polls() {
+    let conversation = Conversation::new(DIRECT);
+    let origin = conversation.fleet.node("nodea");
+    let spoke = conversation.fleet.node("nodeb");
+    let receivers: Vec<_> = (0..5)
+        .map(|index| {
+            let started = api(
+                spoke,
+                "agent.start",
+                json!({
+                    "name":format!("burst-{index}"), "argv":["/bin/sh"], "cwd":spoke.repo
+                }),
+            );
+            Agent {
+                id: started["agent"]["agent_id"].as_str().unwrap().into(),
+                pane: started["agent"]["pane_id"].as_str().unwrap().into(),
+            }
+        })
+        .collect();
+    for (index, receiver) in receivers.iter().enumerate() {
+        fleet::wait_until("burst recipient discovery", DEADLINE, || {
+            api(origin, "agent.list", json!({}))["fleet"]
+                .as_array()?
+                .iter()
+                .any(|entry| entry["agent_id"] == receiver.id)
+                .then_some(())
+        });
+        conversation.sender.cli(
+            origin,
+            &[
+                "msg",
+                "send",
+                "--agent",
+                &receiver.id,
+                "--intent",
+                "needs-reply",
+                "--correlation-id",
+                &format!("burst-{index}"),
+                "question",
+            ],
+        );
+        assert_eq!(mail(spoke, &receiver.pane).as_array().unwrap().len(), 1);
+    }
+    api(origin, "fleet.pause", json!({}));
+    // Stop conversation polling: this test exercises the outbound edge lane.
+    db(origin)
+        .execute("UPDATE envelopes SET collect_done=1", [])
+        .unwrap();
+    // Five real senders each stay within the production 20/minute limit.
+    for (index, receiver) in receivers.iter().enumerate() {
+        let output = spoke.home.join(format!("burst-{index}.json"));
+        let command = format!(
+            "i=0; while [ $i -lt 20 ]; do {} msg reply burst-{index} answer-$i >/dev/null || break; i=$((i+1)); done; printf '{{\"result\":{{\"count\":%s}}}}\\n' \"$i\" >{}",
+            quote(env!("CARGO_BIN_EXE_flk")), quote(output.to_str().unwrap())
+        );
+        spoke.run_in_pane(&receiver.pane, &command);
+        assert_eq!(cli_result(&output)["count"], 20);
+    }
+    let polls = conversation.fleet.base.join("outbound-polls-nodea-nodeb");
+    let count = || {
+        std::fs::read_to_string(&polls)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+    let before = count();
+    api(origin, "fleet.resume", json!({}));
+    let mut received = std::collections::HashSet::new();
+    fleet::wait_until("all held answers collected", DEADLINE, || {
+        for message in read(origin, &conversation.sender.pane).as_array().unwrap() {
+            assert!(received.insert(message["correlation_id"].as_str().unwrap().to_owned()));
+        }
+        (received.len() == 100).then_some(())
+    });
+    // Seven batches of 16 plus their acks, with room for one wake/idle poll.
+    assert!(
+        count() - before <= 16,
+        "{} polls for 100 answers",
+        count() - before
+    );
+}
+
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
+#[test]
+fn outbound_answer_import_failure_skips_only_its_own_ack() {
+    let conversation = Conversation::new(DIRECT);
+    conversation.send();
+    conversation.read_question();
+    let origin = conversation.fleet.node("nodea");
+    let spoke = conversation.fleet.node("nodeb");
+    api(origin, "fleet.pause", json!({}));
+    db(origin)
+        .execute("UPDATE envelopes SET collect_done=1", [])
+        .unwrap();
+    let first = conversation.reply();
+    let second = conversation
+        .receiver
+        .cli(spoke, &["msg", "reply", "question", "second answer"]);
+    let store = db(origin);
+    store
+        .execute_batch(
+            "CREATE TRIGGER fail_first_answer BEFORE INSERT ON envelopes
+        WHEN json_extract(CAST(NEW.body AS TEXT), '$.message.body')='answer body'
+        BEGIN SELECT RAISE(FAIL, 'transient import fault'); END;",
+        )
+        .unwrap();
+    api(origin, "fleet.resume", json!({}));
+    let imported = mail(origin, &conversation.sender.pane);
+    assert_eq!(imported.as_array().unwrap().len(), 1);
+    assert_eq!(imported[0]["correlation_id"], second["correlation_id"]);
+    state(
+        spoke,
+        second["correlation_id"].as_str().unwrap(),
+        "collected",
+    );
+    assert_eq!(
+        status(spoke, first["correlation_id"].as_str().unwrap())["state"],
+        "held"
+    );
+    store
+        .execute_batch("DROP TRIGGER fail_first_answer")
+        .unwrap();
+    due(spoke);
+    conversation
+        .receiver
+        .cli(spoke, &["msg", "reply", "question", "wake retry"]);
+    let mut correlations = std::collections::HashSet::new();
+    fleet::wait_until("retry imports unacknowledged answer", DEADLINE, || {
+        for message in read(origin, &conversation.sender.pane).as_array().unwrap() {
+            correlations.insert(message["correlation_id"].as_str().unwrap().to_owned());
+        }
+        correlations
+            .contains(first["correlation_id"].as_str().unwrap())
+            .then_some(())
+    });
+}
+
+fn receipt_waits_for_original_custody(receipt_state: &str) {
+    let conversation = Conversation::new(DIRECT);
+    let origin = conversation.fleet.node("nodea");
+    let spoke = conversation.fleet.node("nodeb");
+    std::fs::write(
+        conversation.fleet.base.join("lose-receipt-nodea-nodeb"),
+        b"",
+    )
+    .unwrap();
+    let sent = conversation.sender.cli(
+        origin,
+        &[
+            "msg",
+            "send",
+            "--agent",
+            &conversation.receiver.id,
+            "--intent",
+            "fyi",
+            "--correlation-id",
+            "question",
+            "question body",
+        ],
+    );
+    assert_eq!(sent["state"], "queued");
+    let sender_store = db(origin);
+    let receiver_store = db(spoke);
+    if receipt_state == "expired" {
+        receiver_store
+            .execute(
+                "UPDATE envelopes SET inbox_deadline=0 WHERE correlation='question'",
+                [],
+            )
+            .unwrap();
+    }
+    read(spoke, &conversation.receiver.pane);
+    let offered = || {
+        receiver_store.query_row(
+        "SELECT count(*) FROM envelopes WHERE kind='receipt' AND state='held' AND collect_attempts>0
+         AND json_extract(CAST(body AS TEXT), '$.state')=?1", [receipt_state], |row| row.get::<_, i64>(0)).unwrap()
+    };
+    fleet::wait_until("unready receipt offered", DEADLINE, || {
+        (offered() > 0).then_some(())
+    });
+    // Allow any erroneous ack to arrive before checking retained custody.
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(
+        offered() > 0,
+        "unready {receipt_state} receipt was acknowledged"
+    );
+    assert_eq!(status(origin, "question")["state"], "queued");
+    // Hold the next receipt offer while the original's retry receives its ack.
+    receiver_store
+        .execute(
+            "UPDATE envelopes SET retry_at=9223372036854775807 WHERE kind='receipt'",
+            [],
+        )
+        .unwrap();
+    sender_store
+        .execute(
+            "UPDATE envelopes SET retry_at=0,lease_until=0 WHERE correlation='question'",
+            [],
+        )
+        .unwrap();
+    state(origin, "question", "delivered");
+    receiver_store
+        .execute("UPDATE envelopes SET retry_at=0 WHERE kind='receipt'", [])
+        .unwrap();
+    // A fresh delivery emits a real wake without shortening production polls.
+    conversation.sender.cli(
+        origin,
+        &[
+            "msg",
+            "send",
+            "--agent",
+            &conversation.receiver.id,
+            "--intent",
+            "fyi",
+            "--correlation-id",
+            "wake-probe",
+            "wake probe",
+        ],
+    );
+    state(origin, "question", receipt_state);
+    fleet::wait_until("receipt acknowledged after application", DEADLINE, || {
+        (offered() == 0).then_some(())
+    });
+}
+
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
+#[test]
+fn read_receipt_is_not_acked_until_lost_push_response_is_recovered() {
+    receipt_waits_for_original_custody("read");
+}
+
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
+#[test]
+fn expired_receipt_is_not_acked_until_lost_push_response_is_recovered() {
+    receipt_waits_for_original_custody("expired");
+}
+
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
+#[test]
+fn duplicate_read_receipt_is_acked_without_rewriting_the_original() {
+    let conversation = Conversation::new(DIRECT);
+    let origin = conversation.fleet.node("nodea");
+    let spoke = conversation.fleet.node("nodeb");
+    conversation.send();
+    let receiver_store = db(spoke);
+    fleet::wait_until("initial receipt drained", DEADLINE, || {
+        let sent: bool = receiver_store
+            .query_row(
+                "SELECT receipt_sent='delivered' FROM envelopes WHERE correlation='question'",
+                [],
+                |r| r.get(0),
+            )
+            .ok()?;
+        let held: i64 = receiver_store
+            .query_row(
+                "SELECT count(*) FROM envelopes WHERE kind='receipt' AND state='held'",
+                [],
+                |r| r.get(0),
+            )
+            .ok()?;
+        (sent && held == 0).then_some(())
+    });
+    db(origin)
+        .execute("UPDATE envelopes SET collect_done=1", [])
+        .unwrap();
+    std::fs::write(
+        conversation
+            .fleet
+            .base
+            .join("lose-outbound-ack-nodea-nodeb"),
+        b"",
+    )
+    .unwrap();
+    conversation.read_question();
+    state(origin, "question", "read");
+    fleet::wait_until("read receipt ack lost", DEADLINE, || {
+        conversation
+            .fleet
+            .base
+            .join("lost-outbound-ack-nodea-nodeb")
+            .exists()
+            .then_some(())
+    });
+    let store = db(origin);
+    store
+        .execute_batch(
+            "CREATE TRIGGER forbid_receipt_rewrite BEFORE UPDATE OF remote_state ON envelopes
+        WHEN OLD.correlation='question'
+        BEGIN SELECT RAISE(FAIL, 'duplicate receipt attempted a write'); END;",
+        )
+        .unwrap();
+    due(spoke);
+    conversation.sender.cli(
+        origin,
+        &[
+            "msg",
+            "send",
+            "--agent",
+            &conversation.receiver.id,
+            "--intent",
+            "fyi",
+            "--correlation-id",
+            "duplicate-wake",
+            "wake probe",
+        ],
+    );
+    fleet::wait_until("duplicate receipt acknowledged", DEADLINE, || {
+        let held: i64 = receiver_store.query_row("SELECT count(*) FROM envelopes WHERE kind='receipt' AND state='held' AND json_extract(CAST(body AS TEXT),'$.state')='read'", [], |r| r.get(0)).ok()?;
+        (held == 0).then_some(())
+    });
+    assert_eq!(status(origin, "question")["state"], "read");
+    store
+        .execute_batch("DROP TRIGGER forbid_receipt_rewrite")
+        .unwrap();
+}
+
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
+#[test]
+fn imports_and_reads_for_outbound_neighbors_emit_no_mesh_wakes() {
+    use std::io::{BufRead, BufReader, Write};
+    let conversation = Conversation::new(SPOKE);
+    let hub = conversation.fleet.node("nodeb");
+    let mut stream = std::os::unix::net::UnixStream::connect(&hub.api_socket).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    writeln!(
+        stream,
+        "{}",
+        json!({"id":"quiet", "method":"events.subscribe", "params":{
+            "subscriptions":[{"type":"mesh.outbound_pending"}]
+        }})
+    )
+    .unwrap();
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    assert!(!line.contains("error"));
+    conversation.send();
+    conversation.read_question();
+    line.clear();
+    assert!(
+        reader.read_line(&mut line).is_err(),
+        "unexpected wake: {line}"
+    );
+}
+
+// Fake SSH relay needs the debug-only ancestry override; release ignores it (#1715).
+#[cfg(debug_assertions)]
+#[test]
+fn answer_signature_covers_the_collection_token() {
+    let conversation = Conversation::new(SPOKE);
+    conversation.send();
+    conversation.read_question();
+    let capture = conversation.fleet.base.join("capture-delivery-nodeb-nodea");
+    std::fs::write(&capture, b"").unwrap();
+    let reply = conversation.reply();
+    let correlation = reply["correlation_id"].as_str().unwrap();
+    let mut answer: Value = fleet::wait_until("answer captured", DEADLINE, || {
+        serde_json::from_slice(&std::fs::read(&capture).ok()?).ok()
+    });
+    let first = answer["envelope"]["return_binding"]["collection_token"][0]
+        .as_u64()
+        .unwrap();
+    answer["envelope"]["return_binding"]["collection_token"][0] = json!(first ^ 1);
+    let replay = conversation.fleet.base.join("replay-delivery-nodeb-nodea");
+    std::fs::write(&replay, serde_json::to_vec(&answer).unwrap()).unwrap();
+    std::fs::remove_file(capture).unwrap();
+    let hub = conversation.fleet.node("nodeb");
+    state(hub, correlation, "held");
+    due(hub);
+    fleet::wait_until("forged answer attempted", DEADLINE, || {
+        (delivery_attempts(&conversation.fleet, "nodeb", "nodea", correlation) >= 2).then_some(())
+    });
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(
+        read(conversation.fleet.node("nodea"), &conversation.sender.pane),
+        json!([])
+    );
+    std::fs::remove_file(replay).unwrap();
+    state(hub, correlation, "refused");
+    let refused = status(hub, correlation);
+    assert_eq!(refused["detail"], "invalid_signature");
+    // A terminally refused immutable answer requires a new message key.
+    conversation.reply();
+    conversation.answer_once();
+}

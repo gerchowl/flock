@@ -18,6 +18,9 @@ impl App {
         if target.is_empty() {
             return encode_error(id, "invalid_request", "target is required");
         }
+        if let Some(error) = self.structured_terminal_error(&target) {
+            return super::responses::encode_error_body(id, self.agent_target_error_body(error));
+        }
         // Live resolution first: agent name / terminal id → public pane id.
         if let Ok(resolved) = self.resolve_terminal_target(&target) {
             if let Some(pane_id) = self.public_pane_id(resolved.ws_idx, resolved.pane_id) {

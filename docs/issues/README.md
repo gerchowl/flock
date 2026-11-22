@@ -11,7 +11,7 @@
 - [#40](0040-pane-header-promotable-session-specific-fields-containers-pr.md) `CLOSED` — pane header: promotable session-specific fields (containers, progress, custom KV)
 - [#41](0041-sidebar-sections-servers-spaces-divider-parity-all-current-s.md) `CLOSED` — sidebar sections: servers↔spaces divider parity + all/current scope toggles (servers, spaces) like agents
 - [#42](0042-sidebar-state-language-ssot-agent-icons-on-workspace-rows-tr.md) `CLOSED` — sidebar state-language SSoT: agent icons on workspace rows, traffic light on primary rows, PR/gh status everywhere
-- [#45](0045-session-comms-patterns-from-dompt-full-state-lww-late-join-s.md) `OPEN` — session-comms patterns from dompt: full-state LWW + late-join seed, absolute commands, holder token, wire-shape contract tests
+- [#45](0045-session-comms-patterns-from-private-project-full-state-lww-late-join-s.md) `OPEN` — session-comms patterns from private-project: full-state LWW + late-join seed, absolute commands, holder token, wire-shape contract tests
 - [#46](0046-spoke-renders-the-full-fleet-in-the-spaces-list-fold-snapsho.md) `CLOSED` — spoke renders the full fleet in the spaces list (fold snapshot workspaces) + right-click server filter
 - [#47](0047-remote-attach-must-port-the-client-s-terminal-theme-panes-re.md) `CLOSED` — remote attach must port the client's terminal theme (panes render pitch-black on spokes)
 - [#57](0057-follow-ups-from-56-review-member-strip-overflow-test-per-fra.md) `OPEN` — follow-ups from #56 review: member-strip overflow test + per-frame section-key memoization
@@ -55,7 +55,7 @@
 - [#128](0128-herdr-web-connected-status-badge-overlaps-the-top-right-tui.md) `CLOSED` — herdr-web: 'connected' status badge overlaps the top-right TUI (server/repo picker)
 - [#129](0129-herdr-web-cli-friendly-on-screen-key-bar-esc-tab-ctrl-arrows.md) `CLOSED` — herdr-web: CLI-friendly on-screen key bar (Esc/Tab/Ctrl/arrows/pipe/prefix)
 - [#130](0130-herdr-web-forward-wheel-touch-as-mouse-events-scroll-convers.md) `CLOSED` — herdr-web: forward wheel/touch as mouse events (scroll conversation + right-click parity)
-- [#131](0131-port-herdr-web-bridge-into-herdr-as-a-first-class-option-g-f.md) `CLOSED` — port herdr-web bridge into herdr as a first-class option (g-fleet keeps only the tailscale-serve exposure)
+- [#131](0131-port-herdr-web-bridge-into-herdr-as-a-first-class-option-g-f.md) `CLOSED` — port herdr-web bridge into herdr as a first-class option (the fleet configuration repo keeps only the tailscale-serve exposure)
 - [#132](0132-server-switch-probe-ssh-commands-have-no-timeout-batchmode-s.md) `CLOSED` — Server switch: probe SSH commands have no timeout/BatchMode → switch can hang forever
 - [#133](0133-server-switch-cold-dial-does-3-4-sequential-ssh-round-trips.md) `CLOSED` — Server switch: cold dial does 3–4 sequential SSH round-trips → slow switches
 - [#134](0134-server-switch-config-snapshot-peers-can-t-pre-warm-legacy-pa.md) `CLOSED` — Server switch: config/snapshot peers can't pre-warm + legacy path has no timeout-bounded fallback
@@ -67,7 +67,7 @@
 - [#145](0145-keys-and-clipboard-not-reaching-inner-pane-when-claude-code.md) `OPEN` — Keys and clipboard not reaching inner pane when Claude Code runs inside a herdr pane
 - [#147](0147-herdr-web-map-tailscale-identity-to-a-herdr-user-allow-list.md) `CLOSED` — herdr web: map tailscale identity to a herdr user / allow-list (auth beyond loopback)
 - [#148](0148-herdr-web-idle-ws-timeout-concurrent-session-cap.md) `CLOSED` — herdr web: idle WS timeout + concurrent-session cap
-- [#149](0149-g-fleet-retire-herdr-web-mvp-run-an-always-on-herdr-server-d.md) `OPEN` — g-fleet: retire herdr-web MVP, run an always-on `herdr server` daemon + `herdr web` on atlas
+- [#149](0149-fleet-config-retire-herdr-web-mvp-run-an-always-on-herdr-server-d.md) `OPEN` — the fleet configuration repo: retire herdr-web MVP, run an always-on `herdr server` daemon + `herdr web` on atlas
 - [#150](0150-herdr-web-native-socket-bridge-drop-the-per-connection-pty-u.md) `OPEN` — herdr web: native socket bridge (drop the per-connection PTY) — unblocks #128/#129/#130
 - [#151](0151-herdr-web-first-class-session-name-flag.md) `CLOSED` — herdr web: first-class `--session <name>` flag
 - [#152](0152-server-switch-stage-3-idle-evict-unused-warm-ssh-bridges-lar.md) `OPEN` — Server switch (stage-3): idle-evict unused warm ssh bridges (large-fleet only)

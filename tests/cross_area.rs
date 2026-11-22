@@ -42,6 +42,7 @@ impl SpawnedFlock {
 
 impl Drop for SpawnedFlock {
     fn drop(&mut self) {
+        let _timing = support::timing::phase(support::timing::Phase::Teardown);
         let pid = self.child.process_id();
         let _ = self.child.kill();
         self.close_master();
@@ -105,6 +106,7 @@ fn test_lock() -> MutexGuard<'static, ()> {
 }
 
 fn wait_for_socket(path: &Path, timeout: Duration) {
+    let _timing = support::timing::wait("ready: socket");
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if path.exists() && UnixStream::connect(path).is_ok() {
@@ -125,11 +127,14 @@ fn spawn_server_with_path(
     api_socket_path: &Path,
     path_override: Option<&Path>,
 ) -> SpawnedFlock {
-    fs::create_dir_all(config_home.join("flock")).unwrap();
+    let _timing = support::timing::phase(support::timing::Phase::Spawn);
+    fs::create_dir_all(config_home.join(support::paths::app_dir_name())).unwrap();
     fs::create_dir_all(runtime_dir).unwrap();
     register_runtime_dir(runtime_dir);
     fs::write(
-        config_home.join("flock/config.toml"),
+        config_home
+            .join(support::paths::app_dir_name())
+            .join("config.toml"),
         "onboarding = false\n",
     )
     .unwrap();
@@ -145,8 +150,9 @@ fn spawn_server_with_path(
 
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flk"));
     cmd.arg("server");
-    cmd.env("XDG_CONFIG_HOME", config_home);
-    cmd.env("XDG_RUNTIME_DIR", runtime_dir);
+    for (key, value) in support::environment::isolated_env(config_home, runtime_dir) {
+        cmd.env(key, value);
+    }
     cmd.env("FLOCK_SOCKET_PATH", api_socket_path);
     cmd.env_remove("FLOCK_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", "/bin/sh");
@@ -155,7 +161,8 @@ fn spawn_server_with_path(
         cmd.env("PATH", path);
     }
 
-    let child = pair.slave.spawn_command(cmd).unwrap();
+    support::environment::assert_pty_isolated(&cmd);
+    let child = support::environment::spawn_pty(pair.slave.as_ref(), cmd).unwrap();
     register_spawned_flock_pid(child.process_id());
     drop(pair.slave);
 
@@ -170,6 +177,7 @@ fn spawn_client_process(
     runtime_dir: &Path,
     api_socket_path: &Path,
 ) -> SpawnedFlock {
+    let _timing = support::timing::phase(support::timing::Phase::Spawn);
     register_runtime_dir(runtime_dir);
     let pair = native_pty_system()
         .openpty(PtySize {
@@ -183,14 +191,16 @@ fn spawn_client_process(
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flk"));
     cmd.arg("client");
     cmd.env("FLOCK_DISABLE_SOUND", "1");
-    cmd.env("XDG_CONFIG_HOME", config_home);
-    cmd.env("XDG_RUNTIME_DIR", runtime_dir);
+    for (key, value) in support::environment::isolated_env(config_home, runtime_dir) {
+        cmd.env(key, value);
+    }
     cmd.env("FLOCK_SOCKET_PATH", api_socket_path);
     cmd.env_remove("FLOCK_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", "/bin/sh");
     cmd.env_remove("FLOCK_ENV");
 
-    let child = pair.slave.spawn_command(cmd).unwrap();
+    support::environment::assert_pty_isolated(&cmd);
+    let child = support::environment::spawn_pty(pair.slave.as_ref(), cmd).unwrap();
     register_spawned_flock_pid(child.process_id());
     drop(pair.slave);
 
@@ -444,6 +454,7 @@ fn decode_varint_u32(payload: &[u8], offset: usize) -> Result<(u32, usize), Stri
 }
 
 fn client_handshake(stream: &mut UnixStream, version: u32, cols: u16, rows: u16) {
+    let _timing = support::timing::phase(support::timing::Phase::Handshake);
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .expect("set read timeout");
@@ -747,7 +758,14 @@ fn cross_area_detach_and_reattach_preserves_state() {
     drop(client_a);
 
     // Simulate activity while detached.
-    pane_send_text(&api_socket, &pane_id, "echo DETACHED_UPDATE\n");
+    pane_send_text(&api_socket, &pane_id, "echo DETACHED_UPDATE");
+    let enter = send_json_request(
+        &api_socket,
+        "detached_enter",
+        "pane.send_keys",
+        json!({"pane_id": pane_id, "keys": ["Enter"]}),
+    );
+    assert!(enter.get("error").is_none());
     assert!(pane_read_recent_contains(
         &api_socket,
         &pane_id,

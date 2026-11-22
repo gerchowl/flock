@@ -7,6 +7,8 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
 
+use crate::api::error_code::ErrorCode;
+use crate::checksum::AssetRef as RemoteAssetRef;
 use crate::process::TracedCommand;
 
 use serde::Deserialize;
@@ -17,13 +19,20 @@ use std::sync::{
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+/// Private install-script signals, never returned directly as CLI statuses.
+/// Ordinary shell/tool errors (including 2, 126, 127) retain their stderr.
+const INSTALL_TRANSFER_MISMATCH: i32 = 30;
+const INSTALL_CHECKSUM_TOOL_MISSING: i32 = 31;
+
 const BRIDGE_ACCEPT_POLL: Duration = Duration::from_millis(50);
 const BRIDGE_SOCKET_PERMISSION_MODE: u32 = 0o600;
 const REMOTE_SERVER_SHUTDOWN_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
 const REMOTE_SERVER_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const CURRENT_PROTOCOL: u32 = crate::protocol::PROTOCOL_VERSION;
-const STABLE_UPDATE_MANIFEST_URL: &str = "https://flock.dev/latest.json";
-const PREVIEW_UPDATE_MANIFEST_URL: &str = "https://flock.dev/preview.json";
+const STABLE_UPDATE_MANIFEST_URL: &str =
+    "https://github.com/gerchowl/flock/releases/latest/download/latest.json";
+const PREVIEW_UPDATE_MANIFEST_URL: &str =
+    "https://raw.githubusercontent.com/gerchowl/flock/dev/website/preview.json";
 const REMOTE_BINARY_ENV_VAR: &str = "FLOCK_REMOTE_BINARY";
 pub(crate) const REATTACH_COMMAND_ENV_VAR: &str = "FLOCK_REATTACH_COMMAND";
 
@@ -125,9 +134,11 @@ pub(crate) struct RemoteLaunch {
     pub(crate) proxy_jump: Option<String>,
 }
 
-pub(crate) fn extract_remote_args(
-    args: &[String],
-) -> Result<(Vec<String>, Option<RemoteLaunch>), String> {
+/// Strip remote globals without decoding native command arguments.
+/// Remote option values remain UTF-8 text and retain typed decoding refusals.
+pub(crate) fn extract_remote_args<T: AsRef<std::ffi::OsStr> + Clone + From<&'static str>>(
+    args: &[T],
+) -> Result<(Vec<T>, Option<RemoteLaunch>), String> {
     let mut cleaned = Vec::with_capacity(args.len());
     if let Some(program) = args.first() {
         cleaned.push(program.clone());
@@ -140,27 +151,30 @@ pub(crate) fn extract_remote_args(
     let mut index = 1;
     while index < args.len() {
         let arg = &args[index];
-        if arg == "--" {
+        let text = arg.as_ref().to_str();
+        if text == Some("--") {
             cleaned.extend_from_slice(&args[index..]);
             break;
         }
-        if arg == "--handoff" {
+        if text == Some("--handoff") {
             live_handoff = true;
             index += 1;
             continue;
         }
-        if arg == "--remote" {
+        if text == Some("--remote") {
             if remote_target.is_some() {
                 return Err("--remote can only be specified once".to_string());
             }
             let Some(value) = args.get(index + 1) else {
                 return Err("missing value for --remote".to_string());
             };
-            remote_target = Some(validate_remote_target(value)?.to_owned());
+            let value = crate::cli::argv::text_argument(index + 1, value.as_ref().to_os_string())
+                .map_err(|err| err.to_string())?;
+            remote_target = Some(validate_remote_target(&value)?.to_owned());
             index += 2;
             continue;
         }
-        if let Some(value) = arg.strip_prefix("--remote=") {
+        if let Some(value) = text.and_then(|arg| arg.strip_prefix("--remote=")) {
             if remote_target.is_some() {
                 return Err("--remote can only be specified once".to_string());
             }
@@ -168,19 +182,21 @@ pub(crate) fn extract_remote_args(
             index += 1;
             continue;
         }
-        if arg == "--remote-keybindings" {
+        if text == Some("--remote-keybindings") {
             if keybindings_seen {
                 return Err("--remote-keybindings can only be specified once".to_string());
             }
             let Some(value) = args.get(index + 1) else {
                 return Err("missing value for --remote-keybindings".to_string());
             };
-            keybindings = RemoteKeybindings::parse(value)?;
+            let value = crate::cli::argv::text_argument(index + 1, value.as_ref().to_os_string())
+                .map_err(|err| err.to_string())?;
+            keybindings = RemoteKeybindings::parse(&value)?;
             keybindings_seen = true;
             index += 2;
             continue;
         }
-        if let Some(value) = arg.strip_prefix("--remote-keybindings=") {
+        if let Some(value) = text.and_then(|arg| arg.strip_prefix("--remote-keybindings=")) {
             if keybindings_seen {
                 return Err("--remote-keybindings can only be specified once".to_string());
             }
@@ -211,7 +227,7 @@ pub(crate) fn extract_remote_args(
         return Err("--remote-keybindings requires --remote".to_string());
     }
     if remote.is_none() && live_handoff {
-        cleaned.push("--handoff".to_string());
+        cleaned.push("--handoff".into());
     }
 
     Ok((cleaned, remote))
@@ -239,7 +255,10 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
     // captured before `remote.target` is moved into the bridge.
     let active_ssh_target = remote.target.clone();
     let local_socket = local_forward_socket_path(&remote.target, &session_name);
-    let program = std::env::args().next().unwrap_or_else(|| "flk".to_string());
+    let program = crate::cli::argv::text_argument(
+        0,
+        std::env::args_os().next().unwrap_or_else(|| "flk".into()),
+    )?;
     let reattach_command = reattach_command(
         &program,
         &remote.target,
@@ -526,31 +545,6 @@ impl RemoteFlock {
     fn with_shell_path(mut self, shell_path: String) -> Self {
         self.shell_path = shell_path;
         self
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
-enum RemoteAssetRef {
-    Url(String),
-    Object { url: String, sha256: Option<String> },
-}
-
-impl RemoteAssetRef {
-    fn url(&self) -> &str {
-        match self {
-            Self::Url(url) => url,
-            Self::Object { url, .. } => url,
-        }
-    }
-
-    fn sha256(&self) -> Option<&str> {
-        match self {
-            Self::Url(_) => None,
-            Self::Object { sha256, .. } => {
-                sha256.as_deref().filter(|value| !value.trim().is_empty())
-            }
-        }
     }
 }
 
@@ -1293,18 +1287,20 @@ fn confirm_remote_server_stop(
     Ok(false)
 }
 
+/// #600: the importer validates `expected_version` against its OWN
+/// `build_info::version()` (`handoff::receive_after_token`), so a pin naming
+/// this client's build is a claim about a binary that lives on the far side of
+/// the ssh connection. Ask the binary at `--import-exe` what it is and pin
+/// that. The protocol pin stays this client's — the wire is what the client
+/// actually needs to match, and `remote_binary_matches` already confirmed the
+/// remote binary speaks it.
 fn live_handoff_remote_server(
     target: &str,
     remote_flock: &RemoteFlock,
     context: LaunchContext,
 ) -> io::Result<()> {
-    let command = format!(
-        "{} server live-handoff --import-exe {} --expected-protocol {} --expected-version {}",
-        remote_flock.shell_path,
-        remote_flock.shell_path,
-        CURRENT_PROTOCOL,
-        current_version()
-    );
+    let import_version = remote_import_binary_version(target, remote_flock);
+    let command = live_handoff_command(remote_flock, import_version.as_deref());
     let output = ssh_sh_output(target, &command)?;
     if !output.status.success() {
         return Err(command_failed("remote server live handoff failed", &output));
@@ -1318,6 +1314,49 @@ fn live_handoff_remote_server(
         ),
     );
     Ok(())
+}
+
+/// The remote handoff command, with the version the importer will check.
+///
+/// `expected_version` of `None` drops `--expected-version` from the command
+/// entirely rather than pinning a guess: an unpinned import is the state a
+/// hand-run `flk server live-handoff` is already in, and it relaxes only the
+/// version half of the importer's validation.
+fn live_handoff_command(remote_flock: &RemoteFlock, expected_version: Option<&str>) -> String {
+    let expected_version = expected_version
+        .map(|version| format!(" --expected-version {}", shell_quote(version)))
+        .unwrap_or_default();
+    format!(
+        "{0} server live-handoff --import-exe {0} --expected-protocol {CURRENT_PROTOCOL}{expected_version}",
+        remote_flock.shell_path,
+    )
+}
+
+/// What the binary that will run the import reports as its version, which is
+/// the only version the importer can agree with.
+///
+/// One extra ssh round trip on a path that already spends several, and it
+/// answers with `None` rather than an error: a failed probe drops the version
+/// pin and the handoff still runs.
+fn remote_import_binary_version(target: &str, remote_flock: &RemoteFlock) -> Option<String> {
+    let command = format!("{} --version", remote_flock.shell_path);
+    let output = ssh_sh_output(target, &command).ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_flk_version(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// `flk --version` prints one line, `flk <version>` (`main`). Anything else —
+/// a shell error, a wrapper, a build that prints nothing — yields no pin: a
+/// version read out of unexpected output is the refusal this replaced, and a
+/// missing pin costs nothing but the check.
+fn parse_flk_version(stdout: &str) -> Option<String> {
+    let version = stdout.lines().next()?.trim().strip_prefix("flk ")?.trim();
+    if version.is_empty() || version.contains(char::is_whitespace) {
+        return None;
+    }
+    Some(version.to_string())
 }
 
 fn stop_remote_server(
@@ -1394,11 +1433,12 @@ fn remote_shell_resolves_managed_install(stdout: &str) -> bool {
 fn download_release_asset(platform: &RemotePlatform) -> io::Result<InstallSource> {
     let asset_key = platform.asset_key();
     let asset = remote_release_asset(&asset_key)?;
+    crate::update::ensure_release_asset_origin(&asset.url).map_err(io::Error::other)?;
 
     let dir = private_download_dir(&asset_key)?;
     let path = dir.join("flock.tmp");
     let status = TracedCommand::new("curl", "remote")
-        .args(["-sfL", "--max-time", "120", "-o"])
+        .args(["-sfL", "--proto-redir", "=https", "--max-time", "120", "-o"])
         .arg(&path)
         .arg(&asset.url)
         .status_traced()
@@ -1407,14 +1447,12 @@ fn download_release_asset(platform: &RemotePlatform) -> io::Result<InstallSource
         let _ = fs::remove_dir_all(&dir);
         return Err(io::Error::other("download failed"));
     }
-    if let Some(expected) = &asset.sha256 {
-        if let Err(err) = crate::checksum::verify_sha256(&path, expected) {
-            let _ = fs::remove_dir_all(&dir);
-            return Err(io::Error::new(
-                err.kind(),
-                format!("downloaded remote asset checksum verification failed: {err}"),
-            ));
-        }
+    if let Err(err) = crate::checksum::verify_asset(&path, asset.sha256.as_deref()) {
+        let _ = fs::remove_dir_all(&dir);
+        return Err(io::Error::new(
+            err.kind(),
+            format!("downloaded remote asset checksum verification failed: {err}"),
+        ));
     }
 
     Ok(InstallSource::temporary(path, dir))
@@ -1424,6 +1462,8 @@ fn fetch_remote_manifest(url: &str) -> io::Result<Vec<u8>> {
     let output = TracedCommand::new("curl", "remote")
         .args([
             "-sfL",
+            "--proto-redir",
+            "=https",
             "--retry",
             "3",
             "--connect-timeout",
@@ -1591,21 +1631,14 @@ fn install_remote_flock(
         &source_path.display().to_string(),
         &remote_flock.shell_path,
     );
-    let script = format!(
-        r#"dest="$HOME/{install_suffix}"
-dir="${{dest%/*}}"
-mkdir -p "$dir"
-tmp="${{dest}}.tmp.$$"
-cat > "$tmp"
-chmod 755 "$tmp"
-mv "$tmp" "$dest"
-"#,
-        install_suffix = remote_flock.install_suffix
-    );
+    let mut source = File::open(source_path)?;
+    let expected = crate::checksum::file_sha256(&mut source)?;
+    let script = remote_install_script(remote_flock, &expected);
 
-    let mut child = TracedCommand::new("ssh", "remote")
+    let child = TracedCommand::new("ssh", "remote")
         .args(control_plane_jump_args(target)?)
         .arg("-T")
+        .arg("-C")
         .arg(target)
         .arg(format!("/bin/sh -eu -c {}", shell_quote(&script)))
         .stdin(Stdio::piped())
@@ -1616,7 +1649,23 @@ mv "$tmp" "$dest"
         .spawn_traced()
         .map_err(|err| io::Error::new(err.kind(), format!("failed to start ssh install: {err}")))?;
 
-    let mut source = File::open(source_path)?;
+    if let Err(error) = finish_remote_upload(child, &mut source) {
+        crate::logging::remote_install_failed(target, &remote_flock.shell_path, &error.to_string());
+        return Err(error);
+    }
+    crate::logging::remote_install_completed(target, &remote_flock.shell_path);
+    Ok(())
+}
+
+/// Reap the upload process and preserve the originating transfer failure.
+fn finish_remote_upload(
+    mut child: std::process::Child,
+    source: &mut impl io::Read,
+) -> io::Result<()> {
+    let mut source = UploadReader {
+        inner: source,
+        read_failed: false,
+    };
     let copy_result = if let Some(mut stdin) = child.stdin.take() {
         io::copy(&mut source, &mut stdin).map(|_| ())
     } else {
@@ -1625,21 +1674,82 @@ mv "$tmp" "$dest"
             "ssh install stdin missing",
         ))
     };
-    let output = child.wait_with_output()?;
-    let status = output.status;
-    copy_result?;
-
-    if status.success() {
-        crate::logging::remote_install_completed(target, &remote_flock.shell_path);
-        Ok(())
-    } else {
-        let err = match crate::process::shape_stderr_tail(&output.stderr) {
-            Some(tail) => format!("remote install exited with {status}: {tail}"),
-            None => format!("remote install exited with {status}"),
-        };
-        crate::logging::remote_install_failed(target, &remote_flock.shell_path, &err);
-        Err(io::Error::other(err))
+    let output = child.wait_with_output();
+    if source.read_failed {
+        return copy_result;
     }
+    let output = output?;
+    remote_install_result(output.status, &output.stderr)?;
+    copy_result
+}
+
+/// Identify read-side failures without wrapping or replacing the original error.
+struct UploadReader<'a, R> {
+    inner: &'a mut R,
+    read_failed: bool,
+}
+impl<R: io::Read> io::Read for UploadReader<'_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let result = self.inner.read(buffer);
+        // A retried Interrupted read must not misclassify a later write failure.
+        self.read_failed = result.is_err();
+        result
+    }
+}
+
+/// Stage and verify a received upload before atomically replacing the binary.
+fn remote_install_script(remote_flock: &RemoteFlock, expected: &str) -> String {
+    format!(
+        r#"dest="$HOME/{install_suffix}"
+dir="${{dest%/*}}"
+mkdir -p "$dir"
+tmp="${{dest}}.tmp.$$"
+trap 'rm -f "$tmp"' 0
+cat > "$tmp"
+if command -v sha256sum >/dev/null 2>&1; then
+    actual=$(sha256sum "$tmp")
+elif command -v shasum >/dev/null 2>&1; then
+    actual=$(shasum -a 256 "$tmp")
+else
+    exit {missing_exit}
+fi
+actual=${{actual%% *}}
+[ "$actual" = {expected} ] || exit {mismatch_exit}
+chmod 755 "$tmp"
+mv "$tmp" "$dest"
+"#,
+        install_suffix = remote_flock.install_suffix,
+        expected = shell_quote(expected),
+        mismatch_exit = INSTALL_TRANSFER_MISMATCH,
+        missing_exit = INSTALL_CHECKSUM_TOOL_MISSING,
+    )
+}
+
+/// Decode only the two private signals; every other failure preserves stderr.
+fn remote_install_result(status: std::process::ExitStatus, stderr: &[u8]) -> io::Result<()> {
+    if status.success() {
+        return Ok(());
+    }
+    match status.code() {
+        Some(INSTALL_TRANSFER_MISMATCH) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                ErrorCode::RemoteChecksumMismatch,
+            ))
+        }
+        Some(INSTALL_CHECKSUM_TOOL_MISSING) => {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                ErrorCode::ChecksumToolMissing,
+            ))
+        }
+        _ => {}
+    }
+    let message = match crate::process::shape_stderr_tail(stderr) {
+        Some(tail) => format!("remote install exited with {status}: {tail}"),
+        None => format!("remote install exited with {status}"),
+    };
+    Err(io::Error::other(message))
 }
 
 /// SSH options applied to every non-interactive control-plane invocation
@@ -1649,6 +1759,7 @@ mv "$tmp" "$dest"
 /// flock" failure mode. `BatchMode` refuses to prompt, `ConnectTimeout` bounds
 /// the TCP connect, and `accept-new` trusts first-seen host keys without asking.
 const SSH_NONINTERACTIVE_OPTS: &[&str] = &[
+    "-C",
     "-o",
     "BatchMode=yes",
     "-o",
@@ -1800,31 +1911,59 @@ pub(crate) struct SshStdioBridge {
 struct BridgeHealth {
     consecutive_failures: u32,
     last_reason: Option<crate::peers::SshFailureReason>,
+    /// The newest connection that has carried bytes, by the accept-order number
+    /// the accept loop gave it when it was accepted.
+    latest_success: u64,
+    /// The newest connection whose failure was recorded, in the same
+    /// accept-order numbering.
+    latest_failure_seq: u64,
 }
 
 impl BridgeHealth {
     /// Record a failed connection; returns its attempt number in the current
-    /// run and whether this is the one that makes the run persistent. A tunnel
-    /// that worked before it died starts a fresh run: it is a drop, not a
-    /// dial that never got through.
+    /// run and whether this is the one that makes the run persistent, or `None`
+    /// when the failure is older than a later success and so describes nothing
+    /// the bridge is doing now. A tunnel that worked before it died starts a
+    /// fresh run: it is a drop, not a dial that never got through.
     fn record_failure(
         &mut self,
+        seq: u64,
         established: bool,
         reason: crate::peers::SshFailureReason,
-    ) -> (u32, bool) {
+    ) -> Option<(u32, bool)> {
+        // The client reads a dead tunnel's EOF before this thread has read ssh's
+        // stderr, so the redial's success is free to land first and this
+        // failure after it. A connection older than that success has been
+        // redialed past — the newer one carried bytes, the only evidence a
+        // tunnel works — so its failure neither reopens nor extends the run. It
+        // is still logged: that dial did fail, and ssh's stderr is the
+        // operator's only record of why (#621).
+        if seq < self.latest_success {
+            return None;
+        }
         if established {
             self.consecutive_failures = 0;
         }
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
         self.last_reason = Some(reason);
-        (
+        self.latest_failure_seq = self.latest_failure_seq.max(seq);
+        Some((
             self.consecutive_failures,
             self.consecutive_failures == crate::peers::DIAL_FAILURE_PERSISTS_AFTER,
-        )
+        ))
     }
 
-    fn record_success(&mut self) {
-        *self = Self::default();
+    /// Record a connection that worked. The run of failures closes only for a
+    /// success at least as new as the newest recorded failure: the mirror of
+    /// the guard above, since a connection that exits cleanly long after the
+    /// bridge has redialed past it cannot report on the tunnel in use (#621).
+    fn record_success(&mut self, seq: u64) {
+        self.latest_success = self.latest_success.max(seq);
+        if seq < self.latest_failure_seq {
+            return;
+        }
+        self.consecutive_failures = 0;
+        self.last_reason = None;
     }
 
     /// The classified reason the latest connection failed with, while the
@@ -1837,9 +1976,62 @@ impl BridgeHealth {
 /// Live ssh children of one bridge, by connection id.
 type ActiveChildPids = Arc<std::sync::Mutex<HashMap<u64, u32>>>;
 
+/// Pipes and lifecycle of one SSH tunnel. An injected spawner can provide an
+/// in-process transport without changing forwarding, health or failure logging.
+/// Implementations must close their pipes on exit. Transports without a PID
+/// must finish when the client disconnects, since teardown cannot signal them.
+trait BridgeChild: Send {
+    /// A real child PID for bridge teardown, or none for an in-process transport.
+    fn id(&self) -> Option<u32>;
+    fn kill(&mut self) -> io::Result<()>;
+    fn wait(&mut self) -> io::Result<std::process::ExitStatus>;
+    fn take_pipes(&mut self) -> io::Result<BridgePipes>;
+}
+
+struct BridgePipes {
+    stdin: Box<dyn io::Write + Send>,
+    stdout: Box<dyn io::Read + Send>,
+    stderr: Option<Box<dyn io::Read + Send>>,
+}
+
+impl BridgeChild for std::process::Child {
+    fn id(&self) -> Option<u32> {
+        Some(self.id())
+    }
+
+    fn kill(&mut self) -> io::Result<()> {
+        self.kill()
+    }
+
+    fn wait(&mut self) -> io::Result<std::process::ExitStatus> {
+        self.wait()
+    }
+
+    fn take_pipes(&mut self) -> io::Result<BridgePipes> {
+        let stdin = self
+            .stdin
+            .take()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "ssh bridge stdin missing"))?;
+        let stdout = self.stdout.take().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::BrokenPipe, "ssh bridge stdout missing")
+        })?;
+        Ok(BridgePipes {
+            stdin: Box::new(stdin),
+            stdout: Box::new(stdout),
+            stderr: self.stderr.take().map(|pipe| Box::new(pipe) as _),
+        })
+    }
+}
+
+/// Spawn one connection in accept order. Production always starts SSH through
+/// the traced-command funnel. The seam keeps transport policy out of forwarding.
+type BridgeSpawner =
+    Arc<dyn Fn(&mut TracedCommand, u64) -> io::Result<Box<dyn BridgeChild>> + Send + Sync>;
+
 /// Everything one bridge connection needs to dial its ssh, shared by the
 /// connection threads.
 struct BridgeDial {
+    spawn: BridgeSpawner,
     target: String,
     remote_flock: RemoteFlock,
     session_name: String,
@@ -1889,6 +2081,28 @@ impl SshStdioBridge {
         manage_ssh_config: bool,
         proxy_jump: Option<String>,
     ) -> io::Result<Self> {
+        Self::start_with_spawner(
+            target,
+            remote_flock,
+            local_socket,
+            session_name,
+            manage_ssh_config,
+            proxy_jump,
+            Arc::new(|command, _| command.spawn_traced().map(|child| Box::new(child) as _)),
+        )
+    }
+
+    /// Start the same listener and forwarding path with an explicit spawner.
+    /// The spawner owns transport creation only, not health or log decisions.
+    fn start_with_spawner(
+        target: String,
+        remote_flock: RemoteFlock,
+        local_socket: PathBuf,
+        session_name: String,
+        manage_ssh_config: bool,
+        proxy_jump: Option<String>,
+        spawn: BridgeSpawner,
+    ) -> io::Result<Self> {
         let _ = std::fs::remove_file(&local_socket);
         let listener = UnixListener::bind(&local_socket)?;
         crate::ipc::restrict_socket_permissions(&local_socket, BRIDGE_SOCKET_PERMISSION_MODE)?;
@@ -1928,6 +2142,7 @@ impl SshStdioBridge {
                 .bridge_stderr_settle_ms,
         );
         let dial = Arc::new(BridgeDial {
+            spawn,
             target,
             remote_flock,
             session_name,
@@ -2363,8 +2578,13 @@ pub(crate) fn is_valid_ssh_proxy_jump(chain: &str) -> bool {
 /// and a relayed peer via the relayer alone. `None` when nothing is left.
 pub(crate) fn client_relative_proxy_jump(chain: Option<&str>) -> Option<String> {
     let short = crate::app::short_host_name();
-    let full = sysinfo::System::host_name().unwrap_or_default();
-    relative_proxy_jump(chain?, &[short.as_str(), full.as_str()])
+    match sysinfo::System::host_name() {
+        Ok(full) => relative_proxy_jump(chain?, &[short.as_str(), full.as_str()]),
+        Err(error) => {
+            crate::logging::system_information_unavailable("proxy_jump_host_name", &error);
+            relative_proxy_jump(chain?, &[short.as_str()])
+        }
+    }
 }
 
 /// Cut `chain` after the last hop naming one of `self_names`. Matched EXACTLY
@@ -2578,13 +2798,14 @@ fn bridge_connection(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let mut child = command
-        .spawn_traced()
+    let mut child = (dial.spawn)(&mut command, connection)
         .map_err(|err| io::Error::new(err.kind(), format!("failed to start ssh bridge: {err}")))?;
     // Publish the child's pid so bridge Drop can SIGKILL it to unblock the
     // `child.wait()` below on teardown (#176). Removed before returning.
-    if let Ok(mut pids) = active_child_pids.lock() {
-        pids.insert(connection, child.id());
+    if let Some(pid) = child.id() {
+        if let Ok(mut pids) = active_child_pids.lock() {
+            pids.insert(connection, pid);
+        }
     }
     // A teardown that began before the pid was published cannot have killed
     // this child, and the wait below would then park until ssh gave up on its
@@ -2593,15 +2814,11 @@ fn bridge_connection(
     if should_stop.load(Ordering::Acquire) {
         let _ = child.kill();
     }
-    let mut child_stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "ssh bridge stdin missing"))?;
-    let mut child_stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "ssh bridge stdout missing"))?;
-    let child_stderr = child.stderr.take();
+    let BridgePipes {
+        stdin: mut child_stdin,
+        stdout: mut child_stdout,
+        stderr: child_stderr,
+    } = child.take_pipes()?;
     let mut stream_to_child = stream.try_clone()?;
     let mut child_to_stream = stream;
 
@@ -2616,7 +2833,7 @@ fn bridge_connection(
     let download = thread::spawn(move || {
         let delivered = copy_flush_marking_first(&mut child_stdout, &mut child_to_stream, || {
             if let Ok(mut health) = through_health.lock() {
-                health.record_success();
+                health.record_success(connection);
             }
         })
         .unwrap_or(0);
@@ -2669,7 +2886,7 @@ fn bridge_connection(
     crate::logging::remote_bridge_exited(target, status.code(), intentional_teardown);
     if status.success() {
         if let Ok(mut health) = dial.health.lock() {
-            health.record_success();
+            health.record_success(connection);
         }
         return Ok(());
     }
@@ -2689,10 +2906,14 @@ fn bridge_connection(
         .map(|lines| lines.iter().cloned().collect::<Vec<_>>().join("\n"))
         .and_then(|text| crate::process::shape_stderr_tail(text.as_bytes()));
     let reason = crate::peers::SshFailureReason::classify(stderr_tail.as_deref().unwrap_or(""));
+    // A failure the bookkeeping declined, because a newer connection had already
+    // succeeded: its run stays closed, so it logs as attempt 1 and can never be
+    // the persistent one (#621).
     let (attempt, persistent) = dial
         .health
         .lock()
-        .map(|mut health| health.record_failure(delivered > 0, reason))
+        .ok()
+        .and_then(|mut health| health.record_failure(connection, delivered > 0, reason))
         .unwrap_or((1, false));
     crate::logging::remote_bridge_failed(
         target,
@@ -2732,7 +2953,11 @@ impl BridgeFailureLog<'_> {
     }
 }
 
-/// [`copy_flush`], calling `on_first` once the first bytes have been written.
+/// [`copy_flush`], calling `on_first` once the first bytes have arrived, before
+/// they are written onward. The mark comes first on purpose: the client reads
+/// these bytes as proof the tunnel works, so a client that looked at the
+/// bridge's bookkeeping in between would still see the previous connection's
+/// failure (#621).
 fn copy_flush_marking_first<R: io::Read, W: io::Write>(
     reader: &mut R,
     writer: &mut W,
@@ -2747,9 +2972,9 @@ fn copy_flush_marking_first<R: io::Read, W: io::Write>(
             Err(err) => return Err(err),
         }
     };
+    on_first();
     writer.write_all(&buffer[..first])?;
     writer.flush()?;
-    on_first();
     Ok(first as u64 + copy_flush(reader, writer)?)
 }
 
@@ -3042,6 +3267,41 @@ mod tests {
         {
             let _route = route_control_plane("ws00860001", None);
             assert!(control_plane_jump_args("ws00860001").unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn bridge_dial_argv_compresses_managed_and_plain_connections() {
+        let remote_flock = RemoteFlock::for_platform(RemotePlatform {
+            os: "linux",
+            arch: "x86_64",
+        });
+        let config = std::env::temp_dir().join("flock-compression-ssh-config");
+        for ssh_config in [None, Some(config.as_path())] {
+            let argv = bridge_dial_argv(
+                "operator@example.com",
+                &remote_flock,
+                crate::session::DEFAULT_SESSION_NAME,
+                ssh_config,
+                None,
+            )
+            .expect("valid bridge dial");
+            let compression = argv
+                .iter()
+                .position(|arg| arg == "-C")
+                .expect("compression flag");
+            let target = argv
+                .iter()
+                .position(|arg| arg == "operator@example.com")
+                .expect("target");
+            assert!(
+                compression < target,
+                "compression must be an SSH option: {argv:?}"
+            );
+            assert_eq!(
+                argv.first().map(String::as_str),
+                Some(if ssh_config.is_some() { "-F" } else { "-T" })
+            );
         }
     }
 
@@ -3369,6 +3629,309 @@ mod tests {
         );
     }
 
+    /// In-process SSH stand-in: real byte pipes, exit status and stderr, with
+    /// no shell startup or counter file inside the socket-read failure ceiling.
+    struct FixtureSsh {
+        pipes: Option<BridgePipes>,
+        control: UnixStream,
+        exited: std::sync::mpsc::Receiver<std::process::ExitStatus>,
+        stderr_read: std::sync::mpsc::Receiver<()>,
+        worker: Option<JoinHandle<()>>,
+    }
+
+    struct FixtureStderr {
+        text: io::Cursor<Vec<u8>>,
+        done: Option<std::sync::mpsc::Sender<()>>,
+    }
+
+    impl io::Read for FixtureStderr {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = io::Read::read(&mut self.text, buf)?;
+            if n == 0 {
+                if let Some(done) = self.done.take() {
+                    let _ = done.send(());
+                }
+            }
+            Ok(n)
+        }
+    }
+
+    impl BridgeChild for FixtureSsh {
+        fn id(&self) -> Option<u32> {
+            None
+        }
+
+        fn kill(&mut self) -> io::Result<()> {
+            self.control.shutdown(std::net::Shutdown::Both)
+        }
+
+        fn wait(&mut self) -> io::Result<std::process::ExitStatus> {
+            let status = self
+                .exited
+                .recv_timeout(Duration::from_secs(5))
+                .map_err(io::Error::other)?;
+            // The fixture's exit is gated on stderr consumption, rather than
+            // hoping its reader gets scheduled inside the product settle bound.
+            self.stderr_read
+                .recv_timeout(Duration::from_secs(5))
+                .map_err(io::Error::other)?;
+            self.worker
+                .take()
+                .expect("fixture worker")
+                .join()
+                .expect("fixture SSH worker panicked");
+            Ok(status)
+        }
+
+        fn take_pipes(&mut self) -> io::Result<BridgePipes> {
+            self.pipes
+                .take()
+                .ok_or_else(|| io::Error::other("fixture pipes already taken"))
+        }
+    }
+
+    impl Drop for FixtureSsh {
+        fn drop(&mut self) {
+            let _ = self.control.shutdown(std::net::Shutdown::Both);
+            if let Some(worker) = self.worker.take() {
+                worker.join().expect("fixture SSH worker panicked");
+            }
+        }
+    }
+
+    fn fixture_spawner(failures: u64, complaint: &'static str) -> BridgeSpawner {
+        Arc::new(move |_, connection| {
+            use std::os::unix::process::ExitStatusExt;
+            let (stdin, mut input) = UnixStream::pair()?;
+            let (stdout, mut output) = UnixStream::pair()?;
+            let control = input.try_clone()?;
+            let (exit_tx, exited) = std::sync::mpsc::channel();
+            let (stderr_tx, stderr_read) = std::sync::mpsc::channel();
+            let failed = connection <= failures;
+            let worker = thread::spawn(move || {
+                let status = if failed {
+                    std::process::ExitStatus::from_raw(255 << 8)
+                } else {
+                    copy_flush(&mut input, &mut output).expect("fixture echo");
+                    std::process::ExitStatus::from_raw(0)
+                };
+                drop(input);
+                drop(output);
+                let _ = exit_tx.send(status);
+            });
+            Ok(Box::new(FixtureSsh {
+                pipes: Some(BridgePipes {
+                    stdin: Box::new(stdin),
+                    stdout: Box::new(stdout),
+                    stderr: Some(Box::new(FixtureStderr {
+                        text: io::Cursor::new(if failed {
+                            complaint.as_bytes().to_vec()
+                        } else {
+                            vec![]
+                        }),
+                        done: Some(stderr_tx),
+                    })),
+                }),
+                control,
+                exited,
+                stderr_read,
+                worker: Some(worker),
+            }))
+        })
+    }
+
+    /// A process-local log sink and event feed. nextest isolates each test.
+    /// Keep capture and notification under one lock to preserve chunk order.
+    fn capture_bridge_events(f: impl FnOnce(BridgeEvents)) -> String {
+        #[derive(Clone)]
+        struct Sink {
+            bytes: Arc<std::sync::Mutex<Vec<u8>>>,
+            sender: std::sync::mpsc::Sender<Vec<u8>>,
+        }
+        impl io::Write for Sink {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                let mut captured = self.bytes.lock().unwrap();
+                captured.extend_from_slice(bytes);
+                let _ = self.sender.send(bytes.to_vec());
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self {
+                self.clone()
+            }
+        }
+        let bytes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(Sink {
+                bytes: Arc::clone(&bytes),
+                sender,
+            })
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .finish();
+        tracing::subscriber::set_global_default(subscriber).expect("test owns global log capture");
+        f(BridgeEvents {
+            receiver,
+            pending: String::new(),
+        });
+        let captured = String::from_utf8_lossy(&bytes.lock().unwrap()).into_owned();
+        captured
+    }
+
+    struct BridgeEvents {
+        receiver: std::sync::mpsc::Receiver<Vec<u8>>,
+        pending: String,
+    }
+
+    impl BridgeEvents {
+        /// Wait for completed failure bookkeeping, never just EOF or a reaped
+        /// PID. Fail on producer exit, unexpected events, or a silent producer.
+        fn failure(
+            &mut self,
+            in_flight: &std::sync::atomic::AtomicUsize,
+            target: &str,
+            attempt: u32,
+        ) -> io::Result<String> {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "failure event did not arrive",
+                    ));
+                }
+                while let Some(end) = self.pending.find('\n') {
+                    let line: String = self.pending.drain(..=end).collect();
+                    if !line.contains(&format!("target=\"{target}\"")) {
+                        continue;
+                    }
+                    if line.contains("remote.bridge.listener_failed") {
+                        return Err(io::Error::other(format!("bridge producer failed: {line}")));
+                    }
+                    if line.contains("remote.bridge.failed") {
+                        if line.contains("torn_down")
+                            || !line.contains(&format!("attempt={attempt} "))
+                        {
+                            return Err(io::Error::new(io::ErrorKind::InvalidData, line));
+                        }
+                        return Ok(line);
+                    }
+                }
+                // Completion is published after logging. Recheck the queue
+                // after observing it to avoid racing the final notification.
+                let chunk = if in_flight.load(Ordering::Acquire) == 0 {
+                    self.receiver.try_recv().map_err(|err| {
+                        io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            format!("bridge producer ended without failure event: {err}"),
+                        )
+                    })?
+                } else {
+                    self.receiver
+                        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                        .map_err(|err| {
+                            let kind = match err {
+                                std::sync::mpsc::RecvTimeoutError::Timeout => {
+                                    io::ErrorKind::TimedOut
+                                }
+                                std::sync::mpsc::RecvTimeoutError::Disconnected => {
+                                    io::ErrorKind::BrokenPipe
+                                }
+                            };
+                            io::Error::new(
+                                kind,
+                                format!("waiting for failure attempt {attempt}: {err}"),
+                            )
+                        })?
+                };
+                self.pending
+                    .push_str(&String::from_utf8(chunk).expect("log chunks are UTF-8"));
+            }
+        }
+    }
+
+    #[test]
+    fn bridge_failure_events_reject_a_dead_producer() {
+        use std::sync::atomic::AtomicUsize;
+        let (sender, receiver) = std::sync::mpsc::channel();
+        drop(sender);
+        let mut events = BridgeEvents {
+            receiver,
+            pending: String::new(),
+        };
+        for in_flight in [0, 1] {
+            assert_eq!(
+                events
+                    .failure(&AtomicUsize::new(in_flight), "fixture.example", 1)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::BrokenPipe
+            );
+        }
+    }
+
+    #[test]
+    fn bridge_failure_events_reject_an_unexpected_attempt() {
+        use std::sync::atomic::AtomicUsize;
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender.send(b"target=\"fixture.example\" event=\"remote.bridge.failed\" attempt=2 outcome=\"error\"\n".to_vec()).unwrap();
+        let mut events = BridgeEvents {
+            receiver,
+            pending: String::new(),
+        };
+        assert_eq!(
+            events
+                .failure(&AtomicUsize::new(1), "fixture.example", 1)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn bridge_failure_events_bound_a_live_silent_producer() {
+        use std::sync::atomic::AtomicUsize;
+        // The sender stays alive and silent: timeout is failure-only evidence.
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        let mut events = BridgeEvents {
+            receiver,
+            pending: String::new(),
+        };
+        assert_eq!(
+            events
+                .failure(&AtomicUsize::new(1), "fixture.example", 1)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+    }
+
+    #[test]
+    fn bridge_failure_events_accept_a_complete_chunked_event_after_producer_exit() {
+        use std::sync::atomic::AtomicUsize;
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender
+            .send(b"target=\"fixture.example\" event=\"remote.bridge.".to_vec())
+            .unwrap();
+        sender
+            .send(b"failed\" attempt=1 outcome=\"error\"\n".to_vec())
+            .unwrap();
+        drop(sender);
+        let mut events = BridgeEvents {
+            receiver,
+            pending: String::new(),
+        };
+        assert!(events
+            .failure(&AtomicUsize::new(0), "fixture.example", 1)
+            .is_ok());
+    }
+
     /// #436 at the bridge: the tunnel's ssh dies (exit 255, a line on stderr),
     /// and a redial of the SAME local socket gets a fresh ssh that works.
     /// ssh's complaint goes to the log, never to the terminal the client
@@ -3378,40 +3941,20 @@ mod tests {
         use std::io::{Read, Write};
 
         let target = "redial-target";
-        let stub_dir = std::env::temp_dir().join(format!("flock-redial-{}", std::process::id()));
-        let counter = stub_dir.join("dials");
-        // First dial: the network is gone. Every later dial: an echo tunnel.
-        let script = format!(
-            "#!/bin/sh\n\
-             n=$(cat '{counter}' 2>/dev/null || echo 0)\n\
-             n=$((n+1))\n\
-             echo \"$n\" > '{counter}'\n\
-             if [ \"$n\" -eq 1 ]; then\n\
-               echo 'Connection to atlas closed by remote host.' >&2\n\
-               exit 255\n\
-             fi\n\
-             exec cat\n",
-            counter = counter.display()
-        );
-        let stub_dir = install_stub_ssh("redial", &script);
         let socket =
             PathBuf::from("/tmp").join(format!("flock-bridge-redial-{}.sock", std::process::id()));
-        let original_path = std::env::var("PATH").unwrap_or_default();
 
         let mut echoed = Vec::new();
         let mut first_saw_eof = false;
-        let out = crate::logging::capture_logs_across_threads(|| {
-            // SAFETY: nextest runs each test in its own process.
-            unsafe {
-                std::env::set_var("PATH", format!("{}:{original_path}", stub_dir.display()));
-            }
-            let bridge = SshStdioBridge::start(
+        let out = capture_bridge_events(|mut events| {
+            let bridge = SshStdioBridge::start_with_spawner(
                 target.to_string(),
                 test_remote_flock(),
                 socket.clone(),
                 "default".to_string(),
                 false,
                 None,
+                fixture_spawner(1, "Connection to atlas closed by remote host.\n"),
             )
             .expect("start bridge listener");
 
@@ -3434,14 +3977,13 @@ mod tests {
             if second.read_exact(&mut buf).is_ok() {
                 echoed = buf.to_vec();
             }
+            events
+                .failure(&bridge.connections_in_flight, target, 1)
+                .expect("first dial failure bookkeeping");
             drop(second);
             drop(bridge);
         });
-        unsafe {
-            std::env::set_var("PATH", original_path);
-        }
         let _ = std::fs::remove_file(&socket);
-        let _ = std::fs::remove_dir_all(&stub_dir);
 
         assert!(
             first_saw_eof,
@@ -3544,27 +4086,6 @@ mod tests {
         }
     }
 
-    /// A stub `ssh` that fails its first `failures` dials with ssh's own
-    /// "Connection refused" on stderr and exit 255, then echoes.
-    fn install_flaky_ssh(name: &str, failures: u32) -> PathBuf {
-        let counter = std::env::temp_dir()
-            .join(format!("flock-{name}-{}", std::process::id()))
-            .join("dials");
-        let script = format!(
-            "#!/bin/sh\n\
-             n=$(cat '{counter}' 2>/dev/null || echo 0)\n\
-             n=$((n+1))\n\
-             echo \"$n\" > '{counter}'\n\
-             if [ \"$n\" -le {failures} ]; then\n\
-               echo 'ssh: connect to host flaky port 22: Connection refused' >&2\n\
-               exit 255\n\
-             fi\n\
-             exec cat\n",
-            counter = counter.display()
-        );
-        install_stub_ssh(name, &script)
-    }
-
     /// Dial the bridge once: true when bytes make it through and back.
     fn round_trip(socket: &Path) -> bool {
         use std::io::{Read, Write};
@@ -3585,26 +4106,24 @@ mod tests {
     #[test]
     fn a_first_attempt_failure_the_retry_fixes_is_not_a_warning() {
         let target = "flaky-once";
-        let stub_dir = install_flaky_ssh("flaky-once", 1);
         let socket =
             PathBuf::from("/tmp").join(format!("flock-bridge-flaky1-{}.sock", std::process::id()));
-        let original_path = std::env::var("PATH").unwrap_or_default();
         let mut first = true;
         let mut retry = false;
         let mut cleared = false;
         let mut stale_while_live = None;
-        let out = crate::logging::capture_logs_across_threads(|| {
-            // SAFETY: nextest runs each test in its own process.
-            unsafe {
-                std::env::set_var("PATH", format!("{}:{original_path}", stub_dir.display()));
-            }
-            let bridge = SshStdioBridge::start(
+        let out = capture_bridge_events(|mut events| {
+            let bridge = SshStdioBridge::start_with_spawner(
                 target.to_string(),
                 test_remote_flock(),
                 socket.clone(),
                 "default".to_string(),
                 false,
                 None,
+                fixture_spawner(
+                    1,
+                    "ssh: connect to host flaky port 22: Connection refused\n",
+                ),
             )
             .expect("start bridge listener");
             first = round_trip(&socket);
@@ -3621,16 +4140,13 @@ mod tests {
             }
             stale_while_live = bridge.failing_reason();
             drop(live);
-            // The retry's tunnel ends cleanly once the client hangs up, and
-            // that closes the run of failures.
-            cleared = wait_until(Duration::from_secs(5), || bridge.failing_reason().is_none());
+            events
+                .failure(&bridge.connections_in_flight, target, 1)
+                .expect("first dial failure bookkeeping");
+            cleared = bridge.failing_reason().is_none();
             drop(bridge);
         });
-        unsafe {
-            std::env::set_var("PATH", original_path);
-        }
         let _ = std::fs::remove_file(&socket);
-        let _ = std::fs::remove_dir_all(&stub_dir);
 
         assert!(
             !first,
@@ -3667,39 +4183,33 @@ mod tests {
     #[test]
     fn a_persisting_bridge_failure_warns_once_with_its_reason() {
         let target = "flaky-always";
-        let stub_dir = install_flaky_ssh("flaky-always", 99);
         let socket =
             PathBuf::from("/tmp").join(format!("flock-bridge-flaky9-{}.sock", std::process::id()));
-        let original_path = std::env::var("PATH").unwrap_or_default();
         let mut reason = None;
-        let out = crate::logging::capture_logs_across_threads(|| {
-            // SAFETY: nextest runs each test in its own process.
-            unsafe {
-                std::env::set_var("PATH", format!("{}:{original_path}", stub_dir.display()));
-            }
-            let bridge = SshStdioBridge::start(
+        let out = capture_bridge_events(|mut events| {
+            let bridge = SshStdioBridge::start_with_spawner(
                 target.to_string(),
                 test_remote_flock(),
                 socket.clone(),
                 "default".to_string(),
                 false,
                 None,
+                fixture_spawner(
+                    99,
+                    "ssh: connect to host flaky port 22: Connection refused\n",
+                ),
             )
             .expect("start bridge listener");
-            for _ in 0..3 {
+            for attempt in 1..=3 {
                 assert!(!round_trip(&socket));
+                events
+                    .failure(&bridge.connections_in_flight, target, attempt)
+                    .expect("each dial finishes failure bookkeeping before the next");
             }
-            assert!(wait_until(Duration::from_secs(5), || {
-                bridge.failing_reason().is_some() && live_bridge_children(&bridge) == 0
-            }));
             reason = bridge.failing_reason();
             drop(bridge);
         });
-        unsafe {
-            std::env::set_var("PATH", original_path);
-        }
         let _ = std::fs::remove_file(&socket);
-        let _ = std::fs::remove_dir_all(&stub_dir);
 
         assert_eq!(reason, Some(crate::peers::SshFailureReason::ConnectRefused));
         let ours: Vec<&str> = out.lines().filter(|l| l.contains(target)).collect();
@@ -3719,6 +4229,109 @@ mod tests {
             warns[0]
         );
         assert!(warns[0].contains("stderr_tail="), "{}", warns[0]);
+    }
+
+    /// #621: the bookkeeping on its own, with no threads to race. A redial's
+    /// success can be recorded before the first attempt's late failure, and
+    /// that failure must not reopen the run while the newer tunnel is live — a
+    /// failure newer than the last success still opens it, at attempt 1.
+    #[test]
+    fn a_failure_older_than_a_later_success_does_not_open_the_run() {
+        let mut health = BridgeHealth::default();
+        health.record_success(2);
+        assert_eq!(
+            health.record_failure(1, false, crate::peers::SshFailureReason::ConnectRefused),
+            None,
+            "a failure from before the newest success is not the bridge's state"
+        );
+        assert_eq!(health.failing_reason(), None);
+        assert_eq!(
+            health.record_failure(3, false, crate::peers::SshFailureReason::ConnectRefused),
+            Some((1, false)),
+            "a newer failure still opens a run, and never as the persistent one"
+        );
+        assert_eq!(
+            health.failing_reason(),
+            Some(crate::peers::SshFailureReason::ConnectRefused)
+        );
+    }
+
+    /// #621: the mirror of that guard, on the other side of the ordering. A
+    /// connection 1 whose clean exit is recorded after connection 2 has failed
+    /// cannot close the run connection 2 opened; a success at least as new
+    /// still closes it.
+    #[test]
+    fn a_late_success_from_an_older_connection_does_not_close_a_newer_failure() {
+        let mut health = BridgeHealth::default();
+        assert_eq!(
+            health.record_failure(2, false, crate::peers::SshFailureReason::ConnectRefused),
+            Some((1, false))
+        );
+        health.record_success(1);
+        assert_eq!(
+            health.failing_reason(),
+            Some(crate::peers::SshFailureReason::ConnectRefused),
+            "a connection the bridge has redialed past cannot close the newer failure's run"
+        );
+        health.record_success(3);
+        assert_eq!(health.failing_reason(), None);
+    }
+
+    /// #621: the decline is `<`, not `<=`. A connection that carried bytes and
+    /// then died is the bridge's current state, so its own failure is recorded.
+    #[test]
+    fn a_failure_from_the_newest_successful_connection_is_still_recorded() {
+        let mut health = BridgeHealth::default();
+        health.record_success(2);
+        assert_eq!(
+            health.record_failure(2, false, crate::peers::SshFailureReason::ConnectRefused),
+            Some((1, false))
+        );
+        assert_eq!(
+            health.failing_reason(),
+            Some(crate::peers::SshFailureReason::ConnectRefused)
+        );
+    }
+
+    /// A writer that records whether the tunnel's first bytes had already been
+    /// marked as a success when they reached it.
+    struct WitnessWriter {
+        marked: Arc<std::sync::atomic::AtomicBool>,
+        marked_before_write: bool,
+    }
+
+    impl io::Write for WitnessWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.marked_before_write = self.marked.load(Ordering::Acquire);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// #621: the run closes when the tunnel delivers, not once the client has
+    /// been handed the bytes. A mark taken after the write leaves a window the
+    /// client can read an earlier connection's failure through, which is how a
+    /// redial's live tunnel could still be labelled with the attempt before it.
+    #[test]
+    fn first_delivered_bytes_mark_the_success_before_they_are_written_onward() {
+        let marked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut reader = io::Cursor::new(b"ping".to_vec());
+        let mut writer = WitnessWriter {
+            marked: Arc::clone(&marked),
+            marked_before_write: false,
+        };
+        let delivered = copy_flush_marking_first(&mut reader, &mut writer, || {
+            marked.store(true, Ordering::Release);
+        })
+        .expect("copy");
+        assert_eq!(delivered, 4);
+        assert!(
+            writer.marked_before_write,
+            "the client must not be able to read the bridge's state before the mark"
+        );
     }
 
     /// Does the bridge currently hold a live ssh child pid? Used to prove the
@@ -3837,7 +4450,7 @@ mod tests {
 
     #[test]
     fn extract_remote_args_removes_space_form() {
-        let args = vec![
+        let args: Vec<String> = vec![
             "flock".into(),
             "--remote".into(),
             "dev".into(),
@@ -3852,7 +4465,7 @@ mod tests {
 
     #[test]
     fn extract_remote_args_removes_equals_form() {
-        let args = vec!["flock".into(), "--remote=user@host".into()];
+        let args: Vec<String> = vec!["flock".into(), "--remote=user@host".into()];
         let (cleaned, remote) = extract_remote_args(&args).unwrap();
         assert_eq!(cleaned, vec!["flock"]);
         let remote = remote.unwrap();
@@ -3862,7 +4475,7 @@ mod tests {
 
     #[test]
     fn extract_remote_args_accepts_remote_keybindings_server() {
-        let args = vec![
+        let args: Vec<String> = vec![
             "flock".into(),
             "--remote".into(),
             "dev".into(),
@@ -3877,7 +4490,7 @@ mod tests {
 
     #[test]
     fn extract_remote_args_accepts_remote_keybindings_space_form() {
-        let args = vec![
+        let args: Vec<String> = vec![
             "flock".into(),
             "--remote=dev".into(),
             "--remote-keybindings".into(),
@@ -3890,7 +4503,7 @@ mod tests {
 
     #[test]
     fn extract_remote_args_accepts_explicit_handoff() {
-        let args = vec!["flock".into(), "--remote=dev".into(), "--handoff".into()];
+        let args: Vec<String> = vec!["flock".into(), "--remote=dev".into(), "--handoff".into()];
 
         let (cleaned, remote) = extract_remote_args(&args).unwrap();
 
@@ -3902,7 +4515,7 @@ mod tests {
 
     #[test]
     fn extract_remote_args_preserves_child_remote_options_after_separator() {
-        let args = vec![
+        let args: Vec<String> = vec![
             "flock".into(),
             "agent".into(),
             "start".into(),
@@ -3923,7 +4536,7 @@ mod tests {
 
     #[test]
     fn extract_remote_args_preserves_handoff_without_remote() {
-        let args = vec!["flock".into(), "update".into(), "--handoff".into()];
+        let args: Vec<String> = vec!["flock".into(), "update".into(), "--handoff".into()];
 
         let (cleaned, remote) = extract_remote_args(&args).unwrap();
 
@@ -3933,14 +4546,14 @@ mod tests {
 
     #[test]
     fn extract_remote_args_rejects_remote_keybindings_without_remote() {
-        let args = vec!["flock".into(), "--remote-keybindings=server".into()];
+        let args: Vec<String> = vec!["flock".into(), "--remote-keybindings=server".into()];
         let err = extract_remote_args(&args).unwrap_err();
         assert_eq!(err, "--remote-keybindings requires --remote");
     }
 
     #[test]
     fn extract_remote_args_rejects_duplicate_remote_keybindings() {
-        let args = vec![
+        let args: Vec<String> = vec![
             "flock".into(),
             "--remote=dev".into(),
             "--remote-keybindings=local".into(),
@@ -3952,21 +4565,21 @@ mod tests {
 
     #[test]
     fn extract_remote_args_requires_value() {
-        let args = vec!["flock".into(), "--remote".into()];
+        let args: Vec<String> = vec!["flock".into(), "--remote".into()];
         let err = extract_remote_args(&args).unwrap_err();
         assert_eq!(err, "missing value for --remote");
     }
 
     #[test]
     fn extract_remote_args_rejects_empty_value() {
-        let args = vec!["flock".into(), "--remote=".into()];
+        let args: Vec<String> = vec!["flock".into(), "--remote=".into()];
         let err = extract_remote_args(&args).unwrap_err();
         assert_eq!(err, "missing value for --remote");
     }
 
     #[test]
     fn extract_remote_args_rejects_duplicate_values() {
-        let args = vec![
+        let args: Vec<String> = vec![
             "flock".into(),
             "--remote=dev".into(),
             "--remote=prod".into(),
@@ -3977,7 +4590,7 @@ mod tests {
 
     #[test]
     fn extract_remote_args_rejects_option_like_target() {
-        let args = vec!["flock".into(), "--remote".into(), "-oProxyCommand=x".into()];
+        let args: Vec<String> = vec!["flock".into(), "--remote".into(), "-oProxyCommand=x".into()];
         let err = extract_remote_args(&args).unwrap_err();
         assert_eq!(err, "--remote target must not start with '-'");
     }
@@ -4058,6 +4671,135 @@ mod tests {
             remote_bridge_command(&remote_flock, crate::session::DEFAULT_SESSION_NAME),
             "exec \"$HOME/.local/bin/flk\" remote-client-bridge"
         );
+    }
+
+    /// #600: the importer checks `expected_version` against its own build, so
+    /// the pin has to name the binary at `--import-exe` — the one this command
+    /// probed — and never this client's build.
+    #[test]
+    fn live_handoff_pins_the_import_binarys_own_version() {
+        let probed = parse_flk_version("flk 0.8.0-fork.629bd3d\n").expect("probe reply");
+        assert_eq!(
+            live_handoff_command(&test_remote_flock(), Some(&probed)),
+            format!(
+                r#""$HOME/.local/bin/flk" server live-handoff --import-exe "$HOME/.local/bin/flk" --expected-protocol {CURRENT_PROTOCOL} --expected-version 0.8.0-fork.629bd3d"#
+            )
+        );
+        assert!(
+            !current_version().is_empty(),
+            "the client's version is what this pin must NOT carry"
+        );
+    }
+
+    /// #600: a probe that answers with anything but `flk <version>` — a shell
+    /// error, a wrapper script, a build that prints nothing — must leave the
+    /// handoff unpinned rather than pinned to a guess, and must not stop it.
+    #[test]
+    fn live_handoff_drops_the_version_pin_when_the_probe_found_none() {
+        let remote_flock = test_remote_flock();
+        assert_eq!(parse_flk_version("sh: flk: not found\n"), None);
+        assert_eq!(parse_flk_version(""), None);
+        assert_eq!(parse_flk_version("flk \n"), None);
+        assert_eq!(parse_flk_version("flk 0.9.0 extra\n"), None);
+        assert_eq!(
+            live_handoff_command(&remote_flock, None),
+            format!(
+                r#""$HOME/.local/bin/flk" server live-handoff --import-exe "$HOME/.local/bin/flk" --expected-protocol {CURRENT_PROTOCOL}"#
+            )
+        );
+    }
+
+    /// The pin is only worth anything if it names the binary that will run the
+    /// import, so drive the whole call against a stub remote and read the
+    /// command it was actually handed. A pin carrying this client's version is
+    /// the refusal #600 reported: the importer is a different build.
+    #[test]
+    fn a_remote_live_handoff_asks_the_import_binary_and_pins_its_answer() {
+        let stub = r#"#!/bin/sh
+script=$(cat)
+printf '%s\n' "$script" >> "$(dirname "$0")/scripts.log"
+case "$script" in
+  *--version*)
+    printf '%s\n' 'flk 0.8.0-fork.629bd3d'
+    ;;
+esac
+exit 0
+"#;
+        let stub_dir = install_stub_ssh("handoff-pin", stub);
+        let handoff = handoff_script_run_against_stub(&stub_dir);
+        let _ = std::fs::remove_dir_all(&stub_dir);
+
+        assert!(
+            handoff.contains("--expected-version 0.8.0-fork.629bd3d"),
+            "the pin must be the probed import binary's own version: {handoff}"
+        );
+        assert!(
+            !handoff.contains(&current_version()),
+            "this client's version must never be pinned for a remote import: {handoff}"
+        );
+        assert!(
+            handoff.contains(&format!("--expected-protocol {CURRENT_PROTOCOL}")),
+            "the protocol pin is the one this client needs to match: {handoff}"
+        );
+    }
+
+    /// The same call against a remote whose `--version` fails: the handoff
+    /// still runs, still pins the protocol, and carries no version pin.
+    #[test]
+    fn a_remote_live_handoff_runs_unpinned_when_the_probe_failed() {
+        let stub = r#"#!/bin/sh
+script=$(cat)
+printf '%s\n' "$script" >> "$(dirname "$0")/scripts.log"
+case "$script" in
+  *--version*)
+    printf 'no version here\n' >&2
+    exit 3
+    ;;
+esac
+exit 0
+"#;
+        let stub_dir = install_stub_ssh("handoff-probe-failed", stub);
+        let handoff = handoff_script_run_against_stub(&stub_dir);
+        let _ = std::fs::remove_dir_all(&stub_dir);
+
+        assert!(
+            !handoff.contains("--expected-version"),
+            "a failed probe must drop the version pin, not guess one: {handoff}"
+        );
+        assert!(
+            handoff.contains(&format!("--expected-protocol {CURRENT_PROTOCOL}")),
+            "the protocol pin survives a failed version probe: {handoff}"
+        );
+    }
+
+    /// Run one remote live handoff with `ssh` resolved to `stub_dir`, and
+    /// return the script the launcher sent for the handoff itself. `ssh_sh_output`
+    /// feeds the remote script on stdin, so the stub's log is what the remote
+    /// would have run.
+    fn handoff_script_run_against_stub(stub_dir: &Path) -> String {
+        let original_path = std::env::var("PATH").unwrap_or_default();
+        // SAFETY: nextest runs each test in its own process, so no other thread
+        // in this process is reading PATH while it is swapped, the same reason
+        // the bridge tests above give.
+        unsafe {
+            std::env::set_var("PATH", format!("{}:{original_path}", stub_dir.display()));
+        }
+        let result = live_handoff_remote_server(
+            "stub-handoff-target",
+            &test_remote_flock(),
+            LaunchContext::FederationSwitch,
+        );
+        unsafe {
+            std::env::set_var("PATH", original_path);
+        }
+        result.expect("live handoff against the stub remote");
+
+        let recorded = std::fs::read_to_string(stub_dir.join("scripts.log")).expect("stub log");
+        recorded
+            .lines()
+            .find(|line| line.contains("server live-handoff"))
+            .unwrap_or_else(|| panic!("the stub never saw the handoff: {recorded}"))
+            .to_string()
     }
 
     #[test]
@@ -4401,6 +5143,29 @@ mod tests {
     }
 
     #[test]
+    fn stable_remote_asset_shapes_retain_checksum_for_shared_verification() {
+        let root = crate::test_support::TempDir::socket();
+        let path = root.path().join("binary");
+        fs::write(&path, b"corrupt").unwrap();
+        for value in [
+            serde_json::json!("https://example.invalid/asset"),
+            serde_json::json!({"url":"https://example.invalid/asset", "sha256":"a".repeat(64)}),
+        ] {
+            let manifest: RemoteUpdateManifest = serde_json::from_value(serde_json::json!({
+                "version":"99.0.0", "assets":{"fixture":value.clone()}
+            }))
+            .unwrap();
+            let asset = remote_asset_info(&manifest.assets["fixture"]);
+            let result = crate::checksum::verify_asset(&path, asset.sha256.as_deref());
+            if value.is_string() {
+                assert!(result.is_ok());
+            } else {
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+            }
+        }
+    }
+
+    #[test]
     fn remote_server_restart_reason_requires_stop_for_protocol_mismatch() {
         assert_eq!(
             remote_server_restart_reason(Some(&current_version()), Some(0), false),
@@ -4671,3 +5436,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod install_tests;

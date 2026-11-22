@@ -69,6 +69,11 @@ mode = "gate"
 #   [event."peer.dial.still_failing"]
 #   max_pct = 5.0
 
+# API socket accept failures log at run boundaries, never per retry (#470).
+[event."api.listener.accept"]
+max_pct = 5.0
+mode = "gate"
+
 # --- SILENCE: the switch has to be observable -------------------------------
 # A completed slot switch emitted NOTHING at INFO. That is why a measured 5.05s
 # connect→handshake stall was undiagnosable from a default-level tail (#43,

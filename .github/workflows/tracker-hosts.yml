@@ -31,7 +31,9 @@ permissions:
   contents: read
 
 concurrency:
-  group: tracker-hosts-${{ github.event.pull_request.number || github.event.issue.number || github.ref }}
+  # A PR comment must not cancel the pull_request check for the same PR.
+  # Supersede older runs only within the same event kind.
+  group: tracker-hosts-${{ github.event_name }}-${{ github.event.pull_request.number || github.event.issue.number || github.ref }}
   cancel-in-progress: true
 
 jobs:

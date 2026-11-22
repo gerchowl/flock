@@ -228,7 +228,7 @@ mod tests {
 
         let published: Vec<crate::api::schema::EventEnvelope> = app
             .event_hub
-            .events_after(0)
+            .ring_snapshot_after(0)
             .into_iter()
             .map(|(_, envelope)| envelope)
             .collect();

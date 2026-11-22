@@ -1,8 +1,9 @@
+use super::deadline::{self, DeadlineStream};
 use std::fmt;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::de::DeserializeOwned;
 
@@ -10,6 +11,18 @@ use crate::api::schema::{
     ErrorResponse, EventsSubscribeParams, Method, PingParams, Request, ResponseResult,
     SubscriptionEventEnvelope, SuccessResponse,
 };
+
+mod input_write;
+pub(crate) use input_write::SUBMIT_CAP;
+
+const MIN_ALLOCATION_PREVIEW_PROTOCOL: u32 = 26;
+
+/// How many times `request_value_retrying` sends a request again after a
+/// transient transport error, on top of the first attempt.
+const TRANSIENT_RETRIES: u32 = 3;
+
+/// The pause before the first retry, doubled before each one after it.
+const TRANSIENT_BACKOFF: Duration = Duration::from_millis(100);
 
 /// API connection target resolved by clients at the process edge.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,10 +41,35 @@ impl ConnectionTarget {
     }
 }
 
+/// Caller-declared dispatch semantics (ADR-0029 §2). Unclassified calls mutate.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RequestClass {
+    /// The server may change state, so an unanswered dispatch cannot be retried.
+    #[default]
+    Mutating,
+    /// Repeating this operation cannot apply an effect twice.
+    ReadOrIdempotent,
+}
+impl RequestClass {
+    /// Explicit CLI allowlist. Consuming reads and new methods remain mutating.
+    pub(crate) fn for_method(method: &Method) -> Self {
+        match method {
+            method if method.is_retry_safe() => Self::ReadOrIdempotent,
+            Method::MsgWaitReply(_)
+            | Method::PaneWaitForOutput(_)
+            | Method::EventsWait(_)
+            | Method::EventsRead(_) => Self::ReadOrIdempotent,
+            _ => Self::Mutating,
+        }
+    }
+}
+
 /// Reusable client for Flock's newline-delimited JSON API.
 #[derive(Debug, Clone)]
 pub struct ApiClient {
     target: ConnectionTarget,
+    class: RequestClass,
+    credential: Option<std::sync::Arc<crate::structured::lease::LeaseCredential>>,
 }
 
 impl ApiClient {
@@ -40,7 +78,31 @@ impl ApiClient {
     }
 
     pub fn for_target(target: ConnectionTarget) -> Self {
-        Self { target }
+        Self {
+            target,
+            credential: None,
+            class: RequestClass::default(),
+        }
+    }
+
+    /// Immutable session transport, reused by calls, probes and channel reconnects.
+    pub(crate) fn scoped(
+        path: PathBuf,
+        credential: crate::structured::lease::LeaseCredential,
+    ) -> Self {
+        Self {
+            target: ConnectionTarget::SocketPath(path),
+            credential: Some(std::sync::Arc::new(credential)),
+            class: RequestClass::default(),
+        }
+    }
+
+    /// Declare request semantics while retaining the session credential.
+    pub fn with_class(&self, class: RequestClass) -> Self {
+        Self {
+            class,
+            ..self.clone()
+        }
     }
 
     pub fn socket_path(&self) -> PathBuf {
@@ -53,11 +115,12 @@ impl ApiClient {
     }
 
     pub fn request_value(&self, request: &Request) -> Result<serde_json::Value, ApiClientError> {
-        let mut stream = self.connect()?;
-        write_request(&mut stream, request)?;
-
-        let mut reader = BufReader::new(stream);
-        read_json_line(&mut reader)
+        if input_write::requires(&request.method) {
+            return input_write::call(self, request, input_write::cap(&request.method), None);
+        }
+        let timeout = deadline::request_timeout(request, deadline::REQUEST_TIMEOUT);
+        let end = deadline::end_after(Instant::now(), timeout)?;
+        self.request_value_retrying(request, timeout, Some(end))
     }
 
     pub fn request_value_with_timeout(
@@ -65,13 +128,157 @@ impl ApiClient {
         request: &Request,
         timeout: Duration,
     ) -> Result<serde_json::Value, ApiClientError> {
-        let mut stream = self.connect()?;
-        stream.set_write_timeout(Some(timeout))?;
-        stream.set_read_timeout(Some(timeout))?;
-        write_request(&mut stream, request)?;
+        if input_write::requires(&request.method) {
+            return input_write::call(self, request, timeout, None);
+        }
+        self.check_allocation_preview_protocol(request, Some(timeout))?;
+        if let Some(refusal) = super::compatibility::refuse_skew(self, request)? {
+            return Ok(refusal);
+        }
+        self.exchange_with_timeout(request, timeout)
+            .map_err(Attempt::into_error)
+    }
 
-        let mut reader = BufReader::new(stream);
-        read_json_line(&mut reader)
+    /// `request_value_with_timeout`, sent again with backoff when the socket
+    /// answers with a transient error (#910).
+    ///
+    /// Completed-input calls are never retried, including before dispatch;
+    /// their shared path reports lost post-dispatch replies as unknown effect.
+    ///
+    /// An elapsed bounded reply wait reports `TimedOut`; the server may still
+    /// be working. The request is retried up to [`TRANSIENT_RETRIES`] times,
+    /// but only where that is safe:
+    /// a failure before the request was written (the connect) retries for any
+    /// method, one after it only for a [`Method::is_retry_safe`] read, since
+    /// the server may already have applied a write it never answered.
+    ///
+    /// `timeout` bounds each attempt and `deadline`, when given, bounds all of
+    /// them: no attempt is granted more than the time left, and no retry
+    /// starts that its backoff would carry past the deadline.
+    pub fn request_value_retrying(
+        &self,
+        request: &Request,
+        timeout: Duration,
+        deadline: Option<Instant>,
+    ) -> Result<serde_json::Value, ApiClientError> {
+        if input_write::requires(&request.method) {
+            return input_write::call(self, request, timeout, deadline);
+        }
+        self.check_allocation_preview_protocol(request, Some(timeout))?;
+        if let Some(refusal) = super::compatibility::refuse_skew(self, request)? {
+            return Ok(refusal);
+        }
+        let started = Instant::now();
+        let mut backoff = TRANSIENT_BACKOFF;
+        let mut retries = 0;
+        loop {
+            let attempt_timeout = match deadline {
+                None => timeout,
+                Some(deadline) => {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return Err(DeadlineStream::timeout_at(&self.socket_path(), started).into());
+                    }
+                    left.min(timeout)
+                }
+            };
+            let failure = match self.exchange_with_timeout(request, attempt_timeout) {
+                Ok(response) => return Ok(response),
+                Err(failure) => failure,
+            };
+            let retry = retries < TRANSIENT_RETRIES
+                && failure.is_transient()
+                && (failure.before_send()
+                    || (self.class == RequestClass::ReadOrIdempotent
+                        && request.method.is_retry_safe()))
+                && deadline.is_none_or(|deadline| Instant::now() + backoff < deadline);
+            if !retry {
+                return Err(failure.into_error());
+            }
+            tracing::debug!(
+                request = request.id.as_str(),
+                retry = retries + 1,
+                error = failure.error().to_string().as_str(),
+                "api request hit a transient error; retrying",
+            );
+            std::thread::sleep(backoff);
+            backoff *= 2;
+            retries += 1;
+        }
+    }
+
+    /// One bounded round trip, saying whether it failed before the request
+    /// reached the socket.
+    fn exchange_with_timeout(
+        &self,
+        request: &Request,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, Attempt> {
+        let mut stream = DeadlineStream::connect(&self.socket_path(), timeout, self.class)
+            .map_err(|err| Attempt::BeforeSend(err.into()))?;
+        write_request(&mut stream, request, self.credential.as_deref())
+            .map_err(Attempt::AfterSend)?;
+        let mut response =
+            read_json_line(&mut BufReader::new(stream)).map_err(Attempt::AfterSend)?;
+        if matches!(request.method, Method::Ping(_)) {
+            super::compatibility::observe_ping(self, &response);
+        } else {
+            super::compatibility::normalize(self, &mut response);
+        }
+        Ok(response)
+    }
+
+    /// Preserve the requiring input caller's original absolute deadline.
+    fn exchange_until(
+        &self,
+        request: &Request,
+        deadline: Instant,
+    ) -> Result<serde_json::Value, Attempt> {
+        self.exchange_until_after_write(request, deadline, || {})
+    }
+
+    /// Test seam: gate the first read until the peer has replied and closed.
+    /// Production uses a no-op hook and the same transport path.
+    fn exchange_until_after_write(
+        &self,
+        request: &Request,
+        deadline: Instant,
+        after_write: impl FnOnce(),
+    ) -> Result<serde_json::Value, Attempt> {
+        let started = Instant::now();
+        let mut stream = crate::platform::socket_deadline::connect(&self.socket_path(), deadline)
+            .map_err(|err| {
+            Attempt::BeforeSend(
+                DeadlineStream::connect_error(&self.socket_path(), started, err).into(),
+            )
+        })?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(Attempt::BeforeSend(
+                DeadlineStream::timeout_at(&self.socket_path(), started).into(),
+            ));
+        }
+        stream
+            .set_write_timeout(Some(remaining))
+            .map_err(|err| Attempt::BeforeSend(err.into()))?;
+        stream
+            .set_read_timeout(Some(remaining))
+            .map_err(|err| Attempt::BeforeSend(err.into()))?;
+        write_request(&mut stream, request, self.credential.as_deref())
+            .map_err(Attempt::AfterSend)?;
+        after_write();
+        let mut response =
+            read_json_line_until(&stream, deadline, Instant::now).map_err(Attempt::AfterSend)?;
+        if matches!(request.method, Method::Ping(_)) {
+            super::compatibility::observe_ping(self, &response);
+        } else if input_write::requires(&request.method) {
+            if input_write::normalize(&request.method, &mut response) {
+                response["id"] = serde_json::json!(request.id);
+            }
+        } else {
+            super::compatibility::normalize(self, &mut response);
+        }
+        Ok(response)
     }
 
     #[allow(dead_code)] // Kept as the typed subscription API; CLI wait paths use subscribe_value to preserve raw ack errors.
@@ -89,45 +296,160 @@ impl ApiClient {
         Ok((parse_response_value(ack)?, stream))
     }
 
+    /// Check the capability with a bounded ping before an `after_sequence`
+    /// subscription. Missing support is a typed refusal, never a live fallback.
+    /// Legacy `after` and omitted cursors do not require the probe.
     pub fn subscribe_value(
         &self,
         request: &Request,
         read_timeout: Option<Duration>,
     ) -> Result<(serde_json::Value, EventStream), ApiClientError> {
+        if input_write::requires(&request.method) {
+            return Err(ApiClientError::UnexpectedResult(
+                "input calls are not subscriptions".into(),
+            ));
+        }
+        if let Method::EventsSubscribe(params) = &request.method {
+            let refusal = if params.after.is_some() && params.after_sequence.is_some() {
+                Some((
+                    super::error_code::ErrorCode::InvalidParams,
+                    "after and after_sequence are mutually exclusive",
+                ))
+            } else if params.after_sequence.is_some() {
+                let ping = Request {
+                    id: "api-client:events-capability".into(),
+                    method: Method::Ping(PingParams::default()),
+                };
+                let response = self
+                    .with_class(RequestClass::ReadOrIdempotent)
+                    .request_value_with_timeout(
+                        &ping,
+                        read_timeout.unwrap_or(Duration::from_secs(5)),
+                    )?;
+                (response.pointer("/result/capabilities/events_live_start").and_then(serde_json::Value::as_bool) != Some(true))
+                    .then_some((super::error_code::ErrorCode::ServerVersionGap, "after_sequence requires events_live_start; update the server before subscribing"))
+            } else {
+                None
+            };
+            if let Some((code, message)) = refusal {
+                return Err(ApiClientError::ErrorResponse(ErrorResponse {
+                    id: request.id.clone(),
+                    error: super::schema::ErrorBody {
+                        data: None,
+                        code: code.as_str().into(),
+                        message: message.into(),
+                    },
+                }));
+            }
+        }
         let mut stream = self.connect()?;
-        write_request(&mut stream, request)?;
+        write_request(&mut stream, request, self.credential.as_deref())?;
         if let Some(timeout) = read_timeout {
             stream.set_read_timeout(Some(timeout))?;
         }
 
         let mut reader = BufReader::new(stream);
-        let ack = read_json_line(&mut reader)?;
+        let mut ack = read_json_line(&mut reader)?;
+        super::compatibility::normalize(self, &mut ack);
         Ok((ack, EventStream { reader }))
     }
 
     pub fn status(&self) -> Result<crate::api::RuntimeStatus, ApiClientError> {
-        let response = self.request(Request {
-            id: "api-client:status".into(),
-            method: Method::Ping(PingParams::default()),
-        })?;
+        let response = self
+            .with_class(RequestClass::ReadOrIdempotent)
+            .request(Request {
+                id: "api-client:status".into(),
+                method: Method::Ping(PingParams::default()),
+            })?;
         match response.result {
             ResponseResult::Pong {
                 version,
                 protocol,
                 capabilities,
                 session_health,
+                api_listener,
+                agent_account_diagnostic,
+                ..
             } => Ok(crate::api::RuntimeStatus {
                 version: Some(version),
                 protocol: Some(protocol),
                 capabilities,
                 session_health,
+                api_listener,
+                agent_account_diagnostic,
             }),
             result => Err(ApiClientError::UnexpectedResult(format!("{result:?}"))),
         }
     }
 
+    fn check_allocation_preview_protocol(
+        &self,
+        request: &Request,
+        timeout: Option<Duration>,
+    ) -> Result<(), ApiClientError> {
+        if !request.method.is_allocation_preview() {
+            return Ok(());
+        }
+        let ping = Request {
+            id: "api-client:preview-protocol".into(),
+            method: Method::Ping(PingParams::default()),
+        };
+        let response = self
+            .with_class(RequestClass::ReadOrIdempotent)
+            .request_value_with_timeout(&ping, timeout.unwrap_or(Duration::from_secs(5)))?;
+        let protocol = response
+            .pointer("/result/protocol")
+            .and_then(serde_json::Value::as_u64);
+        if protocol.is_none_or(|version| version < u64::from(MIN_ALLOCATION_PREVIEW_PROTOCOL)) {
+            return Err(ApiClientError::Io(io::Error::other(format!(
+                "allocation preview requires server protocol {} or newer, received {protocol:?}; update the server before retrying --dry-run",
+                MIN_ALLOCATION_PREVIEW_PROTOCOL,
+            ))));
+        }
+        Ok(())
+    }
     fn connect(&self) -> io::Result<UnixStream> {
         UnixStream::connect(self.socket_path())
+    }
+}
+
+/// How one round trip failed, split at the point where the server could
+/// first have seen the request.
+#[derive(Debug)]
+enum Attempt {
+    /// Nothing was written: sending again cannot apply anything twice.
+    BeforeSend(ApiClientError),
+    /// The request may have reached the server, whatever came back.
+    AfterSend(ApiClientError),
+}
+
+impl Attempt {
+    fn error(&self) -> &ApiClientError {
+        match self {
+            Self::BeforeSend(err) | Self::AfterSend(err) => err,
+        }
+    }
+
+    fn into_error(self) -> ApiClientError {
+        match self {
+            Self::BeforeSend(err) | Self::AfterSend(err) => err,
+        }
+    }
+
+    fn before_send(&self) -> bool {
+        matches!(self, Self::BeforeSend(_))
+    }
+
+    /// `EAGAIN`/`EWOULDBLOCK` is how a socket timeout surfaces, and `TimedOut`
+    /// is the same event on a platform that names it. Anything else (a refused
+    /// connection, a missing socket, a reply that does not parse) is not going
+    /// to change by asking again a moment later.
+    fn is_transient(&self) -> bool {
+        matches!(
+            self.error(),
+            ApiClientError::Io(err)
+                if matches!(err.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)
+        )
     }
 }
 
@@ -195,15 +517,31 @@ impl From<serde_json::Error> for ApiClientError {
     }
 }
 
-fn write_request(stream: &mut UnixStream, request: &Request) -> Result<(), ApiClientError> {
-    stream.write_all(serde_json::to_string(request)?.as_bytes())?;
+fn write_request(
+    stream: &mut impl Write,
+    request: &Request,
+    credential: Option<&crate::structured::lease::LeaseCredential>,
+) -> Result<(), ApiClientError> {
+    #[derive(serde::Serialize)]
+    struct Envelope<'a> {
+        request: &'a Request,
+        credential: &'a crate::structured::lease::LeaseCredential,
+    }
+    let wire = match credential {
+        Some(credential) => serde_json::to_vec(&Envelope {
+            request,
+            credential,
+        })?,
+        None => serde_json::to_vec(request)?,
+    };
+    stream.write_all(&wire)?;
     stream.write_all(b"\n")?;
     stream.flush()?;
     Ok(())
 }
 
 fn read_json_line<T: DeserializeOwned>(
-    reader: &mut BufReader<UnixStream>,
+    reader: &mut BufReader<impl Read>,
 ) -> Result<T, ApiClientError> {
     let mut line = String::new();
     let read = reader.read_line(&mut line)?;
@@ -213,8 +551,53 @@ fn read_json_line<T: DeserializeOwned>(
     serde_json::from_str(&line).map_err(ApiClientError::Json)
 }
 
+/// Poll each partial read against one absolute cap without post-write setsockopt.
+/// Peer close is readable: queued reply bytes must survive it. The clock seam
+/// lets tests drive expiry without sleeps or input replay.
+fn read_json_line_until(
+    stream: &UnixStream,
+    deadline: Instant,
+    mut now: impl FnMut() -> Instant,
+) -> Result<serde_json::Value, ApiClientError> {
+    let mut line = Vec::new();
+    let mut chunk = [0; 8192];
+    loop {
+        let remaining = deadline.saturating_duration_since(now());
+        if remaining.is_zero() {
+            return Err(ApiClientError::Io(io::ErrorKind::TimedOut.into()));
+        }
+        let read = match crate::platform::socket::read_ready(stream, &mut chunk, remaining) {
+            Ok(read) => read,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::Interrupted
+                        | io::ErrorKind::WouldBlock
+                        | io::ErrorKind::TimedOut
+                ) =>
+            {
+                continue
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if read == 0 {
+            break;
+        }
+        let chunk = &chunk[..read];
+        let end = chunk.iter().position(|byte| *byte == b'\n');
+        line.extend_from_slice(&chunk[..end.map_or(chunk.len(), |index| index + 1)]);
+        if end.is_some() {
+            break;
+        }
+    }
+    if line.iter().all(u8::is_ascii_whitespace) {
+        return Err(ApiClientError::EmptyResponse);
+    }
+    serde_json::from_slice(&line).map_err(ApiClientError::Json)
+}
+
 fn read_optional_json_line<T: DeserializeOwned>(
-    reader: &mut BufReader<UnixStream>,
+    reader: &mut BufReader<impl Read>,
 ) -> Result<Option<T>, ApiClientError> {
     let mut line = String::new();
     let read = reader.read_line(&mut line)?;
@@ -249,6 +632,463 @@ pub(crate) fn parse_response_value(
 mod tests {
     use super::*;
 
+    /// Joining the peer gates the client after write until the reply and EOF exist.
+    fn closed_reply(method: Method, result: serde_json::Value) {
+        let tag = if matches!(method, Method::PaneSubmit(_)) {
+            "pane.submit"
+        } else {
+            "ping"
+        };
+        let peer = crate::test_support::ScriptedApi::new(vec![(tag, Some(result.clone()))]);
+        let client = peer.client();
+        let request = Request {
+            id: "closed-peer".into(),
+            method,
+        };
+        let response = client
+            .exchange_until_after_write(&request, Instant::now() + input_write::SUBMIT_CAP, || {
+                assert_eq!(peer.finish().len(), 1);
+            })
+            .unwrap_or_else(|error| match error {
+                Attempt::BeforeSend(error) => panic!("before dispatch: {error}"),
+                Attempt::AfterSend(error) => panic!("discarded a complete reply: {error}"),
+            });
+        let mut expected = result;
+        expected["id"] = serde_json::json!(request.id);
+        assert_eq!(response, expected);
+    }
+    fn closed_submit() -> Method {
+        Method::PaneSubmit(
+            serde_json::from_value(serde_json::json!({
+            "pane_id":"fixture-pane", "text":"brief" }))
+            .unwrap(),
+        )
+    }
+    #[test]
+    fn r3_closed_peer_submit_refusal_stays_a_refusal() {
+        closed_reply(
+            closed_submit(),
+            serde_json::json!({"error":{
+            "code":"input_not_empty", "message":"draft is present"}}),
+        );
+    }
+    #[test]
+    fn r3_closed_peer_submit_success_stays_a_success() {
+        closed_reply(
+            closed_submit(),
+            serde_json::json!({"result":{
+            "type":"guarded_submit", "outcome":"accepted", "reason":null, "retried":false}}),
+        );
+    }
+    #[test]
+    fn r3_closed_peer_ping_refusal_stays_a_refusal() {
+        closed_reply(
+            Method::Ping(PingParams::default()),
+            serde_json::json!({"error":{
+            "code":"invalid_params", "message":"invalid probe"}}),
+        );
+    }
+    #[test]
+    fn r3_closed_peer_ping_success_stays_a_success() {
+        closed_reply(
+            Method::Ping(PingParams::default()),
+            serde_json::json!({"result":{
+            "type":"pong", "pid":1, "version":"fixture", "protocol_version":crate::protocol::PROTOCOL_VERSION,
+            "capabilities":{"pane_input_write_ack":true}}}),
+        );
+    }
+
+    #[test]
+    fn s4_fragmented_reply_cannot_renew_the_absolute_cap() {
+        let (stream, mut producer) = UnixStream::pair().unwrap();
+        producer.write_all(b"{").unwrap();
+        let start = Instant::now();
+        let deadline = start + Duration::from_millis(100);
+        let mut reads = 0;
+        let error = read_json_line_until(&stream, deadline, || {
+            reads += 1;
+            if reads == 1 {
+                start
+            } else {
+                deadline + Duration::from_nanos(1)
+            }
+        })
+        .unwrap_err();
+        assert!(matches!(error,ApiClientError::Io(ref e) if e.kind()==io::ErrorKind::TimedOut));
+        assert_eq!(reads, 2, "each fragment rechecks the same cap");
+        drop(producer);
+    }
+    #[test]
+    fn opted_in_subscription_checks_capability_then_sends_distinct_cursor() {
+        let directory = crate::test_support::TempDir::socket();
+        let path = directory.path().join("events.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::new(stream);
+            let ping: serde_json::Value = read_json_line(&mut reader).unwrap();
+            assert_eq!(ping["method"], "ping");
+            writeln!(reader.get_mut(), "{}", serde_json::json!({"id":ping["id"], "result":{"type":"pong","version":"fixture","protocol":crate::protocol::PROTOCOL_VERSION,"capabilities":{"events_live_start":true}}})).unwrap();
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::new(stream);
+            let request: serde_json::Value = read_json_line(&mut reader).unwrap();
+            writeln!(
+                reader.get_mut(),
+                "{}",
+                serde_json::json!({"id":request["id"], "result":{"type":"subscription_started"}})
+            )
+            .unwrap();
+            request
+        });
+        let client = ApiClient::for_target(ConnectionTarget::SocketPath(path.clone()));
+        let request: Request = serde_json::from_value(serde_json::json!({"id":"resume","method":"events.subscribe","params":{"subscriptions":[],"after_sequence":7}})).unwrap();
+        let (ack, _) = client
+            .subscribe_value(&request, Some(Duration::from_secs(5)))
+            .unwrap();
+        assert_eq!(ack["result"]["type"], "subscription_started");
+        let sent = server.join().unwrap();
+        assert_eq!(sent["params"]["after_sequence"], 7);
+        assert!(sent["params"].get("after").is_none());
+    }
+
+    #[test]
+    fn opted_in_subscription_refuses_a_server_without_the_capability() {
+        for advertised in [None, Some(false)] {
+            let directory = crate::test_support::TempDir::socket();
+            let path = directory.path().join("events.sock");
+            let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            let server = std::thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(stream);
+                let request: serde_json::Value = read_json_line(&mut reader).unwrap();
+                let mut response = serde_json::json!({"id":request["id"],"result":{"type":"pong","version":"fixture","protocol":crate::protocol::PROTOCOL_VERSION}});
+                if let Some(value) = advertised {
+                    response["result"]["capabilities"] =
+                        serde_json::json!({"events_live_start":value});
+                }
+                writeln!(reader.get_mut(), "{response}").unwrap();
+                listener.set_nonblocking(true).unwrap();
+                (request, listener)
+            });
+            let request:Request=serde_json::from_value(serde_json::json!({"id":"new","method":"events.subscribe","params":{"subscriptions":[],"after_sequence":0}})).unwrap();
+            let client = ApiClient::for_target(ConnectionTarget::SocketPath(path.clone()));
+            let result = client.subscribe_value(&request, Some(Duration::from_secs(5)));
+            let (probe, listener) = server.join().unwrap();
+            assert!(
+                matches!(result,Err(ApiClientError::ErrorResponse(ref e)) if e.error.code=="server_version_gap"),
+                "expected a typed capability refusal"
+            );
+            assert_eq!(probe["method"], "ping");
+            assert!(matches!(listener.accept(),Err(e) if e.kind()==io::ErrorKind::WouldBlock));
+        }
+    }
+
+    #[test]
+    fn allocation_dry_run_refuses_old_server_before_sending_allocation() {
+        let path = std::env::temp_dir().join(format!("f459-{}.sock", std::process::id()));
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            let ping: Request = read_json_line(&mut reader).unwrap();
+            assert!(matches!(ping.method, Method::Ping(_)));
+            let response = serde_json::json!({"id": ping.id, "result": {
+                "type": "pong", "version": "old", "protocol": MIN_ALLOCATION_PREVIEW_PROTOCOL - 1,
+            }});
+            writeln!(reader.get_mut(), "{response}").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            listener
+        });
+        let client = ApiClient::for_target(ConnectionTarget::SocketPath(path.clone()))
+            .with_class(RequestClass::ReadOrIdempotent);
+        let request = Request {
+            id: "preview".into(),
+            method: Method::WorktreeCreate(crate::api::schema::WorktreeCreateParams {
+                dry_run: true,
+                ..Default::default()
+            }),
+        };
+        let error = client.request_value(&request).unwrap_err();
+        assert!(error.to_string().contains("requires server protocol"));
+        let error = client
+            .request_value_with_timeout(&request, Duration::from_millis(100))
+            .unwrap_err();
+        assert!(!error.to_string().is_empty());
+        let listener = server.join().unwrap();
+        // The second attempt only queued another protocol ping, never an allocation.
+        let (stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream);
+        let ping: Request = read_json_line(&mut reader).unwrap();
+        assert!(matches!(ping.method, Method::Ping(_)));
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn allocation_dry_run_accepts_protocol_27() {
+        let path = std::env::temp_dir().join(format!("f459-new-{}.sock", std::process::id()));
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            let ping: Request = read_json_line(&mut reader).unwrap();
+            assert!(matches!(ping.method, Method::Ping(_)));
+            writeln!(
+                reader.get_mut(),
+                "{}",
+                serde_json::json!({"id": ping.id, "result": {
+                    "type": "pong", "version": "future", "protocol": 27,
+                }})
+            )
+            .unwrap();
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            let request: Request = read_json_line(&mut reader).unwrap();
+            assert!(request.method.is_allocation_preview());
+            writeln!(
+                reader.get_mut(),
+                "{}",
+                serde_json::json!({"id": request.id, "result": {
+                    "type": "allocation_plan", "operation": "worktree.create", "plan": {},
+                }})
+            )
+            .unwrap();
+        });
+        let client = ApiClient::for_target(ConnectionTarget::SocketPath(path.clone()))
+            .with_class(RequestClass::ReadOrIdempotent);
+        let response = client
+            .request_value(&Request {
+                id: "preview".into(),
+                method: Method::WorktreeCreate(crate::api::schema::WorktreeCreateParams {
+                    dry_run: true,
+                    ..Default::default()
+                }),
+            })
+            .unwrap();
+        assert_eq!(response["result"]["type"], "allocation_plan");
+        server.join().unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// #1028: a server from before `events.read` rejects it as an unknown
+    /// variant, and the client reports the version gap (exit 78), not that.
+    #[test]
+    fn events_read_against_an_older_server_is_a_version_gap() {
+        let path = std::env::temp_dir().join(format!("f1028-{}.sock", std::process::id()));
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            for reply in [
+                serde_json::json!({"code": "invalid_request",
+                    "message": "invalid request: unknown variant `events.read`"}),
+                serde_json::json!({"type": "pong", "version": "1.2.0", "protocol": 27}),
+            ] {
+                let (stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream);
+                let request: Request = read_json_line(&mut reader).unwrap();
+                let key = if reply["code"].is_string() {
+                    "error"
+                } else {
+                    "result"
+                };
+                writeln!(
+                    reader.get_mut(),
+                    "{}",
+                    serde_json::json!({"id": request.id, key: reply})
+                )
+                .unwrap();
+            }
+        });
+        let client = ApiClient::for_target(ConnectionTarget::SocketPath(path.clone()))
+            .with_class(RequestClass::ReadOrIdempotent);
+        let response = client
+            .request_value(&Request {
+                id: "read".into(),
+                method: Method::EventsRead(Default::default()),
+            })
+            .unwrap();
+        assert_eq!(
+            response["error"]["code"],
+            super::super::compatibility::ERROR_CODE
+        );
+        server.join().unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// A fake server for #910 that takes exactly `connections` connections,
+    /// reads each request, and leaves the first `stalls` of them unanswered so
+    /// the client's read times out with `EAGAIN`, the way a server under load
+    /// does. Every later one gets a `pong`. The thread hands back the listener,
+    /// switched to non-blocking, so a test can prove nothing else connected.
+    fn stalling_server(
+        name: &str,
+        stalls: usize,
+        connections: usize,
+    ) -> (PathBuf, std::thread::JoinHandle<StallingServer>) {
+        let path = std::env::temp_dir().join(format!("f910-{name}-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut held = Vec::new();
+            let mut seen = Vec::new();
+            for index in 0..connections {
+                let (stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream);
+                let request: Request = read_json_line(&mut reader).unwrap();
+                if index >= stalls {
+                    let response = serde_json::json!({"id": request.id, "result": {
+                        "type": "pong", "version": "test", "protocol": 27,
+                    }});
+                    writeln!(reader.get_mut(), "{response}").unwrap();
+                } else {
+                    held.push(reader);
+                }
+                seen.push(request);
+            }
+            listener.set_nonblocking(true).unwrap();
+            // The stalled connections are handed back rather than dropped: a
+            // close here would reach the client as EOF instead of a timeout.
+            (listener, seen, held)
+        });
+        (path, server)
+    }
+
+    type StallingServer = (
+        std::os::unix::net::UnixListener,
+        Vec<Request>,
+        Vec<BufReader<UnixStream>>,
+    );
+
+    fn assert_no_further_connection(listener: &std::os::unix::net::UnixListener) {
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock,
+            "the client connected more often than the test allowed"
+        );
+    }
+
+    fn agent_get() -> Request {
+        Request {
+            id: "f910".into(),
+            method: Method::AgentGet(crate::api::schema::AgentTarget {
+                target: "worker".into(),
+            }),
+        }
+    }
+
+    const ATTEMPT: Duration = Duration::from_millis(50);
+
+    #[test]
+    fn a_read_is_retried_through_eagain_until_it_is_answered() {
+        let (path, server) = stalling_server("read", 2, 3);
+        let client = ApiClient::for_target(ConnectionTarget::SocketPath(path.clone()))
+            .with_class(RequestClass::ReadOrIdempotent);
+        let response = client
+            .request_value_retrying(&agent_get(), ATTEMPT, None)
+            .expect("the third attempt is answered");
+        assert_eq!(response["result"]["type"], "pong");
+        let (listener, seen, _held) = server.join().unwrap();
+        assert_eq!(seen.len(), 3);
+        assert!(seen.iter().all(|request| request == &agent_get()));
+        assert_no_further_connection(&listener);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_write_that_timed_out_is_not_sent_again() {
+        let (path, server) = stalling_server("write", 1, 1);
+        let client = ApiClient::for_target(ConnectionTarget::SocketPath(path.clone()))
+            .with_class(RequestClass::ReadOrIdempotent);
+        let close = Request {
+            id: "f910".into(),
+            method: Method::PaneClose(crate::api::schema::PaneTarget {
+                pane_id: "w1:p1".into(),
+            }),
+        };
+        let error = client
+            .with_class(RequestClass::Mutating)
+            .request_value_retrying(&close, ATTEMPT, None)
+            .unwrap_err();
+        assert!(
+            matches!(&error, ApiClientError::Io(err) if err.get_ref().is_some_and(|e| e.is::<deadline::RequestOutcomeUnknown>())),
+            "a dispatched mutation has an unknown outcome: {error:?}"
+        );
+        let (listener, seen, _held) = server.join().unwrap();
+        assert_eq!(seen, vec![close]);
+        assert_no_further_connection(&listener);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_read_that_never_answers_gives_up_after_the_retries() {
+        let attempts = TRANSIENT_RETRIES as usize + 1;
+        let (path, server) = stalling_server("never", attempts, attempts);
+        let client = ApiClient::for_target(ConnectionTarget::SocketPath(path.clone()))
+            .with_class(RequestClass::ReadOrIdempotent);
+        let error = client
+            .request_value_retrying(&agent_get(), ATTEMPT, None)
+            .unwrap_err();
+        assert!(
+            matches!(&error, ApiClientError::Io(err) if err.kind() == io::ErrorKind::TimedOut),
+            "{error:?}"
+        );
+        let (listener, seen, _held) = server.join().unwrap();
+        assert_eq!(seen.len(), attempts);
+        assert_no_further_connection(&listener);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn no_retry_starts_that_the_deadline_cannot_hold() {
+        let (path, server) = stalling_server("deadline", 1, 1);
+        let client = ApiClient::for_target(ConnectionTarget::SocketPath(path.clone()))
+            .with_class(RequestClass::ReadOrIdempotent);
+        // One 50 ms attempt fits; the 100 ms backoff after it does not.
+        let deadline = Instant::now() + Duration::from_millis(120);
+        let error = client
+            .request_value_retrying(&agent_get(), ATTEMPT, Some(deadline))
+            .unwrap_err();
+        assert!(matches!(&error, ApiClientError::Io(_)), "{error:?}");
+        // The connection count below is the real check; this only catches a
+        // retry loop that ignored the deadline outright, with room for a slow
+        // host.
+        assert!(Instant::now() < deadline + Duration::from_secs(2));
+        let (listener, seen, _held) = server.join().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_no_further_connection(&listener);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn only_reads_and_previews_are_retry_safe() {
+        assert!(agent_get().method.is_retry_safe());
+        assert!(Method::Ping(PingParams::default()).is_retry_safe());
+        assert!(
+            Method::WorktreeCreate(crate::api::schema::WorktreeCreateParams {
+                dry_run: true,
+                ..Default::default()
+            })
+            .is_retry_safe()
+        );
+        assert!(!Method::WorktreeCreate(Default::default()).is_retry_safe());
+        assert!(!Method::PaneClose(crate::api::schema::PaneTarget {
+            pane_id: "w1:p1".into(),
+        })
+        .is_retry_safe());
+        assert!(!Method::MsgRead(crate::api::schema::MsgReadParams { pane: None }).is_retry_safe());
+    }
+
     #[test]
     fn local_session_target_resolves_named_session_socket() {
         let client = ApiClient::for_target(ConnectionTarget::LocalSession(Some("work".into())));
@@ -258,7 +1098,43 @@ mod tests {
     #[test]
     fn socket_path_target_uses_explicit_path() {
         let path = PathBuf::from("/tmp/flock-test.sock");
-        let client = ApiClient::for_target(ConnectionTarget::SocketPath(path.clone()));
+        let client = ApiClient::for_target(ConnectionTarget::SocketPath(path.clone()))
+            .with_class(RequestClass::ReadOrIdempotent);
         assert_eq!(client.socket_path(), path);
     }
+    #[test]
+    fn s3a_r2_malformed_optional_error_data_preserves_the_primary_error() {
+        for data in [
+            serde_json::json!(17),
+            serde_json::json!(true),
+            serde_json::json!("future data"),
+            serde_json::json!([]),
+            serde_json::json!({"input_write": []}),
+            serde_json::json!({"input_write": {"bytes_written": -1, "bytes_total": 5,
+                "reason": "deadline", "remainder_discarded": true}}),
+            serde_json::json!({"input_write": {"reason": "deadline"}}),
+        ] {
+            let raw = serde_json::json!({"id":"write", "error":{
+                "code":"input_write_failed", "message":"inspect the pane", "data":data}});
+            let Err(ApiClientError::ErrorResponse(response)) = parse_response_value(raw) else {
+                panic!("optional error data must not hide the primary refusal: {data}");
+            };
+            assert_eq!(response.id, "write");
+            assert_eq!(response.error.code, "input_write_failed");
+            assert_eq!(response.error.message, "inspect the pane");
+            assert_eq!(crate::cli::error_code_exit(&response.error.code, false), 8);
+            assert!(
+                response.error.data.is_none(),
+                "invalid detail must be ignored"
+            );
+        }
+    }
 }
+
+#[cfg(test)]
+mod deadline_tests;
+
+#[cfg(test)]
+mod deadline_liveness_tests;
+#[cfg(test)]
+mod deadline_round2_tests;

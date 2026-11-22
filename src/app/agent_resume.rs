@@ -18,11 +18,12 @@ struct PendingAgentResumeCandidate {
 }
 
 impl App {
+    /// Whether a deferred plan is eligible for automatic launch; failed plans need a user retry.
     pub(crate) fn has_pending_agent_resumes(&self) -> bool {
         self.state
             .terminals
             .values()
-            .any(|terminal| terminal.pending_agent_resume_plan.is_some())
+            .any(|terminal| terminal.pending_agent_resume_plan.is_some() && !terminal.resume_failed)
     }
 
     pub(crate) fn sync_pending_agent_resume_deadline(&mut self, now: Instant) {
@@ -104,6 +105,10 @@ impl App {
                     else {
                         continue;
                     };
+                    // Failed deferred launches remain resumable, but are not auto-retried.
+                    if terminal.resume_failed {
+                        continue;
+                    }
                     let Some(plan) = terminal.pending_agent_resume_plan.clone() else {
                         continue;
                     };
@@ -152,6 +157,9 @@ impl App {
         pane_infos
     }
 
+    /// Make one explicit retry by terminal ID, bypassing automatic `resume_failed`
+    /// suppression (ADR-0028 §1/§3). Failure keeps the plan and returns `false`.
+    /// A successful launch clears the failure flag and pending plan.
     pub(crate) fn start_pending_agent_resume_for_terminal(
         &mut self,
         terminal_id: &crate::terminal::TerminalId,
@@ -215,6 +223,11 @@ impl App {
         }
 
         let Some(resume_command) = shell_command_from_argv(&plan.argv) else {
+            // ADR-0028 §1/§3: retain the plan, but suppress automatic retries
+            // after a launch failure, including a command that cannot launch.
+            if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
+                terminal.resume_failed = true;
+            }
             crate::logging::agent_resume_empty_argv(
                 pane_id.raw(),
                 &terminal_id.to_string(),
@@ -223,6 +236,20 @@ impl App {
             return false;
         };
 
+        // ADR-0028 §1/§3: retain the prior lifecycle before inserting a
+        // runtime, then publish the real transition in the sequenced stream.
+        // Detector updates alone cannot recover the prior Offline status.
+        let before = self.find_pane(pane_id).and_then(|(ws_idx, _)| {
+            self.pane_info(ws_idx, pane_id)
+                .map(|pane| (ws_idx, pane.agent_status))
+        });
+
+        // #1179: the resumed agent keeps its question policy hint.
+        let _questions = self
+            .state
+            .terminals
+            .get(&terminal_id)
+            .map(|terminal| crate::integration::set_pending_questions(terminal.questions));
         let runtime = match crate::terminal::TerminalRuntime::spawn(
             pane_id,
             rows,
@@ -244,32 +271,28 @@ impl App {
                     &err.to_string(),
                 );
                 if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
-                    terminal.clear_agent_runtime_identity_after_respawn();
+                    terminal.resume_failed = true;
                 }
                 return false;
             }
         };
 
-        // Re-select the Claude account profile the session was launched under.
-        // flk spawns a FRESH login shell here with no CLAUDE_CONFIG_DIR, so
-        // without this the resumed session falls back to the default ~/.claude
-        // account and is orphaned from the profile it belongs to. The
-        // SessionStart hook recorded session_id -> config_dir; restore it by
-        // exporting into the pane so the resume (and any later relaunch in this
-        // pane) run under the right account. See
-        // `agent_resume::claude_config_dir_for_session`.
+        // Re-select the account profile the session was launched under
+        // (#1010). flk spawns a FRESH login shell here with no selector such
+        // as CLAUDE_CONFIG_DIR, so without this the resumed session falls back
+        // to the CLI's default account and is orphaned from the profile it
+        // belongs to. What the terminal recorded at start or hibernate, and
+        // the session record Claude's SessionStart hook wrote, are exported
+        // into the pane so the resume (and any later relaunch in this pane)
+        // run under the right account. See `App::resume_profile_env`.
         let mut input = String::new();
-        if let Some(config_dir) = claude_resume_config_dir(&plan) {
+        let shell = crate::pane::pane_shell(&self.state.default_shell);
+        for (key, value) in self.resume_profile_env(&terminal_id, &plan) {
             // In the pane shell's OWN syntax. `export FOO=bar` is a syntax
             // error in fish, so a fish user would get no profile set at all and
             // silently resume under the default account — precisely the failure
             // this restore exists to prevent, just moved to a different shell.
-            let shell = crate::pane::pane_shell(&self.state.default_shell);
-            input.push_str(&env_assignment_for_shell(
-                &shell,
-                "CLAUDE_CONFIG_DIR",
-                &config_dir,
-            ));
+            input.push_str(&env_assignment_for_shell(&shell, &key, &value));
             input.push('\r');
         }
         input.push_str(&resume_command);
@@ -282,13 +305,36 @@ impl App {
                 &err.to_string(),
             );
             runtime.shutdown();
+            if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
+                terminal.resume_failed = true;
+            }
             return false;
         }
 
         self.terminal_runtimes.insert(terminal_id.clone(), runtime);
         if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
+            terminal.resume_failed = false;
             terminal.pending_agent_resume_plan = None;
             terminal.respawn_shell_on_exit = false;
+        }
+        if let Some((ws_idx, previous_status)) = before {
+            if let Some(pane) = self.pane_info(ws_idx, pane_id) {
+                if previous_status != pane.agent_status {
+                    self.emit_event(crate::api::schema::EventEnvelope {
+                        event: crate::api::schema::EventKind::PaneAgentStatusChanged,
+                        data: crate::api::schema::EventData::PaneAgentStatusChanged {
+                            pane_id: pane.pane_id,
+                            workspace_id: pane.workspace_id,
+                            agent_status: pane.agent_status,
+                            agent: pane.agent,
+                            title: pane.title,
+                            display_agent: pane.display_agent,
+                            custom_status: pane.custom_status,
+                            state_labels: pane.state_labels,
+                        },
+                    });
+                }
+            }
         }
         true
     }
@@ -325,14 +371,6 @@ fn stable_terminal_inner_rect(pane_inner: Rect) -> Rect {
         pane_inner.width.saturating_sub(1),
         pane_inner.height,
     )
-}
-
-/// The recorded `CLAUDE_CONFIG_DIR` (account profile) for a Claude resume plan,
-/// if the SessionStart hook captured one. `None` for non-Claude agents, or a
-/// Claude session launched under the default `~/.claude` (nothing recorded).
-fn claude_resume_config_dir(plan: &crate::agent_resume::AgentResumePlan) -> Option<String> {
-    let session_id = crate::agent_resume::claude_resume_session_id(plan)?;
-    crate::agent_resume::claude_config_dir_for_session(session_id)
 }
 
 fn shell_command_from_argv(argv: &[String]) -> Option<String> {
@@ -451,6 +489,121 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resume_emits_one_live_status_and_orders_explicit_hibernation_events() {
+        use crate::api::schema::{AgentStatus, EventData};
+        for (explicit, hibernated) in [(false, false), (true, false), (true, true)] {
+            let mut app = test_app();
+            let log =
+                crate::test_support::unique_temp_path("1650-resume-event").with_extension("jsonl");
+            app.event_hub = crate::api::EventHub::with_persistence(log.clone());
+            app.state.default_shell = "/bin/sh".into();
+            app.state.shell_mode = crate::config::ShellModeConfig::NonLogin;
+            app.state
+                .workspaces
+                .push(crate::workspace::Workspace::test_new("resume-event"));
+            app.state.active = Some(0);
+            app.state.ensure_test_terminals();
+            app.state.view.terminal_area = Rect::new(0, 0, 80, 24);
+            let pane = app.state.workspaces[0].focused_pane_id().unwrap();
+            let id = app.state.workspaces[0].terminal_id(pane).unwrap().clone();
+            let public_pane = app.public_pane_id(0, pane).unwrap();
+            let public_workspace = app.public_workspace_id(0);
+            let terminal = app.state.terminals.get_mut(&id).unwrap();
+            terminal.set_detected_state(
+                Some(crate::detect::Agent::OpenCode),
+                crate::detect::AgentState::Idle,
+            );
+            let plan = crate::agent_resume::AgentResumePlan {
+                agent: "opencode".into(),
+                argv: vec!["/bin/sh".into(), "-c".into(), "read -r fixture".into()],
+                dedupe_key: "resume-event-fixture".into(),
+            };
+            if hibernated {
+                terminal.set_hibernated_resume_plan(Some(plan));
+            } else {
+                terminal.pending_agent_resume_plan = Some(plan);
+            }
+            assert_eq!(
+                app.pane_info(0, pane).unwrap().agent_status,
+                if hibernated {
+                    AgentStatus::Hibernated
+                } else {
+                    AgentStatus::Offline
+                }
+            );
+            let sequence = app.event_hub.current_sequence();
+            // Theme deferral cannot claim that a live execution exists.
+            assert!(!app.start_pending_agent_resumes(false));
+            assert!(app.event_hub.ring_snapshot_after(sequence).is_empty());
+            let launched = if explicit {
+                app.resume_hibernated_pane(0, pane).is_ok()
+            } else {
+                app.start_pending_agent_resumes(true)
+            };
+            let live_status = app.pane_info(0, pane).unwrap().agent_status;
+            let events = app.event_hub.ring_snapshot_after(sequence);
+            let repeated = app.start_pending_agent_resumes(true);
+            let repeated_events = app.event_hub.ring_snapshot_after(sequence);
+            // Reap the owned fake shell before any assertions can panic.
+            for (_, runtime) in app.terminal_runtimes.drain() {
+                runtime.shutdown();
+            }
+            drop(app);
+            let reopened = crate::api::EventHub::with_persistence(log.clone());
+            let replayed = reopened.ring_snapshot_after(sequence);
+            drop(reopened);
+            std::fs::remove_file(log).unwrap();
+            assert_eq!(
+                serde_json::to_value(&events).unwrap(),
+                serde_json::to_value(replayed).unwrap()
+            );
+            assert!(launched, "explicit={explicit}");
+            assert_eq!(live_status, AgentStatus::Idle);
+            let changes: Vec<_> = events
+                .iter()
+                .filter_map(|(_, event)| match &event.data {
+                    EventData::PaneAgentStatusChanged {
+                        pane_id,
+                        workspace_id,
+                        agent_status,
+                        ..
+                    } => Some((pane_id, workspace_id, *agent_status)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                changes,
+                vec![(&public_pane, &public_workspace, AgentStatus::Idle)],
+                "explicit={explicit}: {events:?}"
+            );
+            if hibernated {
+                assert_eq!(
+                    events
+                        .iter()
+                        .map(|(_, event)| &event.event)
+                        .collect::<Vec<_>>(),
+                    vec![
+                        &crate::api::schema::EventKind::PaneAgentStatusChanged,
+                        &crate::api::schema::EventKind::AgentResumedFromHibernation
+                    ],
+                    "live status must precede the hibernation resume fact: {events:?}"
+                );
+            } else {
+                assert_eq!(
+                    events
+                        .iter()
+                        .map(|(_, event)| event.event)
+                        .collect::<Vec<_>>(),
+                    vec![crate::api::schema::EventKind::PaneAgentStatusChanged],
+                    "a deferred resume must emit only live status: {events:?}"
+                );
+            }
+            assert!(!repeated);
+            assert_eq!(events.len(), repeated_events.len());
+        }
+    }
+
+    #[tokio::test]
     async fn pending_agent_resume_waits_for_host_theme_before_launch() {
         let mut app = test_app();
         let workspace = crate::workspace::Workspace::test_new("restored");
@@ -481,6 +634,8 @@ mod tests {
 
         assert!(!app.start_pending_agent_resumes(false));
         assert!(app.terminal_runtimes.get(&terminal_id).is_none());
+        assert!(!app.state.terminals[&terminal_id].resume_failed);
+        assert!(app.has_pending_agent_resumes());
 
         app.state.host_terminal_theme = crate::terminal_theme::TerminalTheme {
             foreground: Some(crate::terminal_theme::RgbColor {
@@ -533,12 +688,138 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_resume_whose_shell_will_not_spawn_clears_the_agent_name_in_place() {
-        // #456: this is the second production call site of
-        // `clear_agent_runtime_identity_after_respawn`, and the reason "a name
-        // stops resolving only when the pane goes away" is not a true thing to
-        // tell a reader. The pane is still here; the name is gone, so
-        // `agent get <name>` answers `agent_not_found` on a live pane.
+    async fn empty_resume_argv_fails_once_and_stops_automatic_retries() {
+        let mut app = test_app();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("empty-resume")];
+        app.state.ensure_test_terminals();
+        app.state.view.terminal_area = Rect::new(0, 0, 80, 24);
+        let terminal_id = app.state.workspaces[0]
+            .terminal_id(app.state.workspaces[0].tabs[0].root_pane)
+            .unwrap()
+            .clone();
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .pending_agent_resume_plan = Some(crate::agent_resume::AgentResumePlan {
+            agent: "codex".into(),
+            argv: Vec::new(),
+            dedupe_key: "empty-resume".into(),
+        });
+        let now = Instant::now();
+        app.sync_pending_agent_resume_deadline(now);
+        assert!(app.pending_agent_resume_deadline.is_some());
+        let logs = crate::logging::capture_logs(|| {
+            assert!(!app.start_pending_agent_resumes(true));
+        });
+        assert!(logs.contains("reason=\"empty_argv\""), "{logs}");
+        let logs = crate::logging::capture_logs(|| {
+            assert!(!app.start_pending_agent_resumes(true));
+        });
+        assert!(
+            !logs.contains("empty_argv"),
+            "an invalid deferred plan must not be retried on the next tick: {logs}"
+        );
+        assert!(app.state.terminals[&terminal_id].resume_failed);
+        assert!(
+            app.state.terminals[&terminal_id]
+                .pending_agent_resume_plan
+                .is_some(),
+            "keep the saved plan for explicit recovery"
+        );
+        assert!(!app.has_pending_agent_resumes());
+        app.sync_pending_agent_resume_deadline(now);
+        assert!(app.pending_agent_resume_deadline.is_none());
+        assert_eq!(app.terminal_runtimes.len(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn operator_retry_by_terminal_id_rechecks_failed_plan_and_starts_after_repair() {
+        // capture_logs uses a thread-local subscriber, so keep this test current-thread.
+        // ADR-0028 §1/§3: failed plans retain their identity for explicit retry.
+        struct RuntimeCleanup(App);
+
+        impl Drop for RuntimeCleanup {
+            fn drop(&mut self) {
+                for (_, runtime) in self.0.terminal_runtimes.drain() {
+                    runtime.shutdown();
+                }
+            }
+        }
+
+        let mut cleanup = RuntimeCleanup(test_app());
+        let app = &mut cleanup.0;
+        app.state.default_shell = "/bin/sh".into();
+        app.state.shell_mode = crate::config::ShellModeConfig::NonLogin;
+        let workspace = crate::workspace::Workspace::test_new("operator-retry");
+        let pane = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(pane).cloned().unwrap();
+        app.state.view.terminal_area = Rect::new(0, 0, 80, 24);
+        app.state.view.pane_infos = workspace.tabs[0].layout.panes(app.state.view.terminal_area);
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.ensure_test_terminals();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal
+            .set_agent_name("retry-agent".into())
+            .expect("the retry fixture uses a valid agent name");
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "flock:codex".into(),
+            agent: "codex".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("retry-session").unwrap(),
+        });
+        terminal.pending_agent_resume_plan = Some(crate::agent_resume::AgentResumePlan {
+            agent: "codex".into(),
+            argv: Vec::new(),
+            dedupe_key: "operator-retry".into(),
+        });
+        assert!(!app.start_pending_agent_resumes(true));
+        assert!(app.state.terminals[&terminal_id].resume_failed);
+        let info = app.agent_info_for_target("retry-agent").unwrap();
+        assert_eq!(info.blocked_reason.as_deref(), Some("resume_failed"));
+        assert!(info.resumable);
+
+        let logs = crate::logging::capture_logs(|| {
+            assert!(!app.start_pending_agent_resume_for_terminal(&terminal_id, 24, 80, true));
+        });
+        assert_eq!(logs.matches("reason=\"empty_argv\"").count(), 1, "{logs}");
+        assert!(app.state.terminals[&terminal_id].resume_failed);
+        assert!(app.state.terminals[&terminal_id]
+            .pending_agent_resume_plan
+            .is_some());
+        assert_eq!(app.terminal_runtimes.len(), 0);
+
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .pending_agent_resume_plan
+            .as_mut()
+            .unwrap()
+            .argv = vec!["/bin/sh".into(), "-c".into(), "read -r fixture".into()];
+        assert!(!app.start_pending_agent_resumes(true));
+        assert_eq!(
+            app.terminal_runtimes.len(),
+            0,
+            "repair alone does not enable automatic retry"
+        );
+        assert!(app.start_pending_agent_resume_for_terminal(&terminal_id, 24, 80, true));
+        assert_eq!(app.terminal_runtimes.len(), 1);
+        assert!(!app.state.terminals[&terminal_id].resume_failed);
+        assert!(app.state.terminals[&terminal_id]
+            .pending_agent_resume_plan
+            .is_none());
+        assert_eq!(
+            app.agent_info_for_target("retry-agent")
+                .unwrap()
+                .blocked_reason,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_deferred_resume_cold_restore_allows_one_automatic_attempt() {
+        // #661: failed resume must retain the identity and retry plan for pending mail.
         let mut app = test_app();
         let workspace = crate::workspace::Workspace::test_new("restored");
         let pane_id = workspace.tabs[0].root_pane;
@@ -568,7 +849,12 @@ mod tests {
                 .terminals
                 .get_mut(&terminal_id)
                 .expect("test terminal should exist");
-            terminal.set_agent_name("reviewer".into());
+            terminal.set_agent_name("reviewer".into()).unwrap();
+            terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+                source: "flock:codex".into(),
+                agent: "codex".into(),
+                session_ref: crate::agent_resume::AgentSessionRef::id("codex-session").unwrap(),
+            });
             terminal.pending_agent_resume_plan = Some(crate::agent_resume::AgentResumePlan {
                 agent: "codex".into(),
                 argv: vec!["/bin/sh".into(), "-c".into(), "sleep 5".into()],
@@ -588,7 +874,18 @@ mod tests {
             .to_string_lossy()
             .into_owned();
 
+        let sequence = app.event_hub.current_sequence();
         assert!(!app.start_pending_agent_resumes(false));
+        assert!(
+            app.event_hub
+                .ring_snapshot_after(sequence)
+                .iter()
+                .all(|(_, event)| !matches!(
+                    event.data,
+                    crate::api::schema::EventData::PaneAgentStatusChanged { .. }
+                )),
+            "a failed spawn cannot announce a live status"
+        );
 
         assert!(
             app.state.workspaces[0].terminal_id(pane_id).is_some(),
@@ -599,15 +896,83 @@ mod tests {
             .terminals
             .get(&terminal_id)
             .expect("terminal should survive a failed resume");
-        assert!(
-            terminal.agent_name.is_none(),
-            "a resume that cannot spawn its shell drops the agent name in place"
+        assert_eq!(terminal.agent_name(), Some("reviewer"));
+        assert!(terminal.resume_failed);
+        assert!(terminal.pending_agent_resume_plan.is_some());
+        assert!(terminal.hibernated_resume_plan.is_none());
+        assert!(terminal.is_agent_terminal());
+        let info = app.agent_info_for_target("reviewer").unwrap();
+        assert_eq!(info.agent_status, crate::api::schema::AgentStatus::Offline);
+        assert_eq!(info.blocked_reason.as_deref(), Some("resume_failed"));
+        let agent_id = terminal.agent_id.clone();
+        let session = terminal.persisted_agent_session.clone();
+        let snapshot = crate::persist::capture(
+            crate::persist::RegistryCapture {
+                registry: &app.state.structured_agents,
+                now_ms: Some(42),
+            },
+            &app.state.workspaces,
+            &app.state.terminals,
+            &app.terminal_runtimes,
+            app.state.active,
+            app.state.selected,
+            app.state.panel_scopes(),
+            app.state.sidebar_width,
+            app.state.sidebar_section_split,
+            app.state.collapsed_space_keys.clone(),
+            Default::default(),
+        );
+        // Round-trip the actual persisted representation, with no live runtime transfer.
+        let snapshot = serde_json::from_slice(&serde_json::to_vec(&snapshot).unwrap()).unwrap();
+        let mut cold = test_app();
+        cold.state.default_shell = app.state.default_shell.clone();
+        cold.state.shell_mode = crate::config::ShellModeConfig::NonLogin;
+        let (workspaces, terminals, runtimes) = crate::persist::restore(
+            &snapshot,
+            None,
+            24,
+            80,
+            0,
+            &cold.state.default_shell,
+            cold.state.shell_mode,
+            true,
+            cold.event_tx.clone(),
+            cold.render_notify.clone(),
+            cold.render_dirty.clone(),
         );
         assert!(
-            !terminal.is_agent_terminal(),
-            "with no name and nothing else naming it, the pane stops being an \
-             agent target and `agent get <name>` answers agent_not_found"
+            runtimes.is_empty(),
+            "cold restore must defer the native session"
         );
+        cold.state.workspaces = workspaces;
+        cold.state.terminals = terminals;
+        cold.terminal_runtimes = runtimes.into();
+        cold.state.view.terminal_area = Rect::new(0, 0, 80, 24);
+        let terminal = cold.state.terminals.values().next().unwrap();
+        assert_eq!(terminal.agent_id, agent_id);
+        assert_eq!(terminal.persisted_agent_session, session);
+        assert!(!terminal.resume_failed);
+        assert!(terminal.pending_agent_resume_plan.is_some());
+        assert!(terminal.hibernated_resume_plan.is_none());
+        assert!(cold.has_pending_agent_resumes());
+
+        // The same missing shell makes the one fresh automatic attempt observable
+        // without ever launching a provider CLI or reading a developer's profile.
+        let logs = crate::logging::capture_logs(|| {
+            assert!(!cold.start_pending_agent_resumes(true));
+        });
+        assert!(logs.contains("event=\"agent_resume.spawn\""), "{logs}");
+        assert!(cold.state.terminals.values().next().unwrap().resume_failed);
+        assert!(!cold.has_pending_agent_resumes());
+        let logs = crate::logging::capture_logs(|| {
+            assert!(!cold.start_pending_agent_resumes(true));
+        });
+        assert!(
+            !logs.contains("agent_resume.spawn"),
+            "must not retry: {logs}"
+        );
+        cold.sync_pending_agent_resume_deadline(Instant::now());
+        assert!(cold.pending_agent_resume_deadline.is_none());
     }
 
     #[tokio::test]

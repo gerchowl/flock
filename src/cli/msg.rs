@@ -24,6 +24,8 @@ pub(super) fn run_msg_command(args: &[String]) -> std::io::Result<i32> {
         "reply" => msg_reply(&args[1..]),
         "list" => msg_list(&args[1..]),
         "read" => msg_read(&args[1..]),
+        "operator-read" => msg_operator_inbox(&args[1..], true),
+        "operator-list" => msg_operator_inbox(&args[1..], false),
         "status" => msg_status(&args[1..]),
         "mute" => msg_mute(&args[1..]),
         "help" | "--help" | "-h" => {
@@ -38,16 +40,10 @@ pub(super) fn run_msg_command(args: &[String]) -> std::io::Result<i32> {
 }
 
 /// Every option `flk msg send` understands, named once.
-///
-/// The list is not decoration: the cross-host relay IS `flk msg send` run on
-/// the peer that owns the recipient (`send_peer_message`), so when a peer
-/// refuses a flag this list is that peer telling the sender which build it is
-/// running. In a version-skewed fleet that is the entire diagnosis (#380).
 const SEND_OPTIONS: &[&str] = &[
     "--repo",
     "--agent",
     "--from-agent",
-    "--from-host",
     "--correlation-id",
     "--reply-to",
     "--intent",
@@ -83,15 +79,10 @@ fn unknown_option(command: &str, flag: &str, known: &[&str]) -> String {
 struct SendArgs {
     repo: Option<String>,
     intent: MsgIntent,
-    /// A `--intent` spelling this build does not know, kept until the whole
-    /// argv is read: whether it is a refusal or a degradation depends on
-    /// whether this is a relay, and `--from-host` may come after it.
-    unknown_intent: Option<String>,
     correlation_id: Option<String>,
     in_reply_to: Option<String>,
     agent: Option<String>,
     from_agent: Option<String>,
-    from_host: Option<String>,
     /// #576: after sending, wait for the answer (`flk wait reply`).
     await_reply: bool,
     /// How long `--await` waits, in ms.
@@ -111,15 +102,13 @@ fn parse_send_args(args: &[String]) -> Result<SendArgs, String> {
     let mut parsed = SendArgs {
         repo: None,
         intent: MsgIntent::default(),
-        unknown_intent: None,
         correlation_id: None,
         in_reply_to: None,
         agent: None,
         from_agent: None,
-        from_host: None,
         await_reply: false,
         timeout_ms: None,
-        json: false,
+        json: super::output::json(),
         positional: Vec::new(),
     };
     let mut index = 0;
@@ -147,10 +136,6 @@ fn parse_send_args(args: &[String]) -> Result<SendArgs, String> {
                 parsed.agent = Some(value()?);
                 index += 2;
             }
-            "--from-host" => {
-                parsed.from_host = Some(value()?);
-                index += 2;
-            }
             "--from-agent" => {
                 parsed.from_agent = Some(value()?);
                 index += 2;
@@ -161,9 +146,9 @@ fn parse_send_args(args: &[String]) -> Result<SendArgs, String> {
             // noticing is the one worth forcing.
             "--intent" => {
                 let raw = value()?;
-                let (intent, unknown) = MsgIntent::from_wire_relayed(&raw);
-                parsed.intent = intent;
-                parsed.unknown_intent = unknown.then_some(raw);
+                parsed.intent = MsgIntent::from_wire(&raw).ok_or_else(|| {
+                    format!("unknown --intent {raw:?}: expected {}", intent_spellings())
+                })?;
                 index += 2;
             }
             "--json" => {
@@ -206,18 +191,6 @@ fn parse_send_args(args: &[String]) -> Result<SendArgs, String> {
             }
         }
     }
-    // ADR-0018 §1. A relayed send comes from a peer that may run a newer
-    // build, so a tier this build does not know is read as `needs_reply`:
-    // skew fails toward the recipient hearing about it. An operator typing
-    // `--intent` by hand gets the refusal instead — a typo is not skew.
-    if let Some(raw) = &parsed.unknown_intent {
-        if parsed.from_host.is_none() {
-            return Err(format!(
-                "unknown --intent {raw:?}: expected {}",
-                intent_spellings()
-            ));
-        }
-    }
     // #576. Waiting on an `fyi` would wait for an answer nobody was asked
     // for, and `--timeout` without `--await` would be silently ignored.
     if parsed.await_reply && parsed.intent == MsgIntent::Fyi {
@@ -254,12 +227,10 @@ fn msg_send(args: &[String]) -> std::io::Result<i32> {
     let SendArgs {
         repo,
         intent,
-        unknown_intent,
         correlation_id,
         in_reply_to,
         agent,
         from_agent,
-        from_host,
         await_reply,
         timeout_ms,
         json,
@@ -289,46 +260,52 @@ fn msg_send(args: &[String]) -> std::io::Result<i32> {
         id: "cli:msg:send".into(),
         method: Method::MsgSend(MsgSendParams {
             from_agent,
-            from_host,
             to,
             body,
             correlation_id,
             in_reply_to,
             intent,
-            intent_unrecognised: unknown_intent,
         }),
     })?;
     if !await_reply {
-        return super::print_response(&response);
+        return super::print_send_response(&response);
     }
     // #576 `--await`: the send's own result goes to stderr, so stdout is the
     // answer alone — what a harness hands back when this ran as a background
     // task.
-    eprintln!("{}", serde_json::to_string(&response).unwrap_or_default());
     if response.get("error").is_some() {
-        return Ok(1);
+        let exit_code = super::error_exit(&response, true);
+        return Ok(super::output::error(&response, exit_code));
     }
+    eprintln!("{}", serde_json::to_string(&response).unwrap_or_default());
     let Some(sent_id) = response["result"]["correlation_id"].as_str() else {
         eprintln!("flk msg send --await: the send returned no correlation id to wait on");
         return Ok(1);
     };
-    await_reply_for(sent_id, timeout_ms, json)
+    await_reply_for(sent_id, timeout_ms, json, None)
 }
 
 /// `flk wait reply` exit status (#576): an answer arrived.
-const EXIT_REPLIED: i32 = 0;
+const EXIT_REPLIED: i32 = super::exit::SUCCESS;
 /// No answer is coming: the recipient is muted (its deferral is printed), or
 /// the message was dropped unread.
-const EXIT_NO_ANSWER: i32 = 3;
+const EXIT_NO_ANSWER: i32 = super::exit::NO_ANSWER;
+/// The receiver refused custody of the message; the reason is printed.
+const EXIT_REFUSED: i32 = super::exit::MSG_REFUSED;
 /// The wait ran out first. The coreutils `timeout` convention.
-const EXIT_TIMEOUT: i32 = 124;
+const EXIT_TIMEOUT: i32 = super::exit::TIMEOUT;
 
 fn exit_for(outcome: &str) -> i32 {
     match outcome {
         "replied" => EXIT_REPLIED,
-        "deferred" | "expired" => EXIT_NO_ANSWER,
+        "deferred"
+        | "expired"
+        | "recipient_gone"
+        | "outcome_retention_elapsed"
+        | "undeliverable" => EXIT_NO_ANSWER,
+        "refused" => super::exit::moved(EXIT_REFUSED),
         "timeout" => EXIT_TIMEOUT,
-        _ => 1,
+        _ => super::exit::FAILURE,
     }
 }
 
@@ -337,10 +314,25 @@ pub(super) fn wait_reply(args: &[String]) -> std::io::Result<i32> {
     const USAGE: &str = "usage: flk wait reply <correlation_id> [--timeout MS] [--json]";
     let mut correlation_id = None;
     let mut timeout_ms = None;
-    let mut json = false;
+    let mut reference = None;
+    let mut json = super::output::json();
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
+            "--reference" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing --reference JSON");
+                    return Ok(2);
+                };
+                reference = match serde_json::from_str(value) {
+                    Ok(reference) => Some(reference),
+                    Err(error) => {
+                        eprintln!("invalid status reference: {error}");
+                        return Ok(2);
+                    }
+                };
+                index += 2;
+            }
             "--timeout" => {
                 let Some(value) = args.get(index + 1) else {
                     eprintln!("missing value for --timeout");
@@ -356,7 +348,11 @@ pub(super) fn wait_reply(args: &[String]) -> std::io::Result<i32> {
             other if looks_like_option(other) => {
                 eprintln!(
                     "{}",
-                    unknown_option("flk wait reply", other, &["--timeout", "--json"])
+                    unknown_option(
+                        "flk wait reply",
+                        other,
+                        &["--timeout", "--json", "--reference"]
+                    )
                 );
                 return Ok(2);
             }
@@ -374,7 +370,7 @@ pub(super) fn wait_reply(args: &[String]) -> std::io::Result<i32> {
         eprintln!("{USAGE}");
         return Ok(2);
     };
-    await_reply_for(&correlation_id, timeout_ms, json)
+    await_reply_for(&correlation_id, timeout_ms, json, reference)
 }
 
 /// Hold `msg.wait_reply` and report how it ended: the answer's body on
@@ -383,17 +379,18 @@ fn await_reply_for(
     correlation_id: &str,
     timeout_ms: Option<u64>,
     json: bool,
+    reference: Option<crate::mesh::store::StatusReference>,
 ) -> std::io::Result<i32> {
     let response = super::send_request(&Request {
         id: "cli:wait:reply".into(),
         method: Method::MsgWaitReply(crate::api::schema::MsgWaitReplyParams {
+            reference,
             correlation_id: correlation_id.to_string(),
             timeout_ms,
         }),
     })?;
     if response.get("error").is_some() {
-        eprintln!("{}", serde_json::to_string(&response).unwrap_or_default());
-        return Ok(1);
+        return Ok(super::output::error(&response, super::exit::FAILURE));
     }
     let result = &response["result"];
     let outcome = result["outcome"].as_str().unwrap_or_default();
@@ -419,7 +416,16 @@ fn await_reply_for(
             );
             println!("{}", reply["body"].as_str().unwrap_or_default());
         }
+        "recipient_gone" | "outcome_retention_elapsed" => eprintln!("{correlation_id}: {outcome}"),
+        "refused" => eprintln!(
+            "{correlation_id} was refused by the receiver: {}",
+            result["detail"].as_str().unwrap_or("no reason given")
+        ),
         "expired" => eprintln!("{correlation_id} was dropped unread; no answer is coming"),
+        "undeliverable" => eprintln!(
+            "{correlation_id} could not be delivered by a forwarding hub: {}",
+            result["detail"].as_str().unwrap_or("no reason given")
+        ),
         "timeout" => eprintln!(
             "no answer to {correlation_id} yet (last state: {})",
             result["state"].as_str().unwrap_or("unknown")
@@ -433,9 +439,9 @@ fn await_reply_for(
 /// a known repo (from the live workspace list); otherwise the whole string
 /// is a bare pane target.
 fn resolve_shorthand(target: String) -> std::io::Result<MessageTarget> {
-    let Some((left, right)) = target.split_once(':') else {
-        return Ok(MessageTarget::Pane { pane: target });
-    };
+    if !target.contains(':') {
+        return Ok(MessageTarget::from_bare(target));
+    }
     let known_repos = super::send_request(&Request {
         id: "cli:msg:repos".into(),
         method: Method::WorkspaceList(EmptyParams {}),
@@ -460,14 +466,21 @@ fn resolve_shorthand(target: String) -> std::io::Result<MessageTarget> {
             })
     })
     .unwrap_or_default();
-    if known_repos.iter().any(|repo| repo == left) {
-        Ok(MessageTarget::RepoPane {
-            repo: left.to_string(),
-            pane: right.to_string(),
-        })
-    } else {
-        Ok(MessageTarget::Pane { pane: target })
+    Ok(shorthand_with_repos(target, &known_repos))
+}
+
+/// Resolve the CLI's legacy repo shorthand against an explicit directory.
+/// Keeping this pure lets tests exercise address selection without a socket.
+fn shorthand_with_repos(target: String, known_repos: &[String]) -> MessageTarget {
+    if let Some((left, right)) = target.split_once(':') {
+        if known_repos.iter().any(|repo| repo == left) {
+            return MessageTarget::RepoPane {
+                repo: left.into(),
+                pane: right.into(),
+            };
+        }
     }
+    MessageTarget::from_bare(target)
 }
 
 /// Parse `flk msg reply`'s argv into `(intent, positional)`.
@@ -526,7 +539,7 @@ fn msg_reply(args: &[String]) -> std::io::Result<i32> {
         eprintln!("{USAGE}");
         return Ok(2);
     }
-    super::print_response(&super::send_request(&Request {
+    super::print_send_response(&super::send_request(&Request {
         id: "cli:msg:reply".into(),
         method: Method::MsgReply(MsgReplyParams {
             correlation_id: positional[0].clone(),
@@ -590,6 +603,34 @@ fn msg_read(args: &[String]) -> std::io::Result<i32> {
     })?)
 }
 
+fn parse_operator_inbox(args: &[String], consume: bool) -> Option<Method> {
+    match args {
+        [flag, pane] if flag == "--pane" && !pane.is_empty() && !pane.starts_with('-') => {
+            let params = crate::api::schema::MsgOperatorInboxParams { pane: pane.clone() };
+            Some(if consume {
+                Method::MsgOperatorRead(params)
+            } else {
+                Method::MsgOperatorList(params)
+            })
+        }
+        _ => None,
+    }
+}
+
+fn msg_operator_inbox(args: &[String], consume: bool) -> std::io::Result<i32> {
+    let Some(method) = parse_operator_inbox(args, consume) else {
+        eprintln!(
+            "usage: flk msg operator-{} --pane TARGET",
+            if consume { "read" } else { "list" }
+        );
+        return Ok(super::exit::USAGE);
+    };
+    super::print_response(&super::send_request(&Request {
+        id: "cli:msg:operator-inbox".into(),
+        method,
+    })?)
+}
+
 /// `flk msg status` — the sender's view.
 ///
 /// `msg list` answers "what is waiting for me"; nothing answered "what
@@ -600,12 +641,48 @@ fn msg_status(args: &[String]) -> std::io::Result<i32> {
         eprintln!("usage: flk msg status <correlation_id>");
         return Ok(2);
     };
-    super::print_response(&super::send_request(&Request {
+    let reference = match args.get(1).map(String::as_str) {
+        None => None,
+        Some("--reference") if args.len() == 3 => match serde_json::from_str(&args[2]) {
+            Ok(reference) => Some(reference),
+            Err(error) => {
+                eprintln!("invalid status reference: {error}");
+                return Ok(2);
+            }
+        },
+        _ => {
+            eprintln!("usage: flk msg status <correlation_id> [--reference JSON]");
+            return Ok(2);
+        }
+    };
+    let response = super::send_request(&Request {
         id: "cli:msg:status".into(),
         method: Method::MsgStatus(crate::api::schema::MsgStatusParams {
+            reference,
             correlation_id: correlation_id.clone(),
         }),
-    })?)
+    })?;
+    let code = super::print_response(&response)?;
+    if code != 0 {
+        return Ok(code);
+    }
+    Ok(status_exit(response["result"]["state"].as_str()))
+}
+
+/// `flk msg status` exit code: states no answer can follow exit like a
+/// no-answer wait, everything still live or settled-good exits 0.
+fn status_exit(state: Option<&str>) -> i32 {
+    match state {
+        Some("refused") => super::exit::moved(EXIT_REFUSED),
+        Some(
+            "expired"
+            | "recipient_gone"
+            | "outcome_retention_elapsed"
+            | "collect_failed"
+            | "undeliverable",
+        ) => EXIT_NO_ANSWER,
+        _ => super::exit::SUCCESS,
+    }
 }
 
 /// `flk msg mute` — the receiver-side half of the wake rule (#316).
@@ -680,7 +757,7 @@ fn print_msg_help() {
          under a tighter rate limit"
     );
     eprintln!("  flk msg list [--pane TARGET]");
-    eprintln!("  flk msg read [--pane TARGET]   consume an inbox (agents use the MCP tool)");
+    eprintln!("  flk msg read [--pane TARGET]   consume your attested pane or structured inbox");
     eprintln!(
         "  flk msg status <correlation_id>  what became of a message you sent, and its reply"
     );
@@ -702,7 +779,9 @@ fn print_msg_help() {
          deliver it as text"
     );
     eprintln!("  targets: pane id, terminal id, unique agent name; or repo:pane / --repo NAME");
-    eprintln!("  agents read their own inbox (flock_msg_read); flock never types into a session");
+    eprintln!("  flk msg operator-list --pane TARGET  operator peek at a legacy pane inbox");
+    eprintln!("  flk msg operator-read --pane TARGET  operator consumes a legacy pane inbox");
+    eprintln!("  agents read their attested inbox with flock_msg_read or flk msg read");
 }
 
 #[cfg(test)]
@@ -714,6 +793,80 @@ mod tests {
 
     fn argv(args: &[&str]) -> Vec<String> {
         args.iter().map(|arg| (*arg).to_string()).collect()
+    }
+
+    #[test]
+    fn operator_inbox_requires_exactly_one_named_pane() {
+        for consume in [false, true] {
+            let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+            let method = super::parse_operator_inbox(&args(&["--pane", "p_1"]), consume).unwrap();
+            let wire = serde_json::to_value(&method).unwrap();
+            assert_eq!(
+                wire["method"],
+                if consume {
+                    "msg.operator_read"
+                } else {
+                    "msg.operator_list"
+                }
+            );
+            assert_eq!(wire["params"]["pane"], "p_1");
+            for input in [
+                vec![],
+                vec!["p_1"],
+                vec!["--pane"],
+                vec!["--pane", ""],
+                vec!["--pane", "--help"],
+                vec!["--pane", "p_1", "extra"],
+            ] {
+                assert!(super::parse_operator_inbox(&args(&input), consume).is_none());
+            }
+            assert_eq!(method.is_retry_safe(), !consume);
+        }
+    }
+
+    #[test]
+    fn bare_message_targets_keep_the_same_identity_as_mcp() {
+        for (target, expected) in [
+            (
+                "w3:p2",
+                crate::api::schema::MessageTarget::Pane {
+                    pane: "w3:p2".into(),
+                },
+            ),
+            (
+                "reviewer",
+                crate::api::schema::MessageTarget::Pane {
+                    pane: "reviewer".into(),
+                },
+            ),
+            (
+                "agent_atlas_6f21c4",
+                crate::api::schema::MessageTarget::Agent {
+                    agent: "agent_atlas_6f21c4".into(),
+                },
+            ),
+        ] {
+            assert_eq!(super::shorthand_with_repos(target.into(), &[]), expected);
+        }
+    }
+
+    #[test]
+    fn repo_shorthand_requires_a_known_repo_and_preserves_the_pane_suffix() {
+        use crate::api::schema::MessageTarget;
+        let repos = vec!["fixture-repo".into()];
+        assert_eq!(
+            super::shorthand_with_repos("fixture-repo:w3:p2".into(), &repos),
+            MessageTarget::RepoPane {
+                repo: "fixture-repo".into(),
+                pane: "w3:p2".into()
+            }
+        );
+        assert_eq!(
+            super::shorthand_with_repos("other-repo:w3:p2".into(), &repos),
+            MessageTarget::Pane {
+                pane: "other-repo:w3:p2".into()
+            }
+        );
     }
 
     #[test]
@@ -804,6 +957,35 @@ mod tests {
         assert_eq!(super::exit_for("expired"), 3);
         assert_eq!(super::exit_for("timeout"), 124);
         assert_eq!(super::exit_for("anything else"), 1);
+        assert_eq!(super::exit_for("recipient_gone"), 3);
+        assert_eq!(super::exit_for("outcome_retention_elapsed"), 3);
+        assert_eq!(super::exit_for("undeliverable"), 3);
+        assert_eq!(super::exit_for("refused"), 13);
+    }
+
+    #[test]
+    fn msg_status_exits_3_only_for_states_no_answer_can_follow() {
+        for state in [
+            "queued",
+            "custody",
+            "delivered",
+            "read",
+            "held",
+            "collected",
+            "relayed",
+        ] {
+            assert_eq!(super::status_exit(Some(state)), 0, "{state}");
+        }
+        for state in [
+            "expired",
+            "outcome_retention_elapsed",
+            "recipient_gone",
+            "collect_failed",
+            "undeliverable",
+        ] {
+            assert_eq!(super::status_exit(Some(state)), 3, "{state}");
+        }
+        assert_eq!(super::status_exit(Some("refused")), 13);
     }
 
     #[test]
@@ -867,32 +1049,9 @@ mod tests {
     }
 
     #[test]
-    fn the_relays_own_command_line_still_parses() {
-        // The exact argv `peer_message_command` builds. If refusing unknown
-        // flags ever broke this, the fix would have closed the corruption by
-        // breaking cross-host messaging outright.
-        let parsed = parse_send_args(&argv(&[
-            "--agent",
-            "agent_atlas_1",
-            "--from-agent",
-            "agent_hopper_2",
-            "--from-host",
-            "hopper",
-            "--correlation-id",
-            "c-1",
-            "--reply-to",
-            "c-0",
-            "--intent",
-            "needs_reply",
-            "--json",
-            "--",
-            "re-derive both parameters",
-        ]))
-        .expect("the relay's own command line must survive its own refusal rule");
-        assert_eq!(parsed.agent.as_deref(), Some("agent_atlas_1"));
-        assert_eq!(parsed.from_host.as_deref(), Some("hopper"));
-        assert_eq!(parsed.in_reply_to.as_deref(), Some("c-0"));
-        assert_eq!(parsed.intent, MsgIntent::NeedsReply);
-        assert_eq!(parsed.positional, vec!["re-derive both parameters"]);
+    fn removed_from_host_flag_is_refused() {
+        let error = parse_send_args(&argv(&["--from-host", "nodea", "p1", "hello"]))
+            .expect_err("removed flag");
+        assert!(error.contains("unknown option \"--from-host\""), "{error}");
     }
 }

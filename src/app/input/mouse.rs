@@ -121,11 +121,10 @@ impl AppState {
                     if let Some(inner) =
                         crate::ui::float_overlay_inner_rect(self.view.terminal_area)
                     {
-                        let metrics = terminal_runtimes
-                            .get(&terminal_id)
-                            .and_then(|rt| rt.scroll_metrics());
-                        if let Some(sel) = self.selection.as_mut() {
-                            sel.drag(mouse.column, mouse.row, inner, metrics);
+                        if let (Some(sel), Some(rt)) =
+                            (self.selection.as_mut(), terminal_runtimes.get(&terminal_id))
+                        {
+                            rt.pin_selection(sel, Some((mouse.column, mouse.row, inner)));
                         }
                     }
                     return true;
@@ -214,6 +213,7 @@ impl AppState {
                     self.selection = Some(crate::selection::Selection::anchor(
                         pane_id, row, column, metrics,
                     ));
+                    self.pin_selection_content(terminal_runtimes);
                     self.selection_autoscroll = None;
                 }
             }
@@ -920,6 +920,7 @@ impl AppState {
                         col,
                         self.pane_scroll_metrics(terminal_runtimes, info.id),
                     ));
+                    self.pin_selection_content(terminal_runtimes);
                 } else if let Some(info) = self.view.pane_infos.iter().find(|p| {
                     p.header_rect.is_some_and(|h| {
                         mouse.column >= h.x
@@ -3001,9 +3002,14 @@ mod tests {
                 agent: Some(Agent::Pi),
                 state: AgentState::Idle,
                 activity: None,
+                provider_limit: None,
                 visible_blocker: false,
                 visible_idle: false,
                 visible_working: false,
+                settled_with_background_shells: false,
+                background_tasks: None,
+                needs_human: None,
+                question: None,
                 process_exited: false,
                 observed_at: std::time::Instant::now(),
             });

@@ -11,10 +11,15 @@
 // — TracedCommand (logging redesign PR-3) is a source-code lint, not a test-scaffolding one.
 #![allow(clippy::disallowed_methods)]
 
+mod support;
+
+use support::paths::app_dir_name;
+
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use support::environment::Command;
 
 fn unique_test_dir() -> PathBuf {
     let nanos = SystemTime::now()
@@ -142,12 +147,4 @@ fn failed_remote_connect_story_is_in_the_log_at_default_level() {
     );
 
     let _ = fs::remove_dir_all(&base);
-}
-
-fn app_dir_name() -> &'static str {
-    if cfg!(debug_assertions) {
-        "flock-dev"
-    } else {
-        "flock"
-    }
 }

@@ -1,0 +1,14 @@
+
+     (ctrl+b to run in background)
+
+·
+Investigating why every working pane reads idle after a client detaches
+from the server…
+
+  ⎿  Tip: Use /btw to ask a quick side question without interrupting
+     Claude's current work
+
+────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · gh auth login for PR

@@ -1,0 +1,22 @@
+[0m[2m│                                                    │[0m
+[0m[2m│ [0mSee full release notes:[0m[2m                            │[0m
+[0m[2m│ [0m[4mhttps://github.com/openai/codex/releases/latest[0m[2m    │[0m
+[0m[2m╰────────────────────────────────────────────────────╯[0m
+
+
+  >_ [0m[1mOpenAI Codex[0m[2m (v0.160.1)[0m
+     [0m[2m/fixture/codex-721/work[0m
+
+  A new prompt awakens.
+
+
+[0m[1m[2m› [0mReply exactly ALT_CAPTURE_721. Do not use tools.
+
+
+• [0m[2mWorking (0s • [0m[1mesc[0m[2m to interrupt)[0m
+
+
+[0m[1m› [0m[2mAsk Codex to do anything[0m
+
+  GPT-6.1-Sol default · /fixture/codex-721/wo…
+  [0m[1m? [0mfor shortcuts

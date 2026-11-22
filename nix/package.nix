@@ -11,18 +11,22 @@
   git,
   apple-sdk ? null,
   cctools ? null,
-  # Build identity baked into `flock status` / federation summaries:
-  # version renders as "<base>-<channel>.<id>" (src/build_info.rs). The
-  # flake passes the fork channel + short rev so every deployed build
-  # self-identifies — two fork builds are otherwise indistinguishable
-  # ("0.6.8" / proto N). null keeps the plain upstream version string.
+  # Build identity (src/build_info.rs). With no channel the version is the
+  # plain Cargo version: `main` only moves on a release, so a build of it is
+  # exactly that release. A non-null channel renders "<base>-<channel>.<id>".
+  # buildCommit is the full rev, recorded as provenance (report blocks)
+  # without changing the version string.
   buildChannel ? null,
   buildId ? null,
-  # Build the `web` cargo feature (the `flk web` xterm bridge, gerchowl/flock#131).
-  # Off by default so the standard build stays lean (no axum/rust-embed); the
-  # flake exposes a `flock-web` package with this on. The binary is still
-  # `bin/flk` — the feature only adds the `web` subcommand.
+  buildCommit ? null,
+  # Build the `web` feature: terminal bridge and structured GUI bundle router.
+  # Off by default so the standard build stays lean (no axum/rust-embed).
+  # The flake exposes `flock-web` with this on, still installing `bin/flk`.
+  # The server listener mounts the GUI router separately (#1828).
   withWeb ? false,
+  # Prebuilt Vite dist supplied by packages.<system>.flock-client (#1731).
+  # Direct package callers may omit it and receive the typed HTTP refusal.
+  guiDist ? null,
 }:
 
 let
@@ -85,6 +89,8 @@ rustPlatform.buildRustPackage {
   };
 
   nativeBuildInputs = [
+    # SDK-defined process facts compile through cc-rs on Darwin.
+    stdenv.cc
     git
     pkg-config
   ]
@@ -100,11 +106,17 @@ rustPlatform.buildRustPackage {
     LIBGHOSTTY_VT_ZIG_SYSTEM_DIR = zigDeps;
     ZIG = lib.getExe zig_0_15;
   }
+  // lib.optionalAttrs (withWeb && guiDist != null) {
+    FLOCK_GUI_DIST = guiDist;
+  }
   // lib.optionalAttrs (buildChannel != null) {
     FLOCK_BUILD_CHANNEL = buildChannel;
   }
   // lib.optionalAttrs (buildId != null) {
     FLOCK_BUILD_ID = buildId;
+  }
+  // lib.optionalAttrs (buildCommit != null) {
+    FLOCK_BUILD_COMMIT = buildCommit;
   }
   // lib.optionalAttrs stdenv.hostPlatform.isDarwin {
     SDKROOT = darwinSdkRoot;

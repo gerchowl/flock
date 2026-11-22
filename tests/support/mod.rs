@@ -9,8 +9,21 @@ use std::sync::{Mutex, Once, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+pub mod command;
+pub mod composer;
 pub mod fleet;
+pub mod json_api;
+pub mod paths;
+pub mod process_lifetime;
 pub mod process_table;
+pub mod readiness;
+pub mod sandboxes;
+pub mod scripted;
+pub mod server_startup;
+pub mod socket_dir;
+pub mod timing;
+
+pub mod environment;
 
 static PID_REGISTRY: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
 static RUNTIME_DIR_REGISTRY: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
@@ -88,6 +101,7 @@ pub fn flock_server_pids_for_runtime_dir(runtime_dir: &Path) -> std::io::Result<
 }
 
 pub fn cleanup_test_base(base: &Path) {
+    let _timing = timing::phase(timing::Phase::Teardown);
     let runtime_dir = base.join("runtime");
     let runtime_dirs = HashSet::from([runtime_dir.clone()]);
 
@@ -139,6 +153,7 @@ fn terminate_servers_under_base(base: &Path) {
 }
 
 pub fn wait_for_socket(path: &Path, timeout: Duration) {
+    let _timing = timing::wait("ready: socket");
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if path.exists() && UnixStream::connect(path).is_ok() {
@@ -149,7 +164,51 @@ pub fn wait_for_socket(path: &Path, timeout: Duration) {
     panic!("socket did not appear at {}", path.display());
 }
 
+/// The handoff importers server `old_pid` spawned inside the sandbox rooted at
+/// `config_home` (#1261).
+///
+/// An importer runs `flk server --handoff-import <socket>`, with its token in the
+/// environment. Its socket is `<config dir>/flock-handoff-<old pid>.sock`;
+/// the config dir is under the sandbox's `XDG_CONFIG_HOME`. Legacy exporters
+/// append the token positionally, which does not affect this lookup.
+/// The file name alone is not enough:
+/// pids are reused, so a test server can share its pid with the server an
+/// operator's live importer was spawned by, and a global `pgrep -f` on the file
+/// name would hand the live server to this harness's cleanup kill. The socket
+/// argument must therefore sit under `config_home` and carry the exact name.
+/// argv is read through `process_table` and compared literally, never as a
+/// pattern.
+pub fn handoff_importer_pids(config_home: &Path, old_pid: u32) -> Vec<u32> {
+    let socket_name = format!("flock-handoff-{old_pid}.sock");
+    let roots: Vec<PathBuf> = [
+        Some(config_home.to_path_buf()),
+        config_home.canonicalize().ok(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let in_sandbox = |socket: &Path| {
+        socket
+            .file_name()
+            .is_some_and(|name| name == socket_name.as_str())
+            && roots.iter().any(|root| socket.starts_with(root))
+    };
+    process_table::list_process_ids()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|pid| *pid != old_pid && *pid != std::process::id())
+        .filter(|pid| {
+            process_table::process_info(*pid).is_ok_and(|info| {
+                info.argv
+                    .windows(2)
+                    .any(|pair| pair[0] == "--handoff-import" && in_sandbox(Path::new(&pair[1])))
+            })
+        })
+        .collect()
+}
+
 pub fn wait_for_file(path: &Path, timeout: Duration) {
+    let _timing = timing::wait("ready: file");
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if path.exists() {
@@ -198,7 +257,7 @@ pub fn frame_message(payload: &[u8]) -> Vec<u8> {
 /// means a protocol bump touches one line rather than the dozen call sites
 /// that used to hardcode the number — which is how a bump used to fail a
 /// terminal-size test for reasons that had nothing to do with terminal sizes.
-pub const PROTOCOL_VERSION: u32 = 25;
+pub const PROTOCOL_VERSION: u32 = 34;
 
 /// The live-handoff refusal notice a server sends a connecting client while a
 /// live update is in flight (#38). A client that reads it opens its retry
@@ -360,6 +419,7 @@ pub fn client_handshake_with_fleet_and_theme(
     fleet_option_bytes: &[u8],
     theme_option_bytes: &[u8],
 ) -> Result<(u32, Option<String>), String> {
+    let _timing = timing::phase(timing::Phase::Handshake);
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .map_err(|e| e.to_string())?;
@@ -857,6 +917,8 @@ pub fn cleanup_registered_flock_pids() {
 
 fn ensure_cleanup_hooks() {
     INIT.call_once(|| {
+        // Before the cleanup `atexit` below, so the timing report runs after it.
+        timing::init();
         let _ = cleanup_servers_with_missing_runtime_dir();
         start_global_watchdog();
 
@@ -990,7 +1052,7 @@ fn terminate_servers_for_runtime_dirs(runtime_dirs: &HashSet<PathBuf>) {
 /// on Linux and the Darwin equivalents elsewhere. What identifies a process as ours has
 /// not changed and is the reason this is safe to run on a developer's whole
 /// machine: `is_test_flock_binary` requires the executable to be THIS
-/// checkout's `target/debug/flk`, so a daemon built by another session from
+/// Cargo-selected binary under test, so a daemon built by another session from
 /// its own worktree — or an installed `flock` — is never in the returned set.
 /// The `server` argv check narrows it further to servers.
 ///
@@ -1078,7 +1140,7 @@ fn current_checkout_root() -> &'static Path {
 }
 
 /// The one executable this sweep is ever allowed to kill: this checkout's own
-/// debug build of `flk`.
+/// Cargo-selected build of `flk`, in any profile or target directory.
 ///
 /// Equality against a canonicalised path, not a component-prefix test. The
 /// earlier `path.ends_with("target/debug/flk") && path.starts_with(root)` admits
@@ -1104,7 +1166,7 @@ fn is_test_flock_binary(path: &Path) -> bool {
     static EXPECTED: OnceLock<Option<PathBuf>> = OnceLock::new();
 
     let expected = EXPECTED
-        .get_or_init(|| fs::canonicalize(current_checkout_root().join("target/debug/flk")).ok())
+        .get_or_init(|| fs::canonicalize(env!("CARGO_BIN_EXE_flk")).ok())
         .as_deref();
 
     match expected {
@@ -1117,6 +1179,7 @@ fn is_test_flock_binary(path: &Path) -> bool {
 }
 
 extern "C" fn run_atexit_cleanup() {
+    let _timing = timing::phase(timing::Phase::Teardown);
     cleanup_registered_flock_pids();
 }
 
@@ -1129,6 +1192,9 @@ impl Drop for CleanupGuard {
 }
 
 fn terminate_pid(pid: u32) {
+    if server_startup::signal_owned_group(pid) {
+        return;
+    }
     let pid_t = pid as libc::pid_t;
 
     if process_exists(pid_t) {
@@ -1197,6 +1263,36 @@ fn process_exists(pid: libc::pid_t) -> bool {
     }
 }
 
+/// Install a fake `gh` in `bin`, a directory the test puts first on the
+/// server's PATH, so a worktree's merge gate gets the same answer on every
+/// host instead of whatever the host's gh is, or is not, logged into (#1278:
+/// CI's unauthenticated gh failed the gate, a developer's real gh could reach
+/// GitHub).
+///
+/// It answers every `gh pr view` the way gh does for a branch with no PR, so
+/// the gate goes on to the local git evidence, and refuses anything else. Each
+/// call's argv is appended to `<bin>/gh.log`.
+pub fn write_fake_gh(bin: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::create_dir_all(bin).unwrap();
+    let log = bin.join("gh.log");
+    let script = format!(
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> '{log}'
+if [ "$1" = pr ] && [ "$2" = view ]; then
+  echo 'no pull requests found for branch "'"$3"'"' >&2
+  exit 1
+fi
+echo "fake gh: unsupported command: $*" >&2
+exit 1
+"#,
+        log = log.display()
+    );
+    let gh = bin.join("gh");
+    fs::write(&gh, script).unwrap();
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1236,11 +1332,11 @@ mod tests {
     }
 
     #[test]
-    fn test_binary_matcher_accepts_current_checkout_debug_binary() {
-        let binary = current_checkout_root().join("target/debug/flk");
+    fn test_binary_matcher_accepts_the_binary_under_test() {
+        let binary = PathBuf::from(env!("CARGO_BIN_EXE_flk"));
         assert!(
             is_test_flock_binary(&binary),
-            "current checkout debug binary should be considered test-owned"
+            "the actual binary under test must be considered test-owned"
         );
     }
 
@@ -1303,33 +1399,27 @@ mod tests {
     /// different one.
     #[test]
     fn test_binary_matcher_accepts_a_symlink_to_the_checkout_binary() {
-        let real = current_checkout_root().join("target/debug/flk");
-        if !real.exists() {
-            // Not built in this test's environment; the accept-case above
-            // already covers the direct path.
-            return;
-        }
+        let real = PathBuf::from(env!("CARGO_BIN_EXE_flk"));
+        assert!(real.is_file(), "Cargo must build the fixture executable");
 
-        let link_dir = std::env::temp_dir().join(format!(
-            "flock-binary-matcher-link-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&link_dir).expect("create link dir");
-        let link = link_dir.join("flk");
-        let linked = symlink(&real, &link);
+        let link_dir = super::socket_dir::SocketDir::reserve("flk-bin-link");
+        let link = link_dir.path().join("flk");
+        symlink(&real, &link).expect("link the actual Cargo binary");
+        assert!(
+            is_test_flock_binary(&link),
+            "a symlink to the selected binary stays test-owned"
+        );
+    }
 
-        if linked.is_ok() {
-            assert!(
-                is_test_flock_binary(&link),
-                "a symlink resolving to this checkout's binary is that binary"
-            );
-        }
-
-        let _ = fs::remove_dir_all(&link_dir);
+    #[test]
+    fn test_binary_matcher_rejects_an_existing_different_flk() {
+        let fixture = super::socket_dir::SocketDir::reserve("flk-bin-other");
+        let other = fixture.path().join("flk");
+        fs::write(&other, "fixture file, never executed").unwrap();
+        assert!(
+            !is_test_flock_binary(&other),
+            "a matching basename cannot authorize reaping"
+        );
     }
 
     fn symlink(original: &Path, link: &Path) -> std::io::Result<()> {

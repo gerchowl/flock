@@ -9,6 +9,12 @@
 //! is how the design keeps mutating verbs (`pane.close`, `worktree.remove`,
 //! `agent.start`, pane `send_*`, …) off the MCP surface.
 //!
+//! `flock_pane_submit` is the guarded exception: it requires a fresh idle
+//! composer and confirms acceptance, with no raw key or dialog override.
+//!
+//! `flock_worktree_kill` exposes teardown with a dry-run default and a caller
+//! workspace guard. Branch deletion still requires positive merge evidence.
+//!
 //! One name deserves care: the tool `flock_agent_start` does NOT build
 //! `Method::AgentStart`. That verb takes raw `argv` and stays excluded, exactly
 //! as the line above says. The tool builds the narrowed `Method::AgentSpawn`,
@@ -20,9 +26,10 @@
 use serde_json::{json, Value};
 
 use crate::api::schema::{
-    AgentForkParams, AgentReadParams, AgentTarget, EmptyParams, LineageParams, MessageTarget,
-    Method, MsgListParams, MsgReplyParams, MsgSendParams, PaneReadParams, ReadFormat, ReadSource,
-    WorktreeListParams,
+    AgentForkParams, AgentReadParams, AgentTarget, DelegateListParams, EmptyParams,
+    EventsReadParams, LineageParams, MessageTarget, Method, MsgListParams, MsgReplyParams,
+    MsgSendParams, OwnerRepoParams, PaneReadParams, ReadFormat, ReadSource, WaitParkParams,
+    WorktreeKillParams, WorktreeListParams,
 };
 
 use super::framing::McpError;
@@ -54,7 +61,8 @@ pub(super) fn table() -> &'static [Tool] {
             name: "flock_agent_list",
             description: "List agents, and the fleet directory. `agents` is \
                           this server's own panes in full — each record \
-                          carries `seen` and `status_age_secs`, and the ones \
+                          carries `seen`, `status_age_secs` and `state` \
+                          (as on `flock_agent_get`), and the ones \
                           in `blocked` status need attention. `fleet` is \
                           every agent addressable from here INCLUDING other \
                           hosts, each row carrying `agent_id`, `host` and \
@@ -66,10 +74,23 @@ pub(super) fn table() -> &'static [Tool] {
         },
         Tool {
             name: "flock_agent_get",
-            description: "Get one agent's details. `target` accepts a public \
-                          pane id, a terminal id, or a unique agent name.",
+            description: "Get one PTY or pane-free structured agent's typed details. `target` accepts a public \
+                          pane id, a terminal id, or a unique agent name. \
+                          `settled_with_background_shells: true` on an \
+                          `idle`/`done` agent means its turn ended while \
+                          shells or agents it started are still running; \
+                          the field is absent otherwise. `state` carries \
+                          `turn`, `lifecycle`, a derived `phase` to branch \
+                          on, `held_ms` and a per-axis `source`; a server \
+                          without it means read `agent_status`.",
             input_schema: schema_target_only,
             build: build_agent_get,
+        },
+        Tool {
+            name: "flock_agent_stop",
+            description: "Stop a structured session by id or unique name. Only the operator or that structured agent itself may stop it. PTY targets return runtime_unsupported (never retry, exit 2).",
+            input_schema: schema_target_only,
+            build: |args| Ok(Method::AgentStop(AgentTarget { target: required_string(&args, "target")? })),
         },
         Tool {
             name: "flock_agent_read",
@@ -110,9 +131,29 @@ pub(super) fn table() -> &'static [Tool] {
             build: build_agent_lineage,
         },
         Tool {
+            name: "flock_delegate_list",
+            description: "List the delegates an architect started, read-only. \
+                          The workflow it serves: start a delegate (`flk \
+                          delegate start`), read its digest, review its PR, \
+                          merge, then reap its worktree. Each row is one \
+                          architect -> delegate edge with the delegate's \
+                          `agent_status`, harness, pane, branch, the PR \
+                          poller's cached `pr`, `edge_age_secs` and \
+                          `status_age_secs`, and a `state`: `live`, \
+                          `hibernated, awaiting merge`, `gone`, `gone, \
+                          worktree retained`, `orphaned`, or `closed, not \
+                          merged`. `architect` is `self` (default: you), \
+                          `all`, or an agent id; `branch` returns the edge \
+                          that owns that branch.",
+            input_schema: schema_delegate_list,
+            build: build_delegate_list,
+        },
+        Tool {
             name: "flock_msg_send",
             description: "Queue a message to another agent, on this host or \
-                          any host in the fleet. Address by `agent` id to \
+                          any host in the fleet. `to` accepts a bare pane id, \
+                          terminal id, unique agent name or fleet agent id, \
+                          or a tagged `pane`, `repo_pane` or `agent` object. Address by `agent` id to \
                           cross machines — a `pane` target names a placement \
                           on THIS server and cannot leave it. Queued to the \
                           recipient's inbox, which it reads with \
@@ -143,12 +184,10 @@ pub(super) fn table() -> &'static [Tool] {
                           Limits: 20 messages/min, 32 \
                           per recipient mailbox. Refusals: \
                           `msg_target_not_found` (no such agent anywhere in \
-                          the fleet), `peer_not_configured` (found it, but \
-                          no edge or hub reaches its host), \
-                          `peer_unreachable` (a hop failed; the message names \
-                          which machine could not reach which, and why), \
-                          `uplink_timeout` (handed to the hub, no answer — \
-                          retrying with the same `correlation_id` is safe), \
+                          the fleet). Mesh outcomes: `queued` or `held` \
+                          while waiting for a path, `refused` with a reason; \
+                          `peer_incompatible` requires upgrading the peer. \
+                          Other refusals: \
                           `msg_not_allowed` (the receiver declines), \
                           `sender_unresolved` (a cross-host send needs an \
                           attestable sender, so it must come from inside a \
@@ -174,20 +213,23 @@ pub(super) fn table() -> &'static [Tool] {
         },
         Tool {
             name: "flock_msg_list",
-            description: "List messages that are still queued (not yet \
-                          delivered). Pass `pane` to restrict to one \
-                          recipient (bare-pane target grammar).",
+            description: "Peek at unread messages. Omit `pane` for your attested pane or structured inbox; listing all panes or another inbox requires the local operator and is audited. A native target may only name your own identity. Includes local wake attempt evidence.",
             input_schema: schema_msg_list,
             build: build_msg_list,
+        },
+        Tool {
+            name: "flock_msg_status",
+            description: "Inspect durable message state: queued, custody, delivered, read, held, collected, refused, undeliverable, expired or outcome_retention_elapsed. Includes replies and submission attempts. Retain the returned reference for queries after retention; old local messages remain supported.",
+            input_schema: schema_msg_status,
+            build: build_msg_status,
         },
         Tool {
             name: "flock_msg_read",
             description: "Read (and consume) the messages waiting for you from \
                           other agents. This is how agent-to-agent messages \
-                          arrive — they are NOT typed into your session. Omit \
-                          `pane` to read your own inbox. Each message carries \
-                          its sender, body, `intent`, and whether you can \
-                          reply. `intent: needs_reply` means the sender is \
+                          arrive. Omit `pane` for your attested pane or structured inbox. Structured reads consume the delivered projection once without another harness delivery. Each message carries \
+                          its sender, body, `intent`, and whether a durable return binding lets you \
+                          reply even while offline. `reply_contract` discloses best-effort older messages. `intent: needs_reply` means the sender is \
                           waiting on an answer — send one with \
                           `flock_msg_reply` rather than leaving it hanging; \
                           `fyi` wants no reply, and answering it burns the \
@@ -228,7 +270,10 @@ pub(super) fn table() -> &'static [Tool] {
                           Returns `outcome`: `replied` (the reply is in \
                           `reply`), `deferred` (the recipient is muted; its \
                           automatic answer is in `reply`), `expired` (dropped \
-                          unread — no answer is coming) or `timeout` (with \
+                          unread), `refused` (the receiver declined it; reason in \
+                          `detail`), `undeliverable` (a forwarding hub could \
+                          not deliver it; reason in `detail`), \
+                          `recipient_gone`, `outcome_retention_elapsed`, or `timeout` (with \
                           the message's last `state`, e.g. `read`). BLOCKS \
                           this MCP session for up to `timeout_ms` (default \
                           60 s, at most 10 min): to wait longer without \
@@ -238,6 +283,12 @@ pub(super) fn table() -> &'static [Tool] {
                           correlation id. Refusal: `message_not_found`.",
             input_schema: schema_msg_wait_reply,
             build: build_msg_wait_reply,
+        },
+        Tool {
+            name: "flock_agent_restart",
+            description: "Ask flock to stop and resume YOUR OWN agent session after your turn ends. Returns immediately: finish this turn normally. Preserves the original launch flags and environment. Flock verifies the resumed session before queuing continue_with (default: continue your task). A grace timeout may force the restart; explicit requests at the rate cap are refused. Unknown startup dialogs need the operator.",
+            input_schema: schema_agent_restart,
+            build: build_agent_restart,
         },
         Tool {
             name: "flock_self_compact",
@@ -260,8 +311,12 @@ pub(super) fn table() -> &'static [Tool] {
                           yourself a keystroke, and you should not be able to. \
                           If a compaction is already armed, yours is refused \
                           rather than replacing it — abort first if you meant \
-                          to rewrite it. Claude Code only; other harnesses are \
-                          refused by name.",
+                          to rewrite it. Pass `instructions` to steer what \
+                          the compaction's summary keeps (goal, status file, \
+                          open PRs, standing rules): flock types them after \
+                          the compact command as `/compact <instructions>`. \
+                          Claude Code only; other harnesses are refused by \
+                          name.",
             input_schema: schema_self_compact,
             build: build_self_compact,
         },
@@ -271,6 +326,12 @@ pub(super) fn table() -> &'static [Tool] {
                           `flock_agent_read`: it changes no pane state.",
             input_schema: schema_pane_read,
             build: build_pane_read,
+        },
+        Tool {
+            name: "flock_pane_submit",
+            description: "Submit to a fresh idle agent with an empty recognized composer. The server serializes input, checks for dialogs and operator edits, and confirms a new turn with at most one Enter retry. Your calling workspace requires self: true. Returns accepted, observed_accepted, unconfirmed or abandoned. Does not mark mail read.",
+            input_schema: schema_pane_submit,
+            build: build_pane_submit,
         },
         Tool {
             name: "flock_worktree_list",
@@ -284,8 +345,25 @@ pub(super) fn table() -> &'static [Tool] {
             build: build_worktree_list,
         },
         Tool {
+            name: "flock_worktree_kill",
+            description: "Tear down a finished worktree space and return its \
+                          `worktree_killed` record. Exactly one of `workspace` \
+                          or `path` is required. `dry_run` defaults to true: \
+                          inspect the plan, then pass `dry_run: false` for a \
+                          real kill. A real kill closes the workspace, removes \
+                          the checkout, and ends remaining processes unless \
+                          `keep_procs: true`. Killing the calling pane's own \
+                          workspace requires `self: true`, otherwise it refuses \
+                          with `self_kill_unconfirmed`. The branch is deleted \
+                          only when merged and `keep_branch` is false. \
+                          `force` permits a dirty checkout but never bypasses \
+                          the merge gate for branch deletion.",
+            input_schema: schema_worktree_kill,
+            build: build_worktree_kill,
+        },
+        Tool {
             name: "flock_agent_start",
-            description: "Start a FRESH agent in an existing checkout. You \
+            description: "Optional runtime structured starts pane-free Claude with a framed opening turn; model is structured-only. Requires a current server and the same attested spawn policy. Start a FRESH agent in an existing checkout. You \
                           supply a PROMPT, never a command line — there is no \
                           argv here by design. Prefer \
                           this over `flock_agent_fork` when the child does not \
@@ -341,6 +419,54 @@ pub(super) fn table() -> &'static [Tool] {
             input_schema: schema_agent_result,
             build: build_agent_result,
         },
+        Tool {
+            name: "flock_events_read",
+            description: "Read the server's durable event log from a cursor \
+                          you hold (ADR-0028): every event with `seq > after`, \
+                          oldest first, filtered by `kinds` and `subjects` (a \
+                          pane, workspace, agent or message id in the event's \
+                          data). Resume from `next_after`, dedupe on `seq`. A \
+                          `gap` means the cursor is older than what is \
+                          retained. With `wait_ms` the call BLOCKS this MCP \
+                          session until a matching event lands (at most 9 \
+                          min); to wait longer, run `flk events wait` as a \
+                          background task. Use it instead of polling \
+                          `flock_agent_get`. Refusals: `invalid_params` (a \
+                          non-durable kind), `cursor_ahead`.",
+            input_schema: schema_events_read,
+            build: build_events_read,
+        },
+        Tool {
+            name: "flock_wait_park",
+            description: "Park yourself on a registered wait (ADR-0028 §5) and \
+                          return at once, so you can end your turn: until \
+                          `deadline_ms` passes you read `waiting_on_event`, and \
+                          a supervisor treats you as parked, not stalled. \
+                          `until` is the predicate: `delegate:<agent id> phase \
+                          in [finished, needs_human, gone]` or \
+                          `reply:<correlation id>`. Returns the `wait_id`, the \
+                          predicate in canonical form and the deadline (Unix \
+                          ms). Refusals: `wait_predicate_invalid`, \
+                          `wait_predicate_unsupported` (`pr:` and \
+                          `any-delegate-of-mine` are not supported yet), \
+                          `wait_deadline_too_long` (over 24 h), \
+                          `too_many_waits` (16 open parks), `peer_incompatible` \
+                          (a delegate on another host), `no_caller_pane`.",
+            input_schema: schema_wait_park,
+            build: build_wait_park,
+        },
+        Tool {
+            name: "flock_owner_show",
+            description: "Return a repo's resident-owner binding (ADR-0035 \
+                          §1), read-only: home `node`, the owner's \
+                          `agent_id`, `checkout`, `harness`, `model`, \
+                          `profiles` and `since_ms`. `repo` is the GitHub \
+                          slug `owner/name`. Binding is an operator verb and \
+                          is not reachable from MCP. Refusal: `not_found` \
+                          (no owner is bound to the repo on this node).",
+            input_schema: schema_owner_show,
+            build: build_owner_show,
+        },
     ]
 }
 
@@ -379,6 +505,8 @@ fn schema_agent_start() -> Value {
     json!({
         "type": "object",
         "properties": {
+            "runtime": {"type":"string", "enum":["pty","structured"], "default":"pty"},
+            "model": {"type":"string", "description":"Structured Claude model; omit for PTY."},
             "agent": {
                 "type": "string",
                 "enum": crate::spawn::AgentKind::supported(),
@@ -400,7 +528,8 @@ fn schema_agent_start() -> Value {
                 },
                 "required": ["kind"]
             },
-            "name": { "type": "string", "description": "Custom label for the child agent." }
+            "name": { "type": "string", "description": "Custom label for the child agent." },
+            "questions": questions_property()
         },
         "required": ["agent", "prompt", "location"],
         "additionalProperties": false
@@ -416,19 +545,79 @@ fn build_agent_start(args: Value) -> Result<Method, McpError> {
     let location: crate::api::schema::SpawnLocation = serde_json::from_value(location.clone())
         .map_err(|err| McpError::invalid_params(format!("invalid location: {err}")))?;
     Ok(Method::AgentSpawn(crate::api::schema::AgentSpawnParams {
+        runtime: serde_json::from_value(args.get("runtime").cloned().unwrap_or(json!("pty")))
+            .map_err(|_| McpError::invalid_params("runtime must be pty or structured"))?,
+        model: optional_string(&args, "model")?,
         agent,
         prompt,
         location,
         name: optional_string(&args, "name")?,
         // An MCP-spawned child never steals the operator's focus.
         focus: false,
+        questions: optional_questions(&args)?,
+        // An MCP caller is an agent, and an unattended start is an operator
+        // verb (ADR-0034 §2), so the tool does not offer it.
+        unattended: false,
     }))
+}
+
+fn schema_pane_submit() -> Value {
+    json!({"type": "object", "required": ["pane_id", "text"], "additionalProperties": false,
+        "properties": {"pane_id": {"type": "string"}, "text": {"type": "string"},
+            "self": {"type": "boolean", "description": "Confirm submission to your own workspace."}, "if_session": {"type": "string"}, "min_age_secs": {"type": "integer", "minimum": 0}}})
+}
+
+fn build_pane_submit(args: Value) -> Result<Method, McpError> {
+    let confirmed = optional_bool(&args, "self")?;
+    let mut args = args;
+    if let Some(object) = args.as_object_mut() {
+        object.remove("self");
+    }
+    let mut params: crate::api::schema::PaneSubmitParams =
+        serde_json::from_value(args).map_err(|err| McpError::invalid_params(err.to_string()))?;
+    params.self_submit_confirmed = Some(confirmed);
+    Ok(Method::PaneSubmit(params))
 }
 
 fn schema_no_args() -> Value {
     json!({
         "type": "object",
         "properties": {},
+        "additionalProperties": false,
+    })
+}
+
+fn schema_delegate_list() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "architect": {
+                "type": "string",
+                "description": "`self` (default), `all`, or an architect's agent id.",
+            },
+            "branch": {
+                "type": "string",
+                "description": "Only the edge whose delegate works on this branch.",
+            },
+            "repo": {
+                "type": "string",
+                "description": "Only edges in this repository (the edge's repo key).",
+            },
+        },
+        "additionalProperties": false,
+    })
+}
+
+fn schema_owner_show() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "repo": {
+                "type": "string",
+                "description": "GitHub slug of the repo, `owner/name`.",
+            },
+        },
+        "required": ["repo"],
         "additionalProperties": false,
     })
 }
@@ -486,6 +675,7 @@ fn schema_agent_fork() -> Value {
                 "type": "string",
                 "description": "Custom label for the new workspace.",
             },
+            "questions": questions_property(),
         },
         "required": ["target"],
         "additionalProperties": false,
@@ -497,9 +687,10 @@ fn schema_msg_send() -> Value {
         "type": "object",
         "properties": {
             "to": {
-                "type": "object",
-                "description": "Message recipient, one of three shapes. \
-                                `{\"type\":\"agent\",\"agent\":\"<agent_id>\"}` is the ONLY shape that reaches another host — \
+                "type": ["object", "string"],
+                "description": "Message recipient: a bare string such as `\"w3:p2\"`, an agent name or an agent id, or one of three objects. \
+                                A bare agent id is sent as the `agent` shape, anything else as the `pane` shape. \
+                                A bare fleet agent id or `{\"type\":\"agent\",\"agent\":\"<agent_id>\"}` reaches another host — \
                                 `agent_id` is fleet-global and restart-stable. \
                                 `{\"type\":\"pane\",\"pane\":\"<pane>\"}` addresses a pane on THIS server only. \
                                 `{\"type\":\"repo_pane\",\"repo\":\"<repo>\",\"pane\":\"<pane>\"}` restricts pane resolution to workspaces backed by that repo. \
@@ -549,10 +740,37 @@ fn schema_msg_send() -> Value {
     })
 }
 
+fn schema_events_read() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "after": {"type": "integer", "minimum": 0, "description": "Return events with `seq` above this; 0 reads from the oldest retained."},
+            "kinds": {"type": "array", "items": {"type": "string"}, "description": "Durable event kinds, e.g. `message_queued`; empty means all."},
+            "subjects": {"type": "array", "items": {"type": "string"}, "description": "Ids an event's data must carry as a top-level value."},
+            "limit": {"type": "integer", "minimum": 1, "description": "At most this many events (default 256)."},
+            "wait_ms": {"type": "integer", "minimum": 0, "description": "Hold the call until a matching event lands, in ms (capped at 540000). Blocks this MCP session."},
+        },
+        "additionalProperties": false,
+    })
+}
+
+fn schema_wait_park() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "until": {"type": "string", "description": "The predicate: `delegate:<agent id> phase in [<phase>, ...]` or `reply:<correlation id>`."},
+            "deadline_ms": {"type": "integer", "minimum": 1, "maximum": 86_400_000, "description": "How long the wait stays open, in ms (at most 24 h). Mandatory."},
+        },
+        "required": ["until", "deadline_ms"],
+        "additionalProperties": false,
+    })
+}
+
 fn schema_msg_wait_reply() -> Value {
     json!({
         "type": "object",
         "properties": {
+            "reference": {"type": "object", "description": "The signed reference returned by msg.status."},
             "correlation_id": {
                 "type": "string",
                 "description": "The correlation id `flock_msg_send` returned for the message you are waiting on.",
@@ -595,13 +813,32 @@ fn schema_msg_reply() -> Value {
     })
 }
 
+fn schema_msg_status() -> Value {
+    json!({"type": "object", "properties": {
+        "correlation_id": {"type": "string", "minLength": 1},
+        "reference": {"type": "object", "description": "The signed reference returned by msg.status."}
+    }, "required": ["correlation_id"], "additionalProperties": false})
+}
+
+fn build_msg_status(args: Value) -> Result<Method, McpError> {
+    Ok(Method::MsgStatus(crate::api::schema::MsgStatusParams {
+        reference: args
+            .get("reference")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|_| McpError::invalid_params("invalid status reference"))?,
+        correlation_id: required_string(&args, "correlation_id")?,
+    }))
+}
+
 fn schema_msg_list() -> Value {
     json!({
         "type": "object",
         "properties": {
             "pane": {
                 "type": "string",
-                "description": "Optional recipient pane target (bare-pane grammar).",
+                "description": "Optional recipient target. Omit for your attested pane or structured inbox, or an audited global list for the local operator.",
             },
         },
         "additionalProperties": false,
@@ -614,7 +851,7 @@ fn schema_msg_read() -> Value {
         "properties": {
             "pane": {
                 "type": "string",
-                "description": "Whose inbox to read. Omit for your own pane.",
+                "description": "Whose inbox to read. Omit for your attested pane or structured self; another native inbox is refused.",
             },
         },
         "additionalProperties": false,
@@ -658,15 +895,98 @@ fn build_worktree_list(_args: Value) -> Result<Method, McpError> {
     Ok(Method::WorktreeList(WorktreeListParams::default()))
 }
 
+fn schema_worktree_kill() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "workspace": {
+                "type": "string",
+                "description": "The open workspace to tear down, by its public workspace id.",
+            },
+            "path": {
+                "type": "string",
+                "description": "The checkout to tear down, by path — the `path` from `flock_worktree_list`. Use this for a checkout nobody has open. Exactly one of `workspace` and `path`.",
+            },
+            "dry_run": {
+                "type": "boolean",
+                "default": true,
+                "description": "Report the plan and touch nothing. DEFAULTS TO TRUE HERE, unlike the CLI: pass `false` to actually remove anything.",
+            },
+            "force": {
+                "type": "boolean",
+                "description": "Remove the checkout even with uncommitted or untracked changes in it. Never widens the branch decision.",
+            },
+            "keep_branch": {
+                "type": "boolean",
+                "description": "Remove the checkout but keep the local branch, whatever the merge gate says.",
+            },
+            "keep_procs": {
+                "type": "boolean",
+                "description": "Report the processes still standing in the removed checkout without signalling them. They are always reported either way.",
+            },
+            "self": {
+                "type": "boolean",
+                "description": "Confirm that the target may be YOUR OWN space. Without it, a kill aimed at the workspace you are calling from is refused (`self_kill_unconfirmed`) — you would be closing your own terminal mid-call.",
+            },
+        },
+        "oneOf": [{"required": ["workspace"]}, {"required": ["path"]}],
+        "additionalProperties": false,
+    })
+}
+
+fn build_worktree_kill(args: Value) -> Result<Method, McpError> {
+    // MCP defaults to inspection. A destructive call must opt in explicitly.
+    let dry_run = match args.get("dry_run") {
+        None | Some(Value::Null) => true,
+        Some(Value::Bool(dry_run)) => *dry_run,
+        Some(_) => {
+            return Err(McpError::invalid_params("`dry_run` must be a boolean"));
+        }
+    };
+    let workspace_id = optional_string(&args, "workspace")?;
+    let path = optional_string(&args, "path")?;
+    if workspace_id.is_some() == path.is_some() {
+        return Err(McpError::invalid_params(
+            "exactly one of `workspace` or `path` is required",
+        ));
+    }
+    Ok(Method::WorktreeKill(WorktreeKillParams {
+        workspace_id,
+        path,
+        force: optional_bool(&args, "force")?,
+        keep_branch: optional_bool(&args, "keep_branch")?,
+        dry_run,
+        keep_processes: optional_bool(&args, "keep_procs")?,
+        // Exclude the MCP process and its ancestors from orphan cleanup.
+        caller_pid: Some(std::process::id()),
+        // Omission arms the guard. The CLI leaves this field absent.
+        self_kill_confirmed: Some(optional_bool(&args, "self")?),
+    }))
+}
+
 fn build_agent_get(args: Value) -> Result<Method, McpError> {
     Ok(Method::AgentGet(AgentTarget {
         target: required_string(&args, "target")?,
     }))
 }
 
+fn build_owner_show(args: Value) -> Result<Method, McpError> {
+    Ok(Method::OwnerShow(OwnerRepoParams {
+        repo: required_string(&args, "repo")?,
+    }))
+}
+
 fn build_agent_lineage(args: Value) -> Result<Method, McpError> {
     Ok(Method::AgentLineage(LineageParams {
         target: required_string(&args, "target")?,
+    }))
+}
+
+fn build_delegate_list(args: Value) -> Result<Method, McpError> {
+    Ok(Method::DelegateList(DelegateListParams {
+        architect: optional_string(&args, "architect")?.unwrap_or_else(|| "self".into()),
+        branch: optional_string(&args, "branch")?,
+        repo: optional_string(&args, "repo")?,
     }))
 }
 
@@ -712,6 +1032,7 @@ fn build_agent_history(args: Value) -> Result<Method, McpError> {
 
 fn build_agent_fork(args: Value) -> Result<Method, McpError> {
     Ok(Method::AgentFork(AgentForkParams {
+        dry_run: false,
         target: required_string(&args, "target")?,
         branch: optional_string(&args, "branch")?,
         // Deliberate narrowings, not dropped fields (#320 P1 audit): `base`
@@ -723,6 +1044,8 @@ fn build_agent_fork(args: Value) -> Result<Method, McpError> {
         label: optional_string(&args, "label")?,
         pivot: optional_string(&args, "pivot")?,
         focus: false,
+        questions: optional_questions(&args)?,
+        unattended: false,
     }))
 }
 
@@ -766,20 +1089,51 @@ fn build_agent_result(args: Value) -> Result<Method, McpError> {
     }))
 }
 
+fn invalid_message_target(reason: impl std::fmt::Display) -> McpError {
+    let mut data = super::framing::refusal(
+        crate::api::error_code::ErrorCode::InvalidParams.as_str(),
+        crate::cli::exit::USAGE,
+    );
+    data["kind"] = json!(crate::api::error_code::ErrorCode::InvalidParams.as_str());
+    data["expected"] = MessageTarget::expected_shapes();
+    McpError {
+        data: Some(data),
+        ..McpError::invalid_params(format!(
+            "invalid `to`: {reason}; expected {}",
+            crate::api::schema::MESSAGE_TARGET_EXPECTED
+        ))
+    }
+}
+
+/// `to` as typed by the model: a bare string (ADR-0029 §5) or the tagged
+/// object. The string becomes the structured target here, so the wire keeps
+/// one shape and an older server accepts it unchanged.
+fn message_target(to: Value) -> Result<MessageTarget, McpError> {
+    let target = if let Value::String(target) = to {
+        MessageTarget::from_bare(target)
+    } else {
+        serde_json::from_value(to).map_err(invalid_message_target)?
+    };
+    let empty = match &target {
+        MessageTarget::Pane { pane } => pane.trim().is_empty(),
+        MessageTarget::Agent { agent } => agent.trim().is_empty(),
+        MessageTarget::RepoPane { repo, pane } => repo.trim().is_empty() || pane.trim().is_empty(),
+    };
+    if empty {
+        return Err(invalid_message_target("address fields must not be empty"));
+    }
+    Ok(target)
+}
+
 fn build_msg_send(args: Value) -> Result<Method, McpError> {
-    // `from_agent`/`from_host` stay unset on purpose: they are a RELAY's
-    // assertion about a sender it could not attest locally. The server reads
-    // this caller's identity from process ancestry, and letting an MCP client
-    // name itself would make the sender stamp a free-text claim.
+    // MCP sender identity comes from the server's process ancestry.
     let to_value = args
         .get("to")
         .cloned()
-        .ok_or_else(|| McpError::invalid_params("missing `to`"))?;
-    let to: MessageTarget = serde_json::from_value(to_value)
-        .map_err(|e| McpError::invalid_params(format!("invalid `to`: {e}")))?;
+        .ok_or_else(|| invalid_message_target("missing `to`"))?;
+    let to = message_target(to_value)?;
     Ok(Method::MsgSend(MsgSendParams {
         from_agent: None,
-        from_host: None,
         to,
         body: required_string(&args, "body")?,
         correlation_id: optional_string(&args, "correlation_id")?,
@@ -790,7 +1144,6 @@ fn build_msg_send(args: Value) -> Result<Method, McpError> {
         // envelope, and the receiver trusts it more for looking deliberate.
         // Refusing the call is the cheapest forcing function there is.
         intent: required_intent(&args, "intent")?,
-        intent_unrecognised: None,
     }))
     .and_then(|method| {
         // #576: waiting on an `fyi` waits for an answer nobody was asked for.
@@ -817,6 +1170,12 @@ const MCP_WAIT_REPLY_MAX_MS: u64 = 600_000;
 fn build_msg_wait_reply(args: Value) -> Result<Method, McpError> {
     Ok(Method::MsgWaitReply(
         crate::api::schema::MsgWaitReplyParams {
+            reference: args
+                .get("reference")
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(|_| McpError::invalid_params("invalid status reference"))?,
             correlation_id: required_string(&args, "correlation_id")?,
             timeout_ms: Some(
                 optional_u64(&args, "timeout_ms")?
@@ -825,6 +1184,22 @@ fn build_msg_wait_reply(args: Value) -> Result<Method, McpError> {
             ),
         },
     ))
+}
+
+/// Ceiling of `flock_events_read`'s hold, below the 600 s MCP tool timeout.
+const MCP_EVENTS_READ_MAX_WAIT_MS: u64 = 540_000;
+
+fn build_wait_park(args: Value) -> Result<Method, McpError> {
+    let params: WaitParkParams = serde_json::from_value(args)
+        .map_err(|err| McpError::invalid_params(format!("invalid wait.park arguments: {err}")))?;
+    Ok(Method::WaitPark(params))
+}
+
+fn build_events_read(args: Value) -> Result<Method, McpError> {
+    let mut params: EventsReadParams = serde_json::from_value(args)
+        .map_err(|err| McpError::invalid_params(format!("invalid events.read arguments: {err}")))?;
+    params.wait_ms = params.wait_ms.map(|ms| ms.min(MCP_EVENTS_READ_MAX_WAIT_MS));
+    Ok(Method::EventsRead(params))
 }
 
 /// `word` as one POSIX shell word: as-is when it is plainly safe, single-quoted
@@ -946,6 +1321,45 @@ fn build_msg_list(args: Value) -> Result<Method, McpError> {
     }))
 }
 
+fn schema_agent_restart() -> Value {
+    json!({"type": "object", "properties": {
+        "target": {"type": "string", "enum": ["self"], "default": "self"},
+        "reason": {"type": "string", "minLength": 1, "maxLength": 1024},
+        "continue_with": {"type": "string", "minLength": 1, "maxLength": 16384},
+        "when": {"type": "string", "enum": ["after_turn"], "default": "after_turn"}
+    }, "required": ["reason"], "additionalProperties": false})
+}
+
+fn build_agent_restart(args: Value) -> Result<Method, McpError> {
+    let params: crate::api::schema::AgentRestartParams =
+        serde_json::from_value(args).map_err(|err| McpError::invalid_params(err.to_string()))?;
+    if params.target != "self" {
+        return Err(McpError::invalid_params(
+            "MCP agent restart is self-only; arbitrary targets require the CLI",
+        ));
+    }
+    if params.reason.trim().is_empty()
+        || params.reason.len() > 1024
+        || params.reason.chars().any(char::is_control)
+        || params.when != "after_turn"
+    {
+        return Err(McpError::invalid_params(
+            "reason must be plain text up to 1024 bytes; when must be after_turn",
+        ));
+    }
+    if let Some(text) = &params.continue_with {
+        if text.trim().is_empty()
+            || text.len() > 16384
+            || crate::agent_self_compact::check_continuation(text).is_err()
+        {
+            return Err(McpError::invalid_params(
+                "continue_with must be one line of plain instructions, at most 16 KiB",
+            ));
+        }
+    }
+    Ok(Method::AgentRestart(params))
+}
+
 fn schema_self_compact() -> Value {
     json!({
         "type": "object",
@@ -954,6 +1368,11 @@ fn schema_self_compact() -> Value {
                 "type": "string",
                 "minLength": 1,
                 "description": "Your own handoff prompt, in your own words: what you want to be doing once you are on the other side of the compaction. This is the text a human would otherwise copy out of your transcript and paste back into you, so write it as instructions to your next self. Required, and it must not be empty — a compaction with no prompt leaves you with no thread to hold. Capped at 16 KiB; put anything longer in a file and name the file.",
+            },
+            "instructions": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Optional. What the compaction's summary must keep — for example: keep GOAL.md, the STATUS.md next step, open PRs and the standing rules. Typed after the compact command as `/compact <instructions>`, so it steers the summary itself, where `continuation` only speaks after it. One line of plain text, at most 500 bytes: Claude Code collapses a longer paste and may then not run it as `/compact`. Omit for a plain `/compact`. Refused for a harness whose compact command takes no argument.",
             },
             "abort": {
                 "type": "boolean",
@@ -1008,10 +1427,30 @@ fn build_self_compact(args: Value) -> Result<Method, McpError> {
             }));
         }
     }
+    let instructions = optional_string(&args, "instructions")?;
+    if let Some(text) = instructions.as_deref() {
+        if text.trim().is_empty() {
+            return Err(McpError::invalid_params(
+                "`instructions` must not be empty when given: omit it for a plain \
+                 `/compact`, or say what the summary must keep.",
+            ));
+        }
+        if crate::agent_self_compact::check_instructions(text).is_err()
+            || text.len() > crate::agent_self_compact::MAX_INSTRUCTIONS_BYTES
+        {
+            return Err(McpError::invalid_params(
+                "`instructions` must be one line of plain text, at most 500 bytes: \
+                 they are typed after `/compact` in the same paste, and a newline \
+                 or escape would submit or end it early. Put the long version in \
+                 a file and name the file.",
+            ));
+        }
+    }
     Ok(Method::PaneArmSelfCompact(
         crate::api::schema::PaneArmSelfCompactParams {
             pane: optional_string(&args, "pane")?,
             continuation,
+            instructions,
             abort,
         },
     ))
@@ -1101,6 +1540,25 @@ fn optional_string(args: &Value, field: &str) -> Result<Option<String>, McpError
     }
 }
 
+/// The `questions` argument of the tools that start an agent (#1179).
+fn questions_property() -> Value {
+    json!({"type": "string", "enum": ["route", "deny"],
+        "description": "Where the child's questions go (ADR-0034 §2). Default route: to you, as structured questions. deny refuses them, e.g. for a delegate started over ssh. A policy that reaches the human is an operator verb and is refused (exit 13)."})
+}
+
+/// `questions`, in any wire spelling: the server, not the schema, refuses a
+/// policy an agent may not grant, so the refusal carries its exit code.
+fn optional_questions(
+    args: &Value,
+) -> Result<Option<crate::api::schema::QuestionPolicy>, McpError> {
+    optional_string(args, "questions")?
+        .map(|raw| {
+            crate::api::schema::QuestionPolicy::parse(&raw)
+                .ok_or_else(|| McpError::invalid_params(format!("invalid `questions`: {raw}")))
+        })
+        .transpose()
+}
+
 fn optional_u64(args: &Value, field: &str) -> Result<Option<u64>, McpError> {
     match args.get(field) {
         None | Some(Value::Null) => Ok(None),
@@ -1149,6 +1607,126 @@ mod tests {
     use super::*;
 
     #[test]
+    fn native_inbox_tools_bind_omitted_targets_and_describe_structured_self() {
+        for name in ["flock_msg_list", "flock_msg_read"] {
+            let tool = find(name).unwrap();
+            assert!(
+                tool.descriptor()["inputSchema"]["properties"]["pane"]["description"]
+                    .as_str()
+                    .unwrap()
+                    .contains("structured")
+            );
+            assert!(matches!(
+                (tool.build)(json!({})).unwrap(),
+                Method::MsgList(MsgListParams { pane: None })
+                    | Method::MsgRead(crate::api::schema::MsgReadParams { pane: None })
+            ));
+        }
+    }
+
+    #[test]
+    fn worktree_kill_defaults_to_dry_run_with_self_guard_armed() {
+        let tool = find("flock_worktree_kill").unwrap();
+        let Method::WorktreeKill(params) =
+            (tool.build)(json!({"workspace": "ws_fixture"})).unwrap()
+        else {
+            panic!("expected worktree kill");
+        };
+        assert!(params.dry_run);
+        assert_eq!(params.self_kill_confirmed, Some(false));
+        assert_eq!(params.workspace_id.as_deref(), Some("ws_fixture"));
+        assert_eq!(params.caller_pid, Some(std::process::id()));
+        assert!(!params.force && !params.keep_branch && !params.keep_processes);
+        assert_eq!(
+            tool.descriptor()["inputSchema"]["properties"]["dry_run"]["default"],
+            true
+        );
+    }
+
+    #[test]
+    fn worktree_kill_maps_explicit_teardown_options() {
+        let Method::WorktreeKill(params) = build_worktree_kill(json!({
+            "path": "fixture-checkout", "dry_run": false, "self": true,
+            "force": true, "keep_branch": true, "keep_procs": true,
+        }))
+        .unwrap() else {
+            panic!("expected worktree kill");
+        };
+        assert!(!params.dry_run);
+        assert_eq!(params.self_kill_confirmed, Some(true));
+        assert_eq!(params.path.as_deref(), Some("fixture-checkout"));
+        assert!(params.force && params.keep_branch && params.keep_processes);
+    }
+
+    #[test]
+    fn worktree_kill_rejects_ambiguous_addresses_and_non_boolean_options() {
+        for args in [
+            json!({}),
+            json!({"workspace": "ws_fixture", "path": "fixture-checkout"}),
+            json!({"path": "fixture-checkout", "dry_run": "false"}),
+            json!({"path": "fixture-checkout", "self": "true"}),
+        ] {
+            assert!(build_worktree_kill(args).is_err());
+        }
+    }
+
+    #[test]
+    fn pane_submit_guards_the_calling_workspace() {
+        for confirmed in [false, true] {
+            let Method::PaneSubmit(params) =
+                build_pane_submit(json!({"pane_id":"1-1", "text":"hello", "self":confirmed}))
+                    .unwrap()
+            else {
+                panic!("expected submit")
+            };
+            assert_eq!(params.self_submit_confirmed, Some(confirmed));
+        }
+        let Method::PaneSubmit(params) =
+            build_pane_submit(json!({"pane_id":"1-1", "text":"hello"})).unwrap()
+        else {
+            panic!("expected submit")
+        };
+        assert_eq!(params.self_submit_confirmed, Some(false));
+    }
+
+    /// #1029: the hold stays below the MCP tool timeout, and a kind the
+    /// server does not know is refused before the call goes out.
+    #[test]
+    fn events_read_caps_its_hold_below_the_tool_timeout() {
+        let Method::EventsRead(params) = build_events_read(json!({
+            "after": 4, "kinds": ["message_queued"], "subjects": ["ws_1:p1"], "wait_ms": 3_600_000
+        }))
+        .unwrap() else {
+            panic!("expected events.read");
+        };
+        assert_eq!(params.after, 4);
+        assert_eq!(serde_json::to_value(&params).unwrap()["after"], 4);
+        let Method::EventsRead(initial) = build_events_read(json!({})).unwrap() else {
+            panic!("expected events.read");
+        };
+        assert_eq!(
+            initial.after, 0,
+            "MCP still requests durable history explicitly"
+        );
+        assert_eq!(params.subjects, ["ws_1:p1"]);
+        assert_eq!(params.wait_ms, Some(MCP_EVENTS_READ_MAX_WAIT_MS));
+        assert!(build_events_read(json!({"kinds": ["no_such_kind"]})).is_err());
+    }
+
+    /// ADR-0035 §1: MCP reads an owner binding and never writes one.
+    #[test]
+    fn owner_show_is_a_read_and_no_tool_binds() {
+        let method = build_owner_show(json!({"repo": "example/widgets"})).unwrap();
+        assert!(matches!(&method, Method::OwnerShow(p) if p.repo == "example/widgets"));
+        assert!(method.is_retry_safe() && !method.needs_current_protocol());
+        assert!(build_owner_show(json!({})).is_err());
+        assert!(!table().iter().any(|tool| matches!(
+            (tool.build)(json!({"repo": "a/b", "target": "x"})),
+            Ok(Method::OwnerBind(_) | Method::OwnerUnbind(_))
+        )));
+    }
+
+    #[test]
     fn table_is_stable_and_complete() {
         // The golden name list — locks both membership and ordering so the
         // tools/list output stays load-bearing for agents that cache it.
@@ -1158,23 +1736,47 @@ mod tests {
             vec![
                 "flock_agent_list",
                 "flock_agent_get",
+                "flock_agent_stop",
                 "flock_agent_read",
                 "flock_agent_fork",
                 "flock_agent_lineage",
+                "flock_delegate_list",
                 "flock_msg_send",
                 "flock_msg_reply",
                 "flock_msg_list",
+                "flock_msg_status",
                 "flock_msg_read",
                 "flock_msg_mute",
                 "flock_msg_wait_reply",
+                "flock_agent_restart",
                 "flock_self_compact",
                 "flock_pane_read",
+                "flock_pane_submit",
                 "flock_worktree_list",
+                "flock_worktree_kill",
                 "flock_agent_start",
                 "flock_agent_history",
                 "flock_agent_result",
+                "flock_events_read",
+                "flock_wait_park",
+                "flock_owner_show",
             ]
         );
+    }
+
+    #[test]
+    fn wait_park_needs_a_deadline() {
+        let Method::WaitPark(params) = build_wait_park(json!({
+            "until": "reply:c1", "deadline_ms": 600_000
+        }))
+        .unwrap() else {
+            panic!("expected wait.park");
+        };
+        assert_eq!(
+            (params.until.as_str(), params.deadline_ms),
+            ("reply:c1", 600_000)
+        );
+        assert!(build_wait_park(json!({"until": "reply:c1"})).is_err());
     }
 
     /// The schema is generated from the enum, so the caller-visible set of
@@ -1401,6 +2003,43 @@ mod tests {
         assert_eq!(params.continuation.as_deref(), Some("open the PR"));
         assert!(params.pane.is_none(), "omitting `pane` means my own");
         assert!(!params.abort);
+    }
+
+    #[test]
+    fn flock_self_compact_carries_the_compaction_instructions() {
+        let method = build_self_compact(json!({
+            "continuation": "open the PR",
+            "instructions": "keep GOAL.md and /tmp/STATUS.md",
+        }))
+        .expect("arms");
+        let Method::PaneArmSelfCompact(params) = method else {
+            panic!("expected pane.arm_self_compact");
+        };
+        assert_eq!(
+            params.instructions.as_deref(),
+            Some("keep GOAL.md and /tmp/STATUS.md")
+        );
+        assert!(schema_self_compact()["properties"]["instructions"].is_object());
+
+        let bare = build_self_compact(json!({"continuation": "open the PR"})).expect("arms");
+        let Method::PaneArmSelfCompact(bare) = bare else {
+            panic!("expected pane.arm_self_compact");
+        };
+        assert_eq!(bare.instructions, None, "omitted stays omitted");
+
+        let cap = crate::agent_self_compact::MAX_INSTRUCTIONS_BYTES;
+        build_self_compact(json!({"continuation": "go", "instructions": "k".repeat(cap)}))
+            .expect("exactly at the cap is accepted");
+        let over = "k".repeat(cap + 1);
+        for bad in ["", "  ", "keep\nthis", "keep\x1b[201~", over.as_str()] {
+            let err = build_self_compact(json!({"continuation": "go", "instructions": bad}))
+                .expect_err("refused");
+            assert!(
+                err.message.contains("instructions"),
+                "{bad:?}: {}",
+                err.message
+            );
+        }
     }
 
     /// A compaction with no prompt behind it would shorten the context and
@@ -1804,6 +2443,69 @@ mod tests {
     }
 
     #[test]
+    fn build_msg_send_accepts_a_bare_string_target() {
+        let to = |target: &str| {
+            let method =
+                build_msg_send(json!({"to": target, "body": "x", "intent": "fyi"})).unwrap();
+            let Method::MsgSend(params) = method else {
+                panic!("expected MsgSend");
+            };
+            params.to
+        };
+        assert_eq!(
+            to("w3:p2"),
+            MessageTarget::Pane {
+                pane: "w3:p2".into()
+            }
+        );
+        assert_eq!(
+            to("reviewer"),
+            MessageTarget::Pane {
+                pane: "reviewer".into()
+            }
+        );
+        assert_eq!(
+            to("agent_atlas_6f21c4"),
+            MessageTarget::Agent {
+                agent: "agent_atlas_6f21c4".into()
+            }
+        );
+    }
+
+    #[test]
+    fn build_msg_send_refuses_a_wrong_shape_with_the_expected_ones() {
+        let err = build_msg_send(json!({"to": 7, "body": "x", "intent": "fyi"})).unwrap_err();
+        assert_eq!(err.code, -32602);
+        let expected = err.data.unwrap()["expected"].as_array().unwrap().len();
+        assert_eq!(expected, 4);
+    }
+
+    #[test]
+    fn message_target_shape_errors_are_typed_and_actionable() {
+        for to in [
+            Value::Null,
+            json!(7),
+            json!([]),
+            json!({}),
+            json!({"type":"agent"}),
+            json!({"type":"other"}),
+            json!(""),
+        ] {
+            let err = build_msg_send(json!({"to":to,"body":"x","intent":"fyi"})).unwrap_err();
+            assert_eq!(err.code, -32602);
+            let data = err.data.unwrap();
+            assert_eq!(data["kind"], "invalid_params");
+            assert_eq!(data["exit"], crate::cli::exit::USAGE);
+            assert_eq!(data["retry"], "never");
+            assert!(data["expected"].is_array());
+            assert!(err.message.contains("pane id"));
+            assert!(err.message.contains("agent id"));
+        }
+        let err = build_msg_send(json!({"body":"x","intent":"fyi"})).unwrap_err();
+        assert_eq!(err.data.unwrap()["kind"], "invalid_params");
+    }
+
+    #[test]
     fn every_message_target_variant_is_expressible_through_the_schema() {
         // The schema and `MessageTarget` are hand-written in two places and
         // they drifted: `Agent` — the ONLY shape that crosses hosts — was
@@ -1882,5 +2584,65 @@ mod tests {
     fn find_returns_none_for_unknown_tool() {
         assert!(find("flock_pane_close").is_none());
         assert!(find("agent.list").is_none());
+    }
+}
+
+#[cfg(test)]
+mod restart_tests {
+    use super::*;
+    #[test]
+    fn restart_mcp_builds_only_the_scheduled_restart_verb() {
+        let Method::AgentRestart(params) =
+            build_agent_restart(json!({"reason": "reload config"})).unwrap()
+        else {
+            panic!("wrong method")
+        };
+        assert_eq!(params.target, "self");
+        assert_eq!(params.when, "after_turn");
+        assert!(params.continue_with.is_none());
+        for args in [
+            json!({"reason": ""}),
+            json!({"reason":"reload", "target":"another-agent"}),
+            json!({"reason":"reload", "when":"now"}),
+            json!({"reason":"reload", "text":"/exit"}),
+            json!({"reason":"reload", "continue_with":"/exit"}),
+            json!({"reason":"reload", "continue_with":"one\ntwo"}),
+        ] {
+            assert!(build_agent_restart(args).is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod structured_tests {
+    use super::*;
+    #[test]
+    fn structured_start_selectors_and_stop_are_narrowed() {
+        let args = json!({"runtime":"structured","agent":"claude","model":"small",
+        "prompt":"review the change", "name":"reviewer",
+        "location":{"kind":"workspace_id","workspace_id":"ws_fixture"},
+        "argv":["untrusted-binary"],"credential":"untrusted"});
+        let Method::AgentSpawn(p) = build_agent_start(args.clone()).unwrap() else {
+            panic!("narrowed spawn required")
+        };
+        assert_eq!(p.runtime, crate::api::schema::AgentRuntime::Structured);
+        assert_eq!(p.model.as_deref(), Some("small"));
+        let wire = serde_json::to_value(p).unwrap();
+        assert!(wire.get("argv").is_none() && wire.get("credential").is_none());
+        for bad in [json!(null), json!(false), json!("future")] {
+            let mut bad_args = args.clone();
+            bad_args["runtime"] = bad;
+            assert!(build_agent_start(bad_args).is_err());
+        }
+        let stop = find("flock_agent_stop").unwrap();
+        assert!(matches!(
+            (stop.build)(json!({"target":"reviewer"})).unwrap(),
+            Method::AgentStop(_)
+        ));
+        assert!((stop.build)(json!({})).is_err());
+        assert_eq!(
+            schema_agent_start()["properties"]["runtime"]["enum"],
+            json!(["pty", "structured"])
+        );
     }
 }

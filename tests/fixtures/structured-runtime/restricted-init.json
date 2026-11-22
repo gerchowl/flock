@@ -1,0 +1,23 @@
+{
+  "type": "system",
+  "subtype": "init",
+  "model": "claude-haiku-5-5",
+  "claude_code_version": "2.1.296",
+  "tools": [
+    "Bash",
+    "Read",
+    "AskUserQuestion"
+  ],
+  "permissionMode": "default",
+  "capabilities": [
+    "interrupt_cancel_queued_v1",
+    "interrupt_send_now_v1"
+  ],
+  "session_id": "session-example",
+  "uuid": "event-example",
+  "mcp_servers": [],
+  "skills": [],
+  "slash_commands": [
+    "fixture-command"
+  ]
+}

@@ -168,6 +168,57 @@ class FreeTextTests(unittest.TestCase):
     def test_a_user_at_host_destination_is_caught(self) -> None:
         self.assertEqual([f[1] for f in self._findings("operator@undeclared-box\n")], ["undeclared-box"])
 
+    def test_package_specs_are_exempt_in_package_context(self) -> None:
+        # Dependabot release notes (#2848): the real shape is `<code>tool@latest</code>`.
+        for text in (
+            "<p>Update <code>vacuum@latest</code> to 0.35.4.</p>\n",
+            "Update `uv@latest` to 0.13.6\n",
+            "pin `tool@v1.2.3` and `tool@1.0.0-rc.1+build.5`\n",
+            "run npx tool@latest --help\n",
+            "run uvx tool@1.2.3\n",
+            "go install example.invalid/cmd/tool@latest\n",
+        ):
+            self.assertEqual(self._findings(text), [], text)
+
+    def test_real_hosts_are_still_caught(self) -> None:
+        for text, expected in (
+            ("ssh root@10.0.0.5\n", "10.0.0.5"),
+            ("ssh root@192.168.1.20\n", "192.168.1.20"),
+            ("ssh `root@10.0.0.5`\n", "10.0.0.5"),
+            ("ssh user@2001:db8::1\n", "2001"),
+            ("ssh deploy@1host\n", "1host"),
+            ("ssh u@5090box\n", "5090box"),
+            ("ssh u@4cores\n", "4cores"),
+            ("ssh u@2fast\n", "2fast"),
+            ("ssh user@v2host\n", "v2host"),
+            ("ssh u@v6-node\n", "v6-node"),
+            ("ssh alice@main\n", "main"),
+            ("ssh ci@master\n", "master"),
+            ("ssh me@stable\n", "stable"),
+            ("ssh ops@beta\n", "beta"),
+            ("ssh ops@alpha\n", "alpha"),
+            ("ssh ops@next\n", "next"),
+            ("ssh ops@canary\n", "canary"),
+            ("ssh lars@rc12\n", "rc12"),
+            ("ssh alice@buildhost\n", "buildhost"),
+            ("ssh `alice@buildhost`\n", "buildhost"),
+            ("`ops@next` and `ops@canary`\n", "next"),
+            ("`deploy@10.0.0.5.6`\n", "10.0.0.5.6"),
+        ):
+            self.assertIn(expected, [f[1] for f in self._findings(text)], text)
+
+    def test_specs_outside_package_context_are_judged(self) -> None:
+        self.assertEqual([f[1] for f in self._findings("ssh ops@latest\n")], ["latest"])
+        self.assertEqual([f[1] for f in self._findings("ssh ops@1.2.3\n")], ["1.2.3"])
+
+    def test_a_dependabot_style_body_has_no_findings(self) -> None:
+        names = [f"tool{i}" for i in range(43)]
+        body = "<ul>\n" + "\n".join(
+            f"<li><p>Update <code>{n}@latest</code> to 0.{i}.1.</p></li>"
+            for i, n in enumerate(names)
+        ) + "\n</ul>\n"
+        self.assertEqual(self._findings(body), [])
+
     def test_a_tailnet_fqdn_is_caught(self) -> None:
         findings = self._findings("undeclared-box.tail1234.ts.net is unreachable\n")
         self.assertIn("undeclared-box.tail1234.ts.net", {f[1] for f in findings})

@@ -74,9 +74,32 @@ pub struct WorktreeKillAllResult {
     pub force_recovered: Vec<String>,
 }
 
+/// One successful PR-poll round: the per-workspace badges, plus each PR it saw
+/// for the `pr.*` events (#1020).
+#[derive(Debug, Default)]
+pub struct PrPollRound {
+    pub states: Vec<(String, Option<crate::worktree::PrStateInfo>)>,
+    pub observed: Vec<crate::pr_poll::PrObservation>,
+    /// The `pr.*` events already logged, read by the worker while the ledger
+    /// is unseeded (the first round after a start).
+    pub seed: Option<Vec<crate::api::schema::EventEnvelope>>,
+}
+
 /// An event from a background task to the main loop.
 #[derive(Debug)]
 pub enum AppEvent {
+    PasteConfirm {
+        paste: crate::app::paste_confirm::Paste,
+        respond_to: std::sync::mpsc::Sender<String>,
+    },
+    /// Complete an explicit agent submission after its paste settling gap.
+    AgentSubmit {
+        request_id: String,
+        pane_id: String,
+        // Keep the revocable submission context off the event enum stack.
+        attempt: Box<crate::app::guarded_submit::Attempt>,
+        respond_to: std::sync::mpsc::Sender<String>,
+    },
     /// A pane's child process exited.
     PaneDied {
         pane_id: PaneId,
@@ -86,11 +109,20 @@ pub enum AppEvent {
         pane_id: PaneId,
         agent: Option<Agent>,
         state: AgentState,
-        /// Free-text activity from the agent's status line while Working.
+        /// Live status text from working chrome or a provider-wait caption.
         activity: Option<String>,
+        provider_limit: Option<crate::detect::provider_limit::ProviderLimit>,
         visible_blocker: bool,
         visible_idle: bool,
         visible_working: bool,
+        /// A Claude turn ended with background shells still running (#922).
+        settled_with_background_shells: bool,
+        /// Background tasks the screen counts (#1022), `None` when it cannot.
+        background_tasks: Option<u32>,
+        /// What a `Blocked` screen asks of a human (#1023), when it can say.
+        needs_human: Option<crate::api::agent_state::HumanReason>,
+        /// The question that screen draws (#1038), when it can be read.
+        question: Option<crate::api::question::QuestionForm>,
         process_exited: bool,
         observed_at: Instant,
     },
@@ -106,12 +138,7 @@ pub enum AppEvent {
     /// (no token, transport down, GraphQL error) and must not be confused with
     /// a successful round that simply found no PRs — the first means the data
     /// is stale, the second means it is accurate and empty.
-    PrStatesUpdated(
-        Result<
-            Vec<(String, Option<crate::worktree::PrStateInfo>)>,
-            crate::pr_poll::PrPollErrorKind,
-        >,
-    ),
+    PrStatesUpdated(Result<PrPollRound, crate::pr_poll::PrPollErrorKind>),
     /// The issue-drop repository directory finished enumerating (#371).
     ///
     /// Carries the ranked list or the classified failure. A failure is not
@@ -124,15 +151,6 @@ pub enum AppEvent {
     PeerPollDue,
     /// Background SSH result: one peer's federated summary (or error).
     PeerSummaryFetched(crate::peers::PeerSummaryFetch),
-    /// #410: a message the spoke `spoke` handed up its relay, for this hub's
-    /// main loop to deliver. In-process on purpose: the only producer is the
-    /// relay reader for the edge this hub dialled, so no socket caller can
-    /// present itself as a spoke's vouched-for frame.
-    UplinkForwarded {
-        spoke: String,
-        message: crate::api::schema::MsgSendParams,
-        respond_to: std::sync::mpsc::Sender<String>,
-    },
     /// Cross-machine checkout (#125), read-only probe (`push=false`): the peer
     /// reported its branch's working-tree / push state, feeding the confirm
     /// dialog before any mutation. `generation` discards a stale leg whose
@@ -215,13 +233,15 @@ pub enum AppEvent {
     },
     /// Agent session identity was reported without state authority.
     AgentSessionReported {
+        /// Unvalidated primary rollout path, never a resume ID or authority.
+        transcript_path: Option<String>,
         pane_id: PaneId,
         source: String,
         agent_label: String,
         seq: Option<u64>,
         session_ref: Option<crate::agent_resume::AgentSessionRef>,
-        /// Normalized Claude Code `SessionStart` source field
-        /// (`startup`/`resume`/`clear`/`compact`). `startup` reports are
+        /// Normalized harness `SessionStart` source field (Codex also accepts
+        /// `fork`). A report alone grants no lifecycle authority. `startup` reports are
         /// treated as nested session noise and never replace an existing
         /// restored session id; the other values are real identity changes.
         session_start_source: Option<String>,
@@ -277,11 +297,14 @@ pub enum AppEvent {
     /// Background `git worktree remove` completed.
     WorktreeRemoveFinished(WorktreeRemoveResult),
     WorktreeKillGateFinished(WorktreeKillGateResult),
-    /// A mute's deferral to a sender on another host finished its hop
-    /// (ADR-0018 §3). The hop runs off the event loop: it is an ssh to the
-    /// sender's server, which may be the very server still waiting on THIS
-    /// one to answer the relayed send that triggered it.
-    MsgDeferralRelayed(MsgDeferralRelay),
+    /// The settings screen's "install recommended integrations" finished on
+    /// a worker thread: one line per target.
+    IntegrationsInstalled(Vec<String>),
+    /// A bounded collection job finished outside the app loop.
+    MeshRoutesCompleted(Box<crate::app::MeshRoutesCompletion>),
+    MeshStoreRecovered(Result<Vec<crate::app::RecoveredMessage>, String>),
+    MeshCollected(Box<crate::mesh::collect::Completion>),
+    MsgRelayCompleted(Box<crate::app::message_relay::RelayCompletion>),
     WorktreeBranchDeleteFinished(WorktreeBranchDeleteResult),
     WorktreeKillAllFinished(WorktreeKillAllResult),
     /// One script check completed on a runner-spawned worker thread
@@ -291,26 +314,7 @@ pub enum AppEvent {
         name: String,
         outcome: crate::checks::Outcome,
         duration_ms: u64,
+        /// Capture diagnostics travel with completion, independently of exit classification.
+        capture_notes: crate::checks::script::CaptureNotes,
     },
-}
-
-/// Outcome of one cross-host deferral (ADR-0018 §3), carrying everything the
-/// App needs to record it — or to withdraw its claim so a later mute retries.
-#[derive(Debug, Clone)]
-pub struct MsgDeferralRelay {
-    /// The deferred message.
-    pub correlation_id: String,
-    pub deferral_correlation_id: String,
-    /// The muted recipient's pane.
-    pub pane: String,
-    pub muted_until_ms: u64,
-    pub reason: Option<String>,
-    /// The muted recipient's identity — the deferral's sender.
-    pub from_agent: String,
-    /// The original sender — the deferral's recipient.
-    pub to_agent: String,
-    pub to_host: String,
-    /// `[[peers]]` entry the hop went through.
-    pub route: String,
-    pub result: Result<(), String>,
 }

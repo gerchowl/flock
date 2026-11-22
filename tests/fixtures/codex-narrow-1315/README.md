@@ -1,0 +1,7 @@
+# Narrow Codex composer replay (#1315)
+
+The issue reported a 15-column idle composer with `› Ask Codex to`, `GPT-6.1-Sol …`, and `? for shortcu`. The scripted native harness in `tests/delegate_codex/narrow_1315.rs` replays those controls in an isolated real Flock PTY. These recent text/ANSI reads were captured at 31 rows by 15 columns with `flk pane read --source recent --format text` and `--format ansi`. No model or operator profile was used.
+
+The invariant controls are the live prompt AND the recognizable shortcut prefix clipped exactly at the native right edge, with no output below it. Clipped controls alone never prove an empty editor: the known styled hint must be present, or known injection text must be verified for readback. A model-shaped row is only a candidate boundary: the editable region before it must contain only the known faint hint, or match the injection text already being verified. A normal-weight model-shaped draft is never evidence of an empty editor. Working and dialog controls veto submission. The banner and `Fhi15` paint marker are incidental and never authorize input.
+
+The fake harness handles native resize notifications through a pipe and redraws on its event loop. The marker includes the native width, so the fixture waits for the actual 15-column frame rather than racing a client resize. The wait has a bounded failure ceiling. CRLF in the raw ANSI capture is intentional.

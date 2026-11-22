@@ -26,8 +26,6 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
-
 use crate::app::App;
 use crate::detect::{Agent, AgentState};
 
@@ -67,10 +65,10 @@ struct PaneWake {
 }
 
 struct InFlight {
-    typed_at: Instant,
     /// When the Enter is due; `None` once it was sent or abandoned.
     submit_at: Option<Instant>,
     count: usize,
+    attempt: Option<super::guarded_submit::Attempt>,
 }
 
 /// Test-only: mark `pane` as having a typed sentence whose Enter has not gone
@@ -81,9 +79,9 @@ struct InFlight {
 pub(crate) fn test_arm_in_flight(tracker: &mut IdleWakeTracker, pane: &str) {
     let entry = tracker.panes.entry(pane.to_string()).or_default();
     entry.in_flight = Some(InFlight {
-        typed_at: Instant::now(),
         submit_at: Some(Instant::now() + Duration::from_secs(30)),
         count: 1,
+        attempt: None,
     });
 }
 
@@ -100,9 +98,12 @@ impl IdleWakeTracker {
     /// two submissions the pane's reader cannot tell apart, and they go in as
     /// one line. One of them has to wait.
     pub(crate) fn in_flight(&self, pane: &str) -> bool {
-        self.panes
-            .get(pane)
-            .is_some_and(|entry| entry.in_flight.is_some())
+        self.panes.get(pane).is_some_and(|entry| {
+            entry
+                .in_flight
+                .as_ref()
+                .is_some_and(|flight| flight.submit_at.is_some())
+        })
     }
 
     fn note_deadline(&mut self, at: Instant) {
@@ -133,18 +134,66 @@ impl App {
         }
     }
 
-    /// The agent read its inbox: whatever was in flight has landed. A wake
-    /// whose Enter was still pending is dropped here, and that is logged like
-    /// every other withheld Enter — its sentence is still in the prompt.
+    /// An inbox read stops the in-flight wake. It proves the mail was read,
+    /// but cannot prove that an outstanding paste reached the composer.
     pub(crate) fn idle_wake_on_read(&mut self, pane: &str) {
-        let pending_enter = self
+        let flight = self
             .idle_wake
             .panes
             .remove(pane)
-            .and_then(|entry| entry.in_flight)
-            .is_some_and(|flight| flight.submit_at.is_some());
-        if pending_enter {
-            crate::logging::idle_wake_abandoned(pane, "inbox_read");
+            .and_then(|entry| entry.in_flight);
+        let pending_attempt = flight
+            .as_ref()
+            .and_then(|flight| flight.attempt.as_ref())
+            .filter(|attempt| attempt.evidence.submit_sent_at_ms.is_none())
+            .map(|attempt| attempt.evidence.attempt_id.clone());
+        if let Some(mut attempt) = flight.and_then(|flight| flight.attempt) {
+            // A draft still mid-restore goes to the stash (#850).
+            let disposition = self.release_guarded_attempt(pane, &mut attempt);
+            self.surface_kept_drafts();
+            if attempt.evidence.submit_sent_at_ms.is_some() {
+                attempt.evidence.state = "read".into();
+                attempt.evidence.reason = Some("inbox_read".into());
+                attempt.evidence.finished_at_ms = Some(super::api::messages::now_ms());
+                self.record_delivery_attempt(&attempt.evidence);
+            } else {
+                let outcome = attempt.outcome_after_release(
+                    super::guarded_submit::Outcome::Abandoned("inbox_read"),
+                    disposition,
+                );
+                self.finish_delivery_attempt(&mut attempt, &outcome);
+                crate::logging::idle_wake_abandoned(pane, "inbox_read");
+            }
+        }
+        for mut attempt in self.delivery_attempts() {
+            if attempt.wake
+                && attempt.pane == pane
+                && attempt.state == "unconfirmed"
+                && pending_attempt.as_deref() != Some(&attempt.attempt_id)
+            {
+                attempt.state = "read".into();
+                attempt.reason = Some("inbox_read".into());
+                attempt.finished_at_ms = Some(super::api::messages::now_ms());
+                self.record_delivery_attempt(&attempt);
+            }
+        }
+    }
+
+    fn abandon_idle_wake(&mut self, pane: &str, reason: &'static str) {
+        let attempt = self
+            .idle_wake
+            .panes
+            .get_mut(pane)
+            .and_then(|entry| entry.in_flight.take())
+            .and_then(|flight| flight.attempt);
+        if let Some(mut attempt) = attempt {
+            self.conclude_guarded_attempt(
+                pane,
+                &mut attempt,
+                &super::guarded_submit::Outcome::Abandoned(reason),
+            );
+            crate::logging::idle_wake_abandoned(pane, reason);
+            self.surface_kept_drafts();
         }
     }
 
@@ -153,6 +202,10 @@ impl App {
     /// wake typed on an earlier tick. Mirrored in both loops (#25).
     pub(crate) fn tick_idle_wakes(&mut self, now: Instant) {
         if !self.state.config.msg.idle_wake {
+            let panes: Vec<_> = self.idle_wake.panes.keys().cloned().collect();
+            for pane in panes {
+                self.abandon_idle_wake(&pane, "idle_wake_disabled");
+            }
             self.idle_wake = IdleWakeTracker::default();
             return;
         }
@@ -169,9 +222,21 @@ impl App {
         if candidates.is_empty() && self.idle_wake.panes.is_empty() {
             return;
         }
-        self.idle_wake
+        let removed: Vec<_> = self
+            .idle_wake
             .panes
-            .retain(|pane, _| candidates.iter().any(|candidate| candidate == pane));
+            .keys()
+            .filter(|pane| !candidates.contains(pane))
+            .cloned()
+            .collect();
+        for pane in removed {
+            self.abandon_idle_wake(&pane, "inbox_unavailable");
+            // Detection can be unknown briefly after restart. Keep the durable
+            // announcement while mail waits, so rediscovery cannot replay keys.
+            if self.mailboxes.queued_len(&pane) == 0 {
+                self.idle_wake.panes.remove(&pane);
+            }
+        }
         for pane in candidates {
             let ids = self.mailboxes.wakeable_ids(&pane);
             self.evaluate_idle_wake(&pane, &ids, now);
@@ -240,7 +305,7 @@ impl App {
                 self.idle_wake.note_deadline(submit_at);
                 return Decision::Suppressed("submit_pending");
             }
-            return self.submit_idle_wake(pane, ws_idx, pane_id, now);
+            return self.submit_idle_wake(pane, now);
         }
         if self
             .idle_wake
@@ -256,8 +321,17 @@ impl App {
             }
             // It left Idle — the wake (or something else) took. Messages it
             // was told about stay announced; only new ones can wake it again.
-            if let Some(entry) = self.idle_wake.panes.get_mut(pane) {
-                entry.in_flight = None;
+            let flight = self
+                .idle_wake
+                .panes
+                .get_mut(pane)
+                .and_then(|entry| entry.in_flight.take());
+            if let Some(mut attempt) = flight.and_then(|flight| flight.attempt) {
+                self.conclude_guarded_attempt(
+                    pane,
+                    &mut attempt,
+                    &super::guarded_submit::Outcome::Abandoned("turn_started_before_enter"),
+                );
             }
         }
 
@@ -310,6 +384,9 @@ impl App {
         if !has_inbox_tool(agent) {
             return Decision::Suppressed("no_inbox_tool");
         }
+        if terminal.restart_in_progress {
+            return Decision::Suppressed("restart_pending");
+        }
         if let Some(blocker) = terminal.idle_wake_blocker(now, settle, fresh) {
             if blocker == "not_settled" {
                 if let Some(settles_at) = terminal.state_settles_at(settle) {
@@ -333,20 +410,27 @@ impl App {
         // is still in the box, and the Enter would submit it together with
         // the sentence. Read off the screen here, at the keystroke, never on
         // the tick.
-        match agent
-            .and_then(|agent| crate::detect::agent_prompt_is_empty(agent, &runtime.visible_text()))
-        {
+        // With the injection lock a one-row draft moves aside for the wake
+        // and comes back after it (#850); the guarded submit decides.
+        let stash = self.injection_lock_enabled();
+        match agent.and_then(|agent| {
+            crate::detect::agent_prompt_is_empty(agent, &runtime.detection_text_and_unfaint().1)
+        }) {
             Some(true) => {}
+            Some(false) if stash => {}
             Some(false) => return Decision::Suppressed("prompt_not_empty"),
             None => return Decision::Suppressed("no_prompt_box"),
         }
 
         let count = self.mailboxes.queued_len(pane);
         let text = idle_wake_text(count);
-        let bytes = super::api_helpers::encode_api_text(runtime, &text);
-        if runtime.try_send_flock_authored(Bytes::from(bytes)).is_err() {
-            return Decision::Suppressed("write_failed");
-        }
+        let attempt =
+            match self.begin_guarded_injection(pane, &text, None, Duration::ZERO, now, true, stash)
+            {
+                Ok(attempt) => attempt,
+                Err("input_not_empty") => return Decision::Suppressed("prompt_not_empty"),
+                Err(reason) => return Decision::Suppressed(reason),
+            };
 
         // The Enter is its own write, after the pane's reader has come back
         // round — the #362 lesson: text and a carriage return in one read are
@@ -356,9 +440,9 @@ impl App {
         let entry = self.idle_wake.panes.entry(pane.to_string()).or_default();
         entry.announced.extend(wakeable_ids.iter().cloned());
         entry.in_flight = Some(InFlight {
-            typed_at: now,
             submit_at: Some(submit_at),
             count,
+            attempt: Some(attempt),
         });
         Decision::Typed
     }
@@ -373,66 +457,37 @@ impl App {
     /// Flock does NOT try to erase an abandoned sentence. It knows what it
     /// wrote, but not what the agent made of it — a TUI may collapse a paste
     /// into a single chip — so a counted run of backspaces could eat into
-    /// whatever sits before it. The wake also stays in flight after an
-    /// abandon, which fails safe: nothing more is typed into that pane until
-    /// its agent leaves `Idle` or reads its inbox, and even then the
-    /// empty-prompt gate refuses to type next to a sentence still sitting
-    /// there.
-    fn submit_idle_wake(
-        &mut self,
-        pane: &str,
-        ws_idx: usize,
-        pane_id: crate::layout::PaneId,
-        now: Instant,
-    ) -> Decision {
-        let typed_at = self
+    /// whatever sits before it. A finished attempt releases its reservation;
+    /// the empty-prompt gate still refuses to type beside a stranded sentence.
+    fn submit_idle_wake(&mut self, pane: &str, now: Instant) -> Decision {
+        let Some(mut attempt) = self
             .idle_wake
             .panes
-            .get(pane)
-            .and_then(|entry| entry.in_flight.as_ref())
-            .map_or(now, |flight| flight.typed_at);
-        let abandon = |app: &mut App, reason: &'static str| {
-            if let Some(flight) = app
-                .idle_wake
-                .panes
-                .get_mut(pane)
-                .and_then(|entry| entry.in_flight.as_mut())
-            {
-                flight.submit_at = None;
-            }
-            Decision::Abandoned(reason)
-        };
-
-        if let Some(suppression) = self.wake_suppression(pane, super::api::messages::now_ms()) {
-            return abandon(self, suppression.reason);
-        }
-        // The full freshness check, not just `state == Idle`: a screen that
-        // went stale or unreadable inside the gap is not evidence either. The
-        // settle is already proven, so it is not asked again.
-        let fresh = Duration::from_millis(self.state.config.msg.idle_wake_fresh_ms);
-        let blocker = match self.terminal_for_pane(ws_idx, pane_id) {
-            Some(terminal) => terminal.idle_wake_blocker(now, Duration::ZERO, fresh),
-            None => Some("pane_gone"),
-        };
-        if let Some(blocker) = blocker {
-            return abandon(self, blocker);
-        }
-        let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
-            return abandon(self, "pane_gone");
-        };
-        if runtime
-            .last_operator_input_at()
-            .is_some_and(|input| input >= typed_at)
-        {
-            return abandon(self, "operator_active");
-        }
-        let Ok(mut keys) = super::api_helpers::encode_api_keys(runtime, &["Enter".to_string()])
+            .get_mut(pane)
+            .and_then(|entry| entry.in_flight.as_mut())
+            .and_then(|flight| flight.attempt.take())
         else {
-            return abandon(self, "write_failed");
+            return Decision::Abandoned("missing_attempt");
         };
-        let enter = keys.pop().unwrap_or_else(|| b"\r".to_vec());
-        if runtime.try_send_flock_authored(Bytes::from(enter)).is_err() {
-            return abandon(self, "write_failed");
+        let before = (attempt.sent, attempt.retried);
+        let outcome = if let Some(suppression) =
+            self.wake_suppression(pane, super::api::messages::now_ms())
+        {
+            Some(self.conclude_guarded_attempt(
+                pane,
+                &mut attempt,
+                &super::guarded_submit::Outcome::Abandoned(suppression.reason),
+            ))
+        } else {
+            self.advance_guarded_submit(pane, &mut attempt, now)
+        };
+        if outcome.is_some() {
+            self.surface_kept_drafts();
+        }
+        let enter_sent = before != (attempt.sent, attempt.retried);
+        let next = now + Duration::from_millis(50);
+        if outcome.is_none() {
+            self.idle_wake.note_deadline(next);
         }
         if let Some(flight) = self
             .idle_wake
@@ -440,9 +495,31 @@ impl App {
             .get_mut(pane)
             .and_then(|entry| entry.in_flight.as_mut())
         {
-            flight.submit_at = None;
+            flight.submit_at = outcome.is_none().then_some(next);
+            flight.attempt = outcome.is_none().then_some(attempt);
         }
-        Decision::Submitted
+        match outcome {
+            None if enter_sent => Decision::Submitted,
+            None => Decision::Suppressed("confirm_pending"),
+            Some(
+                super::guarded_submit::Outcome::Accepted
+                | super::guarded_submit::Outcome::ObservedAccepted,
+            ) => {
+                if let Some(entry) = self.idle_wake.panes.get_mut(pane) {
+                    entry.in_flight = None;
+                }
+                Decision::Suppressed("accepted")
+            }
+            Some(
+                super::guarded_submit::Outcome::Abandoned(reason)
+                | super::guarded_submit::Outcome::Unconfirmed(reason),
+            ) => {
+                if let Some(entry) = self.idle_wake.panes.get_mut(pane) {
+                    entry.in_flight = None;
+                }
+                Decision::Abandoned(reason)
+            }
+        }
     }
 
     /// `pub(crate)` rather than private because `app::self_compact` walks the
@@ -455,6 +532,59 @@ impl App {
     ) -> Option<&crate::terminal::TerminalState> {
         let terminal_id = self.state.terminal_id_for_pane(ws_idx, pane_id)?;
         self.state.terminals.get(&terminal_id)
+    }
+}
+
+impl App {
+    pub(crate) fn restore_delivery_attempts(&mut self) {
+        let mut events = std::collections::BTreeMap::new();
+        for (seq, _, event) in self.event_hub.persisted_events_after(0) {
+            events.insert(seq, event);
+        }
+        events.extend(self.event_hub.ring_snapshot_after(0));
+        let mut restored = std::collections::BTreeMap::new();
+        for event in events.into_values() {
+            if let crate::api::schema::EventData::DeliveryAttemptUpdated { attempt } = event.data {
+                restored.insert(attempt.attempt_id.clone(), attempt);
+            }
+        }
+        if self.node_id.is_some() {
+            if let Ok(Some(stored)) = crate::mesh::runtime_store::read(|store| {
+                store.delivery_attempts().map_err(|e| e.to_string())
+            }) {
+                for attempt in stored {
+                    let current = restored
+                        .entry(attempt.attempt_id.clone())
+                        .or_insert_with(|| attempt.clone());
+                    // With two unfinished copies, retain the store's previous precedence.
+                    if attempt.finished_at_ms > current.finished_at_ms
+                        || (attempt.finished_at_ms.is_none() && current.finished_at_ms.is_none())
+                    {
+                        *current = attempt;
+                    }
+                }
+            }
+        }
+        self.delivery_attempt_registry.borrow_mut().clear();
+        for attempt in restored.into_values() {
+            if attempt.wake {
+                self.idle_wake
+                    .panes
+                    .entry(attempt.pane.clone())
+                    .or_default()
+                    .announced
+                    .extend(attempt.correlation_ids.iter().cloned());
+            }
+            self.delivery_attempt_registry.borrow_mut().record(attempt);
+        }
+        for mut attempt in self.delivery_attempts() {
+            if attempt.finished_at_ms.is_none() {
+                attempt.state = "unconfirmed".into();
+                attempt.reason = Some("server_restarted".into());
+                attempt.finished_at_ms = Some(super::api::messages::now_ms());
+                self.record_delivery_attempt(&attempt);
+            }
+        }
     }
 }
 

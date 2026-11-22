@@ -626,13 +626,17 @@ impl App {
         let workspace_id = ws.id.clone();
         let event_tx = self.event_tx.clone();
         let protected_branches = self.state.config.worktrees.protected_branches.clone();
+        let integration_branches = self.state.config.worktrees.integration_branches.clone();
+        let merge_gate = self.runtime_config.merge_gate.clone();
         std::thread::spawn(move || {
             // One resolver for branch + merge gate + #121 protection, shared
             // with the sweep, `worktree.kill` and `worktree.list --scan`.
             let (verdict, timed_out) = crate::worktree::resolve_kill_verdict_with_timeout(
+                &merge_gate,
                 repo_root.clone(),
                 checkout.clone(),
                 &protected_branches,
+                &integration_branches,
             );
             // #325: what the kill would destroy, collected on the same worker
             // that resolved the gate — the dialog holds its confirm until both
@@ -756,6 +760,9 @@ impl App {
                 working_agent,
                 dirty,
                 merged: false,
+                // Settled when the row's gate lands; Enter waits for every
+                // gate (`resolving`), so this value is never executed.
+                live: false,
             });
             rows.push(WorktreeKillRow {
                 workspace_id: ws.id.clone(),
@@ -789,11 +796,15 @@ impl App {
             let checkout = row.checkout.clone();
             let event_tx = self.event_tx.clone();
             let protected_branches = self.state.config.worktrees.protected_branches.clone();
+            let integration_branches = self.state.config.worktrees.integration_branches.clone();
+            let merge_gate = self.runtime_config.merge_gate.clone();
             std::thread::spawn(move || {
                 let (verdict, timed_out) = crate::worktree::resolve_kill_verdict_with_timeout(
+                    &merge_gate,
                     repo_root.clone(),
                     checkout.clone(),
                     &protected_branches,
+                    &integration_branches,
                 );
                 let _ = event_tx.blocking_send(AppEvent::WorktreeKillGateFinished(
                     crate::events::WorktreeKillGateResult {
@@ -843,6 +854,10 @@ impl App {
             result.gate,
             crate::worktree::WorktreeMergeGate::Merged { .. }
         ) && !result.protected;
+        // #1278: an open PR, a PR question gh could not answer, or a gate that
+        // ran out of clock all leave "under review" possible, so the sweep
+        // must not touch the row at all, forced or not.
+        let live = result.gate.is_live() || result.timed_out;
         row.branch = result.branch;
         row.protected = result.protected;
         row.merge_gate = Some(result.gate);
@@ -851,6 +866,7 @@ impl App {
             working_agent: row.working_agent,
             dirty: row.dirty,
             merged,
+            live,
         });
         self.render_dirty.store(true, Ordering::Release);
         self.render_notify.notify_one();
@@ -1089,6 +1105,9 @@ impl App {
             .collect();
         self.state.worktree_kill_all = None;
         if !indices.is_empty() {
+            for &ws in &indices {
+                self.remove_workspace_agents(ws);
+            }
             self.state.close_workspace_indices(indices);
         }
         self.state.mode = if self.state.active.is_some() {
@@ -1149,7 +1168,7 @@ impl App {
         let list = match crate::worktree::list_existing_worktrees(&space.repo_root) {
             Ok(list) => list,
             Err(err) => {
-                self.state.config_diagnostic = Some(err);
+                self.state.config_diagnostic = Some(err.into());
                 return;
             }
         };
@@ -1552,12 +1571,8 @@ impl App {
         create.creating = true;
         create.error = None;
 
-        let command = crate::worktree::build_worktree_add_new_branch_command(
-            &create.source_checkout_path,
-            &create.checkout_path,
-            &create.branch,
-            &create.base,
-        );
+        let source_checkout_path = create.source_checkout_path.clone();
+        let branch = create.branch.clone();
         let parent_dir = create
             .checkout_path
             .parent()
@@ -1571,15 +1586,27 @@ impl App {
         let base = create.base.clone();
         let event_tx = self.event_tx.clone();
         std::thread::spawn(move || {
+            // Off the UI thread: the base is refreshed from its remote first,
+            // the same as `delegate start` and `worktree create` (#938).
+            let fresh = crate::worktree::resolve_fresh_base(&source_checkout_path, &base);
+            if let Some(note) = &fresh.note {
+                crate::logging::worktree_base_note(&base, note);
+            }
+            let command = crate::worktree::build_worktree_add_new_branch_command(
+                &source_checkout_path,
+                &path,
+                &branch,
+                &fresh.base,
+            );
             let result = if let Some(parent_dir) = parent_dir {
                 std::fs::create_dir_all(&parent_dir)
-                    .map_err(|err| err.to_string())
+                    .map_err(crate::process::CommandFailure::from)
                     .and_then(|()| crate::worktree::run_worktree_command(&command))
             } else {
                 crate::worktree::run_worktree_command(&command)
             };
-            let result =
-                result.map_err(|err| crate::worktree::explain_worktree_add_failure(&base, &err));
+            let result = result
+                .map_err(|err| crate::worktree::explain_worktree_add_failure(&base, &err).into());
             let _ = event_tx.blocking_send(AppEvent::WorktreeAddFinished(WorktreeAddResult {
                 path,
                 result,
@@ -1702,6 +1729,7 @@ impl App {
 
         let command =
             crate::worktree::build_worktree_remove_command(&remove.repo_root, &remove.path, force);
+        let repo_root = remove.repo_root.clone();
         crate::logging::worktree_remove_started(
             &remove.workspace_id.to_string(),
             &remove.path.display().to_string(),
@@ -1719,7 +1747,10 @@ impl App {
                 &path,
                 &crate::worktree::processes::protected_pids(None),
             );
-            let result = crate::worktree::run_worktree_command(&command);
+            let result = crate::worktree::check_worktree_remove(&repo_root, &path)
+                .map_err(|error| crate::process::CommandFailure::from(error.to_string()))
+                .and_then(|()| crate::worktree::run_worktree_command(&command))
+                .map_err(Into::into);
             let _ =
                 event_tx.blocking_send(AppEvent::WorktreeRemoveFinished(WorktreeRemoveResult {
                     workspace_id,
@@ -1797,6 +1828,7 @@ impl App {
                     spawn_env
                         .map_err(|unresolved| unresolved.message())
                         .and_then(|vars| {
+                            self.pretrust_claude_worktree(&plan.argv, &path, &vars);
                             let _spawn_env_guard = crate::integration::set_pending_spawn_env(vars);
                             self.spawn_agent_workspace(path.clone(), rows, cols, &plan.argv, true)
                                 .map(|(ws_idx, _, pane_id)| {
@@ -1956,18 +1988,7 @@ impl App {
                     .state
                     .worktree_remove
                     .as_ref()
-                    .filter(|remove| {
-                        // #325: force stands in for merge evidence. It cannot
-                        // reach a protected branch — `branch_protected` clears
-                        // `delete_branch` when the gate resolves (#121), and
-                        // that is checked first here.
-                        remove.delete_branch
-                            && (remove.force
-                                || matches!(
-                                    remove.merge_gate,
-                                    Some(crate::worktree::WorktreeMergeGate::Merged { .. })
-                                ))
-                    })
+                    .filter(|remove| remove.deletes_branch())
                     .and_then(|remove| {
                         remove
                             .branch
@@ -2004,6 +2025,7 @@ impl App {
                                 .git_space()
                                 .is_some_and(|space| space.repo_root == result.path));
                     if still_same_linked_worktree {
+                        self.remove_workspace_agents(ws_idx);
                         self.state.close_workspace(ws_idx);
                     }
                 }
@@ -2106,12 +2128,19 @@ mod tests {
     }
 
     fn app_for_worktree_tests() -> App {
-        App::new(
+        App::new_with_runtime_config(
             &crate::config::Config::default(),
             true,
             None,
             tokio::sync::mpsc::unbounded_channel().1,
             crate::api::EventHub::default(),
+            crate::app::AppRuntimeConfig {
+                structured_mcp: None,
+                uid_policy: Default::default(),
+                merge_gate: crate::worktree::MergeGateContext {
+                    gh_program: crate::test_support::unique_temp_path("missing-gh"),
+                },
+            },
         )
     }
 
@@ -2595,6 +2624,86 @@ mod tests {
         crate::worktree::run_worktree_command(&remove).unwrap();
         let _ = std::fs::remove_dir_all(worktree_root);
         let _ = std::fs::remove_dir_all(repo);
+    }
+
+    /// #938: the dialog's base is refreshed from its remote on the worker, the
+    /// same as `delegate start` and `worktree create`: a local default branch
+    /// that never pulled does not decide what the new worktree starts from.
+    #[test]
+    fn start_worktree_add_refreshes_a_stale_base_from_its_remote() {
+        let rev = |dir: &std::path::Path, rev: &str| {
+            let out = std::process::Command::new("git")
+                .args(["-C", &dir.display().to_string(), "rev-parse", rev])
+                .output()
+                .expect("rev-parse");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let repo = create_committed_repo("app-worktree-add-fresh-repo");
+        let origin = unique_temp_path("app-worktree-add-fresh-origin");
+        let other = unique_temp_path("app-worktree-add-fresh-other");
+        std::fs::create_dir_all(&origin).unwrap();
+        run_git(&origin, &["init", "--quiet", "--bare"]);
+        run_git(
+            &repo,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        let default = crate::worktree::checkout_branch_name(&repo).expect("a branch");
+        run_git(&repo, &["push", "--quiet", "origin", &default]);
+        run_git(
+            &repo,
+            &[
+                "clone",
+                "--quiet",
+                origin.to_str().unwrap(),
+                other.to_str().unwrap(),
+            ],
+        );
+        run_git(&other, &["config", "user.email", "flock@example.invalid"]);
+        run_git(&other, &["config", "user.name", "Flock Test"]);
+        run_git(
+            &other,
+            &["commit", "--quiet", "--allow-empty", "-m", "landed"],
+        );
+        run_git(&other, &["push", "--quiet", "origin", &default]);
+        let landed = rev(&other, "HEAD");
+
+        let worktree_root = unique_temp_path("app-worktree-add-fresh-root");
+        let branch = "worktree/app-fresh";
+        let checkout =
+            crate::worktree::default_checkout_path(&worktree_root, "flock", "repo-key", branch);
+        let mut app = app_for_worktree_tests();
+        app.state.worktree_directory = worktree_root.clone();
+        app.state.worktree_create = Some(WorktreeCreateState {
+            branch_plan: None,
+            branch_parent: None,
+            source_workspace_id: "source".into(),
+            source_checkout_path: repo.clone(),
+            source_existing_membership: None,
+            source_repo_root: repo.clone(),
+            repo_key: "repo-key".into(),
+            repo_name: "flock".into(),
+            branch: branch.into(),
+            base: default.clone(),
+            checkout_path: checkout.clone(),
+            branch_input: crate::app::line_editor::LineEditor::new(branch),
+            seed: crate::app::line_editor::LineEditor::default(),
+            focus: crate::app::state::WorktreeCreateFocus::Branch,
+            error: None,
+            creating: false,
+        });
+
+        app.start_worktree_add();
+        match wait_for_worktree_event(&mut app) {
+            AppEvent::WorktreeAddFinished(result) => assert_eq!(result.result, Ok(())),
+            other => panic!("unexpected event: {other:?}"),
+        }
+        assert_eq!(rev(&checkout, "HEAD"), landed);
+
+        let remove = crate::worktree::build_worktree_remove_command(&repo, &checkout, false);
+        crate::worktree::run_worktree_command(&remove).unwrap();
+        for dir in [&worktree_root, &repo, &origin, &other] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 
     #[test]
@@ -3393,7 +3502,11 @@ mod tests {
             std::env::temp_dir().join(format!("flock-tui-home-{}-{nanos}", std::process::id()));
         let project = home.join(".claude/projects/-repo-flock");
         std::fs::create_dir_all(&project).unwrap();
-        std::fs::write(project.join(format!("{session_id}.jsonl")), "{}\n").unwrap();
+        std::fs::write(
+            project.join(format!("{session_id}.jsonl")),
+            format!("{}\n", serde_json::json!({"sessionId":session_id})),
+        )
+        .unwrap();
         std::env::set_var("HOME", &home);
         home
     }
@@ -3944,6 +4057,94 @@ mod tests {
             row.tier,
             crate::worktree::KillTier::KillBranch { dirty: false }
         );
+    }
+
+    #[test]
+    fn the_sweep_never_touches_an_open_pr_or_an_unknown_verdict() {
+        // #1278 round 2: an open PR, a PR question gh could not answer, and a
+        // gate that ran out of clock used to land on CheckoutOnly, so the
+        // sweep removed the checkout of a PR under review. Even the operator's
+        // force escalation must leave them alone.
+        let cases = [
+            (
+                crate::worktree::WorktreeMergeGate::OpenPr { number: Some(150) },
+                false,
+            ),
+            (
+                crate::worktree::WorktreeMergeGate::Unknown {
+                    reason: "gh failed: API rate limit exceeded".into(),
+                },
+                false,
+            ),
+            (crate::worktree::WorktreeMergeGate::NotMerged, true),
+        ];
+        for (gate, timed_out) in cases {
+            for dirty in [false, true] {
+                let mut app = app_for_worktree_tests();
+                let mut row = sweep_row("feature/under-review");
+                row.dirty = dirty;
+                app.state.worktree_kill_all = Some(WorktreeKillAllState {
+                    rows: vec![row],
+                    executing: false,
+                    force_dirty: true,
+                });
+                app.handle_worktree_kill_gate_finished(crate::events::WorktreeKillGateResult {
+                    workspace_id: "ws".into(),
+                    path: std::path::PathBuf::from("/repo/flock-issue"),
+                    branch: Some("feature/under-review".into()),
+                    gate: gate.clone(),
+                    protected: false,
+                    timed_out,
+                    probe: None,
+                });
+                let row = &app.state.worktree_kill_all.as_ref().unwrap().rows[0];
+                assert_eq!(row.tier, crate::worktree::KillTier::SkipLive, "{gate:?}");
+                assert_eq!(
+                    crate::worktree::planned_action(row.tier, true),
+                    KillAction::Skip,
+                    "{gate:?}, dirty {dirty}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_forced_single_kill_keeps_the_branch_of_an_open_pr_or_unknown_verdict() {
+        // #1278: force stands in for missing merge evidence, not for a PR
+        // someone is reviewing (or one nobody could rule out).
+        let state = |gate| WorktreeRemoveState {
+            managed: true,
+            workspace_id: "ws".into(),
+            repo_root: std::path::PathBuf::from("/repo/flock"),
+            path: std::path::PathBuf::from("/repo/flock-issue"),
+            error: None,
+            removing: true,
+            force_confirmation: None,
+            focus: RemoveWorktreeControl::Remove,
+            force: true,
+            probe: None,
+            delete_branch: true,
+            branch: Some("feature/live".into()),
+            merge_gate: Some(gate),
+            branch_protected: false,
+            gate_timed_out: false,
+        };
+        assert!(
+            !state(crate::worktree::WorktreeMergeGate::OpenPr { number: Some(150) })
+                .deletes_branch()
+        );
+        assert!(!state(crate::worktree::WorktreeMergeGate::Unknown {
+            reason: "gh failed: offline".into()
+        })
+        .deletes_branch());
+        // The neighbours: force still covers plain missing evidence, and
+        // merged evidence still deletes.
+        assert!(state(crate::worktree::WorktreeMergeGate::NotMerged).deletes_branch());
+        let mut merged = state(crate::worktree::WorktreeMergeGate::Merged {
+            evidence: "merged into main".into(),
+        });
+        merged.force = false;
+        assert!(merged.deletes_branch());
     }
 
     // ---------------------------------------------------------------

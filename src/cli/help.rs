@@ -58,6 +58,10 @@ const HELP_FLAGS: [&str; 2] = ["--help", "-h"];
 /// `pane` is the group to watch when adding rows here: `src/cli/pane.rs` owns
 /// those parsers and its own help text, and this table mirrors them.
 const VERBS: &[(&str, &str, &str)] = &[
+    ("profile", "enable", super::profile::ENABLE_USAGE),
+    ("msg", "operator-read", "flk msg operator-read --pane TARGET"),
+    ("msg", "operator-list", "flk msg operator-list --pane TARGET"),
+    ("structured", "grants", super::grants::USAGE),
     ("server", "stop", "flk server stop"),
     (
         "server",
@@ -69,14 +73,14 @@ const VERBS: &[(&str, &str, &str)] = &[
     ("status", "client", "flk status client [--json]"),
     ("config", "edit", "flk config edit"),
     ("config", "reset-keys", "flk config reset-keys"),
-    ("config", "check", "flk config check [--path PATH]"),
+    ("config", "check", "flk config check [--path PATH] [--json]"),
     ("channel", "set", "flk channel set <stable|preview>"),
     ("channel", "show", "flk channel show"),
     ("workspace", "list", "flk workspace list"),
     (
         "workspace",
         "create",
-        "flk workspace create [--cwd PATH] [--label TEXT] [--focus] [--no-focus]",
+        "flk workspace create [--cwd PATH] [--label TEXT] [--focus] [--no-focus] [--dry-run]",
     ),
     ("workspace", "get", "flk workspace get <workspace_id>"),
     ("workspace", "focus", "flk workspace focus <workspace_id>"),
@@ -86,6 +90,14 @@ const VERBS: &[(&str, &str, &str)] = &[
         "flk workspace rename <workspace_id> <label>",
     ),
     ("workspace", "close", "flk workspace close <workspace_id>"),
+    ("delegate", "start", super::delegate::START_USAGE),
+    ("delegate", "send", super::delegate::SEND_USAGE),
+    ("delegate", "wait", super::delegate::WAIT_USAGE),
+    ("delegate", "result", super::delegate::RESULT_USAGE),
+    ("delegate", "status", super::delegate::STATUS_USAGE),
+    ("delegate", "rebind", super::delegate::backfill::USAGE),
+    ("delegate", "reap", super::delegate::REAP_USAGE),
+    ("delegate", "list", super::delegate_list::LIST_USAGE),
     (
         "worktree",
         "list",
@@ -94,7 +106,7 @@ const VERBS: &[(&str, &str, &str)] = &[
     (
         "worktree",
         "create",
-        "flk worktree create [--workspace ID | --cwd PATH] [--branch NAME] [--base REF] [--path PATH] [--label TEXT] [--focus] [--no-focus] [--json]",
+        "flk worktree create [--workspace ID | --cwd PATH] [--branch NAME] [--base REF] [--path PATH] [--label TEXT] [--focus] [--no-focus] [--json] [--dry-run]",
     ),
     (
         "worktree",
@@ -125,7 +137,7 @@ const VERBS: &[(&str, &str, &str)] = &[
     (
         "tab",
         "create",
-        "flk tab create [--workspace <workspace_id>] [--cwd PATH] [--label TEXT] [--focus] [--no-focus]",
+        "flk tab create [--workspace <workspace_id>] [--cwd PATH] [--label TEXT] [--focus] [--no-focus] [--dry-run]\n  --workspace places the tab in that workspace; --cwd only sets the directory.",
     ),
     ("tab", "get", "flk tab get <tab_id>"),
     ("tab", "focus", "flk tab focus <tab_id>"),
@@ -134,7 +146,7 @@ const VERBS: &[(&str, &str, &str)] = &[
     (
         "notification",
         "show",
-        "flk notification show <title> [--body TEXT] [--position top-left|top-right|bottom-left|bottom-right] [--sound none|done|request]",
+        "flk notification show <title> [--body TEXT] [--position top-left|top-right|bottom-left|bottom-right] [--sound none|done|request]\nUses [ui.toast] delivery in the server config. delivery = \"off\" (the default) disables popups and returns reason \"disabled\".\nExit 0: shown; exit 3: not shown (disabled, busy, rate_limited, or no_foreground_client). JSON is printed in either case.\nNotifications are still recorded when not shown. Use flk notification list to read them.",
     ),
     (
         "notification",
@@ -146,22 +158,24 @@ const VERBS: &[(&str, &str, &str)] = &[
         "read",
         "flk notification read <notification-id> | --all",
     ),
-    ("agent", "list", "flk agent list"),
+    ("agent", "list", "flk agent list [--resumable]"),
     ("agent", "get", "flk agent get <target>"),
     (
         "agent",
         "read",
         "flk agent read <target> [--source visible|recent|recent-unwrapped] [--lines N] [--format text|ansi] [--ansi]",
     ),
-    ("agent", "send", "flk agent send <target> <text>"),
+    ("agent", "send", super::agent::AGENT_SEND_USAGE),
     ("agent", "rename", "flk agent rename <target> <name>|--clear"),
     ("agent", "focus", "flk agent focus <target>"),
     ("agent", "wait", super::agent::AGENT_WAIT_USAGE),
     ("agent", "attach", "flk agent attach <target> [--takeover]"),
     ("agent", "start", super::agent::AGENT_START_USAGE),
     ("agent", "fork", super::agent::AGENT_FORK_USAGE),
-    ("agent", "hibernate", "flk agent hibernate <target>"),
-    ("agent", "resume", "flk agent resume <target>"),
+    ("agent", "hibernate", "flk agent hibernate <target>|--all"),
+    ("agent", "resume", "flk agent resume <target>|--all"),
+    ("agent", "restart", super::agent::AGENT_RESTART_USAGE),
+    ("agent", "history", super::agent::AGENT_HISTORY_USAGE),
     ("agent", "result", super::agent::AGENT_RESULT_USAGE),
     (
         "msg",
@@ -173,8 +187,8 @@ const VERBS: &[(&str, &str, &str)] = &[
         "reply",
         "flk msg reply <correlation_id> <text...> [--intent fyi|needs-reply|blocking] [-- <text starting with dashes>]",
     ),
-    ("msg", "list", "flk msg list [--pane TARGET]"),
-    ("msg", "read", "flk msg read [--pane TARGET]"),
+    ("msg", "list", "flk msg list [--pane TARGET]   peek at your attested pane or structured inbox; listing all panes or another inbox requires the local operator and is audited"),
+    ("msg", "read", "flk msg read [--pane TARGET]   consume your attested pane or structured inbox"),
     ("msg", "status", "flk msg status <correlation_id>"),
     (
         "msg",
@@ -184,30 +198,30 @@ const VERBS: &[(&str, &str, &str)] = &[
     ("mcp", "serve", "flk mcp serve"),
     ("terminal", "attach", "flk terminal attach <terminal_id> [--takeover]"),
     ("pane", "list", "flk pane list [--workspace <workspace_id>]"),
-    ("pane", "get", "flk pane get <pane_id>"),
-    ("pane", "rename", "flk pane rename <pane_id> <label>|--clear"),
+    ("pane", "get", "flk pane get <target>"),
+    ("pane", "rename", "flk pane rename <target> <label>|--clear"),
     (
         "pane",
         "read",
-        "flk pane read <pane_id> [--source visible|recent|recent-unwrapped] [--lines N] [--format text|ansi] [--ansi]",
+        super::pane::PANE_READ_USAGE,
     ),
     (
         "pane",
         "split",
-        "flk pane split <pane_id> --direction right|down [--cwd PATH] [--focus] [--no-focus]",
+        "flk pane split <target> --direction right|down [--cwd PATH] [--focus] [--no-focus] [--dry-run]",
     ),
     (
         "pane",
         "move",
-        "flk pane move <pane_id> --tab <tab_id> --split right|down [--target-pane ID] [--ratio FLOAT] [--focus|--no-focus]\n       flk pane move <pane_id> --new-tab [--workspace ID] [--label TEXT] [--focus|--no-focus]\n       flk pane move <pane_id> --new-workspace [--label TEXT] [--tab-label TEXT] [--focus|--no-focus]",
+        "flk pane move <target> --tab <tab_id> --split right|down [--target-pane ID] [--ratio FLOAT] [--focus|--no-focus]\n       flk pane move <target> --new-tab [--workspace ID] [--label TEXT] [--focus|--no-focus]\n       flk pane move <target> --new-workspace [--label TEXT] [--tab-label TEXT] [--focus|--no-focus]",
     ),
-    ("pane", "close", "flk pane close <pane_id>"),
-    ("pane", "send-text", "flk pane send-text <pane_id> <text>"),
-    ("pane", "send-keys", "flk pane send-keys <pane_id> <key> [key ...]"),
+    ("pane", "close", super::pane::PANE_CLOSE_USAGE),
+    ("pane", "send-text", super::pane::PANE_SEND_TEXT_USAGE),
+    ("pane", "send-keys", super::pane::PANE_SEND_KEYS_USAGE),
     (
         "pane",
         "arm-self-compact",
-        "flk pane arm-self-compact [--pane <pane_id>] [--abort] <handoff prompt>",
+        "flk pane arm-self-compact [--pane <pane_id>] [--abort] [--instructions <text> | --instructions-file <path>] <handoff prompt>",
     ),
     (
         "pane",
@@ -217,7 +231,7 @@ const VERBS: &[(&str, &str, &str)] = &[
     (
         "pane",
         "report-metadata",
-        "flk pane report-metadata <pane_id> --source ID [--agent LABEL] [--applies-to-source ID] [--title TEXT|--clear-title] [--display-agent TEXT|--clear-display-agent] [--custom-status TEXT|--clear-custom-status] [--state-label STATUS=TEXT] [--clear-state-labels] [--seq N] [--ttl-ms N]",
+        "flk pane report-metadata [<pane_id>] [--pane <pane_id>] --source ID [--agent LABEL] [--applies-to-source ID] [--title TEXT|--clear-title] [--display-agent TEXT|--clear-display-agent] [--custom-status TEXT|--clear-custom-status] [--state-label STATUS=TEXT] [--clear-state-labels] [--seq N] [--ttl-ms N]",
     ),
     (
         "pane",
@@ -239,7 +253,7 @@ const VERBS: &[(&str, &str, &str)] = &[
         "clear-field",
         "flk pane clear-field <key> [--pane <pane_id>]",
     ),
-    ("pane", "run", "flk pane run <pane_id> <command>"),
+    ("pane", "run", super::pane::PANE_RUN_USAGE),
     ("peers", "status", "flk peers status [--json]"),
     ("peers", "summary", "flk peers summary [--json]"),
     (
@@ -279,6 +293,7 @@ const VERBS: &[(&str, &str, &str)] = &[
         "reply",
         "flk wait reply <correlation_id> [--timeout MS] [--json]",
     ),
+    ("wait", "park", super::events::PARK_USAGE),
     (
         "integration",
         "install",
@@ -296,12 +311,26 @@ const VERBS: &[(&str, &str, &str)] = &[
         "flk integration manifest <pi|omp|claude|codex|copilot|kimi|opencode|hermes|qodercli> [--json]",
     ),
     ("integration", "verify", "flk integration verify"),
+    ("events", "read", super::events::READ_USAGE),
+    ("events", "wait", super::events::WAIT_USAGE),
+    ("adapter", "hello", super::adapter::HELLO_USAGE),
+    ("owner", "policy", super::owner::POLICY_USAGE),
     ("checks", "list", "flk checks list"),
     ("checks", "ack", "flk checks ack <name>"),
     ("checks", "run", "flk checks run <name>"),
     ("fleet", "pause", "flk fleet pause [--reason TEXT]"),
     ("fleet", "resume", "flk fleet resume"),
     ("fleet", "status", "flk fleet status"),
+    ("owner", "bind", super::owner::BIND_USAGE),
+    ("owner", "unbind", super::owner::UNBIND_USAGE),
+    ("owner", "list", super::owner::LIST_USAGE),
+    ("owner", "show", super::owner::SHOW_USAGE),
+    ("goal", "arm", "flk goal arm <goal> [--check CMD]... [--agent TARGET] [--json]"),
+    ("goal", "status", "flk goal status [--agent TARGET] [--json]"),
+    ("goal", "pause", "flk goal pause [--minutes N] [--agent TARGET] [--json]"),
+    ("goal", "resume", "flk goal resume [--agent TARGET] [--json]"),
+    ("goal", "stop", "flk goal stop [--reason TEXT] [--agent TARGET] [--json]"),
+    ("session", "retained", super::retained::USAGE),
     ("session", "list", "flk session list [--json]"),
     ("session", "attach", "flk session attach <name>"),
     ("session", "stop", "flk session stop <name> [--json]"),
@@ -399,6 +428,19 @@ pub(super) fn help_usage(args: &[String]) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::{asks_for_help, help_usage, LITERAL_TEXT, VERBS};
+
+    #[test]
+    fn pane_verb_help_documents_targets_and_precedence() {
+        for verb in ["read", "send-text", "send-keys", "close"] {
+            // `send-text`'s `--raw` opt-out (#1162) sits before the target.
+            let usage = usage_for(&["pane", verb, "--help"])
+                .unwrap()
+                .replace(" [--raw]", "");
+            assert!(usage.contains(&format!("flk pane {verb} <target>")));
+            assert!(usage.contains("pane id, terminal id, or unique agent name/label"));
+            assert!(usage.contains("A pane id wins over a same-named agent"));
+        }
+    }
 
     fn argv(words: &[&str]) -> Vec<String> {
         std::iter::once("flk")
@@ -526,6 +568,10 @@ mod tests {
     /// Naming them here rather than only in the module docs is what keeps the
     /// choice reviewable: adding a seventh name is a visible act.
     const SELF_SERVED: &[&str] = &[
+        // Nested credential verbs share their complete operator-only usage.
+        "client",
+        // Retained-record diagnostics have no action verb.
+        "doctor",
         // What a target resolves from, and how reused branch names disambiguate.
         "lineage",
         // `--since` suffixes and where the rendered file lands by default.
@@ -581,6 +627,11 @@ mod tests {
             "worktree" => include_str!("worktree.rs"),
             "tab" => include_str!("tab.rs"),
             "notification" => include_str!("notification.rs"),
+            "delegate" => concat!(
+                include_str!("delegate.rs"),
+                include_str!("delegate_list.rs"),
+                include_str!("delegate/backfill.rs")
+            ),
             "agent" => include_str!("agent.rs"),
             "msg" => include_str!("msg.rs"),
             "mcp" => include_str!("mcp.rs"),
@@ -591,8 +642,17 @@ mod tests {
             "integration" => include_str!("integration.rs"),
             "checks" => include_str!("checks.rs"),
             "fleet" => include_str!("fleet.rs"),
-            // These six live inline in the dispatcher itself.
-            "config" | "channel" | "terminal" | "wait" | "session" | "hook" => {
+            "owner" => include_str!("owner.rs"),
+            "goal" => include_str!("goal.rs"),
+            "structured" => include_str!("grants.rs"),
+            "profile" => include_str!("profile.rs"),
+            "events" => include_str!("events.rs"),
+            "adapter" => include_str!("adapter.rs"),
+            // `wait park` shares the `events` parser.
+            "wait" => concat!(include_str!("../cli.rs"), include_str!("events.rs")),
+            "session" => concat!(include_str!("../cli.rs"), include_str!("retained.rs")),
+            // These four live inline in the dispatcher itself.
+            "config" | "channel" | "terminal" | "hook" => {
                 include_str!("../cli.rs")
             }
             _ => "",
@@ -675,17 +735,114 @@ mod tests {
         }
     }
 
+    /// Read actual match patterns, including aliases and optional subcommands.
+    /// Comments and string expressions cannot invent a routed verb.
+    fn routed_verbs(source: &str) -> std::collections::BTreeSet<String> {
+        use syn::visit::Visit;
+        #[derive(Default)]
+        struct Routes(std::collections::BTreeSet<String>);
+        impl Routes {
+            fn pattern(&mut self, pattern: &syn::Pat) {
+                match pattern {
+                    syn::Pat::Lit(syn::ExprLit {
+                        lit: syn::Lit::Str(value),
+                        ..
+                    }) => {
+                        self.0.insert(value.value());
+                    }
+                    syn::Pat::Or(pattern) => {
+                        for case in &pattern.cases {
+                            self.pattern(case);
+                        }
+                    }
+                    syn::Pat::Paren(pattern) => self.pattern(&pattern.pat),
+                    syn::Pat::Guard(pattern) => self.pattern(&pattern.pat),
+                    syn::Pat::TupleStruct(pattern) if pattern.path.is_ident("Some") => {
+                        for element in &pattern.elems {
+                            self.pattern(element);
+                        }
+                    }
+                    _ => (),
+                }
+            }
+        }
+        impl<'ast> Visit<'ast> for Routes {
+            fn visit_arm(&mut self, arm: &'ast syn::Arm) {
+                self.pattern(&arm.pat);
+                syn::visit::visit_arm(self, arm);
+            }
+        }
+        let module = syn::parse_file(source).expect("CLI parser source must parse");
+        let mut routes = Routes::default();
+        routes.visit_file(&module);
+        routes.0
+    }
+
+    #[test]
+    fn dispatch_patterns_include_aliases_but_not_command_shaped_text() {
+        let verbs = routed_verbs(
+            r#"
+            fn route(verb: &str, optional: Option<&str>) {
+                // "comment-only" => ignored()
+                let text = "Some(\"string-only\")";
+                match verb {
+                    "get"
+                    | "status" => { let text = "body-only"; }
+                    "stop" => (),
+                    _ => (),
+                }
+                match optional {
+                    Some("list" | "show") => (),
+                    Some("guarded") if optional == Some("guard-expression-only") => (),
+                    _ => (),
+                }
+            }
+        "#,
+        );
+        assert_eq!(verbs.len(), 6);
+        for verb in ["get", "status", "stop", "list", "show", "guarded"] {
+            assert!(verbs.contains(verb), "missing routed verb {verb}");
+        }
+        for verb in [
+            "comment-only",
+            "string-only",
+            "body-only",
+            "deleted",
+            "guard-expression-only",
+        ] {
+            assert!(!verbs.contains(verb), "invented routed verb {verb}");
+        }
+    }
+
     /// Every verb the table claims exists is a verb its dispatcher routes.
     ///
     /// The other direction of the same walk: a row left behind by a renamed or
     /// deleted verb is a help answer for a command that no longer exists.
     #[test]
     fn every_tabelled_verb_is_still_dispatched() {
+        let mut groups = std::collections::BTreeMap::new();
         for (group, verb, _) in VERBS {
-            let source = group_parser_source(group);
+            let verbs = groups.entry(*group).or_insert_with(|| {
+                // Concatenated modules have separate inner attributes.
+                let sources = match *group {
+                    "delegate" => vec![
+                        include_str!("delegate.rs"),
+                        include_str!("delegate_list.rs"),
+                        include_str!("delegate/backfill.rs"),
+                    ],
+                    "wait" => vec![DISPATCH_SOURCE, include_str!("events.rs")],
+                    "session" => vec![DISPATCH_SOURCE, include_str!("retained.rs")],
+                    // The group routes grants inline; its nested parser owns flags.
+                    "structured" => vec![DISPATCH_SOURCE, group_parser_source(group)],
+                    _ => vec![group_parser_source(group)],
+                };
+                sources
+                    .into_iter()
+                    .flat_map(routed_verbs)
+                    .collect::<std::collections::BTreeSet<_>>()
+            });
             assert!(
-                source.contains(&format!("\"{verb}\" =>"))
-                    || source.contains(&format!("Some(\"{verb}\")")),
+                verbs.contains(*verb),
                 "{group} no longer routes a {verb} verb, but the help table does"
             );
         }
@@ -755,6 +912,9 @@ mod tests {
             "pane send-keys",
             "pane arm-self-compact",
             "session delete",
+            "delegate start",
+            "delegate send",
+            "delegate reap",
         ] {
             let (group, verb) = invocation.split_once(' ').expect("group verb");
             assert!(
@@ -784,6 +944,9 @@ mod tests {
             ("agent", "start"),
             ("pane", "split"),
             ("workspace", "create"),
+            ("delegate", "start"),
+            ("delegate", "send"),
+            ("delegate", "reap"),
         ] {
             let words = [invocation.0, invocation.1, "--help"];
             assert_eq!(

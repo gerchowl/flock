@@ -23,7 +23,7 @@ url: https://github.com/gerchowl/herdr/issues/103
 ## The fix (layered)
 1. **CI (durable)**: extend peer_federation.rs with a slots-ENABLED variant of the switch tests -- spawn the spoke server, drive the switch with slots on, assert the rendered spoke frame contains the home row + folded hub spaces. This exact test fails on #102 and passes on its fix. Parameterize the existing switch e2e over `[slots] {disabled, enabled}`.
 2. **Config-fork lint**: any behavior gated on a config flag (slots, tab_mode, server_state_mark) should have a paired e2e or a documented why-not.
-3. **Pre-flip smoke (process)**: before flipping a fleet-wide config like slots-on in g-fleet, run a federation smoke (below) -- don't flip blind.
+3. **Pre-flip smoke (process)**: before flipping a fleet-wide config like slots-on in the fleet configuration repo, run a federation smoke (below) -- don't flip blind.
 4. **Live smoke harness (tui-probe / VMs)**: a scripted real switch (hopper->bastion) that screenshots the spoke frame and asserts the servers band. We HAVE the VMs; wire a `just herdr-smoke` that drives it headlessly.
 
 ## Acceptance
@@ -43,5 +43,5 @@ Partial: PR #104 added resolve_handshake_fleet red->green seam tests (the cold-d
 
 ### gerchowl — 2026-06-13T18:39:31Z
 
-Shipped: PR #113 (spawn_switch_dial dial-boundary unit test, red-proofed) + just herdr-smoke (g-fleet) -- a live two-server slots-enabled cross-process switch that asserts the spoke home row, PROVEN to fail on the pre-#104 binary and pass on the fix. This is the pre-flip gate: run it before re-enabling [slots]. The full in-harness slots-client e2e (option a) and warm-flip smoke remain noted follow-ups.
+Shipped: PR #113 (spawn_switch_dial dial-boundary unit test, red-proofed) + just herdr-smoke (the fleet configuration repo) -- a live two-server slots-enabled cross-process switch that asserts the spoke home row, PROVEN to fail on the pre-#104 binary and pass on the fix. This is the pre-flip gate: run it before re-enabling [slots]. The full in-harness slots-client e2e (option a) and warm-flip smoke remain noted follow-ups.
 

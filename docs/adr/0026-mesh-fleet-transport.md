@@ -1,0 +1,945 @@
+# ADR 0026 — Mesh fleet transport and durable message custody
+
+- Status: Accepted
+- Date: 2026-10-08
+- Issues: [#661](https://github.com/gerchowl/flock/issues/661),
+  [#623](https://github.com/gerchowl/flock/issues/623),
+  [#640](https://github.com/gerchowl/flock/issues/640),
+  [#1380](https://github.com/gerchowl/flock/issues/1380) (version negotiation
+  amendment, accepted 2026-11-19, not yet implemented).
+- Decision owner: operator, accepted 2026-10-08 with the defaults and further
+  rulings recorded in the Decisions section below.
+  Extends ADR-0009 and clarifies ADR-0008, superseding their affected transport
+  contracts. The amendments below record the final implementation decisions.
+- Implemented: v1.0.0 (#623 step 1, #661 step 2)
+
+## Evidence and scope
+
+Laptop reachability determining send is asking for trouble. A sleeping,
+roaming or NATed sender must be able to send and receive answers using the
+connections it can initiate. Connectivity determines when mail moves, not
+whether an accepted conversation has a return address.
+
+The pre-mesh #623 analysis established the original failure:
+`src/peers.rs::send_peer_message` performs a one-shot SSH command and discards
+its successful response body. `src/app/api/messages.rs::route_msg_reply`
+resolves the sender afresh and falls back to `hand_up_or_refuse`, not to a
+persisted return capability. `hold_reply` retains answers only in the branch
+with neither sender agent nor pane. `src/app/mailboxes.rs::DeliveredMeta`
+drops the originating host, and `src/api/reply_wait.rs::wait_for_reply` watches
+only the local EventHub. An initial delivery therefore proves neither an
+attached uplink nor a usable route when the answer is written. The historical
+incident's exact topology is not established by these code facts.
+
+Retain the measured held-SSH decision, summary coalescing, explicit liveness
+and reconnect backoff in ADR-0009. Replace the hub/spoke routing restriction
+and one-hub forwarding ceiling for mesh traffic. Supersede the one-shot
+compatibility fallback: mesh requires a held edge with matching protocol. Do
+not replicate logs or tune polling intervals to repair message transport.
+Directory and route knowledge remain bounded summaries pulled over existing
+SSH channels under ADR-0001. Discrete messages, acknowledgements and
+collection responses travel both ways on those channels. The acceptor signals
+pending work with a wake push; the dialer pulls it over the held edge.
+
+## Topology and routing
+
+Every node is a peer. A **dial-capable** node has configured SSH authority
+and can initiate an edge. A **dialable** node accepts inbound SSH from an
+authorized peer. An **undialable** node cannot accept inbound SSH, but may
+still be dial-capable. These are independent properties. A **spoke with no
+outbound edges** initiates none and must be dialable by its hub to receive
+the edge that hub opens. An undialable node with no outbound edges has no
+transport path until one of those conditions changes. A hub forwards or
+holds custody for others, rather than being a distinct identity class. A
+laptop need not be a spoke: ADR-0009's Macs hold outbound edges.
+
+Any dial-capable node may dial reachable configured peers. An authenticated,
+mesh-capable held edge carries traffic in both directions regardless of its
+initiator, without granting SSH credentials or operator authority. An
+undialable laptop uploads mail and receives replies over an edge it opens.
+A spoke with no outbound edges receives the hub's pushes down the edge the
+hub opened. No node must be dialable, but every delivering component needs
+some established edge. During disconnection custody persists, and eventual
+delivery requires a usable path before expiry and a surviving custodian.
+
+Nodes advertise authenticated node identity, mesh protocol version, live
+adjacencies and route generation, without message bodies. Every learned
+route is tied to the held edge and generation that supplied it: withdraw it
+when that edge closes, or when an explicit withdrawal arrives. Propagate
+topology changes over surviving held edges and pull the current summary on
+reconnect. Silence never expires a healthy route. There is no route refresh
+cadence or time lease. Retain last-known owners as offline identity hints,
+never live routes. SSH EOF/liveness and the wedged-relay timeout remain
+ADR-0009's rule 2.
+
+Advertisements name logical next hops, not arbitrary SSH destinations.
+Choose a live shortest path, with a stable node-id tie break, using only
+configured outbound peers or authenticated attached edges. Keep no dial task
+for an address learned only from gossip or `from_host`.
+
+Replace the one-hub guard in `relay_message_to_host` with a bounded route:
+carry the immutable message key, visited node ids and remaining hop budget
+(default eight). Refuse a repeated node or exhausted budget for that
+attempt, retain custody and seek a fresh route. Duplicate edges and changed
+routes do not create new messages. Reject forged origin claims and route
+advertisements not bound to the authenticated neighbor. Same-user SSH is the
+trust boundary, not Byzantine protection against a compromised trusted hub.
+
+## Durable outbox and acknowledgement contract
+
+**Use a dedicated SQLite custody store** at
+`config::state_dir()/mesh-mail.sqlite`, independent of ADR-0005's rotating
+audit log. Use the existing SQLite dependency, WAL transactions and
+`synchronous=FULL`, with durable file/directory creation. The store owns
+outbox envelopes, inbox imports and read state, dedupe tombstones,
+collection capabilities, node identity bindings and final outcomes. Commit
+envelope, dedupe and mailbox import atomically before acknowledging
+acceptance. Recover mailbox/outbox projections from this store, not from
+audit events. Single writer ownership must transfer during live handoff
+before the new server accepts mail. Corrupt/unwritable storage refuses
+durable acceptance loudly, never degrades this contract to memory-only mail.
+
+Persist authenticated origin node and sender identity, target AgentId and
+session id, a sender-server-minted message ULID, caller correlation id for
+threading, optional `in_reply_to` plus the referenced request message key,
+body, intent, remaining TTL and conversation-bound collection capability.
+Persist logical collection peers and receipts, never live connection
+handles. A reply gets a new server-minted message id. The idempotency key is
+`(origin_node_id, message_id)`, not caller-chosen correlation id.
+Retransmits reuse that key and immutable content, conflicting reuse is
+refused. A caller retry that creates a new ULID is a new message, so return
+the minted key on acceptance and provide an authenticated retry operation
+for that same key. At-least-once transport produces exactly-once mailbox
+import within the retention contract, not exactly-once agent execution.
+
+Bound the store independently: 256 MiB total logical data and
+10,000 active envelopes per node, including retained inbox bodies, with a
+reserved 16 MiB within that bound for dedupe and terminal receipts. Check
+quota inside the acceptance transaction. When full, return `mail_store_full`
+without custody acknowledgement, leaving the upstream/origin responsible.
+Refuse new originating sends explicitly. Never evict accepted unexpired mail
+to admit new mail. Terminal receipts use reserved space, and if even that is
+exhausted, pause imports until GC restores space. GC removes bodies only after
+their custody/inbox retention condition is satisfied, and tombstones/outcomes
+only after their own retention deadlines. Checkpoint/truncate WAL and reclaim
+pages to bound physical overhead, with a hard disk-reserve guard that refuses
+writes before exhausting the filesystem.
+
+A full receiver mailbox is a retryable delivery refusal, not a terminal
+outcome. The current custodian retains the message and retries until the
+seven-day custody TTL expires. The local unread inbox TTL is separately 24
+hours from durable inbox import, and does not shorten pre-delivery custody
+TTL. Inbox expiry is recorded as unread-inbox expiry without rewriting the
+already-confirmed delivery receipt. Custody, dedupe and final outcomes keep
+their independent retention rules.
+
+Events stay audit and notification only. Today hubs can append forwarded
+bodies through message events. For mesh records, bodies live solely in the
+custody store: emit metadata (message key, identities, state, reason and
+receipt reference), never forwarded bodies or collection tokens. Local inbox,
+wait and status read the store and use events only to wake observers. Audit's
+rotation or memory-only degradation cannot delete accepted mail or dedupe.
+
+Custody and final delivery are separate receipts. A forwarding node persists
+before issuing a custody receipt and retains its copy until downstream
+custody is durable or a terminal outcome is recorded. The origin retains its
+record until final delivery or expiry, even after a hub accepts custody.
+Custody transfers and final receipts are themselves replayable and collected
+idempotently. A lost acknowledgement triggers a retry of the same key. A hub
+restart reconstructs outstanding forwarding and collection from the store.
+
+Retry transient disconnection with bounded concurrency and exponential
+backoff with jitter, starting at the existing 60-second failed-edge backoff,
+capped at five minutes and reset when an authenticated edge reconnects. Use
+a seven-day TTL budget of unpaused time rather than comparing clocks across
+hosts. Each custodian starts a local deadline at receipt using the
+transferred remaining budget, subtracts elapsed residence time before
+forwarding, and persists that deadline for restart. Duplicate receipt never
+resets it. Nodes must maintain a nondecreasing local expiry clock across
+restarts (clamp wall clock rollback to the last persisted value), so clock
+rollback cannot revive expired mail. The clamp prevents rollback, not
+forward wall-clock jumps: a forward jump can expire mail early and later
+correction cannot revive it. This conservative failure is acceptable to
+preserve bounded retention, and produces an explicit expiry outcome rather
+than a delivery claim. No inter-host skew bound is required. Each origin,
+hub and receiver expires its copy independently, without assuming a
+synchronous fleet-wide expiry instant. Reject exhausted budgets. Keep local
+dedupe records at least through the admitted remaining custody TTL plus 24
+hours, and retain final outcomes for seven days after local termination. A
+receiver's retry budget cannot be increased by duplicate transfers. Quota
+admission reserves the metadata needed to honor these deadlines. There is no
+cross-message ordering guarantee, including within a conversation:
+`in_reply_to` supplies causality, not FIFO. Hold an answer whose request has
+not yet been imported until the reference can be attached, without losing
+it.
+
+| Evidence | Sender-visible meaning |
+| --- | --- |
+| Origin persisted | Accepted locally, queued, possibly offline |
+| Hub persisted | Custody accepted, still no final-delivery claim |
+| Target server persisted mailbox import | Delivered to recipient inbox |
+| Recipient calls genuine `msg.read` | Read |
+| Reply persisted at receiver | Answer held, pending return or collection |
+| Reply imported at origin | Answer available locally to inbox and wait/status |
+| Expiry or authoritative recipient removal | Terminal outcome with reason |
+
+A successful SSH exit or relay write is only transport evidence.
+`MessageRelayed` must not stand in for final delivery. Wake/submit attempts
+from #640 (`typed`, `submit_sent`, `accepted`, `observed_accepted`,
+`unconfirmed`, `abandoned`) are a separate axis: a wake can be accepted while
+mail remains unread. Return delivery/read receipts through the same durable
+mechanism as answers, so the origin's `msg.status` distinguishes custody,
+delivery, read and wake evidence. A wait timeout ends that caller's wait,
+not the outbox job. `wait_reply` observes locally imported results and honest
+queued/expired outcomes without doing synchronous remote polling.
+
+## Origin policy and fleet pause
+
+`[msg] allow_from` matches the ORIGIN node, authenticated by its persisted
+node key and mapped to its locally stored pin name: a configured peer name
+or the name pinned at inbound first contact. An advertised name alone is not
+a policy binding. Display node ids through that pin name in status, routing
+and policy diagnostics. Never match the
+caller-controlled host label or a forwarding hub's identity. Hubs traversed
+by a message are not checked against `allow_from`, so an allowed hop cannot
+launder a disallowed origin. Forwarding preserves the authenticated origin
+binding end to end, and an unknown/unbound origin cannot borrow a hub's
+name.
+
+### Peer names in presentation
+
+Configured names and locally pinned/enrolled bindings are authoritative;
+reported node IDs and carried snapshot names are claims. One shared
+claimed-name presentation function owns comparison and escaping. Comparison
+first applies Unicode compatibility normalization (NFKC), then removes format,
+bidi, control, default-ignorable and whitespace scalars. This catches full-width
+letters and compatibility forms before casefolding and confusable comparison.
+One function returns two keys for each claim and each configured/pinned alias:
+`K1 = skeleton(fold(x))`, and `K2 = fold(skeleton(x))`, repeating the latter
+composition until its fixed point. Two names collide exactly when their K1
+keys match OR their K2 keys match. Here `fold` is full Unicode casefolding and
+`skeleton` is the UTS #39 confusable skeleton. Two keys are necessary because
+folding and skeletons do not commute: fold-first catches `I`/`i`, while
+skeleton-first preserves `I`/`l`, `1`/`l` and `kiIn`/`kiln`. Reapplying a
+fold-first composition cannot recover the capital I already folded away.
+A further skeleton-first pass is sometimes necessary: `M` first becomes `m`,
+then `rn`. Normalization performs at most eight further skeleton-first steps,
+returning its last value if future data fails to converge by that backstop.
+Fast deterministic cases and a nonconverging-step test run normally. The
+exhaustive Unicode-scalar audit is ignored by default and run explicitly when
+updating normalization dependencies; it checks the data with a bounded reference,
+without running the production fixed-point loop.
+The maintained
+[`unicode-security`](https://docs.rs/unicode-security/0.1.2/unicode_security/)
+0.1.2 implementation supplies the skeleton and default-ignorable properties;
+`caseless` 0.2.2 supplies full casefolding and `unicode-general-category` 1.1.0
+supplies format categories. `unicode-normalization` 0.1.26, already locked by
+transitive dependencies, supplies NFKC. These dependencies pass the existing
+cargo-deny license and advisory policy without exceptions. No local confusables table is
+used. These keys are local comparison forms, never display text, persisted
+metadata, or routing keys.
+
+On collision the claimed alias is hidden behind its escaped short node ID;
+otherwise the name is escaped. Every claim carries `[unverified]`, including
+empty names and short-ID fallbacks. Format/bidi/control/default-ignorable
+scalars and whitespace render as visible Unicode escapes; only a single
+interior ASCII space between visible non-whitespace scalars remains literal.
+Literal backslashes are escaped too. Truncation reserves the badge and cuts
+the remaining name/context by terminal cells. Below twelve cells the compact
+badge is `?`; with zero cells no name or badge can render. Icon modes cannot
+replace the badge. Narrow rows may drop ornaments or project context to retain
+this trust cue.
+
+The rule applies to servers (including carried Origin), spaces, agents,
+navigator rows and details, filter headers, checkout and switch notices, and
+fleet-directory/CLI and message/wait host labels. Locally configured rows keep
+their configured name even before a pin exists. A carried Home observation is
+still an unproven claim even when its asserted node ID matches a local pin;
+its Home badge remains as a deliberate UX trade-off. Only proof from that
+observation's source permits a trusted name. Stored owner hints from earlier
+versions pass the same function on read. New owner records preserve the raw
+observation separately from display, preventing repeated badge/escape growth.
+Agent locations keep the raw reported `host` separate from `display_host`.
+Message API `to_host` and persisted mesh payload host metadata use the raw
+observation; fleet directory labels and message/wait notices use presentation.
+For direct delivery (`via: None`), message-status details first resolve the raw
+destination through local delivery route bindings. Exact configured alias/dial-target
+keys on that route, or exact pinned aliases bound to the same node as that route,
+use the trusted local alias. Hub-carried delivery (`via: Some`) always uses
+claimed-name presentation: the recorded event carries no destination owner node
+proof, and a hub's route binding proves only the hop. A claimed destination cannot
+borrow that hub's alias, even when its raw name exactly matches the route.
+Empty keys, lookalikes, case variants and unrelated route claims never gain trust
+through the Unicode comparison keys. Unresolved destinations, including older
+events without a matching local binding, use escaped, badged presentation.
+When alias-collision protection hides a name and no owner identity is available,
+the label is `[unverified] unknown destination`, rather than a bare badge. This
+keeps the destination visible without rendering an unproven configured alias.
+The raw destination metadata remains unchanged.
+None of this rewrites cache keys, identity proofs, policy bindings or dial
+targets. Wire summaries remain observations, not authority to borrow aliases.
+
+Every unproven row uses the same `unverified` wording. Existing identity
+folding associates a hub-pushed claim with the verified Self, Home or pinned
+peer row and renders its hub as a `+via` annotation. The claim cannot change
+the verified row's identity, metrics or dial target. Independent observations
+remain in the cache, and Home switching uses the reserved local target.
+Name similarity never establishes an identity association.
+
+`flk fleet pause` freezes custody completely on the paused node: no new send
+acceptance, retry, forwarding, collection/import, inbox delivery or expiry.
+Return an explicit paused refusal to incoming custody attempts and leave the
+upstream custodian responsible. Existing accepted records remain intact. The
+custody and inbox TTL clocks, as well as retention GC clocks, stop while
+paused. Persist remaining budgets and pause state so restart during pause
+cannot spend TTL or expire mail. Resume from those remaining budgets without
+charging elapsed paused wall time, including a forward clock jump during
+pause. The conservative forward-jump expiry rule applies only to unpaused
+clock advancement. Edge maintenance and read-only status can continue, but
+cannot mutate or delete custody records while paused.
+
+## Replies and sender-side collection
+
+At request acceptance, retain a return capability bound to authenticated
+origin, recipient and full request key in both queued and delivered
+metadata. A correlation id is caller-chosen and is not a secret. Mint an
+unguessable collection token, authenticate each collection caller and scope
+results to that conversation. With same-user SSH, this token scopes requests
+but is not a secrecy boundary against trusted peers or the same OS user. A
+forwarded capability is delegated only to authenticated custodians on the
+recorded path. Never dial an inbound host label or treat a caller-supplied
+hub assertion as attestation.
+
+`route_msg_reply` uses this durable return binding before directory lookup.
+Persist the answer even if the sender is absent from the current directory
+or its laptop is offline. Try immediate delivery over any authenticated mesh
+edge, otherwise report held/queued for collection. `msg_target_not_found` no
+longer means an accepted request's known sender is temporarily unreachable.
+
+A bounded asynchronous collection worker at the origin resumes from its
+outstanding request records without an active CLI waiter. It asks the
+directly connected receiver or custodian for scoped answers and receipts.
+Custodian node ids survive loss of an SSH alias. Collection runs on a held
+authenticated edge; beyond that neighbor, routed custody supplies the
+return path described below. There is no one-shot message or collection
+fallback.
+
+**Amendment Q1 (owner accepted 2026-10-09): route-driven custody forwarding
+replaces the relayed collection query.** If a laptop reconnects through a
+different hub, the holder forwards its single custody copy toward the
+origin node once a live route appears, or offers it for the next-hop
+neighbor to pull. Requests, answers and delivery/read receipts use the same
+bounded routing and durable import mechanism. No synchronous collection
+query is relayed through a chain of hubs, and replies are not replicated to
+speculative future hubs. Without a route to a surviving custodian, mail
+remains held until a path appears or its TTL expires.
+
+**Clarification (#1754): collector assignment and offer history.** A held row's
+`next_hop` selects its current collector; it is not an immutable hub assignment.
+An outbound `mesh.collect` request can offer the row only to that hub, and
+collection revalidates the recipient's route before leasing an offer. A route
+pass can clear an obsolete assignment and assign the same held copy to another reachable hub. Lease expiry alone
+does not authorize another hub. Signed adverts describe the current local
+view, so independent withdrawals in a diamond can temporarily leave a valid
+alternate path through the other hub. A later advert can withdraw that path.
+Silence is not withdrawal, and gating one hub's poll does not gate another.
+
+For a held outbound row, `collect_attempts` counts leased offers, including
+offers whose response or acknowledgement never arrives. It does not count
+successful imports and is not scoped to a hub or route generation. Clearing or replacing
+an assignment preserves this history. Consequently, a row can be unrouted
+with a nonzero offer count, and a subsequent stale-hop rejection must preserve
+that count without adding another offer. A zero-count assertion requires an
+interleaving that excludes every earlier eligible collector; local route
+absence by itself supplies no such proof. Custody remains held until durable
+acknowledgement or a terminal outcome, under the origin/custody contract above.
+
+A spoke with no outbound edges signals pending work with `mesh.wake` on the
+hub-opened edge. The hub pulls neighbor-addressed custody with
+`mesh.collect` and pushes mail toward the spoke with `mesh.deliver`.
+Follow-up answers remain eligible after an earlier final answer; a wake
+can prompt another pull without a permanent conversation poll. Import
+commits before acknowledgement. When the edge disappears, its custodian
+retains mail until reconnect or expiry.
+
+Import collected replies through `src/app/api/messages.rs`'s local event and
+mailbox/store path exactly once, then acknowledge collection. Both
+`msg.status` and `src/api/reply_wait.rs` observe the same local result, and
+ordinary inbox wake rules apply. If the sender has no inbox, retain the
+result for its waiter and status. Mute deferrals are reply producers on this
+same durable path: mint a reply message id, retain custody, route/collect
+and dedupe just like an agent's answer. Delete the separate SSH deferral
+hop. A deferral never replaces an actual answer. A channel-push original is
+settled on durable acceptance of its reply or deferral into custody, not on
+a transient relay write or remote read, so retries cannot produce repeated
+channel originals. Settling this producer-side original does not claim final
+reply delivery or mailbox read. Collection must not drain unrelated receiver
+inbox messages. Retain terminal results through the agreed receipt lifetime
+and expose expiry when the sender returns too late.
+
+## Identity, directory and vanished agents
+
+ADR-0008's AgentId is identity, not an SSH address or a server-local pane
+id. `src/app/directory.rs` remains the single resolution surface. Extend its
+peer summaries with owning node identity, incarnation/generation and
+edge-bound route provenance. Local authoritative identity wins over cached
+entries. A closed advertising edge withdraws its routes, not the agent's
+existence: known identity plus stale location is queued/offline.
+
+**Amendment Q3 (owner accepted 2026-10-09):** a new send whose owner is
+outside the direct/one-hop gossip horizon and has no stored owner hint is
+refused as unknown. A known-but-offline owner is queued. Replies use the
+stored return binding at any depth, even when directory discovery fails.
+Movement requires authenticated owner updates, not reinterpretation of the host
+substring in an AgentId.
+
+The owning server's agent lifecycle handler emits and persists an explicit
+removal tombstone keyed on `(AgentId, session_id)` on explicit kill,
+permanent pane close without a retained resumable session, or confirmed
+agent exit with no resumable session. Process exit alone, transient
+disconnect, hibernation, and a pane replacement during planned resume do not
+emit removal. The lifecycle handler consults persisted session/resume state
+before declaring permanent removal. Transport workers do not infer death
+from missing gossip.
+
+[#582](https://github.com/gerchowl/flock/issues/582)'s restart and same-session
+resume must persist the AgentId and resume binding before stopping the old
+process, then attach the resumed process/pane to that same identity. If resume
+fails, report offline/resume_failed and retain mail pending explicit kill or
+TTL, rather than falsely announcing removal or assigning a new identity.
+A deliberate fresh session uses a new AgentId, never inherits old mail.
+
+A removal tombstone terminates pending mail for that exact AgentId/session
+as `recipient_gone`, returned to sender status/wait with the lifecycle
+reason. Without it the sender sees queued/offline until delivery or expiry.
+A reply to a removed sender still enters its origin's conversation
+status/wait store, but never a replacement agent's inbox. Removal does not
+rewrite existing read or delivery evidence.
+
+## Cross-host replies and confirmations (ADR-0008 clarification)
+
+This decision preserves ADR-0008's tool inbox and sender-authority boundary.
+Agent identity, location and reachability are distinct. A sender AgentId
+names a reply recipient but does not prove a live return channel. `from_host`
+is never dialing authority. Queued and delivered metadata retain the
+transport-attested conversation binding, independent of directory freshness.
+
+The originating server receives replies either by collection over any
+available authenticated edge (including one opened by another node), or by
+a custodian's push down that edge. A sender with no inbox still gets results
+through its local status/wait store. Delivery and genuine read receipts use
+the same custody/collection mechanism. Delivered means durable target inbox
+import, not SSH success, hub custody, accepted wake or recipient read. #640's
+wake evidence remains separate. Wait/status read the dedicated local store,
+not remote polling or an audit ring whose records may rotate away.
+
+`msg.read`'s `replyable` reports a valid durable return binding even when
+the sender is offline, with queued/collection-pending explanation. Unknown
+identity, permanent removal and expiry differ from temporary routing loss.
+Transport attestation and collection tokens never make agent traffic an
+operator instruction.
+
+Terminal refusals by the owning node are recipient-signed receipts
+([#872](https://github.com/gerchowl/flock/issues/872)). When the owner behind
+a forwarding hub refuses a message with a policy reason (`refused` plus the
+reason) or because the target was removed (`recipient_gone`), it signs a
+receipt bound to the message's return binding. The hub takes custody of that
+receipt before recording the refusal and routes it back like delivery and
+read receipts. The origin accepts it only under the recipient node's
+signature, so a hub cannot mint a refusal for another node. Refusals a hub
+decides on its own are not signed by the owner. The receipt travels in an
+optional `receipt` field of the outbound acknowledgement, with a new
+`refused` receipt state, so it requires mesh protocol 5.
+
+Known limitations, fixed in v1.1.0: failures decided at an intermediate node
+(hop budget, loop, no route) are not routed back to the sender
+([#876](https://github.com/gerchowl/flock/issues/876)), and routed receipts do
+not carry expiry or elapsed outcome retention to multi-hop origins
+([#858](https://github.com/gerchowl/flock/issues/858)). In both cases the
+origin keeps the message in custody until its own deadline.
+
+## Components and implementation steps
+
+Implementation responsibilities:
+
+- `src/peer_stream.rs` and `src/cli/peers.rs`: require matching mesh protocol, carry
+  messages and receipts in both directions using delivery, wake pushes and
+  dialer collection, and recover authenticated edges. Keep summary coalescing
+  separate from discrete durable mail.
+- `src/peers.rs`: replace one-shot message sends with held-edge custody and
+  structured acknowledgements, exposing edge refusal reasons in peer status.
+- `src/app/api/messages.rs`, `src/app/mailboxes.rs` and event/schema modules:
+  dedicated custody store, atomic dedupe/import, return bindings and outcomes.
+  Audit schemas carry metadata only, while wait/status query durable records.
+- `src/app/api/edges.rs` and `src/app/edges.rs`: authenticate per-edge relay
+  attachments, replacing the single message uplink. Runtime workers handle
+  mesh custody, deferral production and collection off the app/render loop.
+- `src/app/directory.rs`: edge-bound routes and lifecycle-backed owner tombstones.
+- `src/remote.rs`: keep thin-client bootstrap and protocol compatibility gates
+  separate from fleet routing. A client attachment is not a durable mailbox
+  route or permission to turn every remote session into a router.
+- `src/api/reply_wait.rs`: consume imported local facts, without networking.
+
+**Step-1 prerequisite: node identity bootstrap and persistence.** Generate
+an Ed25519 keypair once in the per-user `config::state_dir()`, with mode
+0600 and fsync, and derive node id from the public key. Never put the
+identity in `~/.config`, which may be dotfile-synced. Persist a local
+machine binding alongside it, validate the binding at startup/enrollment and
+refuse an identity copied to another machine. Report cloned identity
+explicitly and require a new identity/enrollment there, not concurrent reuse
+of the key.
+
+Pin the public key/node id exchanged on the first authenticated held SSH
+edge, and map it to the configured peer name for display and policy.
+Reconnect proves possession against that pinned binding. Reject unexpected
+replacement and require operator re-enrollment. Retain identity across
+restarts and upgrades on the same machine. A direct peer must establish a
+held edge for enrollment and keep a working held edge for messaging or
+collection. Step 1 cannot defer identity to step 2 because dedupe and
+collection authorization depend on it.
+
+**Step 1 (#623):** dedicated store, minted message ids, durable reply outbox
+and authenticated sender-side collection on existing direct or one-hub logical
+paths, with restart recovery, idempotent
+import, delivery receipts and honest pending-collection status. This milestone
+preserved the hub/spoke guard until step 2 replaced it. Holding and collection
+were implemented together: holding alone
+strands the answer. Choose records and keys that step 2 can reuse.
+
+**Step 2 (#661):** generalise custody to requests and replies, advertise
+routes, use either direction of authenticated mesh edges, and add bounded
+multi-hop routing and offline/queued reporting. Replace the
+one-relay-per-server limit with one relay attachment per edge, so multiple
+authenticated neighbors can coexist. Existing reachable hub/spoke topology
+becomes a mesh with fewer edges, requiring no new inbound reachability or
+implicit SSH grants, after the coordinated configuration upgrade below.
+
+The two steps are implementation milestones within the same mesh series, not
+mixed-version releases. Both use held mesh transport, and the old
+uplink/one-shot paths are removed before the coordinated release.
+
+## Rollout: one coordinated upgrade
+
+Mesh ships as a clean breaking release, **v1.0.0**, under semantic
+versioning. Upgrade the whole fleet together in one rollout. Implementation
+commits that change the wire use `!` in the conventional subject or a
+`BREAKING CHANGE` footer. This ADR does not itself bump package versions or
+publish a release.
+
+At each held-edge handshake require identical mesh protocol versions (for
+bumps after the negotiation release see Amendment #1380 below). Refuse
+a mismatch with a clear error naming both local and remote versions and
+`upgrade flk on <peer>` using the configured peer name. v1.0.0 speaks mesh
+protocol 5. Protocol 4 existed only in development builds, whose nodes deny
+the new acknowledgement fields and would reject whole batches, so they are
+refused at hello. The previous release, v0.11.0, has no mesh at all: its
+server rejects `mesh.hello` as an unknown method, and an older relay prints
+CLI usage instead of answering. Both are refused as
+`upgrade flk on <peer> (peer runs a pre-mesh flk)` with the long refusal
+backoff, never the transient retry schedule. Nothing queues for
+that incompatible peer and nothing is downgraded. Refuse new acceptance
+addressed through a known incompatible edge, including collection jobs for
+it. Existing custody remains stored rather than being sent to an
+incompatible peer. Ordinary offline queuing for enrolled matching-protocol
+destinations remains, subject to custody TTL, and is not a compatibility
+mechanism.
+
+A peer that cannot hold an edge, such as an old `flk` or a failing stream,
+is refused until fixed (see Amendment #844 for `summary_command`).
+`flk status` and `flk peers` name the configured peer and concrete reason
+(pre-mesh flk, protocol/version unsupported or
+stream failure). No one-shot or alternate-message transport is attempted.
+
+Delete the old message uplink, one-shot message relay, separate deferral SSH
+hop and their related configuration keys in the mesh series, without a
+deprecation window. This includes `[msg] uplink_timeout_secs`,
+`uplink_heartbeat_secs`, `deferral_relay_concurrency` and custom peer
+`summary_command` compatibility behavior. There are
+no legacy acknowledgements, legacy gates or opt-in legacy sends. Review
+`src/protocol/wire.rs` under the repository's release-relative version rule
+while implementing the breaking wire, rather than bumping it in this doc PR.
+
+**Amendment #844 (owner accepted 2026-10-09):** removed keys warn and are
+ignored rather than refused. Startup, live handoff and reload strip
+`[msg] uplink_timeout_secs`, `uplink_heartbeat_secs`,
+`deferral_relay_concurrency` and `[[peers]] summary_command`, apply every
+other setting, and keep the peer, which then holds an ordinary mesh edge.
+Warnings name the file, line and key in `flk status` and on CLI stderr;
+`flk config check [--json]` lists removed and unknown keys before a rollout
+and exits 1 when there are warnings. Startup, handoff and reload are never
+refused for a removed key. This supersedes the earlier "reject removed keys"
+rule and the refusal of peers with a custom `summary_command`.
+
+**Amendment Q2 (owner accepted 2026-10-09):** dev-build stores at schema
+v1–v11 upgrade in place, idempotently, to the v1.0.0 schema baseline (v12).
+Do not discard live custody to upgrade. Before rollout, make a consistent
+SQLite backup of `mesh-mail.sqlite` and preserve the identity and both
+`mesh-quarantine.jsonl` sidecar files. Copying only the main database while
+its WAL writer is active is not a consistent backup. Quarantined rows are
+archived with their original typed columns before bodies are cleared; a
+failed archive write leaves the row intact. Migration failures name the
+store path and recovery hint; moving it aside starts empty and loses its
+custody, so preserve a backup before any such recovery.
+
+### Amendment #1380: mesh hello version negotiation
+
+Status: Accepted 2026-11-19 by owner decision on
+[#1380](https://github.com/gerchowl/flock/issues/1380); not yet implemented.
+This supersedes "require identical mesh protocol versions" above for every
+bump after the negotiation release. The identical-version rule, its refusal
+text and the `upgrade flk on <peer>` hint remain for a peer outside the
+support window. The mesh VERSION stays 5 until the `command` envelope slice
+(step 2 below) ships.
+
+**Why.** A closed `Kind` enum plus identical-version hello makes every new
+envelope kind a coordinated fleet upgrade (#1380 found this for a `command`
+kind carrying ADR-0036 §5 `cmd`s to another node's agent). Negotiation makes
+later bumps rolling. Its own release is rolling too (see 4): the offer is
+byte-compatible with the VERSION 5 offer while the range is a single version.
+
+**1. Hello and the support window.** Each node advertises the closed range
+`[mesh_min, mesh_max]` it implements. The existing `mesh` field carries
+`mesh_max`, so a reader that knows only the old field sees the highest
+version. `Offer` gains `mesh_min: Option<u32>` with
+`#[serde(skip_serializing_if = "Option::is_none")]`. A node whose range is a
+single version `[V, V]` omits it, so its offer, and therefore the signed
+hello transcript (which re-serializes the `Offer`), is byte-identical to a
+VERSION 5 node's. An absent `mesh_min` reads as `[mesh, mesh]`. A node whose
+range spans two versions always sends it, and because the offer is signed an
+intermediary cannot strip it to turn `[5, 6]` into `[6, 6]`. The window is
+the current VERSION N and the previous one, N-1, floored at 5 because VERSION 4 was development-only: the negotiation release
+advertises `[5, 5]`, the first VERSION 6 build `[5, 6]`, a VERSION 7 build
+`[6, 7]`. The window is a compile-time constant, not configuration.
+
+Both offers are signed in the hello transcript, so the ranges are bound to
+the possession proofs and cannot be changed in transit. Each side always
+computes the session VERSION itself, from the two signed offers, as
+`min(local_max, remote_max)`, and requires it to be at least
+`max(local_min, remote_min)`; otherwise the ranges do not overlap. Nothing
+else selects the VERSION.
+
+The acceptor also reports its computed value in its reply, in an optional
+field of `Challenge`. The transcript signature covers only the role and the
+two offers, so that value is unsigned and strippable: it is a redundant
+cross-check and a diagnostic, never an input. The dialer refuses a reported
+value that differs from its own computation. A missing value is accepted
+only when the acceptor's signed offer is `[5, 5]` (no `mesh_min` and
+`mesh == 5`), which is what every pre-negotiation acceptor sends, and the
+session is then at 5 if and only if the dialer's own range contains 5. If
+the signed offer shows a range, a missing value is refused with
+`mesh_version_mismatch`, so a stripped value cannot lower the session. A
+range with `mesh_min` below 1 or above `mesh_max` is invalid and refused.
+
+No overlap is refused at hello with the existing typed code
+`mesh_version_mismatch` and a message naming both ranges:
+`mesh version mismatch: local 5-6, remote 7-8; upgrade flk on this node`.
+The named side is the one whose `mesh_max` is lower. The refusal takes the
+long backoff and shows in `flk peers` and `flk status` with the configured
+peer name, as for any incompatible peer. The error's `data.mesh` carries the
+refusing node's `mesh_max` (never a lower value) and `data.mesh_min` its
+minimum, so a reader that knows only `mesh` still sees the highest version.
+
+A pre-negotiation node is a peer with an absent `mesh_min`: it reads as
+`[5, 5]` and negotiates normally with any range containing 5. It cannot
+accept an offer with `mesh` above 5, which is what 4 relies on.
+
+**2. Per-peer VERSION and send gating.** The negotiated VERSION is stored
+with the held-edge session of that peer, renegotiated at every hello and
+never persisted. `flk peers` shows it. Every sender, including a forwarding
+hub, checks it per next hop before emitting an envelope kind or a field that
+a version introduced (`deny_unknown_fields` structures stay strict, so a
+field added in VERSION N is also gated). The gate is a single lookup from
+kind or field to the version that introduced it, used at dequeue and at
+forward time, never only at enqueue.
+
+- `message` and `receipt` exist at every negotiable VERSION and are never
+  gated.
+- `command` (VERSION 6) is sent only to a peer at 6 or higher. When the
+  origin's next hop negotiated less, the origin refuses the `cmd` with the
+  existing ADR-0036 §5 `unsupported_for_agent` before any envelope or custody
+  row is created. The peer never sees it, so there is no decode failure on
+  the receiver.
+- A hub that cannot forward a kind to its next hop returns a `refused`
+  receipt to the origin with the same code, and stores nothing. A command
+  whose peer renegotiated lower between accept and dequeue gets the same
+  refusal. A command is never held for a later, newer peer.
+- Held `message`/`receipt` custody to an incompatible peer follows the
+  paragraph above: stored, not sent.
+
+**3. Unknown kinds are protocol violations.** Within a session at VERSION
+`v`, the receiver accepts exactly the kinds that `v` defines. A kind it
+cannot decode, or a known kind introduced after `v`, is a protocol violation,
+never a silent drop and never an unacknowledged skip. The receiver:
+
+1. reads the `kind` tag before decoding the envelope (an absent tag means
+   `message`), so the failure is typed rather than a whole-batch serde error;
+2. imports and acknowledges nothing from that batch, so the sender keeps
+   custody of every envelope in it;
+3. logs `mesh_protocol_violation` with the peer, session VERSION and the
+   offending kind name, as audit metadata with no body;
+4. closes and resets the session, which returns to the long refusal backoff
+   after the reconnect, and shows the reason in `flk peers`.
+
+The mesh wire requires object-form envelopes and envelope-bearing records
+(`Deliver`, `OutboundCollect`, and `OutboundAck`). Sequence-form structs are
+`mesh_protocol_violation`, including sequences used for enclosing records or
+for optional receipt envelopes. The single kind gate enforces these object
+boundaries before decoding or importing any batch. An explicit `kind` must be
+a string; serde enum-map aliases and other tag representations are violations.
+An absent object tag still means `message`. Optional `receipt: null` means no
+envelope, and the collection result's string receipt token remains a token.
+
+`mesh_protocol_violation` is a new error code in the `after_handoff` retry
+class in `src/api/error_code.rs`; the held edge uses the long refusal backoff.
+
+This also covers a peer that claims a VERSION it does not implement: if it
+sends a kind or field above what it negotiated, (3) fires on our side; if it
+claims too much and cannot decode what we send, it resets the session on its
+own side, our send fails as an ordinary stream error and custody is retained.
+
+**4. Rollout.** Slice 1 (negotiation, VERSION 5) is a rolling upgrade with
+no refused-edge window. A node at `[5, 5]` sends the same offer bytes as a
+pre-negotiation node (1), and each reads the other's as `[5, 5]`, so mixed
+fleets keep every edge while nodes are upgraded one at a time, in any order.
+The coordinated-upgrade design was considered and rejected (see
+"Alternatives rejected").
+
+Only slice 2, the first VERSION 6 build, has a precondition: every peer it
+will meet must already run slice 1. Operator procedure:
+
+1. Upgrade every node to the slice 1 build, in any order.
+2. Check `flk peers` on each node: all edges established, no
+   `mesh_version_mismatch`.
+3. Only then deploy a VERSION 6 build, node by node.
+
+A pre-negotiation node already refuses `mesh` 6, and does so before it looks
+at any signature, because `Offer::validate` compares `mesh` first. Deploying
+VERSION 6 to a fleet that still has one fails on that edge, exactly as
+follows (a VERSION 6 node `S` offers `mesh: 6, mesh_min: 5`):
+
+- `S` dials, old node accepts: the old acceptor fails validation with
+  `mesh version mismatch: local 5, remote 6; upgrade flk on this node`
+  and answers `mesh_version_mismatch` with `data.mesh: 5`. It never reaches a
+  signature check, so no `invalid mesh signature` appears. `S` sees a
+  `mesh_version_mismatch` whose `data.mesh` (5) lies inside its own window,
+  which cannot be a no-overlap refusal, so it reports
+  `mesh version mismatch: peer <peer> predates version negotiation; upgrade flk on <peer>`.
+  The text starts with the permanent prefix, so the edge takes the long
+  backoff, never the transient retry schedule.
+- Old node dials, `S` accepts: `S` reads the offer as `[5, 5]`, finds the
+  overlap at 5 and returns its own signed offer, `mesh: 6, mesh_min: 5`. The
+  old dialer runs `validate` on it and fails with
+  `mesh version mismatch: local 5, remote 6; upgrade flk on this node`,
+  which starts with the same permanent prefix and takes the long backoff. It
+  never prints `local 5, remote 5`, because `S` sends no refusal here and,
+  where it does refuse a no-overlap peer, its `data.mesh` is `mesh_max` (1).
+  The handshake never reaches `Finish`, so on `S` the pending enrollment
+  lapses and the edge stays unenrolled.
+- Custody for that peer stays stored (see above) and nothing is sent to it.
+
+Afterwards upgrades roll node by node within the window. A build at N
+negotiates with N-1 and N, so a fleet of mixed adjacent builds keeps every
+edge, and new-kind features apply only between peers at the newer VERSION.
+Skipping a release (N-2 to N) has no overlap and is refused: step through
+N-1. Dropping support for N-2 happens only when the window moves.
+
+Downgrade: rolling a node back from N to N-1 renegotiates at the next hello;
+its peers stop sending N-only kinds and refuse N-only operations as in (2),
+with no data loss, because N-only kinds are never custody. Rolling back more
+than one version has no overlap and is refused at hello.
+
+**5. Security.** Negotiation selects a feature set only; it changes no
+authentication or authorization. Node-key pinning, possession proofs, the
+origin binding and `[msg] allow_from` (see "Origin policy and fleet pause"),
+custody dedupe and TTLs apply identically at every negotiated VERSION, and
+nothing at N-1 skips an origin or custody check that N performs. The ranges
+are signed (1), the window is a constant that no peer or configuration can
+lower, and each side computes the session VERSION from the signed offers, so a
+peer cannot downgrade a session below the window, choose a version the other
+side does not support, or strip fields by editing the offer. A peer that
+advertises a lower range than it implements only loses features. A peer that
+advertises a higher one is caught by (3). Hello runs before any envelope is
+accepted, and an offer that fails validation never reaches the pin or policy
+code.
+
+**6. Tests and slices.**
+
+Implementation-slice tests, using the debug-only version override extended to
+a range (it stays under `cfg!(debug_assertions)`, like
+`FLOCK_TEST_MESH_VERSION`):
+
+- Mixed pairs `[5, 5]`/`[5, 6]` and `[5, 6]`/`[6, 7]` negotiate 5 and 6
+  in both dial directions, and both sides report the same VERSION.
+- No overlap (`[5, 5]` against `[7, 8]`, and `[6, 7]` against `[5, 5]`) is
+  refused with `mesh_version_mismatch`, both ranges in the message, the
+  correct side named, and the long backoff.
+- Downgrade attempt: an offer edited to a lower or wider range fails
+  signature verification; a peer that advertises below the local window is
+  refused; a reported value that differs from the dialer's own computation is
+  refused.
+- Invalid ranges (`min > max`, zero) are refused with their own message.
+- Byte compatibility: an offer at `[5, 5]` serializes with no `mesh_min` and
+  equals a VERSION 5 node's offer and transcript byte for byte; an offer
+  with no `mesh_min` negotiates as `[mesh, mesh]`; removing `mesh_min` from a
+  signed `[5, 6]` offer fails signature verification.
+- A `[5, 5]` slice 1 node against a real pre-negotiation node, in both dial
+  directions: the edge comes up at 5, including the missing reported value
+  on the dialer side. A `[6, 7]` dialer against a reply with no reported
+  value is refused with `mesh_version_mismatch`.
+- `[5, 6]` acceptor reply with the reported value stripped: refused with
+  `mesh_version_mismatch`, and a `[5, 6]` dialer never settles on 5 while
+  the acceptor runs 6.
+- A VERSION 6 node against a pre-negotiation node, in both dial directions,
+  produces the refusals described in 4 and takes the long backoff.
+- The kind/field gate: a kind newer than the session VERSION is never
+  emitted, including after renegotiation and by a forwarding hub; `message`
+  and `receipt` flow at every negotiated VERSION.
+- Receiver: an unknown kind and a known kind above the session VERSION each
+  produce `mesh_protocol_violation`, import and acknowledge nothing from the
+  batch, reset the session and leave sender custody intact.
+- The existing mismatch tests (`mesh_version_refusal_names_both_versions...`,
+  the peer stream mismatch tests) keep passing with range text, and a
+  forged `node_id` or an origin outside `allow_from` is still refused at
+  every negotiated VERSION.
+
+Ordered implementation slices:
+
+1. **Negotiation (VERSION stays 5).** `Offer` ranges and the transcript
+   change, session VERSION in the held-edge session, the kind/field gate
+   helper with its lookup table, receiver violation handling, `flk peers`
+   display, refusal text and the tests above. Not a breaking wire change
+   while the range is `[5, 5]`: it rolls out with no refused-edge window.
+2. **VERSION 6 `command` envelope (#1380).** `Kind::Command` with `cmd_id`,
+   verb, args, the originating principal and its token scopes; destination
+   authorisation of that principal (ADR-0036 §1a, §5; ADR-0043 §4); the
+   `ack` as a `receipt`; VERSION 5 to 6 and the window `[5, 6]`; the
+   `unsupported_for_agent` path for peers below 6; ADR-0036 §5 and the ADR-0043
+   remote command path updated to match. It lands only after slice 1 has
+   shipped to the whole fleet (4) and is the one rollout with a precondition.
+
+## Alternatives rejected
+
+**One coordinated upgrade to ship negotiation (#1380).** An earlier draft of
+the negotiation amendment changed the offer unconditionally and required
+the whole fleet to upgrade at once. Rejected: `Offer` has no
+`deny_unknown_fields` and `transcript()` re-serializes it, so the only
+obstacle was the extra field in the signed bytes. Omitting `mesh_min` for a
+single-version range removes it, makes slice 1 a rolling upgrade, and moves
+the single precondition to the first VERSION 6 build, which old nodes
+already refuse by the `mesh` comparison.
+
+This departs from the owner's 2026-11-19 wording on #1380 ("one final
+coordinated upgrade to ship negotiation"). The departure is deliberate: the
+coordinated upgrade was only needed to avoid a transcript change, and
+byte-compatibility removes that need, so negotiation costs the fleet nothing
+to adopt. The owner is asked to confirm it. If the owner prefers the
+original wording, slice 1 sends `mesh_min` unconditionally and its rollout
+is the coordinated procedure of the earlier draft.
+
+**Require reciprocal peer entries or a dialable laptop.** Makes roaming/NAT
+an operator configuration failure and repeats #623's asymmetry.
+
+**Hold replies without collection, or only warn about unreachable senders.**
+The former strands answers, the latter diagnoses rather than satisfies the
+conversation. Reachability snapshots are advisory, not permanent refusal.
+
+**Only a live reverse route.** Useful fast path, but loses the guarantee when
+an edge closes between request and answer. Durable custody and pull survive it.
+
+**Mandatory central hub.** Existing hubs remain useful custodians, but making
+one indispensable turns its availability into a fleet-wide send prerequisite.
+
+**Extend audit-event retention to support custody.** Rejected. ADR-0005
+rotates at 32 MB or 100,000 events and retains four archives, so neither a
+seven-day hold nor eight-day dedupe window survives arbitrary event volume.
+Time retention would change the audit subsystem's bounded-storage and failure
+posture. A dedicated store provides atomic import and independent quota/GC.
+
+**Proactively replicate replies toward potentially reachable hubs.** Rejected:
+adds body copies and retention obligations without guaranteeing the laptop's
+next network. Route-driven custody forwarding transfers one copy along an
+actual route, retaining it until downstream durable acceptance.
+
+**Replicated logs, a broker, faster polls or ControlMaster alone.** Retain
+ADR-0009's rejections and measurements. Conversation-scoped custody transfers only
+required bodies and receipts, not every node's audit log.
+
+## Non-goals and validation
+
+No new public listener, SSH credential distribution, global log replication,
+keyboard injection, exactly-once agent execution, total ordering, or Byzantine
+consensus. The separate #623 hook/MCP availability gap is outside this design.
+An offline origin with no surviving disk cannot originate new durable mail.
+
+Implementation acceptance must drive isolated real fleet servers from send
+through read, reply and original inbox/wait/status. Cover a one-way-only
+edge, a laptop offline then reconnecting, sender/receiver/hub restarts,
+duplicate imports and lost acknowledgements, route cycles and exhausted hop
+budget, forged tokens/routes/origins, stale directory versus authoritative
+removal, expiry and outbox limits, audit rotation during a held
+conversation, no active waiter, a real answer after deferral, and refusal of
+mismatched protocols. Also cover a laptop collecting through a different
+hub, a spoke with no outbound edges, quiet healthy edges retaining routes,
+closed edges withdrawing routes, and #582 restart/resume retaining identity
+without a removal tombstone. Existing `tests/support/fleet.rs` and
+`tests/mcp_fleet_messaging.rs` supply the harness. Also require end-to-end
+coverage of origin
+allowlists across an allowed forwarding hub, pause/resume and restart while
+paused with no TTL consumption, mailbox-full retry versus 24-hour inbox
+expiry, durable channel-original settlement, cloned identity refusal,
+per-edge relay attachments and explicit refusal diagnostics for unsupported
+summary commands or failed held streams.
+
+## Decisions (accepted by the owner 2026-10-08)
+
+The owner accepted the defaults and made further rulings on 2026-10-08 after
+the port-versus-supersede spike. These rulings replace the previous old-peer
+compatibility decision. Implementation must satisfy all decisions below
+before advertising mesh capability:
+
+1. **TTL and resource defaults:** use seven days of remaining TTL,
+   retry backoff 60 seconds to five minutes with jitter, hop limit eight,
+   256 MiB logical store including a 16 MiB metadata reserve, and 10,000 active
+   envelopes. Bound WAL/disk overhead with checkpoints and a disk-reserve guard.
+2. **Storage:** use the dedicated SQLite store with FULL durability and
+   transactional inbox/dedupe import. Audit events remain metadata only.
+3. **Node identity:** use a once-generated persisted Ed25519 keypair,
+   public-key-derived id, per-user state-dir storage and machine binding,
+   first-edge SSH-authenticated enrollment and pinned possession checks.
+   Operator re-enrollment is required on key replacement.
+4. **Agent removed:** declare removal on explicit kill or permanent close/exit
+   only when no retained resumable session exists. Preserve AgentId through #582
+   restart/resume, key tombstones on AgentId plus session id, and report resume
+   failure as offline until kill or expiry.
+5. **Final-outcome retention:** retain outcomes for seven days after local
+   termination, independent of audit rotation. After GC, return `outcome_retention_elapsed`
+   for queries carrying an expired, authenticated message reference rather
+   than inventing a delivery result.
+6. **Clean break:** ship v1.0.0 and upgrade the fleet together. Require identical
+   mesh protocol at the edge handshake, naming both versions and
+   `upgrade flk on <peer>` on refusal. No legacy path, downgrade or queuing
+   for incompatible peers. Remove message uplink, one-shot relay, deferral hop
+   and related keys as part of the series, with no deprecation window.
+7. **Hub body retention:** retain bodies only in the bounded custody store,
+   delete after durable downstream custody transfer (retain metadata/receipt)
+   or local expiry, and never append them to mesh audit events. Origins and
+   final inbox owners retain their own copies under their respective TTL/read
+   rules. Hubs can read bodies as trusted same-user custodians, and do not
+   replicate them to speculative future hubs.
+8. **Origin policy and display:** `[msg] allow_from` matches the node-key-
+   authenticated origin under its local pin name (configured or inbound
+   first-contact), never intermediate hubs. Advertised names alone confer no
+   policy authority.
+9. **Fleet pause:** freeze all custody activity, including sends, retries,
+   delivery and expiry. Stop TTL/retention clocks while paused, including
+   across restart, and resume without charging paused time.
+10. **Held-edge requirement:** refuse custom summary transports, old peers and
+    failing streams until fixed. `flk status` and `flk peers` expose the reason.
+11. **Reply producers and settlement:** mute deferrals use the same durable
+    reply path. Settle channel-push originals on durable reply/deferral
+    acceptance, without claiming remote delivery or read.
+12. **Inbox and custody lifetime:** local unread inbox TTL is 24 hours,
+    distinct from seven-day custody TTL. A full mailbox is retryable until
+    custody expiry, not terminal.
+13. **Relay attachment scope:** replace the one-relay-per-server limit with
+    per-edge attachments in step 2.

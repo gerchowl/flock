@@ -8,7 +8,7 @@
 //!
 //! ## Trigger block shape
 //!
-//! ````
+//! ````text
 //! ```flk-trigger
 //! on = "issue_updated"
 //! run_id = "optional-stable-id"

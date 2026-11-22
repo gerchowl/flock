@@ -54,7 +54,7 @@ fn parse_status_args(args: &[String]) -> Option<(StatusScope, bool)> {
     }
 
     match args.first().map(|arg| arg.as_str()) {
-        None => Some((StatusScope::Full, false)),
+        None => Some((StatusScope::Full, super::output::json())),
         Some("--json") if args.len() == 1 => Some((StatusScope::Full, true)),
         Some("server") => {
             parse_status_scope_args(args, StatusScope::Server, "flk status server [--json]")
@@ -75,7 +75,7 @@ fn parse_status_scope_args(
     usage: &str,
 ) -> Option<(StatusScope, bool)> {
     match args.get(1).map(|arg| arg.as_str()) {
-        None => Some((scope, false)),
+        None => Some((scope, super::output::json())),
         Some("--json") if args.len() == 2 => Some((scope, true)),
         _ => {
             eprintln!("usage: {usage}");
@@ -96,22 +96,38 @@ pub(crate) enum ServerRuntimeStatus {
         protocol: Option<u32>,
         capabilities: Option<crate::api::schema::ServerCapabilities>,
         session_health: Option<crate::platform::SessionHealth>,
+        api_listener: Option<crate::api::schema::ApiListenerHealth>,
+        agent_account_diagnostic: Option<crate::api::schema::AgentAccountDiagnostic>,
     },
     NotRunning,
 }
 
 fn print_full_status(json: bool) -> std::io::Result<i32> {
+    let config_warnings = crate::config::removed_config_warnings();
     let server = read_server_runtime_status()?;
+    let installed = read_installed_status(&server);
+    let (peers, enrollment_warning) = if matches!(server, ServerRuntimeStatus::Running { .. }) {
+        super::peers::read_enrollment()
+    } else {
+        (Vec::new(), None)
+    };
 
     if json {
         print_json(&FullStatusJson {
+            config_warnings: config_warnings.clone(),
             client: client_status_json(),
             server: server_status_json(&server),
             update: update_status_json(&server),
+            installed,
+            peers,
+            enrollment_warning,
         })?;
         return Ok(0);
     }
 
+    for warning in config_warnings {
+        println!("config warning: {warning}");
+    }
     println!("client:");
     println!("  version: {}", crate::build_info::version());
     println!(
@@ -120,8 +136,25 @@ fn print_full_status(json: bool) -> std::io::Result<i32> {
     );
     println!("  protocol: {}", crate::protocol::PROTOCOL_VERSION);
     println!();
+    println!("peers:");
+    if let Some(warning) = enrollment_warning {
+        println!("  {warning}");
+    }
+    for peer in &peers {
+        println!("  {}", super::peers::enrollment_line(peer));
+    }
+    println!();
     println!("server:");
     print_server_status_body(&server, "  ");
+    println!();
+    println!("installed:");
+    println!("  binary: {}", option_label(installed.binary.as_deref()));
+    println!("  version: {}", option_label(installed.version.as_deref()));
+    println!("  client_drift: {}", drift_label(installed.client_drift));
+    println!("  server_drift: {}", drift_label(installed.server_drift));
+    if let Some(error) = &installed.error {
+        println!("  error: {error}");
+    }
     println!();
     println!("update:");
     println!("  restart_needed: {}", restart_needed_label(&server));
@@ -155,16 +188,42 @@ fn print_client_status(json: bool) -> std::io::Result<()> {
     Ok(())
 }
 
+fn clone_detection_warning(
+    capabilities: Option<&crate::api::schema::ServerCapabilities>,
+) -> Option<&str> {
+    capabilities.and_then(|caps| caps.clone_detection_warning.as_deref())
+}
+
 fn print_server_status_body(server: &ServerRuntimeStatus, indent: &str) {
     match server {
         ServerRuntimeStatus::Running {
-            version, protocol, ..
+            version,
+            protocol,
+            api_listener,
+            agent_account_diagnostic,
+            capabilities,
+            ..
         } => {
+            if let Some(warning) = clone_detection_warning(capabilities.as_ref()) {
+                println!("{indent}{warning}");
+            }
             println!("{indent}status: running");
             println!("{indent}version: {}", option_label(version.as_deref()));
             println!("{indent}protocol: {}", protocol_label(*protocol));
             println!("{indent}compatible: {}", compatibility_label(*protocol));
             println!("{indent}socket: {}", api::socket_path().display());
+            if let Some(diagnostic) = agent_account_diagnostic {
+                let crate::api::schema::AgentAccountDiagnostic::AgentAccountUidCollision { uid } =
+                    diagnostic;
+                println!("{indent}account policy: agent_account_uid_collision: flk-agent UID {uid} equals server UID; operator authority refused");
+            }
+            if let Some(health) = api_listener {
+                println!("{indent}api listener stopped: {}", health.stopped);
+                println!("{indent}api accept errors: {}", health.accept_errors);
+                if let Some(err) = &health.last_accept_error {
+                    println!("{indent}last api accept error: {err}");
+                }
+            }
         }
         ServerRuntimeStatus::NotRunning => {
             println!("{indent}status: not running");
@@ -213,6 +272,8 @@ pub(crate) fn read_server_runtime_status() -> std::io::Result<ServerRuntimeStatu
             protocol: status.protocol,
             capabilities: status.capabilities,
             session_health: status.session_health,
+            api_listener: status.api_listener,
+            agent_account_diagnostic: status.agent_account_diagnostic,
         }),
         Err(ApiClientError::Io(err)) if server_not_running_error(&err) => {
             Ok(ServerRuntimeStatus::NotRunning)
@@ -266,9 +327,113 @@ fn restart_needed_label(server: &ServerRuntimeStatus) -> &'static str {
 
 #[derive(Serialize)]
 struct FullStatusJson {
+    config_warnings: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enrollment_warning: Option<String>,
+    peers: Vec<crate::mesh::hello::Enrollment>,
+    installed: InstalledStatusJson,
     client: ClientStatusJson,
     server: ServerStatusJson,
     update: UpdateStatusJson,
+}
+
+#[derive(Debug, Serialize)]
+struct InstalledStatusJson {
+    binary: Option<String>,
+    version: Option<String>,
+    client_drift: Option<bool>,
+    server_drift: Option<bool>,
+    error: Option<String>,
+}
+
+fn drift_label(drift: Option<bool>) -> &'static str {
+    match drift {
+        Some(true) => "yes",
+        Some(false) => "no",
+        None => "unknown",
+    }
+}
+
+fn read_installed_status(server: &ServerRuntimeStatus) -> InstalledStatusJson {
+    installed_status_at(
+        crate::integration::launch::stable_launch_path(),
+        server,
+        |path| execute_installed_version(path, std::time::Duration::from_secs(2)),
+    )
+}
+
+/// Derive drift from a version probe, retaining real path resolution before
+/// the injected command executes. Production supplies its bounded transport.
+fn installed_status_at(
+    path: std::io::Result<std::path::PathBuf>,
+    server: &ServerRuntimeStatus,
+    execute: impl FnOnce(&std::path::Path) -> std::io::Result<std::process::Output>,
+) -> InstalledStatusJson {
+    let mut status = InstalledStatusJson {
+        binary: None,
+        version: None,
+        client_drift: None,
+        server_drift: None,
+        error: None,
+    };
+    let result = path.and_then(|path| {
+        status.binary = Some(path.display().to_string());
+        probe_installed_version(&path, execute)
+    });
+    match result {
+        Ok(version) => {
+            status.client_drift = Some(version != crate::build_info::version());
+            status.server_drift = match server {
+                ServerRuntimeStatus::Running {
+                    version: running, ..
+                } => running.as_ref().map(|running| running != &version),
+                ServerRuntimeStatus::NotRunning => None,
+            };
+            status.version = Some(version);
+        }
+        Err(err) => status.error = Some(err.to_string()),
+    }
+    status
+}
+
+/// Run the installed binary's identity-only `--version` command with null stdin.
+///
+/// Stdin is fixed inside this executor. The caller supplies the output timeout.
+/// Production supplies this executor to [`probe_installed_version`], which
+/// performs canonicalization before invoking it. Tests can inject controlled
+/// output instead. Never run a harness's arbitrary configured MCP command.
+fn execute_installed_version(
+    path: &std::path::Path,
+    timeout: std::time::Duration,
+) -> std::io::Result<std::process::Output> {
+    crate::process::TracedCommand::new(path, "status")
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .output_traced_with_timeout(timeout)
+}
+
+/// Canonicalize the installed path, then call the injected `execute` executor.
+///
+/// Resolve only for this probe; leave the persisted launch command unchanged.
+/// Production supplies [`execute_installed_version`], while tests return
+/// controlled output after real filesystem canonicalization. Resolution,
+/// execution, unsuccessful exit, and invalid `flk VERSION` output are errors.
+fn probe_installed_version(
+    path: &std::path::Path,
+    execute: impl FnOnce(&std::path::Path) -> std::io::Result<std::process::Output>,
+) -> std::io::Result<String> {
+    let probe_path = std::fs::canonicalize(path)?;
+    let output = execute(&probe_path)?;
+    if !output.status.success() {
+        return Err(std::io::Error::other("installed flk --version failed"));
+    }
+    let text = std::str::from_utf8(&output.stdout).map_err(std::io::Error::other)?;
+    let version = text
+        .trim()
+        .strip_prefix("flk ")
+        .filter(|version| !version.is_empty() && !version.chars().any(char::is_whitespace))
+        .ok_or_else(|| std::io::Error::other("unrecognized installed flk version output"))?;
+    Ok(version.to_owned())
 }
 
 #[derive(Serialize)]
@@ -296,11 +461,17 @@ struct ServerStatusJson {
     /// report this, and collapsing that into a value would assert something
     /// nobody knows.
     session_health: Option<&'static str>,
+    api_listener: Option<crate::api::schema::ApiListenerHealth>,
+    agent_account_diagnostic: Option<crate::api::schema::AgentAccountDiagnostic>,
 }
 
 #[derive(Serialize)]
 struct ServerCapabilitiesJson {
     live_handoff: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    clone_detection_warning: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    node_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -325,6 +496,8 @@ fn server_status_json(server: &ServerRuntimeStatus) -> ServerStatusJson {
             protocol,
             capabilities,
             session_health,
+            api_listener,
+            agent_account_diagnostic,
         } => ServerStatusJson {
             status: "running",
             running: true,
@@ -334,12 +507,16 @@ fn server_status_json(server: &ServerRuntimeStatus) -> ServerStatusJson {
                 .as_ref()
                 .map(|capabilities| ServerCapabilitiesJson {
                     live_handoff: capabilities.live_handoff,
+                    node_id: capabilities.node_id.clone(),
+                    clone_detection_warning: capabilities.clone_detection_warning.clone(),
                 }),
             compatible: protocol.map(|value| value == crate::protocol::PROTOCOL_VERSION),
             socket: api::socket_path().display().to_string(),
             session: crate::session::active_name(),
             restart_needed: restart_needed_bool(server),
             session_health: session_health_label(*session_health),
+            api_listener: api_listener.clone(),
+            agent_account_diagnostic: agent_account_diagnostic.clone(),
         },
         ServerRuntimeStatus::NotRunning => ServerStatusJson {
             status: "not_running",
@@ -352,6 +529,8 @@ fn server_status_json(server: &ServerRuntimeStatus) -> ServerStatusJson {
             session: crate::session::active_name(),
             restart_needed: Some(false),
             session_health: None,
+            api_listener: None,
+            agent_account_diagnostic: None,
         },
     }
 }
@@ -415,4 +594,141 @@ fn status_help_text() -> String {
         "  flk status client [--json]  show local client binary status"
     );
     out
+}
+
+#[cfg(test)]
+mod installed_tests {
+    use super::*;
+
+    #[test]
+    fn installed_version_probe_reports_three_way_drift_after_symlink_retarget() {
+        use std::os::unix::fs::symlink;
+        use std::os::unix::process::ExitStatusExt;
+        let dir = crate::test_support::unique_temp_path("installed-version-drift");
+        std::fs::create_dir_all(&dir).unwrap();
+        let launch = dir.join("flk");
+        let first = dir.join("first");
+        let second = dir.join("second");
+        for path in [&first, &second] {
+            std::fs::write(path, b"version target fixture").unwrap();
+        }
+        let first_resolved = std::fs::canonicalize(&first).unwrap();
+        let second_resolved = std::fs::canonicalize(&second).unwrap();
+        let mut executed = Vec::new();
+        let mut execute = |resolved: &std::path::Path| {
+            executed.push(resolved.to_path_buf());
+            let version = if resolved == first_resolved {
+                crate::build_info::version()
+            } else {
+                assert_eq!(resolved, second_resolved, "execute the resolved target");
+                "99.0.0-fixture".to_owned()
+            };
+            Ok(std::process::Output {
+                status: std::process::ExitStatus::from_raw(0),
+                stdout: format!("flk {version}\n").into_bytes(),
+                stderr: Vec::new(),
+            })
+        };
+        symlink(&first, &launch).unwrap();
+        let server = ServerRuntimeStatus::Running {
+            version: Some(crate::build_info::version()),
+            protocol: Some(crate::protocol::PROTOCOL_VERSION),
+            capabilities: None,
+            session_health: None,
+            api_listener: None,
+            agent_account_diagnostic: None,
+        };
+        let before = installed_status_at(Ok(launch.clone()), &server, &mut execute);
+        assert_eq!(before.client_drift, Some(false), "{before:?}");
+        assert_eq!(before.server_drift, Some(false));
+        std::fs::remove_file(&launch).unwrap();
+        symlink(&second, &launch).unwrap();
+        let after = installed_status_at(Ok(launch.clone()), &server, &mut execute);
+        assert_eq!(after.version.as_deref(), Some("99.0.0-fixture"));
+        assert_eq!(after.client_drift, Some(true));
+        assert_eq!(after.server_drift, Some(true));
+        assert_eq!(after.binary.as_deref(), Some(launch.to_str().unwrap()));
+        assert!(after.error.is_none());
+        let absent =
+            installed_status_at(Ok(launch), &ServerRuntimeStatus::NotRunning, &mut execute);
+        assert!(absent.server_drift.is_none());
+        assert_eq!(absent.version.as_deref(), Some("99.0.0-fixture"));
+        assert_eq!(absent.client_drift, Some(true));
+        assert!(absent.error.is_none());
+        assert_eq!(
+            executed,
+            vec![first_resolved, second_resolved.clone(), second_resolved]
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn installed_version_probe_bounds_hangs_and_reports_unknown_on_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_support::unique_temp_path("installed-version-errors");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("flk");
+        std::fs::write(&path, "#!/bin/sh\nwhile :; do :; done\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let err = probe_installed_version(&path, |path| {
+            execute_installed_version(path, std::time::Duration::from_millis(100))
+        })
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        for script in [
+            "#!/bin/sh\nexit 1\n",
+            "#!/bin/sh\nprintf 'unrelated output\\n'\n",
+        ] {
+            std::fs::write(&path, script).unwrap();
+            let status =
+                installed_status_at(Ok(path.clone()), &ServerRuntimeStatus::NotRunning, |path| {
+                    execute_installed_version(path, std::time::Duration::from_secs(10))
+                });
+            assert!(status.version.is_none());
+            assert!(status.error.is_some());
+            assert!(status.client_drift.is_none());
+            assert!(status.server_drift.is_none());
+        }
+        std::fs::remove_file(&path).unwrap();
+        let missing = installed_status_at(Ok(path), &ServerRuntimeStatus::NotRunning, |path| {
+            execute_installed_version(path, std::time::Duration::from_secs(10))
+        });
+        assert!(missing.error.is_some());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn server_status_json_retains_accept_error_diagnostics() {
+        let server = ServerRuntimeStatus::Running {
+            version: None,
+            protocol: None,
+            capabilities: None,
+            session_health: None,
+            agent_account_diagnostic: Some(
+                crate::api::schema::AgentAccountDiagnostic::AgentAccountUidCollision { uid: 7 },
+            ),
+            api_listener: Some(crate::api::schema::ApiListenerHealth {
+                stopped: true,
+                accept_errors: 2,
+                last_accept_error: Some("injected accept failure".into()),
+            }),
+        };
+        let json = serde_json::to_value(server_status_json(&server)).unwrap();
+        assert_eq!(
+            json["agent_account_diagnostic"]["code"],
+            "agent_account_uid_collision"
+        );
+        assert_eq!(json["agent_account_diagnostic"]["uid"], 7);
+        assert_eq!(json["api_listener"]["stopped"], true);
+        assert_eq!(json["api_listener"]["accept_errors"], 2);
+        assert_eq!(
+            json["api_listener"]["last_accept_error"],
+            "injected accept failure"
+        );
+    }
 }

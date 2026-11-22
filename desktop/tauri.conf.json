@@ -1,0 +1,25 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "flock",
+  "version": "0.1.0",
+  "identifier": "dev.flock.desktop",
+  "build": {
+    "frontendDist": "../web/client/dist",
+    "devUrl": "http://127.0.0.1:5173",
+    "beforeDevCommand": "cd ../web/client && bun install --frozen-lockfile && bun x vite --strictPort",
+    "beforeBuildCommand": "cd ../web/client && bun install --frozen-lockfile && bun run build"
+  },
+  "app": {
+    "withGlobalTauri": false,
+    "windows": [],
+    "security": {
+      "csp": "default-src 'self'; connect-src 'none'; frame-src blob: 'self'",
+      "freezePrototype": true,
+      "capabilities": ["main"]
+    }
+  },
+  "bundle": {
+    "active": false,
+    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.icns", "icons/icon.ico"]
+  }
+}

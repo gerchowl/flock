@@ -1,0 +1,22 @@
+
+✻ Churned for 0s · done 2:25 AM
+
+❯ WEEK please
+
+⏺ Automatic continue stopped · the usage limit
+  now resets more than 24 hours out, so this
+  task will not resume on its own
+  (/rate-limit-options to wait anyway)
+  ⎿  You've hit your weekly limit · resets Oct 15 at
+     7:26am (Europe/Zurich)
+     /login to switch to an API usage-billed account.
+
+✻ Brewed for 0s · done 2:26 AM
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+   What do you want to do?
+
+   ❯ 1. Stop and wait for limit to reset
+     2. Wait here, then continue automatically at Oct
+        15 at 7:26am
+
+   Enter to confirm · Esc to cancel

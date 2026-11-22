@@ -51,6 +51,8 @@ Flock only resumes panes that reported a native session reference through a curr
 
 After a client attaches and provides terminal size and theme context, Flock resumes eligible restored agent panes across workspaces and tabs without waiting for each pane to be focused.
 
+A deferred resume sets `resume_failed` when its command has no arguments, spawning its shell fails, or sending the resume command fails. That flag stops automatic retries in the current server; a cold server restart clears it and allows one fresh automatic attempt when restore conditions are met. An empty resume command is logged once for that automatic attempt, and its saved plan is retained. After that failure, agent info reports `blocked_reason: resume_failed`, and the plan remains resumable. Waiting for terminal theme context is a deferral: it does not set the flag and remains eligible for reconsideration on later ticks.
+
 Native session restore requires these Flock integration versions or newer:
 
 | Agent | Minimum Flock integration version | Resume command |
@@ -77,6 +79,10 @@ Live handoff is for update and remote attach flows that need to replace a runnin
 
 This is different from snapshot restore, pane history replay, and native agent session restore. Handoff tries to keep the current processes alive. The others reconstruct state after the old server has already stopped.
 
+Import startup has a 120-second budget until the replacement is ready. The watchdog is atomically disarmed before readiness is announced, so it cannot terminate a replacement after the old server commits ownership. Before readiness, expiry exits the replacement non-zero and the old server can roll back. Socket reads and writes retain their 30-second timeouts, including the replacement's wait for commit after readiness. Kernel or scheduler stalls can delay deadline enforcement. Rollback waits at most 500 ms to reap a killed importer; a process still waiting in the kernel may remain unreaped until it exits and the exporter exits.
+
+Queued mesh mail survives both a server restart and live handoff. During handoff the old server closes its custody writer before transferring panes, and the replacement opens it after ownership commits. A failed handoff reopens the old writer; a replacement refuses a store older than the generation recorded in the handoff. Pending delivery resumes from durable custody, with duplicate imports suppressed. If the custody store cannot reopen, pane processes and terminal output keep running. `flk status` reports mesh as suspended with the failure reason, and recovery retries every five seconds. Undecodable mailbox records are retained in quarantine and skipped during restoration.
+
 Live handoff is experimental and opt-in:
 
 ```bash
@@ -88,6 +94,14 @@ Plain `flk update` and plain `flk --remote workbox` use the normal restart/stop 
 
 `flk update --handoff` only applies to installs managed by Flock's own updater. Homebrew, mise, and Nix installs are updated through their package managers, so `flk update` is disabled there and cannot perform live handoff.
 
+### Pane count
+
+Live handoff carries any number of panes. The pane terminals cross to the new server in batches of 64, and the old server keeps every pane until the new one confirms it has restored all of them. A handoff that fails part-way leaves every pane with the old server.
+
+The old server is the one sending, so its own limits apply. A server older than this change refuses a session with more than 64 panes. To move off one, close panes down to 64 once, or stop and restart Flock normally. Every handoff after that goes through the new code.
+
+During a handoff the old server briefly holds two descriptors per pane. On macOS the server raises its open-file limit to 8192. On Linux a typical soft limit of 1024 allows about 450 panes. Above that the handoff fails cleanly and the old server keeps every pane. Raise `ulimit -n` for the server to go further.
+
 ## What Survives
 
 | Case | Processes keep running | Layout returns | Recent screen returns | Agent conversation resumes |
@@ -96,3 +110,92 @@ Plain `flk update` and plain `flk --remote workbox` use the normal restart/stop 
 | Server restart | No | Yes | Only with pane screen history | Only with native agent session restore |
 | Update without `--handoff` | Compatible servers keep running; restart-required servers may need stop/restart | Yes after restart | Only with pane screen history | Only with native agent session restore |
 | Update with `--handoff` | Best effort for supported running servers | Yes | Yes, from the live terminal if handoff succeeds | Yes, because the process keeps running if handoff succeeds |
+
+
+## Retained structured records
+
+Retained records are **DEAD** only by version-independent criteria: a non-object
+JSON element, or an exact canonical duplicate of a record already kept (live or
+retained). Canonical JSON sorts object keys and preserves JSON value types.
+Everything else this build cannot use is **FORWARD** and never automatically
+pruned. This includes supported-tag records with changed field shapes, unknown
+runtime/harness values, empty or odd identities, and non-identical conflicting
+records with the same agent ID, name or session ID. A rollback must not destroy
+a newer flk's data merely because this build cannot parse it.
+
+Every capture/save stamps newly retained records with `first_seen_ms` in Unix
+milliseconds. The stamp lives in the separate `structured_retention` snapshot
+field; preserved record JSON is unchanged. The sidecar binds each stamp to an
+array slot and a SHA-256 digest. Valid stamps and extra metadata survive cold
+restore, removal/compaction, repeated saves and live handoff. Invalid or newer
+metadata entries remain raw and are logged without their payloads. Older builds
+may discard the sidecar; a missing stamp gets a new conservative first-seen time
+at the next capture/save. Captures use an injected clock, stamp their snapshot
+copy and never prune. Only actual save/export boundaries prune the live registry.
+
+Saves remove DEAD records strictly older than 30 days
+(`RETAINED_DEAD_MAX_AGE`), then keep at most 256 (`RETAINED_DEAD_MAX`), pruning the
+oldest first. Equal timestamps use original record order. A backward clock does
+not age records early. A failed clock or an unknown sidecar collection format
+refuses automatic retention maintenance with a warning, preserving the data.
+FORWARD records have neither an automatic age limit nor an automatic count cap.
+A retained-only session, including opaque metadata, remains persistable.
+
+### Inspect and purge (operator only)
+
+Use the running session's API socket:
+
+```sh
+flk session retained list
+flk session retained list --json
+flk doctor
+flk doctor --json
+flk session retained purge --dead
+flk session retained purge --dead --older-than 24h
+flk session retained purge --all --yes --older-than 720h
+```
+
+List reports each retained record's kind, current serialized array slot and
+`first_seen_ms` (null/unstamped until capture/save), plus counts per kind. It
+omits opaque payloads; back up `session.json` and inspect its corresponding slots
+before deciding to destroy FORWARD data. Slots are not stable record identifiers.
+Doctor uses the same live counts and hints the purge command when any FORWARD
+record exists or DEAD exceeds 128. It does not inspect an offline session file.
+
+Both list and purge require the operator principal, established by kernel UID
+and lease ancestry. Agent credentials/tokens cannot grant this authority; refusal
+is typed `operator_only` (CLI exit 13). A separate operator shell with the session
+socket can perform maintenance. A compatible running server is required.
+
+Choose exactly one of `--dead` or `--all`. The latter destroys rollback-compatible
+FORWARD data and requires an explicit `--yes` even through the API. Back up and
+check which binary understands these records first. `--older-than` accepts `ms`,
+`s`, `m`, `h` and combinations such as `1h30m`; it selects strictly older stamped
+records. Missing stamps never match an age filter. A backward clock does not
+make a record older. All purges also apply normal save-time DEAD bounds, and the
+reported removed count includes that maintenance. Active records and worker
+observations remain intact. If an age filter removes an earlier copy, a remaining
+last unusable object becomes FORWARD before automatic maintenance.
+
+Purge replaces the snapshot atomically before changing live retained state.
+A save failure before replacement returns a typed error and leaves live records
+unchanged. Directory-sync failure after replacement retains the logged durability
+warning policy described above. Pane-history files remain untouched. A server
+started with `--no-session` only changes its in-memory records. Neither `--all`
+nor `--yes` bypasses an unknown collection shape; follow the repair guide below.
+
+### Repair an unknown collection shape
+
+A non-array `structured_agents` collection is preserved inactive. List/purge return
+typed `retained_collection_shape`; admission
+fails closed with typed `UnsupportedCollectionShape`, directing you here. Other
+PTY workspaces still load; saves preserve the opaque collection.
+
+Back up `session.json` before making repairs. Inspect the backup with a binary
+that understands its format, preferably the version that wrote it. Never change
+or delete a running server's session file: it owns the in-memory copy and can
+overwrite an external edit. During an operator-controlled offline repair, restore
+a valid array from the backup or a compatible binary; preserve every record you
+do not understand. Do not replace an unknown collection with an empty array just
+to make admission succeed. Likewise preserve an unfamiliar `structured_retention`
+format until a compatible binary can interpret it.

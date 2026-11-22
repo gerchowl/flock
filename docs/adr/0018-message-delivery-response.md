@@ -175,7 +175,7 @@ are explicitly pull-only until their integration says otherwise.
 **Operational dependency.** The turn-boundary half requires the agent's `Stop`
 hook to carry flock's entry. On nix-managed hosts that is declared in the host's
 Home-Manager configuration, not installed by `flk integration install`, which
-cannot write a read-only `settings.json` (g-fleet#156).
+cannot write a read-only `settings.json`.
 
 ## Alternatives rejected
 
@@ -189,3 +189,12 @@ cannot write a read-only `settings.json` (g-fleet#156).
   #316's "black hole wearing a politeness hat".
 - **Overloading `blocked` for waiting mail.** One less label, at the cost of the
   meaning #311 restored.
+
+## Mesh amendment (v1.0.0)
+
+See [ADR-0026](0026-mesh-fleet-transport.md), implemented by #623 and #661.
+
+Intent, mute and wake policy remain. ADR-0026 replaces the separate cross-host
+deferral hop with the same durable return binding, signed envelope and custody
+path as ordinary replies. A held deferral survives disconnects and never
+supersedes a genuine answer.

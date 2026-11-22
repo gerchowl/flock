@@ -23,7 +23,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Nix
-        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31.11.3
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
@@ -92,6 +92,7 @@ jobs:
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.15.2
+          use-cache: false
 
       - name: Prefer official Ubuntu mirrors over Azure
         if: runner.os == 'Linux'
@@ -121,8 +122,9 @@ jobs:
           echo "AR_aarch64_unknown_linux_musl=$GITHUB_WORKSPACE/scripts/zig-cross/ar" >> $GITHUB_ENV
 
       - name: Cache Rust artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
+          save-if: ${{ github.ref == 'refs/heads/dev' }}
           key: release-${{ matrix.target }}
 
       - name: Remove Zig caches
@@ -134,11 +136,21 @@ jobs:
       - name: Rename binary
         run: cp target/${{ matrix.target }}/release/flk ${{ matrix.name }}
 
+      - name: Compute asset checksum
+        run: |
+          python3 - <<'PYTHON' | tee ${{ matrix.name }}.sha256
+          import hashlib, pathlib
+          path = pathlib.Path('${{ matrix.name }}')
+          print(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}")
+          PYTHON
+
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.name }}
-          path: ${{ matrix.name }}
+          path: |
+            ${{ matrix.name }}
+            ${{ matrix.name }}.sha256
 
   validate-release-inputs:
     runs-on: ubuntu-latest
@@ -178,6 +190,7 @@ jobs:
             flock-linux-aarch64/flock-linux-aarch64
             flock-macos-x86_64/flock-macos-x86_64
             flock-macos-aarch64/flock-macos-aarch64
+            flock-*/*.sha256
           body_path: RELEASE_NOTES.md
 
   close-released-issues:
@@ -253,6 +266,13 @@ jobs:
               continue
             fi
 
+            # Evaluate outside the condition so malformed metadata fails safely.
+            EXCLUDED="$(jq -f scripts/release_issue_excluded.jq <<<"$data")"
+            if [ "$EXCLUDED" = "true" ]; then
+              echo "Skipping #$issue because it is a tracking issue or epic."
+              continue
+            fi
+
             HAS_NEXT_RELEASE_LABEL="$(jq -r --arg label "$NEXT_RELEASE_LABEL" 'any(.labels[].name; . == $label)' <<<"$data")"
             HAS_LEGACY_NEXT_RELEASE_LABEL="$(jq -r --arg label "$LEGACY_NEXT_RELEASE_LABEL" 'any(.labels[].name; . == $label)' <<<"$data")"
             HAS_PENDING_RELEASE_LABEL="false"
@@ -307,18 +327,36 @@ jobs:
             fi
           done
 
+  # `stable` is the fleet's Nix pin (github:gerchowl/flock/stable). It used to
+  # be moved by hand and sat a release behind; now it follows each published
+  # release. It is a plain unprotected branch, so GITHUB_TOKEN can move it, and
+  # nothing triggers on it.
+  advance-stable:
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Point stable at the released commit
+        run: git push --force origin "${GITHUB_SHA}:refs/heads/stable"
+
   update-latest-json:
     needs: release
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
 
     steps:
-      # main is protected (PRs only, required checks, enforced for admins), so
-      # the manifest lands through a PR. It is opened with an App token, not
+      # The manifest lands on dev through a PR like any other change, and reaches
+      # main with the next release. It is opened with an App token, not
       # GITHUB_TOKEN: a PR opened with GITHUB_TOKEN triggers no workflows, so
       # its required checks would never run and auto-merge would wait forever.
-      - uses: actions/create-github-app-token@v2
+      - uses: actions/create-github-app-token@v3
         id: app-token
         with:
           app-id: ${{ secrets.RELEASE_APP_ID }}
@@ -326,7 +364,7 @@ jobs:
 
       - uses: actions/checkout@v7
         with:
-          ref: main
+          ref: dev
           fetch-depth: 0
           token: ${{ steps.app-token.outputs.token }}
 
@@ -354,6 +392,16 @@ jobs:
             echo "::warning::docs/next/product-announcement.json changed after $GITHUB_REF_NAME; leaving it unchanged."
           fi
 
+      # The client reads this asset: https://github.com/gerchowl/flock/releases/latest/download/latest.json
+      # redirects to the newest non-prerelease release. The in-repo copy below
+      # is only the reviewed record of it.
+      - name: Upload latest.json as a release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          gh release upload "v$VERSION" website/latest.json --clobber
+
       - name: Open the website latest manifest PR
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
@@ -371,7 +419,7 @@ jobs:
           git commit -m "docs: update website manifest for v$VERSION"
           git push --force origin "$BRANCH"
           if ! gh pr view "$BRANCH" --json number >/dev/null 2>&1; then
-            gh pr create --base main --head "$BRANCH" \
+            gh pr create --base dev --head "$BRANCH" \
               --title "docs: update website manifest for v$VERSION" \
               --body "Advertises the v$VERSION release in website/latest.json. Opened by the Release workflow; merges itself once the required checks pass."
           fi

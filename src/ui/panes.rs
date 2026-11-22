@@ -42,6 +42,16 @@ fn pane_border_title(label: &str, pane_width: u16) -> Option<String> {
     Some(format!(" {} ", truncate_label(label, max_label_width)))
 }
 
+const INJECTION_BADGE: &str = " flock is typing… ";
+
+/// The bottom-border badge of a pane whose input an injection holds (#850),
+/// when the border has room for it.
+fn injection_badge(rt: &TerminalRuntime, pane_width: u16) -> Option<&'static str> {
+    (rt.injection_lease_until().is_some()
+        && usize::from(pane_width) >= INJECTION_BADGE.chars().count() + 4)
+        .then_some(INJECTION_BADGE)
+}
+
 fn stable_terminal_inner_rect(pane_inner: Rect) -> Rect {
     // The scrollbar lives ON the pane border now (flush, no reserved
     // gutter) -- content keeps the full inner width.
@@ -294,6 +304,9 @@ pub(super) fn render_panes(
     let terminal_active = app.mode == Mode::Terminal;
 
     for info in &app.view.pane_infos {
+        if super::structured::render_native(app, frame, info) {
+            continue;
+        }
         if let Some(rt) = app.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, info.id) {
             {
                 let border_style =
@@ -315,6 +328,19 @@ pub(super) fn render_panes(
                     .and_then(|label| pane_border_title(&label, info.rect.width))
                 {
                     block = block.title(Line::from(Span::styled(title, border_style)));
+                }
+                // #850: the operator's keys for this pane are held while
+                // flock types into it, so say so where they are looking.
+                if let Some(badge) = injection_badge(rt, info.rect.width) {
+                    block = block.title_bottom(
+                        Line::from(Span::styled(
+                            badge,
+                            Style::default()
+                                .fg(app.palette.yellow)
+                                .add_modifier(Modifier::BOLD),
+                        ))
+                        .right_aligned(),
+                    );
                 }
                 frame.render_widget(block, info.rect);
             }
@@ -343,8 +369,12 @@ pub(super) fn render_panes(
                 .as_ref()
                 .is_some_and(|s| s.source == crate::selection::SelectionSource::PromptPanel);
             if !is_panel_selection {
+                let selection = app
+                    .selection
+                    .as_ref()
+                    .and_then(|selection| rt.resolve_selection(selection));
                 render_selection_highlight(
-                    &app.selection,
+                    &selection,
                     frame,
                     info.id,
                     info.inner_rect,
@@ -1521,6 +1551,18 @@ fn render_empty(app: &AppState, frame: &mut Frame, area: Rect) {
         ),
         area,
     );
+}
+
+/// Native dispatch consumes computed geometry; S10d supplies placement and input routing.
+/// No PTY lookup, subscription reads or state mutation happens during this paint.
+pub(super) fn render_structured(frame: &mut Frame, pane: &super::structured::Pane) {
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(pane.border),
+        pane.area,
+    );
+    pane.paint_content(frame);
 }
 
 #[cfg(test)]

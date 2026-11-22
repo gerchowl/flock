@@ -132,11 +132,13 @@ fn wait_for_file(path: &Path, timeout: Duration) {
 }
 
 fn spawn_server(config_home: &Path, runtime_dir: &Path, api_socket_path: &Path) -> SpawnedFlock {
-    fs::create_dir_all(config_home.join("flock")).unwrap();
+    fs::create_dir_all(config_home.join(support::paths::app_dir_name())).unwrap();
     fs::create_dir_all(runtime_dir).unwrap();
     register_runtime_dir(runtime_dir);
     fs::write(
-        config_home.join("flock/config.toml"),
+        config_home
+            .join(support::paths::app_dir_name())
+            .join("config.toml"),
         "onboarding = false\n",
     )
     .unwrap();
@@ -152,14 +154,16 @@ fn spawn_server(config_home: &Path, runtime_dir: &Path, api_socket_path: &Path) 
 
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flk"));
     cmd.arg("server");
-    cmd.env("XDG_CONFIG_HOME", config_home);
-    cmd.env("XDG_RUNTIME_DIR", runtime_dir);
+    for (key, value) in support::environment::isolated_env(config_home, runtime_dir) {
+        cmd.env(key, value);
+    }
     cmd.env("FLOCK_SOCKET_PATH", api_socket_path);
     cmd.env_remove("FLOCK_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", "/bin/sh");
     cmd.env_remove("FLOCK_ENV");
 
-    let child = pair.slave.spawn_command(cmd).unwrap();
+    support::environment::assert_pty_isolated(&cmd);
+    let child = support::environment::spawn_pty(pair.slave.as_ref(), cmd).unwrap();
     register_spawned_flock_pid(child.process_id());
     drop(pair.slave);
 
@@ -187,14 +191,16 @@ fn spawn_client_process(
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flk"));
     cmd.arg("client");
     cmd.env("FLOCK_DISABLE_SOUND", "1");
-    cmd.env("XDG_CONFIG_HOME", config_home);
-    cmd.env("XDG_RUNTIME_DIR", runtime_dir);
+    for (key, value) in support::environment::isolated_env(config_home, runtime_dir) {
+        cmd.env(key, value);
+    }
     cmd.env("FLOCK_SOCKET_PATH", api_socket_path);
     cmd.env_remove("FLOCK_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", "/bin/sh");
     cmd.env_remove("FLOCK_ENV");
 
-    let child = pair.slave.spawn_command(cmd).unwrap();
+    support::environment::assert_pty_isolated(&cmd);
+    let child = support::environment::spawn_pty(pair.slave.as_ref(), cmd).unwrap();
     register_spawned_flock_pid(child.process_id());
     drop(pair.slave);
 
@@ -205,11 +211,7 @@ fn spawn_client_process(
 }
 
 fn server_log_path(config_home: &Path) -> PathBuf {
-    let app_dir = if cfg!(debug_assertions) {
-        "flock-dev"
-    } else {
-        "flock"
-    };
+    let app_dir = support::paths::app_dir_name();
     config_home.join(app_dir).join("flock-server.log")
 }
 

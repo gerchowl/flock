@@ -14,12 +14,13 @@ use super::super::api_helpers::{
     detect_state_from_api, encode_api_keys, encode_api_text, normalize_custom_status,
     normalize_reported_agent_label, sanitize_reported_prompt,
 };
-use super::responses::{encode_error, encode_success};
+use super::responses::{encode_error, encode_error_with_data, encode_success};
 
 impl App {
     pub(super) fn handle_pane_split(&mut self, id: String, params: PaneSplitParams) -> String {
-        let Some((ws_idx, target_pane_id)) = self.parse_pane_id(&params.target_pane_id) else {
-            return pane_not_found(id, &params.target_pane_id);
+        let (ws_idx, target_pane_id) = match self.resolve_pane_target(&params.target_pane_id) {
+            Ok(target) => target,
+            Err(error) => return target_refusal(id, error),
         };
         let (rows, cols) = self.state.estimate_pane_size();
         let split_cwd = params.cwd.map(std::path::PathBuf::from).or_else(|| {
@@ -33,6 +34,17 @@ impl App {
             });
             Some(self.resolve_new_terminal_cwd(follow_cwd))
         });
+        if params.dry_run {
+            return super::responses::encode_allocation_plan(
+                id,
+                "pane.split",
+                serde_json::json!({
+                    "workspace_id": self.public_workspace_id(ws_idx),
+                    "target_pane_id": self.public_pane_id(ws_idx, target_pane_id),
+                    "direction": params.direction, "cwd": split_cwd, "focus": params.focus,
+                }),
+            );
+        }
         let default_shell = self.state.default_shell.clone();
         let scrollback_limit_bytes = self.state.pane_scrollback_limit_bytes;
         let host_terminal_theme = self.state.host_terminal_theme;
@@ -100,8 +112,9 @@ impl App {
             destination,
             focus,
         } = params;
-        let Some((source_ws_idx, source_pane_id)) = self.parse_pane_id(&pane_id) else {
-            return pane_not_found(id, &pane_id);
+        let (source_ws_idx, source_pane_id) = match self.resolve_pane_target(&pane_id) {
+            Ok(target) => target,
+            Err(error) => return target_refusal(id, error),
         };
         let Some(source_tab_idx) =
             self.state.workspaces[source_ws_idx].find_tab_index_for_pane(source_pane_id)
@@ -169,11 +182,12 @@ impl App {
                 }
                 let target_pane_id = match target_pane_id {
                     Some(raw) => {
-                        let Some((pane_ws_idx, pane_id)) = self.parse_pane_id(&raw) else {
-                            return encode_error(
+                        let Ok((pane_ws_idx, pane_id)) = self.resolve_pane_target(&raw) else {
+                            return encode_error_with_data(
                                 id,
                                 "target_pane_not_found",
                                 format!("target pane {raw} not found"),
+                                expected_targets(),
                             );
                         };
                         let pane_tab_idx =
@@ -240,14 +254,18 @@ impl App {
             identity_cwd: self.state.workspaces[source_ws_idx].identity_cwd.clone(),
         };
 
-        let taken = match self
-            .state
-            .workspaces
-            .get_mut(source_ws_idx)
-            .and_then(|ws| ws.take_pane_for_move(source_pane_id))
-        {
-            Some(taken) => taken,
-            None => return encode_error(id, "pane_move_failed", "source pane could not be moved"),
+        let taken = match self.state.workspaces[source_ws_idx].take_pane_for_move(source_pane_id) {
+            Ok(taken) => taken,
+            Err(crate::structured::view::PlacementError::RelocationUnsupported) => {
+                return encode_error(
+                    id,
+                    "runtime_unsupported",
+                    "native views cannot move between tabs or workspaces",
+                )
+            }
+            Err(_) => {
+                return encode_error(id, "pane_move_failed", "source pane could not be moved")
+            }
         };
         let source_removed_tab_id = taken.removed_tab_idx.map(|_| previous_tab_id.clone());
         let source_workspace_empty = taken.workspace_empty;
@@ -511,8 +529,9 @@ impl App {
     }
 
     pub(super) fn handle_pane_get(&mut self, id: String, target: PaneTarget) -> String {
-        let Some((ws_idx, pane_id)) = self.parse_pane_id(&target.pane_id) else {
-            return pane_not_found(id, &target.pane_id);
+        let (ws_idx, pane_id) = match self.resolve_pane_target(&target.pane_id) {
+            Ok(target) => target,
+            Err(error) => return target_refusal(id, error),
         };
         let Some(pane) = self.pane_info(ws_idx, pane_id) else {
             return pane_not_found(id, &target.pane_id);
@@ -522,8 +541,9 @@ impl App {
     }
 
     pub(super) fn handle_pane_rename(&mut self, id: String, params: PaneRenameParams) -> String {
-        let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
-            return pane_not_found(id, &params.pane_id);
+        let (ws_idx, pane_id) = match self.resolve_pane_target(&params.pane_id) {
+            Ok(target) => target,
+            Err(error) => return target_refusal(id, error),
         };
         let Some(terminal_id) = self
             .state
@@ -537,9 +557,12 @@ impl App {
         let Some(terminal) = self.state.terminals.get_mut(&terminal_id) else {
             return pane_not_found(id, &params.pane_id);
         };
-        match params.label.map(|label| label.trim().to_string()) {
-            Some(label) if !label.is_empty() => terminal.set_manual_label(label),
-            _ => terminal.clear_manual_label(),
+        if let Some(label) = params.label {
+            if terminal.set_manual_label(label).is_err() {
+                return invalid_agent(id);
+            }
+        } else {
+            terminal.clear_manual_label();
         }
         self.state.mark_session_dirty();
         let pane = self.pane_info(ws_idx, pane_id).unwrap();
@@ -548,8 +571,9 @@ impl App {
     }
 
     pub(super) fn handle_pane_read(&mut self, id: String, params: PaneReadParams) -> String {
-        let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
-            return pane_not_found(id, &params.pane_id);
+        let (ws_idx, pane_id) = match self.resolve_pane_target(&params.pane_id) {
+            Ok(target) => target,
+            Err(error) => return target_refusal(id, error),
         };
         // Echo back the canonical public id so a request that used the legacy
         // `<ws>-<n>` form still reads the new-style `<ws>:p<n>` in the result.
@@ -568,16 +592,28 @@ impl App {
             return pane_not_found(id, &params.pane_id);
         };
         let requested_lines = params.lines.unwrap_or(80).min(1000) as usize;
+        let mut unfaint = None;
         let text = match params.format {
             ReadFormat::Text => match params.source {
                 ReadSource::Visible => pane.visible_text(),
                 ReadSource::Recent => pane.recent_text(requested_lines),
                 ReadSource::RecentUnwrapped => pane.recent_unwrapped_text(requested_lines),
+                ReadSource::Detection => pane.detection_text(),
+                ReadSource::DetectionUnfaint => {
+                    let (text, blanked) = pane.detection_text_and_unfaint();
+                    unfaint = Some(blanked);
+                    text
+                }
             },
             ReadFormat::Ansi => match params.source {
                 ReadSource::Visible => pane.visible_ansi(),
                 ReadSource::Recent => pane.recent_ansi(requested_lines),
                 ReadSource::RecentUnwrapped => pane.recent_unwrapped_ansi(requested_lines),
+                ReadSource::Detection => pane.detection_ansi(),
+                ReadSource::DetectionUnfaint => {
+                    unfaint = Some(pane.detection_text_and_unfaint().1);
+                    pane.detection_ansi()
+                }
             },
         };
 
@@ -591,6 +627,7 @@ impl App {
                     source: params.source,
                     format: params.format,
                     text,
+                    unfaint,
                     revision: 0,
                     truncated: false,
                 },
@@ -603,7 +640,7 @@ impl App {
         id: String,
         params: PaneReportAgentParams,
     ) -> String {
-        let Some((_ws_idx, pane_id)) =
+        let Some((ws_idx, pane_id)) =
             self.parse_pane_id_or_peer(&params.pane_id, self.current_api_peer_pid)
         else {
             return pane_not_found(id, &params.pane_id);
@@ -611,14 +648,17 @@ impl App {
         let Some(agent_label) = normalize_reported_agent_label(&params.agent) else {
             return invalid_agent(id);
         };
+        let session_ref = crate::agent_resume::session_ref_from_report(
+            &params.source,
+            &agent_label,
+            params.agent_session_id,
+            params.agent_session_path,
+        );
+        let native_identity = session_ref.is_some();
+        let reported_session = session_ref.as_ref().map(|r| r.value.clone());
         self.handle_internal_event(crate::events::AppEvent::HookStateReported {
             pane_id,
-            session_ref: crate::agent_resume::session_ref_from_report(
-                &params.source,
-                &agent_label,
-                params.agent_session_id,
-                params.agent_session_path,
-            ),
+            session_ref,
             source: params.source,
             agent_label,
             state: detect_state_from_api(params.state),
@@ -627,6 +667,12 @@ impl App {
             seq: params.seq,
         });
 
+        if native_identity {
+            self.note_restart_identity_report(ws_idx, pane_id);
+        }
+        if let Some(session) = reported_session {
+            self.record_reported_session_profile(ws_idx, pane_id, session);
+        }
         encode_success(id, ResponseResult::Ok {})
     }
 
@@ -704,20 +750,97 @@ impl App {
     pub(super) fn handle_pane_report_agent_session(
         &mut self,
         id: String,
-        params: PaneReportAgentSessionParams,
+        mut params: PaneReportAgentSessionParams,
     ) -> String {
-        let Some((ws_idx, pane_id)) =
+        // Recovery addresses the delegate. Hook ancestry identifies the caller,
+        // and remains the target authority only for ordinary harness reports.
+        let target = if let Some(agent_id) = &params.rebind_agent_id {
+            if !self.delegate_recovery_allowed(agent_id) {
+                return encode_error(
+                    id,
+                    "session_unbound",
+                    "only the delegate's supervisor or the operator may recover its session",
+                );
+            }
+            self.resolve_pane_target(agent_id).ok()
+        } else {
             self.parse_pane_id_or_peer(&params.pane_id, self.current_api_peer_pid)
-        else {
+        };
+        let Some((ws_idx, pane_id)) = target else {
+            if params.rebind_agent_id.is_some() {
+                return encode_error(
+                    id,
+                    "session_unbound",
+                    "the recorded agent has no current pane",
+                );
+            }
             return pane_not_found(id, &params.pane_id);
         };
+        if let Some(expected) = &params.rebind_agent_id {
+            let recorded = self
+                .terminal_for_pane(ws_idx, pane_id)
+                .filter(|terminal| terminal.agent_id.to_string() == *expected)
+                .and_then(|terminal| terminal.persisted_agent_session.as_ref())
+                .map(|saved| crate::api::schema::AgentSessionInfo {
+                    source: saved.source.clone(),
+                    agent: saved.agent.clone(),
+                    kind: saved.session_ref.kind,
+                    value: saved.session_ref.value.clone(),
+                });
+            let Some(session) = recorded else {
+                return encode_error(
+                    id,
+                    "session_unbound",
+                    "the delegate has no server-side launch session record",
+                );
+            };
+            if params
+                .agent_session_id
+                .as_deref()
+                .is_some_and(|id| id != session.value)
+                || params.source != session.source
+                || params.agent != session.agent
+                || params.agent_session_path.is_some()
+                || self
+                    .terminal_for_pane(ws_idx, pane_id)
+                    .and_then(super::super::creation::terminal_agent_session_info)
+                    .is_some_and(|current| current != session)
+            {
+                return encode_error(
+                    id,
+                    "session_unbound",
+                    "exact session recovery evidence no longer matches the agent",
+                );
+            }
+            match crate::session_evidence::checked_path(&session) {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    return encode_error(
+                        id,
+                        "session_unbound",
+                        "exact session recovery evidence no longer matches the agent",
+                    )
+                }
+                Err(error) => return encode_error(id, "session_unbound", error.to_string()),
+            }
+            // The caller selects an agent, never its session. Bind only the
+            // identity retained by that agent's own hook or restore path.
+            params.source = session.source;
+            params.agent = session.agent;
+            params.agent_session_id = Some(session.value);
+            params.agent_session_path = None;
+            params.seq = None;
+            params.session_start_source = None;
+        }
         let Some(agent_label) = normalize_reported_agent_label(&params.agent) else {
             return invalid_agent(id);
         };
         // Normalize once and use it twice: the identity event below, and the
         // self-compaction (#540), whose whole completion signal IS this field.
-        let session_start_source =
-            crate::agent_resume::normalize_claude_session_start_source(params.session_start_source);
+        let session_start_source = crate::agent_resume::normalize_session_start_source(
+            &agent_label,
+            params.session_start_source,
+        );
         if let Some(pane) = self.public_pane_id(ws_idx, pane_id) {
             // Done here rather than on the queued event, because the
             // continuation is a keystroke into a pane and this is the one
@@ -728,20 +851,31 @@ impl App {
                 std::time::Instant::now(),
             );
         }
+        let transcript_path = params.agent_session_path.clone();
+        let session_ref = crate::agent_resume::session_ref_from_report(
+            &params.source,
+            &agent_label,
+            params.agent_session_id,
+            params.agent_session_path,
+        );
+        let native_identity = session_ref.is_some();
+        let reported_session = session_ref.as_ref().map(|r| r.value.clone());
         self.handle_internal_event(crate::events::AppEvent::AgentSessionReported {
             pane_id,
-            session_ref: crate::agent_resume::session_ref_from_report(
-                &params.source,
-                &agent_label,
-                params.agent_session_id,
-                params.agent_session_path,
-            ),
+            transcript_path,
+            session_ref,
             source: params.source,
             agent_label,
             seq: params.seq,
             session_start_source,
         });
 
+        if native_identity {
+            self.note_restart_identity_report(ws_idx, pane_id);
+        }
+        if let Some(session) = reported_session {
+            self.record_reported_session_profile(ws_idx, pane_id, session);
+        }
         encode_success(id, ResponseResult::Ok {})
     }
 
@@ -771,6 +905,13 @@ impl App {
         let raw_state_labels_set = !params.state_labels.is_empty();
         let ttl = params.ttl_ms.map(std::time::Duration::from_millis);
         let title = normalize_presentation_text(params.title);
+        if params
+            .display_agent
+            .as_deref()
+            .is_some_and(|name| crate::terminal::agent_name::validate(name).is_err())
+        {
+            return invalid_agent(id);
+        }
         let display_agent = normalize_presentation_text(params.display_agent);
         let custom_status = normalize_custom_status(params.custom_status);
         let applies_to_source = match params.applies_to_source {
@@ -964,17 +1105,35 @@ impl App {
         id: String,
         params: PaneSendTextParams,
     ) -> String {
-        let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
-            return pane_not_found(id, &params.pane_id);
+        let Some(deadline) = crate::app::input_writes::deadline(params.write_timeout_ms.as_ref())
+        else {
+            return encode_error(
+                id,
+                "invalid_params",
+                "write_timeout_ms must be an integer in 1..=30000",
+            );
         };
-        let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
-            return pane_not_found(id, &params.pane_id);
+        let (ws_idx, pane_id) = match self.resolve_pane_target(&params.pane_id) {
+            Ok(target) => target,
+            Err(error) => return target_refusal(id, error),
         };
-        if let Err(err) = runtime.try_send_bytes(Bytes::from(params.text)) {
-            return encode_error(id, "pane_send_failed", err.to_string());
+        if let Some(reason) = (!params.raw)
+            .then(|| self.raw_text_refusal(ws_idx, pane_id))
+            .flatten()
+        {
+            return self.raw_text_refusal_response(id, ws_idx, pane_id, reason);
         }
-
-        encode_success(id, ResponseResult::Ok {})
+        let public = self
+            .public_pane_id(ws_idx, pane_id)
+            .unwrap_or_else(|| pane_id.raw().to_string());
+        self.begin_paste(
+            id,
+            ws_idx,
+            pane_id,
+            params.text,
+            ("pane_not_found", format!("pane {public} not found")),
+            deadline,
+        )
     }
 
     pub(super) fn handle_pane_send_input(
@@ -982,29 +1141,55 @@ impl App {
         id: String,
         params: PaneSendInputParams,
     ) -> String {
-        let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
-            return pane_not_found(id, &params.pane_id);
+        let Some(deadline) = crate::app::input_writes::deadline(params.write_timeout_ms.as_ref())
+        else {
+            return encode_error(
+                id,
+                "invalid_params",
+                "write_timeout_ms must be an integer in 1..=30000",
+            );
         };
+        let (ws_idx, pane_id) = match self.resolve_pane_target(&params.pane_id) {
+            Ok(target) => target,
+            Err(error) => return target_refusal(id, error),
+        };
+        if let Some(reason) = (!params.raw && !params.text.is_empty())
+            .then(|| self.raw_text_refusal(ws_idx, pane_id))
+            .flatten()
+        {
+            return self.raw_text_refusal_response(id, ws_idx, pane_id, reason);
+        }
         let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
-            return pane_not_found(id, &params.pane_id);
+            let public = self
+                .public_pane_id(ws_idx, pane_id)
+                .unwrap_or_else(|| pane_id.raw().to_string());
+            return pane_not_found(id, &public);
         };
         let encoded_keys = match encode_api_keys(runtime, &params.keys) {
             Ok(encoded_keys) => encoded_keys,
             Err(key) => return encode_error(id, "invalid_key", format!("unsupported key {key}")),
         };
-        if !params.text.is_empty() {
-            let text_bytes = encode_api_text(runtime, &params.text);
-            if let Err(err) = runtime.try_send_bytes(Bytes::from(text_bytes)) {
-                return encode_error(id, "pane_send_failed", err.to_string());
-            }
-        }
-        for bytes in encoded_keys {
-            if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
-                return encode_error(id, "pane_send_failed", err.to_string());
-            }
-        }
-
-        encode_success(id, ResponseResult::Ok {})
+        let mut bytes = if params.text.is_empty() {
+            Vec::new()
+        } else {
+            encode_api_text(runtime, &params.text)
+        };
+        let operator_interrupt = crate::pane::is_input_interrupt(&bytes)
+            || encoded_keys
+                .iter()
+                .any(|key| crate::pane::is_input_interrupt(key));
+        bytes.extend(encoded_keys.into_iter().flatten());
+        self.begin_input_write(
+            id,
+            ws_idx,
+            pane_id,
+            crate::app::input_writes::InputPayload {
+                bytes: Bytes::from(bytes),
+                deadline,
+                operator_interrupt,
+                paste: None,
+            },
+        )
     }
 
     /// `pane.arm_self_compact` — an agent asking to shorten its own context
@@ -1021,21 +1206,31 @@ impl App {
         params: PaneArmSelfCompactParams,
     ) -> String {
         let requested = params.pane.clone().unwrap_or_default();
-        let Some((ws_idx, pane_id)) =
-            self.parse_pane_id_or_peer(&requested, self.current_api_peer_pid)
-        else {
+        let pane = self
+            .parse_pane_id_or_peer(&requested, self.current_api_peer_pid)
+            .and_then(|(ws_idx, pane_id)| self.public_pane_id(ws_idx, pane_id));
+        let Some(pane) = pane else {
+            if requested.is_empty() {
+                return encode_error(
+                    id,
+                    "caller_pane_unresolved",
+                    format!(
+                        "the calling pane could not be resolved from the caller's attested \
+                         identity: {}. Pass pane: \"<id>\" (MCP) or --pane <id> (CLI)",
+                        self.caller_pane_refusal_reason(),
+                    ),
+                );
+            }
             return pane_not_found(id, &requested);
         };
-        let Some(pane) = self.public_pane_id(ws_idx, pane_id) else {
-            return pane_not_found(id, &requested);
-        };
-        let answer = |state: SelfCompactState, detail: String| {
+        let answer = |state: SelfCompactState, detail: String, instructions: bool| {
             encode_success(
                 id.clone(),
                 ResponseResult::PaneSelfCompact {
                     pane: pane.clone(),
                     state,
                     detail,
+                    instructions,
                 },
             )
         };
@@ -1051,6 +1246,7 @@ impl App {
                 } else {
                     "nothing was armed, so there was nothing to drop.".to_string()
                 },
+                false,
             );
         }
 
@@ -1108,6 +1304,54 @@ impl App {
                 ),
             );
         }
+        // The instructions ride in the same paste as `/compact`, so they get
+        // the same refusals as the continuation, minus the leading-`/` one:
+        // they are an argument, never the start of a line (#854).
+        let instructions = match params.instructions {
+            None => None,
+            Some(text) if text.trim().is_empty() => {
+                return encode_error(
+                    id,
+                    "invalid_params",
+                    "`instructions` must not be empty when given: omit it for a \
+                     plain `/compact`, or say what the summary must keep.",
+                );
+            }
+            Some(text) => Some(text),
+        };
+        if let Some(text) = instructions.as_deref() {
+            if let Err(problem) = crate::agent_self_compact::check_instructions(text) {
+                return encode_error(
+                    id,
+                    "invalid_params",
+                    match problem {
+                        crate::agent_self_compact::ContinuationProblem::LineBreak => {
+                            "`instructions` must be one line: they are typed after \
+                             `/compact` in the same paste, and a newline would submit \
+                             the command with half of them. Put the long version in a \
+                             file and name the file."
+                        }
+                        _ => {
+                            "`instructions` must be plain text: a control byte or \
+                             escape sequence would end the paste early and be read \
+                             as keystrokes."
+                        }
+                    },
+                );
+            }
+            if text.len() > crate::agent_self_compact::MAX_INSTRUCTIONS_BYTES {
+                return encode_error(
+                    id,
+                    "invalid_params",
+                    format!(
+                        "`instructions` is {} bytes, over the {} byte cap. Write the \
+                         long version to a file and name the file.",
+                        text.len(),
+                        crate::agent_self_compact::MAX_INSTRUCTIONS_BYTES
+                    ),
+                );
+            }
+        }
         if let Some(reason) = self.self_compact_refusal(&pane) {
             return encode_error(
                 id,
@@ -1125,28 +1369,54 @@ impl App {
                 },
             );
         }
-        if !self.arm_self_compact(&pane, continuation, std::time::Instant::now()) {
+        // Unreachable today: every harness that passes `self_compact_refusal`
+        // (Claude Code) also takes instructions. Kept as defence in depth so
+        // widening self-compaction to a harness whose compact command takes
+        // no argument refuses instructions instead of silently dropping them.
+        if instructions.is_some() && !self.self_compact_takes_instructions(&pane) {
+            return encode_error(
+                id,
+                "self_compact_instructions_unsupported",
+                "this agent's harness has no way to take instructions with its \
+                 compact command, so they would be lost and the summary would not \
+                 keep what you asked. Arm without `instructions`, and put what must \
+                 survive in your continuation instead.",
+            );
+        }
+        let steered = instructions.is_some();
+        if !self.arm_self_compact(&pane, continuation, instructions, std::time::Instant::now()) {
             return answer(
                 SelfCompactState::Pending,
                 "a self-compaction is already armed for this pane, so yours was \
                  NOT stored — the handoff prompt already there is untouched. Abort \
                  it first if you meant to replace it."
                     .to_string(),
+                false,
             );
         }
         answer(
             SelfCompactState::Armed,
-            "armed. Nothing has been typed yet and nothing has been compacted: \
-             flock waits for your current turn to end, then asks the harness to \
-             compact, then sends your continuation prompt back as your next turn. \
-             Finish this turn normally."
-                .to_string(),
+            if steered {
+                "armed. Nothing has been typed yet and nothing has been compacted: \
+                 flock waits for your current turn to end, then types `/compact` \
+                 with your instructions for what the summary keeps, then sends your \
+                 continuation prompt back as your next turn. Finish this turn \
+                 normally."
+            } else {
+                "armed. Nothing has been typed yet and nothing has been compacted: \
+                 flock waits for your current turn to end, then asks the harness to \
+                 compact, then sends your continuation prompt back as your next turn. \
+                 Finish this turn normally."
+            }
+            .to_string(),
+            steered,
         )
     }
 
     pub(super) fn handle_pane_close(&mut self, id: String, target: PaneTarget) -> String {
-        let Some((ws_idx, pane_id)) = self.parse_pane_id(&target.pane_id) else {
-            return pane_not_found(id, &target.pane_id);
+        let (ws_idx, pane_id) = match self.resolve_pane_target(&target.pane_id) {
+            Ok(target) => target,
+            Err(error) => return target_refusal(id, error),
         };
         // Capture the canonical public pane id BEFORE close (closing drops
         // the public-number mapping, so emitting the event afterwards using
@@ -1156,12 +1426,35 @@ impl App {
         };
         let workspace_id = self.state.workspaces[ws_idx].id.clone();
         let terminal_id = self.state.terminal_id_for_pane(ws_idx, pane_id);
+        // Capture identity while the placement exists; publish removal only
+        // after checked close succeeds, so a refusal has no lifecycle effects.
+        let removal = terminal_id
+            .as_ref()
+            .and_then(|terminal| self.state.terminals.get(terminal))
+            .and_then(|terminal| {
+                crate::app::agent_removal::capture(
+                    terminal,
+                    crate::app::agent_removal::RemovalEvent::Close,
+                )
+            });
         let should_close_workspace = {
             let Some(ws) = self.state.workspaces.get_mut(ws_idx) else {
                 return pane_not_found(id, &target.pane_id);
             };
-            ws.close_pane(pane_id)
+            match ws.close_pane(pane_id) {
+                Ok(close_workspace) => close_workspace,
+                Err(_) => {
+                    return encode_error(
+                        id,
+                        "internal_error",
+                        "pane layout and content membership disagree; no pane closed",
+                    )
+                }
+            }
         };
+        if let Some(removal) = removal {
+            self.record_agent_removal(removal);
+        }
         if should_close_workspace {
             self.state.close_workspace(ws_idx);
             self.shutdown_detached_terminal_runtimes();
@@ -1190,28 +1483,55 @@ impl App {
         encode_success(id, ResponseResult::Ok {})
     }
 
+    /// Recheck the live lock in the owner's turn before admitting the chosen key.
+    pub(super) fn handle_resolve_codex_lock(
+        &mut self,
+        id: String,
+        params: crate::api::schema::PaneResolveCodexLockParams,
+    ) -> String {
+        let (ws, pane) = match self.resolve_pane_target(&params.pane_id) {
+            Ok(target) => target,
+            Err(error) => return target_refusal(id, error),
+        };
+        let locked = self.lookup_runtime(ws, pane).is_some_and(|(runtime, _)| {
+            crate::detect::codex_conversation_locked(&runtime.detection_text())
+        });
+        if !locked {
+            return encode_error(
+                id,
+                "agent_not_ready",
+                "codex_conversation_locked is not currently detected; no key sent",
+            );
+        }
+        let key = match params.choice {
+            crate::api::schema::CodexLockChoice::Retry => "r",
+            crate::api::schema::CodexLockChoice::Fork => "f",
+        };
+        self.handle_pane_send_keys(
+            id,
+            PaneSendKeysParams {
+                pane_id: params.pane_id,
+                keys: vec![key.into()],
+                write_timeout_ms: params.write_timeout_ms,
+            },
+        )
+    }
+
     pub(super) fn handle_pane_send_keys(
         &mut self,
         id: String,
         params: PaneSendKeysParams,
     ) -> String {
-        let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
-            return pane_not_found(id, &params.pane_id);
-        };
-        let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
-            return pane_not_found(id, &params.pane_id);
-        };
-        let encoded_keys = match encode_api_keys(runtime, &params.keys) {
-            Ok(encoded_keys) => encoded_keys,
-            Err(key) => return encode_error(id, "invalid_key", format!("unsupported key {key}")),
-        };
-        for bytes in encoded_keys {
-            if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
-                return encode_error(id, "pane_send_failed", err.to_string());
-            }
-        }
-
-        encode_success(id, ResponseResult::Ok {})
+        self.handle_pane_send_input(
+            id,
+            PaneSendInputParams {
+                pane_id: params.pane_id,
+                text: String::new(),
+                keys: params.keys,
+                raw: true,
+                write_timeout_ms: params.write_timeout_ms,
+            },
+        )
     }
 }
 
@@ -1285,18 +1605,1172 @@ fn normalize_state_labels(
         .collect()
 }
 
+/// A target refusal; an unknown target names the accepted shapes in
+/// `data.expected` (ADR-0029 §5).
+fn target_refusal(id: String, error: crate::api::schema::ErrorBody) -> String {
+    if error.code == "pane_not_found" {
+        return encode_error_with_data(id, &error.code, error.message, expected_targets());
+    }
+    encode_error(id, &error.code, error.message)
+}
+
+fn expected_targets() -> serde_json::Value {
+    serde_json::json!({ "expected": crate::app::terminal_targets::PANE_TARGET_EXPECTED })
+}
+
 fn pane_not_found(id: String, pane_id: &str) -> String {
     encode_error(id, "pane_not_found", format!("pane {pane_id} not found"))
 }
 
 fn invalid_agent(id: String) -> String {
-    encode_error(id, "invalid_agent", "agent label must not be empty")
+    encode_error(
+        id,
+        crate::api::error_code::ErrorCode::InvalidAgentName.as_str(),
+        crate::terminal::agent_name::POLICY,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{api::schema::SuccessResponse, config::Config, workspace::Workspace};
+
+    fn raw_request(
+        app: &mut App,
+        method: &str,
+        params: serde_json::Value,
+    ) -> std::sync::mpsc::Receiver<String> {
+        let (respond_to, response) = std::sync::mpsc::channel();
+        app.handle_api_request_message(crate::api::ApiRequestMessage {
+            scope: None,
+            request: serde_json::from_value(
+                serde_json::json!({"id":"same", "method":method, "params":params}),
+            )
+            .unwrap(),
+            respond_to,
+            peer_pid: Some(std::process::id()),
+            peer_birth: crate::platform::process_start_time(std::process::id()),
+            peer_uid: Some(crate::platform::peer::effective_uid()),
+        });
+        response
+    }
+
+    #[tokio::test]
+    async fn native_agent_pane_read_returns_runtime_unsupported() {
+        let (mut app, _, _) = app_with_terminal();
+        app.state
+            .structured_agents
+            .register(crate::structured::registry::Record {
+                harness_established: false,
+                profile_identity: None,
+                runtime: crate::structured::registry::StructuredRuntime::Structured,
+                agent_id: "fixture-native".into(),
+                name: Some("native-reader".into()),
+                harness: "claude".into(),
+                session_id: "fixture-session".into(),
+                cwd: std::env::temp_dir(),
+                model: None,
+            })
+            .unwrap();
+        for target in ["fixture-native", "native-reader"] {
+            let response = raw_request(
+                &mut app,
+                "pane.read",
+                serde_json::json!({"pane_id":target,"source":"recent"}),
+            );
+            let value: serde_json::Value =
+                serde_json::from_str(&response.try_recv().unwrap()).unwrap();
+            assert_eq!(
+                value["error"]["code"],
+                crate::api::error_code::ErrorCode::RuntimeUnsupported.as_str(),
+                "{value}"
+            );
+            assert!(value.get("result").is_none(), "{value}");
+        }
+    }
+
+    #[tokio::test]
+    async fn s3c_invalid_timeouts_and_submit_budgets_refuse_without_effect() {
+        for method in ["pane.send_text", "pane.write_text", "agent.send"] {
+            for timeout in [
+                serde_json::json!(null),
+                serde_json::json!(0),
+                serde_json::json!(30001),
+                serde_json::json!(-1),
+                serde_json::json!(true),
+                serde_json::json!(1.5),
+                serde_json::json!("100"),
+                serde_json::json!([]),
+                serde_json::json!({}),
+            ] {
+                let (mut app, _, public, mut bytes) = s3b_leased_app(8);
+                let response = raw_request(
+                    &mut app,
+                    method,
+                    serde_json::json!({"pane_id":public,"target":public,"text":"never","raw":true,"write_timeout_ms":timeout}),
+                );
+                let value: serde_json::Value =
+                    serde_json::from_str(&response.try_recv().unwrap()).unwrap();
+                assert_eq!(
+                    value["error"]["code"], "invalid_params",
+                    "{method}: {value}"
+                );
+                assert!(bytes.try_recv().is_err());
+                assert!(app.input_writes.next_deadline().is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn s3c_submit_refuses_raw_budget_before_any_input() {
+        let (mut app, _, public, mut bytes) = s3b_leased_app(8);
+        let response = raw_request(
+            &mut app,
+            "agent.send",
+            serde_json::json!({"target":public,"text":"never","submit":true,"write_timeout_ms":200}),
+        );
+        let value: serde_json::Value = serde_json::from_str(&response.try_recv().unwrap()).unwrap();
+        assert_eq!(value["error"]["code"], "invalid_params");
+        assert!(bytes.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn s3c_held_deadline_bypasses_observation_and_removes_payload() {
+        for method in ["pane.send_text", "pane.write_text", "agent.send"] {
+            let (mut app, pane, public, mut bytes) = s3b_leased_app(8);
+            let (event_tx, mut events) = tokio::sync::mpsc::channel(8);
+            app.event_tx = event_tx;
+            // App::new makes Git refresh immediately due. Suppress its worker so
+            // GitStatusRefreshed cannot race the paste-observation assertions.
+            app.git_refresh_in_flight = true;
+            let response = raw_request(
+                &mut app,
+                method,
+                serde_json::json!({"pane_id":public,"target":public,"text":"é","raw":true,"write_timeout_ms":200}),
+            );
+            app.state.workspaces[0].tabs[0].runtimes[&pane]
+                .test_process_pty_bytes(b"unrelated repaint");
+            assert!(response.try_recv().is_err());
+            assert!(
+                events.try_recv().is_err(),
+                "observation cannot start at admission"
+            );
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                crate::app::sleep_until_or_pending(app.input_writes.next_deadline()),
+            )
+            .await
+            .unwrap();
+            app.handle_scheduled_tasks(std::time::Instant::now(), false);
+            assert!(
+                app.git_refresh_health.last_attempt.is_none(),
+                "the deadline tick must not dispatch an unrelated Git refresh"
+            );
+            let value: serde_json::Value =
+                serde_json::from_str(&response.try_recv().unwrap()).unwrap();
+            assert_eq!(value["error"]["code"], "input_write_cancelled", "{value}");
+            assert_eq!(value["error"]["data"]["input_write"]["bytes_written"], 0);
+            assert_eq!(value["error"]["data"]["input_write"]["bytes_total"], 2);
+            assert_eq!(value["error"]["data"]["input_write"]["reason"], "deadline");
+            assert!(
+                events.try_recv().is_err(),
+                "expired held writes must bypass paste observation"
+            );
+            app.state.workspaces[0].tabs[0].runtimes[&pane].end_injection_lease("held");
+            assert!(
+                bytes.try_recv().is_err(),
+                "expired paste must never surface after release"
+            );
+            assert!(response.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn s3c_observation_remains_bounded_and_retirement_concludes_once() {
+        let (mut app, pane, public, mut bytes) = s3b_leased_app(64);
+        app.state.workspaces[0].tabs[0].runtimes[&pane].end_injection_lease("held");
+        let (event_tx, mut events) = tokio::sync::mpsc::channel(64);
+        app.event_tx = event_tx;
+        let mut replies = Vec::new();
+        for _ in 0..32 {
+            replies.push(raw_request(
+                &mut app,
+                "pane.write_text",
+                serde_json::json!({"pane_id":public,"text":"é","raw":true,"write_timeout_ms":200}),
+            ));
+        }
+        assert!(replies.iter().all(|reply| reply.try_recv().is_err()));
+        let refused = raw_request(
+            &mut app,
+            "pane.write_input",
+            serde_json::json!({"pane_id":public,"text":"refused","raw":true}),
+        );
+        let value: serde_json::Value = serde_json::from_str(&refused.try_recv().unwrap()).unwrap();
+        assert_eq!(
+            value["error"]["data"]["input_write"]["reason"],
+            "admission_limit"
+        );
+        assert!(
+            app.input_writes.next_deadline().is_none(),
+            "completed observations must not spin on the write deadline"
+        );
+        for _ in 0..32 {
+            assert_eq!(bytes.try_recv().unwrap(), "é".as_bytes());
+        }
+        assert!(bytes.try_recv().is_err());
+        app.input_writes
+            .retire_all(crate::pty::write_receipt::WriteFailure::OwnerChanged);
+        for reply in &replies {
+            let value: serde_json::Value =
+                serde_json::from_str(&reply.try_recv().unwrap()).unwrap();
+            assert_eq!(value["result"]["type"], "paste");
+            assert_eq!(value["result"]["outcome"], "unconfirmed");
+            assert_eq!(value["result"]["reason"], "owner_changed");
+        }
+        for _ in 0..32 {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            app.handle_internal_event(event);
+        }
+        assert!(
+            replies.iter().all(|reply| reply.try_recv().is_err()),
+            "stale observation must never send a second result"
+        );
+        let reused = raw_request(
+            &mut app,
+            "pane.write_input",
+            serde_json::json!({"pane_id":public,"text":"later","raw":true}),
+        );
+        let value: serde_json::Value = serde_json::from_str(&reused.try_recv().unwrap()).unwrap();
+        assert_eq!(value["result"]["type"], "ok");
+        assert_eq!(bytes.try_recv().unwrap(), b"later".as_slice());
+    }
+
+    #[tokio::test]
+    async fn s3c_closed_writer_reports_zero_encoded_bytes_without_observation() {
+        for method in ["pane.send_text", "pane.write_text", "agent.send"] {
+            let (mut app, pane, public, bytes) = s3b_leased_app(8);
+            app.state.workspaces[0].tabs[0].runtimes[&pane].end_injection_lease("held");
+            app.state.workspaces[0].tabs[0].runtimes[&pane].test_process_pty_bytes(b"\x1b[?2004h");
+            drop(bytes);
+            let (event_tx, mut events) = tokio::sync::mpsc::channel(4);
+            app.event_tx = event_tx;
+            let response = raw_request(
+                &mut app,
+                method,
+                serde_json::json!({"pane_id":public,"target":public,"text":"é","raw":true,"write_timeout_ms":200}),
+            );
+            let value: serde_json::Value =
+                serde_json::from_str(&response.try_recv().unwrap()).unwrap();
+            assert_eq!(value["error"]["code"], "input_write_cancelled", "{value}");
+            assert_eq!(value["error"]["data"]["input_write"]["bytes_written"], 0);
+            assert_eq!(value["error"]["data"]["input_write"]["bytes_total"], 14);
+            assert_eq!(
+                value["error"]["data"]["input_write"]["remainder_discarded"],
+                true
+            );
+            assert!(events.try_recv().is_err());
+            assert!(app.input_writes.next_deadline().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn s3c_final_observation_releases_its_quota_before_next_admission() {
+        let (mut app, pane, public, mut bytes) = s3b_leased_app(64);
+        app.state.workspaces[0].tabs[0].runtimes[&pane].end_injection_lease("held");
+        let (event_tx, mut events) = tokio::sync::mpsc::channel(64);
+        app.event_tx = event_tx;
+        let mut replies = Vec::new();
+        for _ in 0..32 {
+            replies.push(raw_request(&mut app, "pane.write_text", serde_json::json!({"pane_id":public,"text":"done","raw":true,"write_timeout_ms":200})));
+        }
+        let refused = raw_request(
+            &mut app,
+            "pane.write_input",
+            serde_json::json!({"pane_id":public,"text":"refused","raw":true}),
+        );
+        let value: serde_json::Value = serde_json::from_str(&refused.try_recv().unwrap()).unwrap();
+        assert_eq!(value["error"]["code"], "input_write_cancelled");
+        for _ in 0..32 {
+            let crate::events::AppEvent::PasteConfirm {
+                mut paste,
+                respond_to,
+            } = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+                .await
+                .unwrap()
+                .unwrap()
+            else {
+                panic!("expected paste observation")
+            };
+            paste.deadline = std::time::Instant::now();
+            app.advance_paste(paste, respond_to);
+            assert_eq!(bytes.try_recv().unwrap(), b"done".as_slice());
+        }
+        for reply in replies {
+            let value: serde_json::Value =
+                serde_json::from_str(&reply.try_recv().unwrap()).unwrap();
+            assert_eq!(value["result"]["type"], "paste");
+            assert!(reply.try_recv().is_err());
+        }
+        let next = raw_request(
+            &mut app,
+            "pane.write_input",
+            serde_json::json!({"pane_id":public,"text":"next","raw":true}),
+        );
+        let value: serde_json::Value = serde_json::from_str(&next.try_recv().unwrap()).unwrap();
+        assert_eq!(value["result"]["type"], "ok");
+        assert_eq!(bytes.try_recv().unwrap(), b"next".as_slice());
+    }
+
+    #[tokio::test]
+    async fn s3c_text_routes_hold_the_reply_and_validate_deadlines_before_admission() {
+        for method in ["pane.send_text", "agent.send"] {
+            let (mut app, _, public, mut bytes) = s3b_leased_app(8);
+            let mut params = serde_json::json!({"pane_id":public,"target":public,"text":"hello","raw":true,"write_timeout_ms":200});
+            let response = raw_request(&mut app, method, params.clone());
+            assert!(
+                matches!(
+                    response.try_recv(),
+                    Err(std::sync::mpsc::TryRecvError::Empty)
+                ),
+                "lease-held text must retain its response owner"
+            );
+            assert!(bytes.try_recv().is_err());
+            params["write_timeout_ms"] = serde_json::json!(null);
+            let refused = raw_request(&mut app, method, params);
+            let value: serde_json::Value =
+                serde_json::from_str(&refused.try_recv().unwrap()).unwrap();
+            assert_eq!(value["error"]["code"], "invalid_params");
+        }
+    }
+
+    #[tokio::test]
+    async fn s3c_write_text_tag_is_contract_bound() {
+        let (mut app, _, public, mut bytes) = s3b_leased_app(8);
+        let response = raw_request(
+            &mut app,
+            "pane.write_text",
+            serde_json::json!({"pane_id":public,"text":"hello","raw":true,"write_timeout_ms":200}),
+        );
+        assert!(matches!(
+            response.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        assert!(bytes.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn s3b_held_raw_input_cannot_reply_at_queue_admission() {
+        let (mut app, _, public) = app_with_terminal();
+        let pane = app.state.workspaces[0].tabs[0].root_pane;
+        let (runtime, _consumer) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        let now = std::time::Instant::now();
+        assert!(runtime.begin_injection_lease(
+            "held",
+            now + std::time::Duration::from_secs(2),
+            now
+        ));
+        app.state.workspaces[0].tabs[0]
+            .runtimes
+            .insert(pane, runtime);
+        let response = raw_request(
+            &mut app,
+            "pane.send_input",
+            serde_json::json!({"pane_id":public,"text":"queued","raw":true}),
+        );
+        assert!(
+            matches!(
+                response.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ),
+            "queue admission must retain the response owner"
+        );
+    }
+
+    #[tokio::test]
+    async fn s3b_invalid_write_timeout_refuses_before_effect() {
+        for timeout in [
+            serde_json::json!(null),
+            serde_json::json!(false),
+            serde_json::json!([]),
+            serde_json::json!({}),
+            serde_json::json!(0),
+            serde_json::json!(30001),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!("1"),
+        ] {
+            let (mut app, _, public) = app_with_terminal();
+            let pane = app.state.workspaces[0].tabs[0].root_pane;
+            let (runtime, mut bytes) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+            app.state.workspaces[0].tabs[0]
+                .runtimes
+                .insert(pane, runtime);
+            let response = raw_request(
+                &mut app,
+                "pane.send_keys",
+                serde_json::json!({"pane_id":public,"keys":["Enter"],"write_timeout_ms":timeout}),
+            );
+            let value: serde_json::Value =
+                serde_json::from_str(&response.try_recv().unwrap()).unwrap();
+            assert_eq!(value["error"]["code"], "invalid_params");
+            assert!(bytes.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn s3b_contract_tags_complete_empty_requests() {
+        for method in ["pane.write_keys", "pane.write_input"] {
+            let (mut app, _, public) = app_with_terminal();
+            let pane = app.state.workspaces[0].tabs[0].root_pane;
+            let (runtime, mut bytes) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+            app.state.workspaces[0].tabs[0]
+                .runtimes
+                .insert(pane, runtime);
+            let response = raw_request(
+                &mut app,
+                method,
+                serde_json::json!({"pane_id":public,"keys":[],"write_timeout_ms":200}),
+            );
+            let value: serde_json::Value =
+                serde_json::from_str(&response.try_recv().unwrap()).unwrap();
+            assert!(value.get("result").is_some(), "{value}");
+            assert!(bytes.try_recv().is_err());
+        }
+    }
+
+    fn s3b_leased_app(
+        capacity: usize,
+    ) -> (
+        App,
+        crate::layout::PaneId,
+        String,
+        tokio::sync::mpsc::Receiver<bytes::Bytes>,
+    ) {
+        let (mut app, _, public) = app_with_terminal();
+        let pane = app.state.workspaces[0].tabs[0].root_pane;
+        let (runtime, bytes) =
+            crate::terminal::TerminalRuntime::test_with_channel_capacity(80, 24, capacity);
+        let now = std::time::Instant::now();
+        assert!(runtime.begin_injection_lease(
+            "held",
+            now + std::time::Duration::from_secs(2),
+            now
+        ));
+        app.state.workspaces[0].tabs[0]
+            .runtimes
+            .insert(pane, runtime);
+        (app, pane, public, bytes)
+    }
+
+    #[tokio::test]
+    async fn s3b_dispatch_aggregates_encoded_bytes_and_preserves_fifo_with_duplicate_ids() {
+        let (mut app, pane, public, mut bytes) = s3b_leased_app(8);
+        let first = raw_request(
+            &mut app,
+            "pane.write_input",
+            serde_json::json!({"pane_id":public,"text":"é","keys":["Enter"],"raw":true}),
+        );
+        let second = raw_request(
+            &mut app,
+            "pane.write_keys",
+            serde_json::json!({"pane_id":public,"keys":["Tab"]}),
+        );
+        assert!(first.try_recv().is_err());
+        assert!(second.try_recv().is_err());
+        let unrelated = raw_request(&mut app, "workspace.list", serde_json::json!({}));
+        let value: serde_json::Value =
+            serde_json::from_str(&unrelated.try_recv().unwrap()).unwrap();
+        assert!(value.get("result").is_some());
+        assert!(app.state.workspaces[0].tabs[0].runtimes[&pane].end_injection_lease("held"));
+        app.input_writes.service();
+        assert_eq!(bytes.try_recv().unwrap().as_ref(), "é\r".as_bytes());
+        assert_eq!(bytes.try_recv().unwrap().as_ref(), b"\t");
+        for response in [first, second] {
+            let value: serde_json::Value =
+                serde_json::from_str(&response.try_recv().unwrap()).unwrap();
+            assert_eq!(value["id"], "same");
+            assert!(value.get("result").is_some());
+            assert!(response.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn s3b_dispatch_deadline_removes_lease_payload_before_reply_and_release() {
+        let (mut app, pane, public, mut bytes) = s3b_leased_app(8);
+        let response = raw_request(
+            &mut app,
+            "pane.write_input",
+            serde_json::json!({"pane_id":public,"text":"dead","raw":true,"write_timeout_ms":200}),
+        );
+        let disconnected = raw_request(
+            &mut app,
+            "pane.send_input",
+            serde_json::json!({"pane_id":public,"text":"gone","raw":true,"write_timeout_ms":200}),
+        );
+        drop(disconnected);
+        let live = raw_request(
+            &mut app,
+            "pane.send_input",
+            serde_json::json!({"pane_id":public,"text":"live","raw":true}),
+        );
+        app.next_resize_poll = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        app.next_auto_update_check = None;
+        app.checks_heartbeat_deadline = None;
+        app.session_save_deadline = None;
+        app.git_refresh_in_flight = true;
+        assert_eq!(
+            app.next_loop_deadline(std::time::Instant::now(), false),
+            app.input_writes.next_deadline()
+        );
+        let expiry_ceiling = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while let Some(deadline) = app
+                .input_writes
+                .next_deadline()
+                .filter(|deadline| *deadline < expiry_ceiling)
+            {
+                crate::app::sleep_until_or_pending(Some(deadline)).await;
+                app.handle_scheduled_tasks(std::time::Instant::now(), false);
+                assert!(
+                    app.input_writes
+                        .next_deadline()
+                        .is_none_or(|next| next > deadline),
+                    "deadline service made no progress"
+                );
+            }
+        })
+        .await
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&response.try_recv().unwrap()).unwrap();
+        assert_eq!(value["error"]["code"], "input_write_cancelled");
+        assert_eq!(value["error"]["data"]["input_write"]["bytes_written"], 0);
+        assert!(app.state.workspaces[0].tabs[0].runtimes[&pane].end_injection_lease("held"));
+        app.input_writes.service();
+        assert_eq!(bytes.try_recv().unwrap().as_ref(), b"live");
+        assert!(bytes.try_recv().is_err());
+        assert!(live.try_recv().is_ok());
+    }
+
+    #[tokio::test]
+    async fn s3b_dispatch_quota_refuses_before_retaining_input_and_reuses_slots() {
+        let (mut app, pane, public, mut bytes) = s3b_leased_app(64);
+        let mut replies = Vec::new();
+        for _ in 0..32 {
+            let response = raw_request(
+                &mut app,
+                "pane.write_input",
+                serde_json::json!({"pane_id":public,"text":"x","raw":true}),
+            );
+            assert!(response.try_recv().is_err());
+            replies.push(response);
+        }
+        let refused = raw_request(
+            &mut app,
+            "pane.write_input",
+            serde_json::json!({"pane_id":public,"text":"refused","raw":true}),
+        );
+        let value: serde_json::Value = serde_json::from_str(&refused.try_recv().unwrap()).unwrap();
+        assert_eq!(value["error"]["code"], "input_write_cancelled");
+        assert_eq!(
+            value["error"]["data"]["input_write"]["reason"],
+            "admission_limit"
+        );
+        assert_eq!(value["error"]["data"]["input_write"]["bytes_total"], 7);
+        assert!(app.state.workspaces[0].tabs[0].runtimes[&pane].end_injection_lease("held"));
+        let reused = raw_request(
+            &mut app,
+            "pane.write_input",
+            serde_json::json!({"pane_id":public,"text":"new","raw":true}),
+        );
+        let value: serde_json::Value = serde_json::from_str(&reused.try_recv().unwrap()).unwrap();
+        assert!(
+            value.get("result").is_some(),
+            "completed requests must release their quota: {value}"
+        );
+        for response in replies {
+            assert!(response.try_recv().is_ok());
+            assert_eq!(bytes.try_recv().unwrap().as_ref(), b"x");
+        }
+        assert_eq!(bytes.try_recv().unwrap().as_ref(), b"new");
+        assert!(bytes.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn s3b_dispatch_owner_and_pane_loss_answer_each_held_request() {
+        for owner_changed in [true, false] {
+            let (mut app, pane, public, mut bytes) = s3b_leased_app(8);
+            let response = raw_request(
+                &mut app,
+                "pane.write_input",
+                serde_json::json!({"pane_id":public,"text":"never","raw":true}),
+            );
+            if owner_changed {
+                app.state.workspaces[0].tabs[0].runtimes[&pane].end_all_injection_leases();
+            } else {
+                app.state.workspaces[0].tabs[0].runtimes.remove(&pane);
+            }
+            app.input_writes.service();
+            let value: serde_json::Value =
+                serde_json::from_str(&response.try_recv().unwrap()).unwrap();
+            assert_eq!(
+                value["error"]["data"]["input_write"]["reason"],
+                if owner_changed {
+                    "owner_changed"
+                } else {
+                    "pane_gone"
+                }
+            );
+            assert_eq!(value["error"]["data"]["input_write"]["bytes_written"], 0);
+            assert!(bytes.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn s3b_keys_only_never_emit_empty_bracketed_paste_markers() {
+        let (mut app, _, public) = app_with_terminal();
+        let pane = app.state.workspaces[0].tabs[0].root_pane;
+        let (runtime, mut bytes) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        runtime.test_process_pty_bytes(b"\x1b[?2004h");
+        app.state.workspaces[0].tabs[0]
+            .runtimes
+            .insert(pane, runtime);
+        let reply = raw_request(
+            &mut app,
+            "pane.write_keys",
+            serde_json::json!({"pane_id":public,"keys":["Enter"]}),
+        );
+        assert!(reply.try_recv().is_ok());
+        assert_eq!(bytes.try_recv().unwrap().as_ref(), b"\r");
+        assert!(bytes.try_recv().is_err());
+        let reply = raw_request(
+            &mut app,
+            "pane.write_input",
+            serde_json::json!({"pane_id":public,"text":"é","keys":["Enter"],"raw":true}),
+        );
+        assert!(reply.try_recv().is_ok());
+        assert_eq!(
+            bytes.try_recv().unwrap().as_ref(),
+            "\x1b[200~é\x1b[201~\r".as_bytes()
+        );
+    }
+
+    #[tokio::test]
+    async fn s3b_api_interrupt_keys_keep_operator_priority_and_fifo() {
+        for (method, mut params, expected) in [
+            (
+                "pane.write_keys",
+                serde_json::json!({"keys":["Esc"]}),
+                b"\x1b",
+            ),
+            (
+                "pane.write_keys",
+                serde_json::json!({"keys":["C-c"]}),
+                b"\x03",
+            ),
+            (
+                "pane.write_input",
+                serde_json::json!({"text":"\u{1b}","raw":true}),
+                b"\x1b",
+            ),
+            (
+                "pane.write_input",
+                serde_json::json!({"text":"\u{3}","raw":true}),
+                b"\x03",
+            ),
+        ] {
+            let (mut app, pane, public, mut bytes) = s3b_leased_app(8);
+            let held = raw_request(
+                &mut app,
+                "pane.write_input",
+                serde_json::json!({"pane_id":public,"text":"held","raw":true}),
+            );
+            assert!(held.try_recv().is_err());
+            params["pane_id"] = public.into();
+            let interrupt = raw_request(&mut app, method, params);
+            app.input_writes.service();
+            assert!(held.try_recv().is_ok());
+            assert!(interrupt.try_recv().is_ok());
+            assert_eq!(bytes.try_recv().unwrap().as_ref(), b"held");
+            assert_eq!(bytes.try_recv().unwrap().as_ref(), expected);
+            assert!(app.state.workspaces[0].tabs[0].runtimes[&pane]
+                .injection_lease_until()
+                .is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn s3b_empty_admission_checks_the_original_deadline() {
+        let (mut app, _, _) = app_with_terminal();
+        let pane = app.state.workspaces[0].tabs[0].root_pane;
+        let (runtime, mut bytes) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.state.workspaces[0].tabs[0]
+            .runtimes
+            .insert(pane, runtime);
+        let response = app.begin_input_write(
+            "empty".into(),
+            0,
+            pane,
+            crate::app::input_writes::InputPayload {
+                bytes: Bytes::new(),
+                deadline: std::time::Instant::now() - std::time::Duration::from_nanos(1),
+                operator_interrupt: false,
+                paste: None,
+            },
+        );
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(value["error"]["code"], "input_write_cancelled");
+        assert_eq!(value["error"]["data"]["input_write"]["bytes_total"], 0);
+        assert_eq!(value["error"]["data"]["input_write"]["reason"], "deadline");
+        assert!(bytes.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn pane_verbs_accept_agent_targets() {
+        for target_kind in ["name", "terminal", "pane", "legacy"] {
+            let (mut app, terminal_id, public) = app_with_terminal();
+            app.state
+                .terminals
+                .get_mut(&terminal_id)
+                .unwrap()
+                .set_agent_name("builder".into())
+                .unwrap();
+            let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+            let (runtime, mut rx) =
+                crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                    80,
+                    24,
+                    0,
+                    b"agent output",
+                    8,
+                );
+            app.state.workspaces[0].tabs[0]
+                .runtimes
+                .insert(pane_id, runtime);
+            let target = match target_kind {
+                "name" => "builder".to_string(),
+                "terminal" => terminal_id.to_string(),
+                "legacy" => public.replace(":p", "-"),
+                _ => public.clone(),
+            };
+            for (method, extra) in [
+                ("pane.read", serde_json::json!({"source": "recent"})),
+                ("pane.send_text", serde_json::json!({"text": "prompt"})),
+                ("pane.send_keys", serde_json::json!({"keys": ["Enter"]})),
+                ("pane.close", serde_json::json!({})),
+            ] {
+                let mut params = extra;
+                params["pane_id"] = target.clone().into();
+                let (event_tx, mut events) = tokio::sync::mpsc::channel(4);
+                app.event_tx = event_tx;
+                let response = raw_request(&mut app, method, params);
+                if method == "pane.send_text" {
+                    let crate::events::AppEvent::PasteConfirm {
+                        mut paste,
+                        respond_to,
+                    } = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+                        .await
+                        .unwrap()
+                        .unwrap()
+                    else {
+                        panic!("expected paste observation")
+                    };
+                    paste.deadline = std::time::Instant::now();
+                    app.advance_paste(paste, respond_to);
+                }
+                let response: serde_json::Value = serde_json::from_str(
+                    &response
+                        .recv_timeout(std::time::Duration::from_secs(1))
+                        .unwrap(),
+                )
+                .unwrap();
+                assert!(response.get("result").is_some(), "{method}: {response}");
+                match method {
+                    "pane.read" => {
+                        assert_eq!(response["result"]["read"]["pane_id"], public);
+                        assert!(response["result"]["read"]["text"]
+                            .as_str()
+                            .unwrap()
+                            .contains("agent output"));
+                    }
+                    "pane.send_text" => assert_eq!(rx.try_recv().unwrap().as_ref(), b"prompt"),
+                    "pane.send_keys" => assert_eq!(rx.try_recv().unwrap().as_ref(), b"\r"),
+                    _ => assert!(app.state.workspaces.is_empty()),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pane_target_id_wins_over_same_named_agent() {
+        let (mut app, _, public) = app_with_terminal();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        app.state.workspaces.push(Workspace::test_new("other"));
+        app.state.ensure_test_terminals();
+        let other = app.state.workspaces[1].tabs[0].root_pane;
+        let other_terminal = app.state.workspaces[1].terminal_id(other).unwrap().clone();
+        app.state
+            .terminals
+            .get_mut(&other_terminal)
+            .unwrap()
+            .set_agent_name(public.clone())
+            .unwrap();
+        assert_eq!(app.resolve_pane_target(&public).unwrap(), (0, pane_id));
+        let response = app.handle_pane_close("precedence".into(), PaneTarget { pane_id: public });
+        assert!(response.contains("\"result\""), "{response}");
+        assert_eq!(app.state.workspaces.len(), 1);
+        assert_eq!(
+            app.state.workspaces[0].terminal_id(other),
+            Some(&other_terminal)
+        );
+    }
+
+    #[test]
+    fn pane_only_verbs_resolve_agent_name_and_fleet_agent_id() {
+        let (mut app, terminal_id, public) = app_with_terminal();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_agent_name("reviewer".into()).unwrap();
+        let agent_id = terminal.agent_id.to_string();
+        for target in ["reviewer".to_string(), agent_id, terminal_id.to_string()] {
+            let get = app.handle_pane_get(
+                "get".into(),
+                PaneTarget {
+                    pane_id: target.clone(),
+                },
+            );
+            let get: serde_json::Value = serde_json::from_str(&get).unwrap();
+            assert_eq!(
+                get["result"]["pane"]["pane_id"],
+                public.as_str(),
+                "{target}"
+            );
+            let rename = app.handle_pane_rename(
+                "rename".into(),
+                PaneRenameParams {
+                    pane_id: target.clone(),
+                    label: Some("lbl".into()),
+                },
+            );
+            assert!(rename.contains("\"result\""), "{target}: {rename}");
+        }
+    }
+
+    #[tokio::test]
+    async fn self_resolves_to_the_callers_pane_by_ancestry() {
+        let (mut app, _, public) = app_with_terminal();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let get = |app: &mut App| {
+            let response = app.handle_pane_get(
+                "get".into(),
+                PaneTarget {
+                    pane_id: "self".into(),
+                },
+            );
+            serde_json::from_str::<serde_json::Value>(&response).unwrap()
+        };
+        assert_eq!(get(&mut app)["error"]["code"], "pane_not_found");
+        crate::test_support::attest_pane_caller(&mut app, pane_id);
+        assert_eq!(get(&mut app)["result"]["pane"]["pane_id"], public.as_str());
+    }
+
+    #[tokio::test]
+    async fn recovery_refuses_unreadable_claude_project_and_names_store() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = crate::test_support::TempDir::socket();
+        let home = root.path().join("home");
+        std::env::set_var("HOME", &home);
+        std::env::set_var("XDG_STATE_HOME", root.path().join("state"));
+        let projects = home.join(".claude/projects");
+        let blocked = projects.join("blocked");
+        for project in [projects.join("visible"), blocked.clone()] {
+            std::fs::create_dir_all(&project).unwrap();
+            std::fs::write(
+                project.join("unreadable-session.jsonl"),
+                "{\"sessionId\":\"unreadable-session\"}\n",
+            )
+            .unwrap();
+        }
+        let (mut app, terminal_id, pane) = app_with_terminal();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.launch_argv = Some(vec!["claude".into()]);
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "flock:claude".into(),
+            agent: "claude".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("unreadable-session").unwrap(),
+        });
+        let agent_id = terminal.agent_id.to_string();
+        app.current_api_peer_pid = Some(std::process::id());
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let response = app.handle_pane_report_agent_session(
+            "recover".into(),
+            PaneReportAgentSessionParams {
+                pane_id: pane,
+                rebind_agent_id: Some(agent_id),
+                source: "flock:claude".into(),
+                agent: "claude".into(),
+                seq: None,
+                agent_session_id: Some("unreadable-session".into()),
+                agent_session_path: None,
+                session_start_source: None,
+            },
+        );
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["error"]["code"], "session_unbound", "{response}");
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains(blocked.to_str().unwrap()),
+            "{response}"
+        );
+        assert!(!app.state.terminals[&terminal_id].agent_session_hook_confirmed());
+    }
+
+    async fn recover_child_session(owner: bool) {
+        recover_child_session_case(owner, false).await;
+    }
+
+    async fn recover_child_session_case(owner: bool, supply_parent_session: bool) {
+        let (mut app, caller_terminal, _) = app_with_terminal();
+        let root = crate::test_support::TempDir::socket();
+        std::env::set_var("CODEX_HOME", root.path());
+        let sessions = root.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let session_id = "00000000-0000-4000-8000-000000000613";
+        std::fs::write(
+            sessions.join(format!("rollout-fixture-{session_id}.jsonl")),
+            include_str!("../../../tests/fixtures/codex/finished.jsonl"),
+        )
+        .unwrap();
+        let caller_pane = app.state.workspaces[0].tabs[0].root_pane;
+        let caller = app.state.terminals.get_mut(&caller_terminal).unwrap();
+        caller.launch_argv = Some(vec!["codex".into()]);
+        let architect = caller.agent_id.to_string();
+        if supply_parent_session {
+            caller.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+                source: "flock:codex".into(),
+                agent: "codex".into(),
+                session_ref: crate::agent_resume::AgentSessionRef::id(session_id).unwrap(),
+            });
+        }
+        app.state.workspaces.push(Workspace::test_new("child"));
+        app.state.ensure_test_terminals();
+        let child_pane = app.state.workspaces[1].tabs[0].root_pane;
+        let child_terminal = app.state.workspaces[1]
+            .terminal_id(child_pane)
+            .unwrap()
+            .clone();
+        let delegate = app.state.terminals[&child_terminal].agent_id.to_string();
+        if !supply_parent_session {
+            crate::test_support::attest_pane_caller(&mut app, child_pane);
+            let report = app.handle_pane_report_agent_session(
+                "launch".into(),
+                PaneReportAgentSessionParams {
+                    pane_id: app.public_pane_id(1, child_pane).unwrap(),
+                    rebind_agent_id: None,
+                    source: "flock:codex".into(),
+                    agent: "codex".into(),
+                    seq: None,
+                    agent_session_id: Some(session_id.into()),
+                    agent_session_path: None,
+                    session_start_source: None,
+                },
+            );
+            assert!(!report.contains("\"error\""), "{report}");
+            let child = app.state.terminals.get_mut(&child_terminal).unwrap();
+            let saved = child.persisted_agent_session.clone().unwrap();
+            child.set_persisted_agent_session(saved);
+        }
+        app.delegations
+            .insert(crate::app::delegation::DelegationEdge {
+                architect: if owner {
+                    architect
+                } else {
+                    "agent_fixture.example_nonowner".into()
+                },
+                delegate: delegate.clone(),
+                via: crate::api::schema::DelegationVia::Start,
+                workspace: app.public_workspace_id(1),
+                worktree: None,
+                branch: None,
+                repo: None,
+                label: None,
+                state: crate::app::delegation::EdgeState::Live,
+                since_ms: 0,
+            });
+        crate::test_support::attest_pane_caller(&mut app, caller_pane);
+        let response = app.handle_pane_report_agent_session(
+            "recover".into(),
+            PaneReportAgentSessionParams {
+                pane_id: app.public_pane_id(1, child_pane).unwrap(),
+                rebind_agent_id: Some(delegate),
+                source: "flock:codex".into(),
+                agent: "codex".into(),
+                seq: None,
+                agent_session_id: Some(session_id.into()),
+                agent_session_path: None,
+                session_start_source: None,
+            },
+        );
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            response.get("error").is_none(),
+            owner && !supply_parent_session,
+            "{response}"
+        );
+        assert_eq!(
+            super::super::super::creation::terminal_agent_session_info(
+                &app.state.terminals[&caller_terminal]
+            )
+            .is_some(),
+            supply_parent_session
+        );
+        let child_session = super::super::super::creation::terminal_agent_session_info(
+            &app.state.terminals[&child_terminal],
+        );
+        assert_eq!(child_session.is_some(), !supply_parent_session);
+        assert_eq!(
+            app.state.terminals[&child_terminal].agent_session_hook_confirmed(),
+            owner && !supply_parent_session
+        );
+        if let Some(session) = child_session {
+            assert_eq!(session.value, session_id);
+        }
+        crate::app::delegation::handler_tests::shutdown(app);
+        std::env::remove_var("CODEX_HOME");
+    }
+
+    #[tokio::test]
+    async fn coordinator_cannot_bind_child_to_its_own_session() {
+        recover_child_session_case(true, true).await;
+    }
+
+    #[tokio::test]
+    async fn coordinator_recovery_targets_owned_child_despite_caller_ancestry() {
+        recover_child_session(true).await;
+    }
+
+    #[tokio::test]
+    async fn coordinator_recovery_refuses_a_non_owner() {
+        recover_child_session(false).await;
+    }
+
+    #[test]
+    fn unknown_pane_target_names_the_expected_shapes() {
+        let (mut app, _, _) = app_with_terminal();
+        let response = app.handle_pane_get(
+            "get".into(),
+            PaneTarget {
+                pane_id: "nobody".into(),
+            },
+        );
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["error"]["code"], "pane_not_found");
+        let expected = response["error"]["data"]["expected"].as_array().unwrap();
+        assert_eq!(
+            expected.len(),
+            crate::app::terminal_targets::PANE_TARGET_EXPECTED.len()
+        );
+        assert!(response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("expected a pane id"));
+    }
+
+    #[test]
+    fn pane_target_accepts_legacy_workspace_pane_form() {
+        let (app, _, public) = app_with_terminal();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let legacy = public.replace(":p", "-");
+        assert_ne!(legacy, public);
+        assert_eq!(app.resolve_pane_target(&legacy).unwrap(), (0, pane_id));
+    }
+
+    #[test]
+    fn pane_send_missing_runtime_names_resolved_pane() {
+        let (mut app, terminal_id, public) = app_with_terminal();
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_agent_name("builder".into())
+            .unwrap();
+        for (method, extra) in [
+            ("pane.send_text", serde_json::json!({"text": "prompt"})),
+            ("pane.send_keys", serde_json::json!({"keys": ["Enter"]})),
+        ] {
+            let mut params = extra;
+            params["pane_id"] = "builder".into();
+            let response: serde_json::Value = serde_json::from_str(
+                &app.handle_api_request(
+                    serde_json::from_value(serde_json::json!({
+                        "id": "missing-runtime", "method": method, "params": params,
+                    }))
+                    .unwrap(),
+                ),
+            )
+            .unwrap();
+            assert_eq!(response["error"]["code"], "pane_not_found");
+            assert_eq!(
+                response["error"]["message"],
+                format!("pane {public} not found")
+            );
+        }
+    }
+
+    #[test]
+    fn pane_verbs_reject_ambiguous_and_missing_agent_targets() {
+        let (mut app, terminal_id, _) = app_with_terminal();
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_agent_name("builder".into())
+            .unwrap();
+        app.state.workspaces.push(Workspace::test_new("other"));
+        app.state.ensure_test_terminals();
+        let other = app.state.workspaces[1].tabs[0].root_pane;
+        let other_terminal = app.state.workspaces[1].terminal_id(other).unwrap().clone();
+        app.state
+            .terminals
+            .get_mut(&other_terminal)
+            .unwrap()
+            .set_agent_name("builder".into())
+            .unwrap();
+        for (target, code) in [
+            ("builder", "agent_target_ambiguous"),
+            ("missing", "pane_not_found"),
+        ] {
+            for (method, extra) in [
+                ("pane.read", serde_json::json!({"source": "recent"})),
+                ("pane.send_text", serde_json::json!({"text": "prompt"})),
+                ("pane.send_keys", serde_json::json!({"keys": ["Enter"]})),
+                ("pane.close", serde_json::json!({})),
+            ] {
+                let mut params = extra;
+                params["pane_id"] = target.into();
+                let response: serde_json::Value = serde_json::from_str(
+                    &app.handle_api_request(
+                        serde_json::from_value(serde_json::json!({
+                            "id": "targets", "method": method, "params": params,
+                        }))
+                        .unwrap(),
+                    ),
+                )
+                .unwrap();
+                assert_eq!(response["error"]["code"], code, "{method}: {response}");
+                if target == "builder" {
+                    let message = response["error"]["message"].as_str().unwrap();
+                    assert!(message.contains(&terminal_id.to_string()));
+                    assert!(message.contains(&other_terminal.to_string()));
+                }
+                assert_eq!(app.state.workspaces.len(), 2);
+            }
+        }
+    }
 
     fn app_with_linked_worktree() -> App {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1324,6 +2798,43 @@ mod tests {
     /// steered agents off a read that never moved the attention queue. Driven
     /// off the wire, both verbs, from both starting values: an "unchanged"
     /// that only held for one of them would be a read that sets `seen`.
+    #[tokio::test]
+    async fn detect_pane_read_excludes_scrollback_and_reads_bottom_screen() {
+        let mut app = App::new(
+            &Config::default(),
+            true,
+            None,
+            tokio::sync::mpsc::unbounded_channel().1,
+            crate::api::EventHub::default(),
+        );
+        let mut ws = Workspace::test_new("detection");
+        let pane_id = ws.tabs[0].root_pane;
+        let mut bytes = "old history\r\n".repeat(40).into_bytes();
+        bytes.extend_from_slice(b"\x1b[2J\x1b[Hlive bottom");
+        ws.tabs[0].runtimes.insert(
+            pane_id,
+            crate::terminal::TerminalRuntime::test_with_scrollback_bytes(80, 24, 0, &bytes),
+        );
+        app.state.workspaces.push(ws);
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        let public = app.public_pane_id(0, pane_id).expect("public id");
+        for format in ["text", "ansi"] {
+            let request = serde_json::json!({"id": "detection", "method": "pane.read",
+                "params": {"pane_id": public, "source": "detection", "lines": 1000, "format": format}});
+            let response: serde_json::Value = serde_json::from_str(
+                &app.handle_api_request(serde_json::from_value(request).expect("request")),
+            )
+            .expect("response");
+            let text = response
+                .pointer("/result/read/text")
+                .and_then(serde_json::Value::as_str)
+                .expect("read text");
+            assert!(text.contains("live bottom"));
+            assert!(!text.contains("old history"));
+        }
+    }
+
     #[tokio::test]
     async fn api_pane_read_leaves_seen_untouched() {
         let mut app = App::new(
@@ -1367,6 +2878,56 @@ mod tests {
     }
 
     #[test]
+    fn refused_pane_close_keeps_identity() {
+        let (mut app, terminal, public) = app_with_terminal();
+        app.state
+            .terminals
+            .get_mut(&terminal)
+            .unwrap()
+            .detected_agent = Some(crate::detect::Agent::Claude);
+        let agent = app.state.terminals[&terminal].agent_id.to_string();
+        let root = app.state.workspaces[0].tabs[0].root_pane;
+        app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
+        app.state.workspaces[0].tabs[0].native_views.insert(
+            root,
+            crate::structured::view::placement::View::Ready(crate::structured::view::Target {
+                agent_id: "fixture-agent".into(),
+                generation: 1,
+            }),
+        );
+        let layout = app.state.workspaces[0].tabs[0].layout.pane_ids();
+        app.sync_directory_events();
+        let sequence = app.event_hub.current_sequence();
+        let request = serde_json::from_value(serde_json::json!({
+            "id": "close", "method": "pane.close", "params": {"pane_id": public}
+        }))
+        .unwrap();
+        let response: serde_json::Value =
+            serde_json::from_str(&app.handle_api_request(request)).unwrap();
+        assert_eq!(app.state.terminals[&terminal].agent_id.to_string(), agent);
+        assert!(!app.state.terminals[&terminal].agent_identity_retired);
+        assert_eq!(response["error"]["code"], "pane_not_found", "{response}");
+        assert_eq!(app.state.workspaces.len(), 1);
+        let tab = &app.state.workspaces[0].tabs[0];
+        assert_eq!(tab.layout.pane_ids(), layout);
+        assert!(tab.panes.contains_key(&root));
+        assert!(tab.native_views.contains_key(&root));
+        assert_eq!(app.event_hub.current_sequence(), sequence);
+        let survivor = layout[1];
+        let tab = &mut app.state.workspaces[0].tabs[0];
+        tab.layout =
+            crate::layout::TileLayout::from_saved(crate::layout::Node::Pane(survivor), survivor);
+        tab.root_pane = survivor;
+        app.handle_internal_event(crate::events::AppEvent::PaneDied { pane_id: root });
+        assert_eq!(
+            app.state.workspaces[0].tabs[0].layout.pane_ids(),
+            vec![survivor]
+        );
+        assert_eq!(app.state.terminals[&terminal].agent_id.to_string(), agent);
+        assert_eq!(app.event_hub.current_sequence(), sequence);
+    }
+
+    #[test]
     fn api_pane_close_closes_linked_worktree_workspace_only() {
         let mut app = app_with_linked_worktree();
         let pane_id = app.state.workspaces[0].tabs[0].root_pane;
@@ -1384,6 +2945,74 @@ mod tests {
         assert_eq!(app.state.request_remove_linked_worktree, None);
         assert!(app.state.workspaces.is_empty());
     }
+    #[tokio::test]
+    async fn security_label_report_api_and_pane_rename_refuse_before_changes() {
+        let mut failures = Vec::new();
+        for method in ["pane.report_agent", "pane.rename", "pane.report_metadata"] {
+            for (case, label) in crate::test_support::hostile_agent_names() {
+                let (mut app, id, public) = app_with_terminal();
+                let params = if method == "pane.rename" {
+                    serde_json::json!({"pane_id":public,"label":label})
+                } else if method == "pane.report_metadata" {
+                    serde_json::json!({"pane_id":public,"source":"custom:fixture","display_agent":label})
+                } else {
+                    serde_json::json!({"pane_id":public,"source":"custom:fixture","agent":label,"state":"working"})
+                };
+                let request = serde_json::from_value(
+                    serde_json::json!({"id":"security-label","method":method,"params":params}),
+                )
+                .unwrap();
+                let response: serde_json::Value =
+                    serde_json::from_str(&app.handle_api_request(request)).unwrap();
+                if response["error"]["code"] != "invalid_agent_name" {
+                    failures.push((method, case));
+                }
+                if response["error"]["code"] == "invalid_agent_name" {
+                    assert!(app.state.terminals[&id].effective_agent_label().is_none());
+                    assert!(app.state.terminals[&id].manual_label.is_none());
+                }
+            }
+        }
+        assert!(failures.is_empty(), "unrefused labels: {failures:?}");
+    }
+
+    #[tokio::test]
+    async fn security_label_internal_hook_drops_before_agent_json_and_gui_events() {
+        for label in ["agent\u{9d}52;c;Zml4dHVyZQ==\u{9c}", "agent\u{202e}other"] {
+            let (mut app, id, public) = app_with_terminal();
+            let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+            app.handle_internal_event(crate::events::AppEvent::HookStateReported {
+                pane_id,
+                source: "custom:fixture".into(),
+                agent_label: label.into(),
+                state: crate::detect::AgentState::Working,
+                message: None,
+                custom_status: None,
+                seq: Some(1),
+                session_ref: None,
+            });
+            for (method, params) in [
+                ("agent.list", serde_json::json!({})),
+                ("agent.get", serde_json::json!({"target":public})),
+            ] {
+                let request = serde_json::from_value(
+                    serde_json::json!({"id":"security-label","method":method,"params":params}),
+                )
+                .unwrap();
+                let response = app.handle_api_request(request);
+                assert!(!response.contains(label), "unsafe agent JSON: {method}");
+            }
+            for (_, event) in app.event_hub.ring_snapshot_after(0) {
+                if let crate::api::schema::EventData::PaneAgentStatusChanged { agent, .. } =
+                    &event.data
+                {
+                    assert_ne!(agent.as_deref(), Some(label));
+                }
+            }
+            assert!(app.state.terminals[&id].effective_agent_label().is_none());
+        }
+    }
+
     /// App with one workspace whose root pane has a live TerminalState.
     /// Returns the app, the terminal id, and the public pane id.
     fn app_with_terminal() -> (App, crate::terminal::TerminalId, String) {

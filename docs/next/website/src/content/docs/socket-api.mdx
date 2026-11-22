@@ -7,6 +7,263 @@ Flock exposes a local socket API for scripts and agents that need to inspect or 
 
 Most automation should start with the CLI wrappers. Use the raw socket API only when you need direct request/response control or long-lived event subscriptions.
 
+## Structured profile admission
+
+`profile.enable` requires client/server protocol 34. It takes `{ "plan": "<id>", "expect": "<digest>" }` and requires
+the local authenticated operator. Agents and pending or enrolled mesh relays
+receive `operator_only`. This incomplete build refuses even operator requests
+with `structured_profiles_not_ready`; no enable plan is consumed or execution
+started. ADR-0052 slice 17 adds the reviewed activation transaction.
+
+The server persists the execution switch (default false) with operator binding
+records in `profile-bindings.json`, beside its session state. Agent-editable
+configuration cannot set it. Unknown or invalid binding entries remain preserved
+and inactive; unsupported store formats are never overwritten. A separate private
+`profile-bindings.floor.json` retains the highest revision across restarts. A
+store restored below that floor is retained unchanged, with its bindings and
+switch withheld. Operator status reports `policy_revision` as the floor and
+`policy_error: {code: "policy_revision_regressed", store, floor}`; profile admission
+and enablement return `policy_revision_regressed`. Unreadable floor or policy state
+returns `policy_revision_unavailable`. Both faults have retry class `after_human`:
+operator recovery is required. Other server operations continue. A missing
+floor is initialized from an existing store on first upgrade. Policy load and
+save transactions hold both an in-process mutex and an exclusive advisory lock
+on the stable `profile-bindings.lock`; contention refuses without waiting.
+Symlinked, non-regular or foreign-owned store/floor/lock files produce
+`policy_revision_unavailable` during load. Temporary files are created exclusively,
+and the lock file is never replaced during policy updates.
+
+`profile.status` accepts `{}`. The authenticated local operator receives
+`policy_revision`, `execution_switch`, and binding records containing explicit
+targets, credential references, bundle digests, grants, and revocation metadata.
+References contain no resolved secret bytes. Agents and pending or enrolled mesh
+relays receive no binding, account, sibling identity, or usage fields. This API
+only projects data. Production execution remains unavailable.
+
+Operator status also includes `session_storage`: durable session/target and binding
+revision pins, `retained_unknown`, `quarantined` staging entry names, and
+`unavailable`. Native config lives under server-owned
+`profile-storage/sessions/<session-id>/config/`, separate from operator profiles.
+Published roots remain retained; startup quarantines unpublished allocation staging
+beside the roots. Unusable records remain untouched and inactive. Storage allocation
+is internal preparation only, with no new launch or credential access.
+
+The following preparation methods require the authenticated local operator.
+Relays and agents receive `operator_only` before mutation. The matching CLI
+commands are `profile plan bind`, `profile bind`, `profile revoke` and `profile status`.
+
+- `profile.plan` accepts `{ "action": "bind", "binding_id": "optional-existing-id",
+  "target": { "repo_id": "repo", "node_ids": ["node"], "agent_ids": ["agent"] },
+  "account_alias": "alias", "credential_ref": "opaque-reference",
+  "credential_generation": 1, "bundle_digests": ["digest"], "grants": [] }`.
+  Omit `binding_id` to allocate a fresh identity. The response contains `plan`,
+  `expect` (the review SHA-256) and `review`, including the predecessor policy
+  revision, previous binding, exact proposed binding and expiration timestamp.
+  Plans expire after five minutes using a suspend-inclusive monotonic deadline; uncommitted plans
+  are discarded on server restart. Wildcard/empty targets are refused.
+- `profile.bind` accepts `{ "plan": "id", "expect": "review-digest" }`. Commit
+  rechecks caller identity, immutable review bytes, expiry and current policy
+  revision while holding both store locks, then allocates the next revision.
+- `profile.revoke` accepts `{ "binding": "id", "reason": "operator reason" }`.
+  It commits a terminal tombstone without preview, increments the policy revision
+  and records the operator principal and operation ID. A revoked identity cannot
+  be rebound; corrected authority needs a fresh identity.
+
+Mutation responses contain `operation_id`, `action`, `principal`, `expect` and the
+committed `binding`. A bind operation uses its plan ID. Repeating a committed bind
+with the same ID/digest/caller returns its original receipt across restart and
+later changes, including revocation; that historical receipt does not change
+current authority. Repeating revocation for the same binding/reason/caller returns
+its original receipt. Receipts persist with the binding document and preserve
+unknown entries without treating them as authority.
+
+Typed preparation refusals include `profile_plan_invalid`, `profile_plan_expired`,
+`profile_revision_conflict`, `profile_binding_revoked`, and
+`profile_binding_not_found`. A stale review requires a fresh plan. Credential
+references remain identifiers only; these methods do not resolve secrets,
+activate profiles or launch processes. Every future profile execution path must pass shared admission
+before accessing secrets, starting processes or transferring mailbox ownership.
+
+Structured session records persist `profile_identity` only after matching harness
+init establishes a conversation. It contains the actual legacy `profile` selector
+and a nullable resolved `binding` (`binding_id`, `revision`). A changed profile,
+binding ID or binding revision refuses continuation with
+`structured_profile_mismatch` before launch, without legacy fallback. Missing pins
+remain legacy-compatible; unsupported pin formats are retained inactive like other
+unknown session records. Current single-account launches carry no binding and do
+not activate profile execution.
+
+## Structured permission decision messages
+
+For the structured `agent.decide` contract, the optional `message` is normalized
+from CRLF to LF, then trimmed, and limited to **2048 UTF-8 bytes**
+(`MAX_PERMISSION_DECISION_MESSAGE_BYTES`). Measure encoded bytes, rather than
+JavaScript string length. Empty and absent messages are allowed. The
+`prompt_control_bytes` rules permit newlines and tabs and refuse terminal escape
+sequences and other control characters, including embedded bare carriage returns.
+Oversized or unsafe messages return typed `invalid_params` before reserving the
+permission request, creating a grant, writing an audit or sending harness input.
+The normalized message is used in both the decision audit and deny response.
+See the [generated structured wire contract](../structured-wire-minimal/).
+
+## Live structured session grants
+
+The local operator can inspect and revoke exact `allow_always` grants without
+ending a structured session. These methods are socket/CLI only; they have no
+WebSocket or MCP management verb. Agent, lease and token callers are refused
+with `operator_only` (exit 13). This uses the existing local-operator admission
+checks and retains operator-mode UID/process-detachment limits (#1177, #1629).
+
+`structured.grants.list {"agent_id":"…"}` returns
+`result.type: "structured_grants"`, the exact `agent_id`, runtime `generation`,
+and `grants`. Each installed grant contains `request_id`, `request_seq`, `tool`,
+`canonical_input_key_hash`, `canonical_input_key_bytes` and `installed_ms`
+(unsigned 64-bit Unix milliseconds from its decision installation audit).
+By default the full `canonical_input_key` field is omitted, even for the operator.
+The fingerprint is the first 16 lowercase hexadecimal SHA-256 digits of the key;
+the length counts its UTF-8 bytes. These are comparison metadata, not grant
+identity or an authorization handle. Revocation still uses the originating
+request handle and runtime generation.
+
+An explicit `structured.grants.list {"agent_id":"…", "show_input":true}` returns
+`canonical_input_key` as well. **The full key can contain secrets from tool input.**
+Opt in only when disclosure is intended; CLI output can enter terminal
+scrollback and logs. Hash and length also disclose comparison metadata. The key
+is canonical JSON `[tool_name, input]`: object keys are recursively sorted;
+arrays and scalar values remain exact. Pending installs are not listed. A runtime holds at most 16 installed/reserved exact keys
+(`MAX_GRANTS`). Names and pane IDs are not accepted as grant identities.
+
+`structured.grants.revoke` takes `agent_id`, `generation`, `request_id` and
+`request_seq`. Use the generation and originating decision handle from the list
+(or the originating permission decision for a pending install). Success returns
+the same redacted result shape with remaining `grants` (no full keys) and a
+`revoked` object containing
+`request_id` and `request_seq`. A stale generation returns
+`permission_grant_stale_generation`; an unknown or already revoked handle returns
+`permission_grant_unknown` (both exit 1, retry `never`). Refresh the list rather
+than replaying a revoke. A runtime that has ended returns `agent_not_found`;
+contention with permission bookkeeping returns `session_busy`.
+
+Revocation removes the exact key and advances its revocation epoch under the
+same Book lock used by permission decisions. A decision admitted before the
+revoke may still allow that one call, but cannot reinstall the grant afterward.
+The next matching request prompts again. Revocation does not undo tool effects
+or recall an already admitted response. Grants remain memory-only and disappear
+when the runtime ends. Successful revocation emits the persisted global event
+`structured_grant_revoked` with `agent_id`, `generation`, `request_id`,
+`request_seq`, and the authenticated revoker `principal`.
+
+## Live handoff
+
+`server.live_handoff` transfers the running server's panes to a replacement executable. Optional params are `import_exe` (executable path), `expected_protocol`, `expected_version`, and `skip_undrained` (default `false`). A `handoff_failed` response carries its stable cause category in `error.data.kind`: `import_refused`, `broken_pipe`, `connection_reset`, `invalid_input`, or `other`. The category describes the cause, not the ownership-commit stage. Treat every category, including unknown future values, as a failure and inspect `message` for diagnostics.
+
+The server canonicalizes an explicit `import_exe`, or its own executable when
+absent, before stopping workers or transferring panes. A missing, dangling or
+non-file target returns `server_executable_unresolved` (retry class
+`after_inspecting`). Restore the binary or select a valid target before retrying.
+Auto-detected daemons use the same resolver, with no unresolved-path fallback.
+The resolved pathname does not pin file contents, and handoff version/protocol
+checks remain required.
+
+## Mesh edge enrollment
+
+`mesh.hello` is a held-relay handshake. A `begin` offer carries `mesh`,
+`name`, `node_id`, `public_key`, and a fresh `nonce`. `mesh` is the maximum
+supported version; optional `mesh_min` is the minimum. A single-version offer
+omits `mesh_min` and reads as `[mesh, mesh]`, preserving the old signed bytes.
+Both sides compute the highest common version from the two signed offers.
+The receiver returns a
+`challenge` with its own offer and a signature binding both offers and the
+acceptor direction. The challenge also reports `negotiated`, an unsigned,
+redundant cross-check. A disagreeing report is refused; a missing report is
+accepted only for an offer with `mesh: 5` and no `mesh_min`. Disjoint or invalid
+ranges return `mesh_version_mismatch`; `data.mesh` remains the refusing node's
+maximum and `data.mesh_min` its minimum. An absent `data.mesh_min` on a
+VERSION 5 refusal identifies a pre-negotiation peer when 5 is in the dialer's
+window. `finish` carries the dialer's signature over the same
+transcript with the dialer direction. Both peers pin the proven key after
+successful verification. `check` verifies that the calling relay still holds
+an enrolled attachment, including after a server restart. Relay methods are
+bound to an SSH-descended process and its start time: some ancestor of the
+relay must be `sshd` (including `sshd-session` and the `sshd:` privsep child)
+or, for Tailscale SSH, `tailscaled`. Anything else is refused with
+`relay_not_from_ssh`.
+
+`peers.enrollment` returns `peers` entries containing `peer`, `node_id`,
+`source` (`configured` or `inbound`), `state`, and `reason`. Established entries
+also contain `negotiated`, the current session version, which is recomputed
+at each hello and never persisted. Its `routes` array
+contains `{node, name, next_hop, hops}` for live shortest paths (at most eight
+hops). Names use locally pinned names when available; other names include an
+eight-character node ID suffix and `(advertised)`. `route_generation` is the
+local route-table change counter for this server process; unchanged adverts
+keep it stable. The response also includes
+`mesh_quarantined` (the number of records isolated after decoding failures)
+and an optional `mesh_suspended_reason` while custody recovery is unavailable.
+The acceptor lists live inbound edges; the dialer retains handshake refusal
+diagnostics.
+
+`mesh.routes { "adverts": [...] }` exchanges signed topology over an enrolled
+edge and returns `{ "adverts": [...] }`. Each advert binds its node ID, public
+key, name, mesh version, generation `[boot_ms, seq]`, and live adjacencies to its
+own signature. Invalid adverts are discarded individually. Exchanges contain
+no SSH addresses, and never authorize dialing a discovered node. Routes remain
+live through silence and are withdrawn on edge closure, without a route TTL.
+Exchanges run on enrollment, debounced topology changes, or `mesh.routes_changed` pushes;
+there is no periodic route refresh. Failed exchanges retry with jittered backoff
+through five seconds, one minute, and five minutes. Paused acceptors return
+`fleet_paused`; resuming triggers another exchange. Each batch replaces that
+supplier's full view, withdrawing omitted records when no supplier remains.
+Split horizon excludes records learned solely from the receiving peer. Route
+wakes and new topology generations clear exchange retry backoff.
+Advert boot generations are persisted so clock rollback across restart cannot
+make a new advert older than its predecessor.
+`peers.summary.node_id` is accepted only when it matches the enrolled peer pin;
+relayed directory rows carry the owning node ID. Last-known agent owners are
+retained across restart as offline hints.
+
+`peers.summary` optionally includes `structured_agents` beside `workspaces`.
+Each row carries `agent_id`, `agent` (harness label), `status`, and
+`runtime: "structured"`; `pane_id` is absent because native placement is local
+and is not advertised by gossip. Workspace agent rows keep their required `pane_id` field,
+including an empty string; a separate structured row type omits it. The list is omitted when empty and defaults to empty when
+reading older peers. Readers skip individual unsupported or invalid structured
+rows (including unknown `runtime` or `status` values) with a diagnostic, keeping
+the other rows and workspaces. A malformed structured collection is treated as
+empty. Supporting hubs preserve supported rows in their JSON `relayed_fleet`
+and `peers.hub_fleet` rows. Remote `agent.list.fleet` and MCP `flock_agent_list`
+include these identities with the same runtime tag and no `pane_id`.
+Address them by agent ID through ordinary `msg.send`; mesh delivery uses the
+native inbox and the existing reply wake path.
+
+This is additive JSON gossip under ADR-0008 identity/location separation.
+Mesh VERSION stays 5: older summary decoders ignore the field. Binary attach
+snapshots keep their existing format; live JSON gossip supplies the structured
+directory. An older peer or hub that does not export/forward the field cannot
+advertise these identities, so its absence is not evidence that none exist.
+
+`peers.enroll_reset { "peer": "<peer>", "source": "configured", "preview": true }`
+shows the affected pin. Repeat with `preview: false` and the returned `node_id`
+as `expected_node_id` to clear it and invalidate its enrollment. Source defaults
+to `configured`. Reset is refused when invoked from an agent pane or over
+MCP/relay; the operator's shell is the trust boundary.
+
+## Owner policy
+
+`owner.policy.show { "repo": "<path>" }` reports a repo's owner policy (ADR-0035 §6.2, [Owner policy](/configuration/#owner-policy-flktoml)). `repo` is any path inside the repo. The result (`type: "owner_policy"`) carries `repo` (the canonical git common dir, the repo key), `default_branch`, `git_ref` (the ref read), `current` (the `.flk.toml` blob id there, or null), `adopted` (absent until the first adoption, then `{ "policy_version": <blob id or null> }`), `pending` (`current` differs from the adopted version), `policy` (the behaviour keys that apply: the adopted version's, or `{}`), `ignored_keys` (the current version's `[owner]` keys this build does not read) and `current_error` when the current version cannot be parsed. It fails with `owner_policy_unreadable` when the path is not in a git repo or the repo has no default branch.
+
+`owner.policy.adopt { "repo": "<path>", "policy_version": "<blob id>" | null }` makes the current version apply. It answers the same result with `adopted_now` (`false` when that version was already adopted). It is refused with `operator_only` for an agent pane, a mesh relay or an unattested caller, with `owner_policy_changed` when `policy_version` is no longer the current one, and with `owner_policy_unreadable` when the current version is not valid TOML. `adopt` is state-changing for the protocol gate, so a newer CLI refuses it against an older server with exit 78. `operator_only` maps to exit 13 through the error-code registry, for the CLI and for MCP's `data.exit`.
+
+When adoption changes policy, the server appends its audit event, syncs the file and syncs the journal directory before applying the policy. Missing persistence or an append/sync failure with a durably completed rollback returns `audit_unavailable` (retry `after_human`, CLI exit 1), with no live policy change or success payload. Repair audit storage and restart the server before retrying. Rollback failure instead returns [`audit_indeterminate`](#required-audit-outcomes). An already adopted version remains a successful no-op. See [ADR-0035 §6.2](https://github.com/gerchowl/flock/blob/dev/docs/adr/0035-resident-repo-owner.md) for the authority boundary.
+
+An adoption is the durable event `owner_policy_adopted { repo, policy_version, reissued }`. The latest one per repo applies. Every server start and every log rotation writes each repo's adoption again with `reissued: true`. A server older than 2.0.0 cannot read a log holding it; 2.0.0 and later skip the kind if they do not know it.
+
+## Required audit outcomes
+
+`owner.bind`, `owner.unbind`, state-changing `owner.policy.adopt`, and `delegate.rebind` share the required-audit writer. It finishes rotation and syncs the journal directory before appending. No rotation occurs during the append. An append or file/directory-sync failure truncates the retained file to its original length, then syncs that file and directory. Only a successful durable rollback permits a definite refusal (`audit_unavailable` for owner mutations, `delegate_audit_unavailable` for rebind): that mutation cannot replay after restart.
+
+If rollback fails, `audit_indeterminate` has retry class `after_inspecting` and CLI/MCP exit 14, like `request_outcome_unknown`. No mutation is applied live and no success payload is returned, but the uncertain mutation may or may not take effect after restart. Every later required-audit mutation receives the same code without appending until restart. Repair storage, restart, and inspect the journal-derived owner/policy state and rebind audit history before deciding whether to retry. The reopened journal is authoritative. Rebind audit replay does not update the client's registry; a retained authorization event does not prove that the client completed its update. Best-effort event producers keep their existing behavior.
+
 ## Choose an integration layer
 
 | Layer | Use it for |
@@ -75,16 +332,24 @@ Raw socket method names use dot notation:
 | Workspace | `workspace.create`, `workspace.list`, `workspace.get`, `workspace.focus`, `workspace.rename`, `workspace.close` |
 | Worktree | `worktree.list`, `worktree.create`, `worktree.open`, `worktree.remove`, `worktree.kill` |
 | Tab | `tab.create`, `tab.list`, `tab.get`, `tab.focus`, `tab.rename`, `tab.close` |
-| Pane | `pane.split`, `pane.list`, `pane.get`, `pane.rename`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.read`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.close`, `pane.wait_for_output` |
-| Agent | `agent.list`, `agent.get`, `agent.read`, `agent.history`, `agent.result`, `agent.send`, `agent.rename`, `agent.focus`, `agent.start`, `agent.fork`, `agent.hibernate`, `agent.resume`, `agent.lineage` |
-| Message | `msg.send`, `msg.reply`, `msg.list`, `msg.read`, `msg.status`, `msg.wait_reply`, `msg.wake`, `msg.mute` |
+| Pane | `pane.split`, `pane.list`, `pane.get`, `pane.rename`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.write_text`, `pane.write_keys`, `pane.write_input`, `pane.stash_show`, `pane.stash_restore`, `pane.read`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.close`, `pane.wait_for_output` |
+| Agent | `agent.list`, `agent.get`, `agent.read`, `agent.history`, `agent.result`, `agent.send`, `agent.rename`, `agent.focus`, `agent.start`, `agent.fork`, `agent.hibernate`, `agent.resume`, `agent.restart`, `agent.lineage` |
+| Delegate | `delegate.list`, `delegate.rebind` |
+| Message | `msg.send`, `msg.reply`, `msg.list`, `msg.read`, `msg.operator_list`, `msg.operator_read`, `msg.status`, `msg.wait_reply`, `msg.wake`, `msg.mute` |
+| Hook | `hook.decide` |
 | Checks | `checks.list`, `checks.ack`, `checks.run` |
 | Events | `events.subscribe`, `events.wait` |
 | Integrations | `integration.install`, `integration.uninstall` |
 
+For `pane.read`, `pane.send_text`, `pane.send_keys`, and `pane.close`, the `pane_id` field also accepts a terminal ID or unique agent name/label. A pane ID takes precedence over a same-named agent. Ambiguous names return `agent_target_ambiguous` with candidate details; unknown targets retain `pane_not_found`.
+
 Some CLI commands are conveniences around these methods. For example, `flk agent wait` resolves an agent target and then subscribes to pane agent state events.
 
-Worktree methods manage Git checkouts as Flock workspaces. `worktree.create` creates a checkout and returns the new `workspace`, `tab`, `root_pane`, and `worktree` records. `worktree.open` opens an existing checkout or returns the already-open workspace. `worktree.remove` runs `git worktree remove` against a linked child workspace and never deletes the branch.
+The allocation methods `worktree.create`, `agent.fork`, `agent.start`, `workspace.create`, `tab.create`, and `pane.split` accept `dry_run: true` (default `false`). They return `{"type":"allocation_plan","operation":"<method>","plan":{...}}` with resolved allocation inputs and create no resources. Plans contain the resolved cwd or checkout path, source/placement identifiers, branch/base for worktrees, and argv for agents. A `pane.split` preview cannot predict a size refusal when the split is executed. Fork previews retain admission, resumability, transcript, and profile checks. Generated branch names are per-request; pass the returned branch/path explicitly to execute that plan. Raw API clients must check `ping` reports protocol 26 or newer before requesting previews, because older servers ignore unknown JSON fields. The bundled API client and CLI do this automatically.
+
+Worktree methods manage Git checkouts as Flock workspaces. `worktree.create` creates a checkout and returns the new `workspace`, `tab`, `root_pane`, and `worktree` records. Its `base` is passed to `git worktree add` as written: the server never fetches, because it runs `worktree.create` on its own loop, and a network wait there would stall every client and the TUI. `flk worktree create --base`, `flk delegate start --base` and the TUI's new-worktree dialog refresh the base from its remote on their own side first and send the resolved ref, so a raw socket client that wants a fresh base fetches before it calls. `worktree.open` opens an existing checkout or returns the already-open workspace. `worktree.remove` runs `git worktree remove` against a linked child workspace and never deletes the branch.
+
+Worktree launch failures keep their method's existing error code. A missing program names the dependency in `error.message` and carries `error.data.reason: "program_not_found"`, `program`, and `path_length` (the server's PATH length in bytes, never its contents). Run `flk preflight` to check server dependencies. A missing launch working directory instead carries `reason: "current_dir_not_found"` and `current_dir`. Filesystem errors and a running git command's path refusals keep their existing messages and do not acquire launch metadata. Repository discovery itself reads Git metadata from files and requires no external program.
 
 Create a worktree from a source workspace:
 
@@ -104,21 +369,307 @@ Remove a linked checkout:
 {"id":"req_3","method":"worktree.remove","params":{"workspace_id":"2","force":false}}
 ```
 
+For a structured agent, `agent.send` resolves its stable identity or unique
+structured name without requiring a terminal. `submit: true` enters the same
+worker-owned queue used by the operator composer and authenticated S7-min send
+service (ADR-0036 §3/S5). Its response is
+`{ "type": "agent_queued", "item_id": "<uuid>" }` after durable admission;
+execution waits for S4 Idle and the preceding real turn result. This acknowledges
+custody, not harness delivery. Queue and global lifecycle facts report progress.
+
+Structured `submit: false` returns `structured_submit_required` (retry `never`)
+before queue or stdin work. `raw` and `write_timeout_ms` are terminal-only options.
+An optional canonical lower-case `item_id` UUID makes an identical committed
+retry idempotent; a different payload under that ID returns `queue_item_conflict`.
+One outstanding admission per item and at most 128 outstanding tickets/replies
+are accepted. Non-operator requests stop at 112 outstanding tickets/replies,
+reserving 16 slots for the operator; `session_busy` is retryable after capacity
+clears. If the worker
+exits or its generation changes before an acknowledgement is consumed,
+`input_write_unknown` requires inspecting the queue before retrying with the
+same lifecycle ID. The admission may already have committed when the worker
+exited; never retry under a fresh ID. There is no
+automatic retry or queue delivery timeout.
+
+Socket operator authority requires a kernel-attested PID and operator UID,
+with neither an agent pane/lease nor an inbound relay edge. Missing or unknown
+credentials and relays receive `not_authorized`; pane/lease-attested agents retain
+their agent identity. Shared-service operator tokens must be verified. Producer
+strings in command JSON never grant authority. A structured self-send is refused
+with `self_message_forbidden`; names or IDs shared with a terminal are refused
+with `agent_target_ambiguous`. Only operator-origin
+slash commands are isolated, verbatim harness turns. Agent-origin slash text is
+ordinary nonce-framed message content. Cold/offline agents require an explicit
+launch; admission does not launch a second writer. The external S7-min send
+adapter is tracked in #1831 and does not add another admission path.
+
+For terminal targets, `agent.send` accepts `{ "target": "worker", "text": "review the auth module", "submit": true }`. Without `submit`, `agent.send`, `pane.send_text` and `pane.send_input` (with `text`) refuse before typing into an agent pane whose composer holds a draft (`input_not_empty`) or that a flock injection holds (`injection_pending`); `"raw": true` types anyway (#1162). A shell pane is never refused. Omit `submit` (or set it to `false`) to paste text without submitting. Both `agent.send` and `pane.send_text` use bracketed paste when enabled and strip embedded paste delimiters; otherwise they send text bytes directly. Use `pane.send_keys` for control keys such as `Enter`, `C-c`, or `Esc`, because control bytes are pasted text when bracketed paste is enabled. With `submit: true`, the paste is followed by a 120 ms gap and a negotiated Enter key event. Submission retains its guarded write and harness-observation flow; a raw `write_timeout_ms` is rejected when `submit` is true. A closed or restarted execution is refused before Enter. This operator input method is intentionally absent from MCP; agents exchange messages through `flock_msg_send` instead. With `submit: true` and the [injection lock](./configuration.mdx#injection-lock) on, a one-row draft is moved aside and typed back. One flock could not put back is kept for `pane.stash_show` / `pane.stash_restore` (`{ "pane_id": "..." }`). Both answer `{ "type": "pane_stash", "pane_id", "drafts" }`: show lists the kept drafts, oldest first, and restore returns the one it typed.
+
+A guarded `agent.send` or `pane.submit` refusal with `unknown_composer` includes current pane diagnostics in `error.data` when the runtime is available: `columns` and `rows` are terminal dimensions, and `bottom_rows` contains up to eight lines of detection text. No input is sent on this refusal. The data is diagnostic context, not a causal sample receipt.
+
 `agent.fork` branches a pane's agent conversation into a new linked worktree: it resolves `target` with the same grammar as `agent.send`, creates a worktree (optional `branch`, `base`, `path`, `label`), and starts a pane resuming a fork of the session, optionally seeded with a `pivot` prompt (omitted ⇒ the configured template; empty string ⇒ no seed). Only Claude sessions can fork; other agents return `unsupported_for_agent`, panes without a stored session return `no_agent_session`, and a session whose transcript is missing from disk returns `transcript_not_found` (the fork would resume nothing and exit). The `agent_forked` response carries `run_id`, `parent_pane_id`, the new `workspace`/`tab`/`root_pane`/`worktree` records, the spawned `argv`, and `seeded`. Each fork also emits an `agent_forked` event with the fork lineage (parent and child identifiers, repo key, branch, seeded).
+
+When `agent.start`, `agent.spawn` or `agent.fork` succeeds and the caller's process ancestry reaches an agent's pane, the server emits a durable `agent_delegated` event: `architect` (that agent's id, never taken from the request), `delegate`, `via` (`start`, `spawn` or `fork`), `workspace`, and, where the start produced them, `worktree`, `branch`, `repo` and `label`. On every server start, including after a live handoff, each still-open edge is emitted again with `reissued: true`, so log rotation cannot drop it. An edge stays open while its delegate is in the server's agent records, or while a removed delegate's worktree is still on disk. `agent.start` accepts an optional `label` for the edge, sent only to a server whose `ping` capabilities include `agent_start_label: true`, and its `agent_started` response carries `edge`: `architect <agent id>`, or `none (unattested)` when no agent pane is in the caller's ancestry.
+
+`agent.start`, `agent.spawn` and `agent.fork` accept an optional `questions` (`ask_human`, `ask_operator`, `route` or `deny`) and `unattended: true` (ADR-0034 §2). Omitted, the policy is `route` for a caller whose ancestry reaches an agent's pane, `ask_operator` with `unattended`, and `ask_human` otherwise. An agent caller asking for `ask_human` or `ask_operator`, or sending `unattended`, gets `questions_widening_refused` (retry `never`, exit 13) before anything is allocated. The policy is the agent record's `questions` field in `agent.get` and `agent.list` (absent from servers predating it, and from peer and fleet summaries), and the `questions` field of a `delegate.list` row. The child's pane gets `FLOCK_QUESTIONS=<policy>` unless the policy is `ask_human`. Send either field only to a server whose `ping` capabilities include `agent_questions: true`: an older server ignores unknown fields. The MCP tools `flock_agent_start` and `flock_agent_fork` take `questions` (`route` or `deny`) and refuse with `server_version_gap` (exit 78) against a server that does not advertise it, rather than starting the child without the policy.
+
+`hook.decide` is the verdict for one harness hook call (ADR-0034 §1). Params: `point` (`question`), `harness` (`claude`, `codex` or `opencode`), and optional `session_id` and `tool_name`. The pane is the caller's, by process ancestry, never a field of the request, and the verdict comes from the policy on its agent record: `{"type":"hook_decide","verdict":"pass"}` or `{"type":"hook_decide","verdict":"deny","reason":"…"}`. A `question` call for a tool that is neither the harness's question tool (`AskUserQuestion` and `ExitPlanMode` for Claude, `request_user_input` for Codex, `question` for opencode) nor in `[questions] human_tools` passes. Otherwise `ask_human` passes, `deny` is refused with the disabled-questions sentence, and `route` and `ask_operator` are refused with `state the question and options in your final message and end your turn` until routing lands. A caller outside every pane gets `no_caller_pane`. A server that predates the method answers `invalid_request`; the hook then follows the pane's `FLOCK_QUESTIONS` hint, as described under [Claude Code](/integrations/#claude-code).
+
+An agent's goal (ADR-0030) is recorded as durable events, all keyed by the agent's id (`agent_id`), never by a pane: `goal_armed` (`record` with `goal`, `checks` and the rest of the record), `goal_amended` (`goal`, `checks`), `goal_status_set` (`status`), `goal_subtask_changed` (`subtask`: `id`, `text`, `done`, optional `owner`), `goal_verdict` (`verdict`: `decision` `allow`, `parked` or `block`, `rung`, optional `reason`), `goal_met`, `goal_paused` (optional `until_ms`), `goal_resumed` and `goal_disarmed` (optional `reason`). The server holds the record in memory, folded from these events once per start. On every start and after every log rotation it emits each open goal again as `goal_armed` with `reissued: true` and the whole record, so rotation cannot drop a goal that has been quiet. Limits: the record keeps only the latest verdict, and older verdicts last as long as the log keeps them; a met goal is no longer re-issued and can rotate out; removing an agent emits `goal_disarmed` with reason `agent removed`. A server older than 2.0.0 cannot read a log that holds these events and quarantines it, so do not run one against such a log. The `goal.*` methods below change and read the record; the MCP tools follow (#1156).
+
+If a 1.x server did run against such a log, it renamed the active file to `event-log.corrupt.jsonl` in the server's data directory (`~/.config/flock`, or `~/.config/flock/sessions/<name>` for a named session) and started a fresh `event-log.jsonl`, numbering above the events it set aside. A rotated file (`event-log.1.jsonl` to `event-log.4.jsonl`) holding a goal event is not renamed, only skipped by that server. The quarantined file is never rotated, and it holds a full copy of every goal that was open when it was set aside, because the server re-issues each open goal into the active file on start and after every rotation. If the 1.x server rotated the log since, its rotations deleted the oldest rotated files (goal events included) and its fresh file may now be `event-log.1.jsonl` or older. Those events are gone, but the quarantined file still covers the goals.
+
+Version 2.0.0 is not enough to recover them. It only skips goal events: it neither folds nor re-issues them, so goals rotate out while it runs. Recovering needs the first release after 2.0.0 that includes the goal record (#1169, listed in the changelog under #1034):
+
+1. Stop every server that uses the log, and upgrade each to that release or newer.
+2. Copy `event-log.corrupt.jsonl` somewhere safe. A second quarantine would overwrite it.
+3. Put its lines in front of the active file, then remove it: `cat event-log.corrupt.jsonl event-log.jsonl > event-log.merged && mv event-log.merged event-log.jsonl && rm event-log.corrupt.jsonl`. If the quarantined file does not end in a newline, drop its last, partial line first. Do this even if the log rotated, because readers order events by sequence, not by file.
+4. Start the server. It reads every event back, folds the goals and re-issues each open one.
+
+Events the 1.x server wrote in between are kept, ordered after the recovered ones.
 
 ```json
 {"id":"req_4","method":"agent.fork","params":{"target":"1-1","branch":"fork/alt","pivot":"try plan B on <branch>"}}
 ```
 
-`msg.send` queues a message for another pane's agent. Delivery is a pull: Flock never types into a session, and the recipient reads its own inbox with `msg.read`. What Flock pushes is the *wake* — at the recipient's next turn boundary its agent integration is told how many messages are waiting and which tool reads them, never what they say. `msg.wake` is the method that decides whether that wake may fire at all; it answers with a count and returns zero while the fleet is paused or the recipient has muted itself with `msg.mute`, in which case the messages stay queued and `msg.list`/`msg.read` are unaffected. A mute is not silent (ADR-0018): every `needs_reply` message that is waiting when `msg.mute` is called, or arrives while it holds, gets exactly one automatic reply to its sender — `in_reply_to` the message, intent `fyi` so it never asks for an answer back, and a body stating the deferral, the optional `reason` the mute was given (sanitised, cut to `[msg] mute_reason_max_chars`, default 200) and the UTC time the mute lifts. It travels the ordinary reply path, so a sender on another host hears it the same way. Renewing or extending a mute does not repeat it, nor does a restart; `fyi` messages get none, and `seconds: 0` (clear) sends nothing. `msg.mute` answers with `muted_until_ms` and `deferred`, the number of already-waiting senders it just answered — sent, not delivered: a deferral to another host counts once it is queued for its ssh hop, and a hop that fails is retried by the next mute — and each deferral is recorded as a durable `message_deferred` event. A recipient that is already idle — and so has no turn boundary coming — is reached differently: for a message that is not `fyi`, flock types a fixed sentence naming the count and the tool into an idle Claude pane, under the gates described in [Waking idle agents](./configuration.mdx#waking-idle-agents). The destination is structured: `{"type":"pane","pane":"..."}` or `{"type":"repo_pane","repo":"...","pane":"..."}`. Messages carry a client-suppliable `correlation_id` (idempotency key: duplicates are accepted once), a sender stamp inferred from the caller's process ancestry (routing and audit metadata only — never authorization), and survive server restarts via the durable event log. They also carry an `intent`, stamped by the sender and delivered on the envelope so a recipient knows what is wanted before it reads the body. It defaults to `fyi` on the wire and is required on the `flock_msg_send` MCP tool. The wake reads it (ADR-0018): `msg.wake` reports zero, with `suppressed: "fyi_only"`, for an inbox holding only `fyi` messages, and once any `needs_reply` or `blocking` message is waiting it reports every queued message, notices included, so the read it prompts clears them. A reply whose `in_reply_to` names a `needs_reply` or `blocking` message wakes its recipient whatever its own stamp, except a mute's automatic deferral. A claimed `from_agent`/`from_host` must be shaped like an agent id / host name, or the send is refused with `invalid_request`. A nudge still names a count and a tool and nothing else. `blocking` additionally surfaces the recipient in the attention cycle under a mail label of its own (never the `blocked` state), files an operator notification when the recipient is muted, and is budgeted per sender by `[msg] blocking_per_hour` — past it the message is still queued, as `needs_reply`, and the result's `warnings` carry `blocking_budget_spent_sent_as_needs_reply` (or `blocking_disabled_sent_as_needs_reply` when the budget is 0). The budget is keyed on an agent the receiving server attested; every unattested sender, relayed ones included, shares one bucket. A relayed intent the receiving build does not recognise is read as `needs_reply` and logged, so version skew fails toward the recipient hearing about it. `msg.reply` routes an answer back to the original sender's pane by correlation id; `msg.list` shows undelivered messages. A message whose sender has no inbox at all (sent from an ssh shell or a script, outside any pane) can still be answered: the reply is **held** under the original's correlation id, recorded on its durable `message_replied` event, and `msg.reply` answers `state: "held"` with the warning `reply_held_for_waiter`. A muted recipient answers such a sender the same way, with a held deferral. `msg.status` carries the answer as `reply` (`correlation_id`, `kind` `reply`/`deferral`, `body`, sender stamp, `held`) once there is one, whether it was delivered to an inbox or held; `state` keeps describing the message's own delivery. `msg.wait_reply` waits for that answer, see [Waiting for state](#waiting-for-state). Rate limit: 20 messages/minute per sender pane; mailbox depth 32; undelivered messages expire after 24 hours. Errors include `msg_target_not_found`, `msg_target_ambiguous`, `self_message_forbidden`, `msg_rate_limited`, `mailbox_full`, and `message_not_found`. A message addressed to an agent on another host is relayed to the server that owns it, and the two ways that can fail are kept apart because they want opposite responses: `peer_unreachable` is transient and worth retrying, while `peer_refused_message` means the peer read the command and rejected it — typically a flag its build predates — and is terminal. Both carry `data.retryable`, `data.peer` and `data.detail`, the last being the far side's own words unedited.
+For a local structured recipient, `msg.send` with
+`{"to":{"type":"agent","agent":"<agent-id>"}}` and a local `msg.reply`
+use the same durable owner as structured `agent.send`. Success adds `item_id`,
+the queue lifecycle UUID, alongside the custody `message_key` and correlation.
+It acknowledges journal commit, not a harness turn or a read. Authenticated
+agents receive their attested producer attribution; a local operator is human.
+A claimed `from_agent` cannot change that attribution. Slash text remains a
+nonce-framed Message, including operator messages. Structured recipients never
+receive a legacy inbox nudge for the same message.
+
+Admission reuses the server's initialized node signing identity. It refuses
+`identity_unknown` rather than creating a key. Local custody and queue admission
+are separate durable commits: recovery verifies the existing Envelope signature
+and native session binding, then retries the same MessageKey-derived lifecycle
+UUID through the owner. An unproven recovered origin is refused and retained in
+custody. A cold owner reports retryable `queue_source_cold`; retained recovery
+waits for an owner or capacity notification. If an acknowledgement is lost,
+inspect the message key and lifecycle before sending a new request: a correlation
+label alone is not an idempotency key.
+
+A known admission refusal, including `session_busy`, settles the own-node
+custody record to the existing terminal `refused` state before returning the
+error. Recovery cannot later enqueue that refused message. This applies to
+immediate admission errors and deferred owner completions. Recovery rechecks
+the current custody state before offering even a previously captured inbox
+snapshot. A failed replay cannot revoke an earlier successful admission.
+An uncertain effect is different: `input_write_unknown` preserves custody and
+returns
+`error.data.message_key` plus `error.data.item_id` for inspection. Do not issue
+a fresh send until that outcome is resolved. A failure to settle a refusal
+also returns this unknown outcome with both keys, rather than promising that
+nothing can be delivered. Actual reads and remote-origin inbox deliveries
+cannot be changed to this local admission refusal.
+
+Unknown native recipients remain in custody with a typed refusal diagnostic;
+missing registry entries or forged pane metadata never fall back to a legacy
+inbox projection. Known terminal recipients retain their normal routing.
+Relayed sends and replies enter the same owner with a
+`node_asserted { sender, origin }` producer. This means "sender as asserted by
+node origin": the verified signing node vouches for attribution only. Its
+sender may be a claim permitted by that node's policy. The forwarding hop and
+body metadata cannot replace this origin. Every relayed item is a nonce-framed
+Message, including slash-prefixed text. Empty or claimed sender labels never
+acquire operator or command authority, and cannot spend a local agent's blocking
+allowance. Remote blocking accounting uses the existing unattested bucket.
+Signature, `allow_from`, native-recipient and
+reply-capability checks run before admission and again on recovery.
+
+Sender `from_host` metadata uses the authoritative origin-name mapping, preferring
+a configured alias over an authenticated inbound name. An unmapped origin has no
+host value: the node-asserted producer carries the claimed sender and signing
+node id in their own fields. A failed name lookup during commitment recovery is
+logged and leaves the host absent, without undoing proven delivery. Display names
+do not grant local agent authority.
+
+A direct `mesh.deliver` acknowledgement for a structured recipient waits for
+queue commit and carries `item_id`; the originating send preserves that ID.
+Background collection acknowledges durable custody independently of queue
+progress. Cold/busy owners keep accepted remote custody for the existing
+owner/capacity wake or same-key retry. An uncertain queue result retains custody
+and its inspection keys. Admission does not mark custody read. Duplicate imports and restarts reuse the complete MessageKey's
+lifecycle ID and never create a legacy nudge for a structured recipient.
+Custody format and mesh VERSION remain unchanged.
+
+For structured recipients, committed admissions settle custody as `delivered`
+without claiming an actual read. Restart restores reply metadata and does not
+re-enqueue settled mail. A crash before settlement recovers idempotently with
+the original lifecycle ID. Recovered transient failures retry in the running
+process with the existing bounded backoff; permanent refusals appear through
+ordinary `msg.status` and the existing refusal event. A changed recipient
+session returns `recipient_gone`. Terminal duplicates never request a retry.
+Only a verified local sender can steer a reply into a structured queue; a
+legacy sender claim keeps the terminal reply route.
+
+If a process crashes after an owner's refusal but before custody settlement,
+the caller receives no reply. Inspect the original correlation ID and message
+key before resending, rather than creating a second key. `input_write_unknown`
+retains custody and returns inspection keys because the effect may have occurred.
+
+For native queue custody, an unavailable journal owner cannot prove that a
+message was never committed. Recovery keeps the same message key until the
+24-hour inbox TTL. Status remains `queued` with detail
+`input_write_unknown:<cause>`, where the cause is `owner_unavailable`,
+`admission_pending`, `write_uncertain`, `commit_proven_settle_pending`,
+`journal_opaque`, `queue_journal_newer`
+or `queue_journal_corrupt`. A reply alone does not prove queue commitment, so
+that diagnostic can remain alongside a reply. Backoff is 4–5 seconds, then
+48–60 seconds, then 240–300 seconds, capped by the remaining TTL. Owner wakes
+may shorten long backoff, but attempts against the same owner generation remain
+at least four seconds apart. A new owner generation can resume immediately.
+At expiry, status is `expired` with detail
+`input_write_unknown:commitment_unknown_at_expiry`. This ends admission recovery
+without claiming the queue never committed the message; positive proof can still
+retain settlement recovery within the outcome window below.
+
+A positive journal proof settles delivery despite an elapsed inbox deadline.
+If saving that settlement fails, `commit_proven_settle_pending` preserves expiry
+protection until delivery is saved; expiry cannot erase that proof.
+If unknown expiry was already persisted, proof corrects only its status to
+`delivered`, once, with detail `delivered_after_expiry:<item_id>` identifying
+the committed lifecycle item. Proof never changes an existing delivered or
+refused outcome. If saving delivery fails again after expiry, positive proof keeps
+settlement retrying on the same capped backoff. Wake notifications cannot create
+a rapid retry loop. Correction ends at the expired row's existing `outcome_until`
+(seven days after expiry is persisted); neither retries nor proof extend it.
+A row still retained at that deadline records
+`input_write_unknown:correction_retention_elapsed`. After maintenance deletes the
+outcome, a retained status reference reports `outcome_retention_elapsed`.
+If saving the final diagnostic fails, a read-only deadline check still stops
+recovery, logs the failure and typed retention-end reason, and leaves the status
+deadline observable.
+
+Automatic post-expiry correction has a restart limit: it uses the authenticated
+envelope retained in memory. Startup recovery omits payload-less expired rows,
+so a restart ends that correction path. It cannot restore deleted payload to
+revalidate the original signature. Ordinary inbox recovery before expiry remains
+available. Payload-less delivered/read outcomes keep their terminal status and
+are omitted from mailbox rehydration.
+Deleted payload stays deleted and released quota stays released. Reply recovery
+uses the existing payload-less route and the original admission's seven-day
+custody/reply deadline. Proof never extends deadlines or restores deleted reply
+metadata. Local replies that need the deleted payload for signature verification
+or pane metadata remain unavailable; remote return bindings retain the existing
+validation and deadline checks.
+Pre-upgrade unsigned rows retain their terminal reply route for the existing
+inbox window (up to 24 hours); they do not gain structured sender authority.
+
+`msg.operator_list {"pane":"TARGET"}` peeks at one legacy pane inbox using
+`msg_list` results; `msg.operator_read {"pane":"TARGET"}` consumes it using
+`msg_read` results. Both require `caller_is_local_operator`: a local operator
+outside pane ancestry, with no structured identity or inbound relay origin.
+Refused callers receive `operator_only`, before target lookup. Successful accesses
+emit a durable `operator_inbox_access` event containing `pane`, `operation`
+(`list` or `read`), `peer_pid`, `peer_uid`, and `message_count`, without bodies.
+`msg.list` without `pane` returns only the non-operator caller's attested inbox;
+unresolved callers receive `caller_pane_unresolved`. A global list requires the
+local operator and emits the same audit event with `pane: null`.
+The ordinary `msg.list` and `msg.read` methods also require this operator check
+when an explicit target names another pane. These operator methods are an interim
+recovery path until agent migration (#3066), and do not restore agent authority.
+
+For terminal recipients, `msg.send` queues a message for another pane's agent. Delivery is a pull: Flock never types into a session, and the recipient reads its own inbox with `msg.read`. What Flock pushes is the *wake* — at the recipient's next turn boundary its agent integration is told how many messages are waiting and which tool reads them, never what they say. `msg.wake` is the method that decides whether that wake may fire at all; it answers with a count and returns zero while the fleet is paused or the recipient has muted itself with `msg.mute`, in which case the messages stay queued and `msg.list`/`msg.read` are unaffected. A mute is not silent (ADR-0018): every `needs_reply` message that is waiting when `msg.mute` is called, or arrives while it holds, gets exactly one automatic reply to its sender — `in_reply_to` the message, intent `fyi` so it never asks for an answer back, and a body stating the deferral, the optional `reason` the mute was given (sanitised, cut to `[msg] mute_reason_max_chars`, default 200) and the UTC time the mute lifts. It travels the ordinary reply path, so a sender on another host hears it the same way. Renewing or extending a mute does not repeat it, nor does a restart; `fyi` messages get none, and `seconds: 0` (clear) sends nothing. `msg.mute` answers with `muted_until_ms` and `deferred`, the number of already-waiting senders it just answered — accepted durably, not delivered: a direct-edge deferral counts once it is held in the custody store for collection — and each deferral is recorded as a durable `message_deferred` event. A recipient that is already idle — and so has no turn boundary coming — is reached differently: for a message that is not `fyi`, flock types a fixed sentence naming the count and the tool into an idle Claude pane, under the gates described in [Waking idle agents](./configuration.mdx#waking-idle-agents). The destination is structured: `{"type":"pane","pane":"..."}` or `{"type":"repo_pane","repo":"...","pane":"..."}`. Messages carry a client-suppliable `correlation_id` (a client label, not the deduplication identity), a sender stamp inferred from the caller's process ancestry (routing and audit metadata only — never authorization), and survive server restarts via the custody store. They also carry an `intent`, stamped by the sender and delivered on the envelope so a recipient knows what is wanted before it reads the body. It defaults to `fyi` on the wire and is required on the `flock_msg_send` MCP tool. The wake reads it (ADR-0018): `msg.wake` reports zero, with `suppressed: "fyi_only"`, for an inbox holding only `fyi` messages, and once any `needs_reply` or `blocking` message is waiting it reports every queued message, notices included, so the read it prompts clears them. A reply whose `in_reply_to` names a `needs_reply` or `blocking` message wakes its recipient whatever its own stamp, except a mute's automatic deferral. A claimed `from_agent` must be shaped like an agent id, or the send is refused with `invalid_request`. A socket sender cannot assert a remote host. A nudge still names a count and a tool and nothing else. `blocking` additionally surfaces the recipient in the attention cycle under a mail label of its own (never the `blocked` state), files an operator notification when the recipient is muted, and is budgeted per sender by `[msg] blocking_per_hour` — past it the message is still queued, as `needs_reply`, and the result's `warnings` carry `blocking_budget_spent_sent_as_needs_reply` (or `blocking_disabled_sent_as_needs_reply` when the budget is 0). The budget is keyed on an agent the receiving server attested; every unattested sender, relayed ones included, shares one bucket. `msg.reply` routes an answer back to the original sender's pane by correlation id; `msg.list` shows undelivered messages. A message whose sender has no inbox at all (sent from an ssh shell or a script, outside any pane) can still be answered: the reply is **held** under the original's correlation id, recorded in the custody store, and `msg.reply` answers `state: "held"` with the warning `reply_held_for_waiter`. A muted recipient answers such a sender the same way, with a held deferral. `msg.status` carries the answer as `reply` (`correlation_id`, `kind` `reply`/`deferral`, `body`, sender stamp, `held`) once there is one, whether it was delivered to an inbox or held; `state` keeps describing the message's own delivery. `msg.wait_reply` waits for that answer, see [Waiting for state](#waiting-for-state). Rate limit: 20 messages/minute per sender pane; mailbox depth 32; undelivered messages expire after 24 hours. Errors include `msg_target_not_found`, `msg_target_ambiguous`, `self_message_forbidden`, `msg_rate_limited`, `mailbox_full`, and `message_not_found`. Mesh sends remain `queued` when transport is unavailable; replies can remain `held`. Permanent refusals report `refused` with a reason, and incompatible edges expose `peer_incompatible`.
+
+Message acceptance commits to the mesh custody store before returning a `message_key` containing `origin_node` and a server-minted ULID `message_id`. Correlation IDs remain caller-selected conversation labels: two accepted sends with the same correlation ID have distinct message keys.
+
+Mesh envelopes and the records that carry them (`Deliver`, `OutboundCollect`,
+and `OutboundAck`) require JSON object form. Sequence-form structs, including
+enclosing records and optional receipt envelopes, cause
+`mesh_protocol_violation`: the entire batch remains unacknowledged and the
+session resets. Explicit envelope `kind` tags must be strings; an absent tag
+means `message`, and enum-map aliases are refused. Optional `receipt: null`
+means no envelope. The collection result's string receipt token is unchanged.
+
+`mesh.deliver` takes a `Deliver` object with these fields:
+
+| Field | Meaning |
+| --- | --- |
+| `envelope` | Immutable signed message: `key` (`origin_node`, `message_id`), `origin_key`, `signature`, `kind` (`message` or `receipt`), `sender`, `target_agent`, `target_session`, `correlation_id`, optional `in_reply_to` and `request_key`, `return_binding`, `intent`, and `body` bytes. Byte vectors are JSON integer arrays. |
+| `remaining_ms` | Remaining unpaused custody TTL in milliseconds; residence time is subtracted before forwarding. |
+| `hops_left` | Remaining forwarding budget, initially eight. |
+| `visited` | Node IDs on the custody path, beginning with the origin and ending with the authenticated upstream neighbor. |
+
+`return_binding` contains the full `request` key, `recipient_node`, secret
+`collection_token` bytes and `collection_peers` node IDs. The origin signature
+binds immutable envelope content; forwarding changes the TTL and route fields,
+not the sender or body. Acceptance returns the same `message_key` and a state
+of `custody`, `delivered` or `duplicate`. Custody at a forwarder is not final
+inbox delivery.
+
+| Mesh failure | Handling |
+| --- | --- |
+| `loop_detected` | Refuse this route attempt, retain upstream custody and wait for a route change. |
+| `hop_budget_exhausted` | Refuse further forwarding, retain upstream custody and seek another route. |
+| `invalid_signature` | Permanently refuse an envelope whose origin signature fails verification. |
+| `peer_incompatible` | Refuse a new send through a known incompatible peer with an upgrade instruction. The edge handshake diagnostic names both mesh support ranges, or that the peer runs a pre-mesh flk. |
+| `mesh_version_mismatch` | Refuse hello when support ranges do not overlap or the reported version fails its cross-check. Retry after upgrading the named side. |
+| `mesh_protocol_violation` | Refuse every envelope in a batch containing an unknown kind or a kind above the session version, acknowledge nothing, reset the edge, and take the long refusal backoff. The retry class is `after_handoff`. |
+
+Delivery refusals use `error.code: "mesh_delivery_refused"` with the specific
+route or signature reason above in `error.message`; `origin_mismatch` has its own error code.
+New-send compatibility refusals use `error.code: "peer_incompatible"`. No
+legacy transport or downgrade is attempted. A peer still running a pre-mesh
+release such as v0.11.0 rejects `mesh.hello` as an unknown method; Flock
+reports it as `upgrade flk on <peer> (peer runs a pre-mesh flk)` in
+`peers.enrollment`, `flk peers`, and send errors, and retries it only on the
+long refusal backoff.
+
+Cross-host sends use `mesh.deliver` over authenticated held edges. The receiver commits inbox import and deduplication in one transaction before returning a receipt. `state: "delivered"` confirms recipient inbox import, not reading or agent execution. `state: "queued"` means the origin retains custody for retry. A new send through a known incompatible peer is refused with `peer_incompatible` and an upgrade instruction. There is no one-shot SSH fallback for these sends. Replies and automatic mute deferrals use the durable return binding. Custodians route answers and delivery/read receipts toward the origin over live mesh paths, or retain them for next-hop collection while offline. The recipient needs no outbound peer entry for collection. Delivered requests, FYI messages included, are polled until a terminal read/expiry receipt arrives: at most one commit per message per poll, and for unread mail no longer than the custody window (seven days). Requests expecting an answer remain eligible until a final answer arrives; a deferral keeps the conversation open. The first poll follows delivery by about five seconds, then polling backs off through 60 seconds to five minutes with jitter. An active `msg.wait_reply` or a re-enrolled edge restores fast polling. Collection survives restart, imports each message key once, and acknowledges only after import. Lost acknowledgements are retried even after a final answer. Invalid reply bindings fail permanently; other import failures become `collect_failed` in `msg.status` after three attempts. Mailbox-full remains retryable. Fleet pause freezes retries and TTL. Replies to messages without a valid return binding return `reply_unavailable`. Collection uses a separate bounded worker lane, with at most one request per peer in flight, so an unavailable collector cannot delay user sends. Same-host replies remain available during mesh-store recovery. Unbound muted questions are still queued for the recipient; the sender receives a `reply_unavailable` warning because the automatic deferral cannot route back.
+
+Held answers are separate from the outbound retry queue: retaining them does not lease rows or commit idle retry ticks. If the target later enrolls an outbound edge to the origin, it activates those answers for delivery. Collection backoff updates are committed as one batch.
+
+Answers and sealed delivery/read receipts follow the current route to the original sender, with custody at each hop. An inbound-only next hop pulls held mail, and `mesh.wake` signals new work even on a one-way edge. An offline origin retains held answers until a route appears; a laptop reconnecting through a different hub receives the holder's single custody copy through route-driven forwarding. Conversation polling can close after a final answer and a terminal receipt, but follow-up answers remain deliverable through neighbor-addressed outbound collection. Direct conversation collection only polls currently pinned outbound peers. There is no relayed conversation-query chain or speculative replication to other hubs.
+
+Mailbox contents are rebuilt from the custody store at boot, with a one-time import of unread messages from the old event log. New `message_queued` audit events carry message keys and metadata; bodies and return capabilities live in the store. Status and reply waits read durable custody records, independently of audit rotation.
+
+Mesh mail stores from development schemas v1–v11 are upgraded in place, idempotently, to the v1.0.0 baseline (v12). Before upgrading, use SQLite backup to capture a consistent database, preserve the node identity, and copy both quarantine sidecars. Copying only an active database file can omit its WAL. Answers held by pre-upgrade dev builds without a copied collection token cannot acquire a valid reply binding during migration and are refused as `invalid reply binding`; this affects development stores only. A failed schema migration reports the database path and a recovery hint: moving the file aside starts an empty store and loses the custody it held. Transient open errors, including lock timeouts during handoff, do not recommend discarding the store. Missing columns are repaired using the baseline defaults when possible. Before clearing any quarantined body, including existing quarantines during migration, the store durably appends the full raw row to `mesh-quarantine.jsonl` beside `mesh-mail.sqlite`. The sidecar is mode 0600 and rotates at 64 MiB, retaining the active file and `mesh-quarantine.jsonl.1`. Each JSON line includes the key, original state, reason, `quarantined_at` (Unix milliseconds), and every SQLite column with its original type. Text and blob values use base64, including `body.base64` and `envelope.base64` (the raw envelope metadata). Quarantined metadata remains in SQLite; bodies are cleared only after the backup is synced. Backup failure leaves the original row unchanged and logs a warning.
+
+To recover quarantined mail, copy both sidecar files before further rotation, find the row by its encoded key, and base64-decode `body.base64` and `envelope.base64`. The `raw_row` object preserves all columns for offline inspection or format repair; integer values are stored directly and real values as IEEE-754 bits. Repair a copy of the database before restoring a row, rather than automatically resending potentially duplicate mail. A crash after backup but before the SQLite commit can leave duplicate archive entries. Retention is bounded: rotating again replaces the older backup file. Permission tightening is best-effort and warns on failure.
 
 ```json
 {"id":"req_5","method":"msg.send","params":{"to":{"type":"repo_pane","repo":"flock","pane":"p1"},"body":"does the peer poller cap retries?","correlation_id":"ask-1","intent":"needs_reply"}}
 ```
 
-A server with no edge to the recipient's host — a spoke, which by design has no `[[peers]]` — hands the message up to its hub instead of refusing it. The hub's `flk peers relay --push` on the spoke long-polls `msg.uplink_take`, pushes each frame up the relay, and the hub's relay reader hands each frame to its own main loop in-process (never through its socket, so no local process can pose as a spoke's frame), which runs its ordinary `msg.send` with the originating `from_agent` kept and the frame's claimed host checked against the edge. The hub's answer comes back down as `msg.uplink_result`, and only then does the sender's `msg.send` return — with `state`, `to_host` and `path` (`"via <hub>"`, or `"direct"` for a hop this server made itself), or with the hub's refusal naming its failed hop (`data.hop`, `data.reason`, `data.via`). The origin the recipient reads is the hub's CONFIGURED name for that spoke: a frame claiming any other machine's identity is refused (`uplink_sender_mismatch`), and a caller's own `from_host` is never what a relay stamps. The same relay carries the fleet DOWN: after each poll the hub sends `peers.hub_fleet` with the peers it polls, and the spoke merges them into its directory and servers band as display-only rows routed via the hub — validated like any relayed row, and never dialled when clicked. The push also carries the hub's own summary as `hub_self` (#424), accepted only when it names the hub bound to the relay: when the hub is the attached client's home it refreshes the carried home row in place, so a space renamed or opened there after the switch shows up; otherwise it is the hub's own display-only row. The relay binds itself first with `peers.relay_attach`, recording its own process: `msg.uplink_take`, `msg.uplink_result` and `peers.hub_fleet` are then refused (`not_the_relay`) from any other process, a live relay is never displaced, and the hub's name is fixed for the binding rather than taken from each frame. Those methods are the relay's plumbing, not a client surface; an in-process caller that cannot be parked sees the interim `state: "handed_up"`, which no socket or MCP caller ever receives. `[msg] uplink_timeout_secs` (default 45) bounds how long a handed-up send waits; `[msg] uplink_heartbeat_secs` (default 20) is how often the relay re-asks, and a relay silent for one of those windows counts as gone; a send no relay ever took then fails at once rather than waiting out its timeout.
+A node retains pinned neighbors and owner hints across disconnects and persists mail for a known owner before returning `state: "queued"`, its minted `message_key`, and route diagnostics. A new send whose owner is outside the direct/one-hop gossip horizon with no stored owner hint returns `msg_target_not_found`; replies retain their return binding at any depth. The hub polls `mesh.collect` with `{"outbound":{"ack":[]}}` over its enrolled edge. Requests, answers (including follow-ups after a final answer), and receipts held for that neighbor are eligible. Each acknowledgement carries the message key and collection token; it follows durable inbox import. Answer tokens must match the original request binding. A receipt is acknowledged only when applied or already reflected in the original; while the original is still in custody or absent, its receipt is re-offered with bounded backoff until the receipt’s own TTL expires. Outbound offers include forwarded requests from third-party origins. Import verifies the immutable origin signature, binds the last visited node to the authenticated edge, checks for a loop, and applies origin policy. Acknowledgements distinguish final inbox delivery from downstream custody. An expired or pruned acknowledgement key does not block other valid acknowledgements in the batch. Offer leases commit together. Repeated collection after lost acknowledgements, restart or handoff cannot import the same key twice. `[msg] allow_from` matches the authenticated origin node by its local pin name (configured or inbound first-contact), not an unpinned advertised name; forwarding hubs are never checked. Local senders are not matched against remote names; `[msg] enabled = false` still disables local acceptance. A hub accepts requests for another owning node into durable forwarding custody. Requests carry `hops_left` (initially eight) and `visited` (initially the origin). A forwarding hop decrements the budget and appends itself. `loop_detected` and `hop_budget_exhausted` clear the upstream next hop while retaining custody until a route-generation change. Policy refusals use `msg_not_allowed`; invalid signatures, malformed envelopes, conflicting keys, mismatched origins, and authoritative removal are permanent refusals. Unknown failures remain transient. These outcomes are persisted on the spoke, published as delivery events, and exposed by `msg.status` as `refused` with `detail`. Backpressure, transient hub storage failures and suspended stores retry with per-row backoff, so unavailable recipients cannot block later mail. The `mesh.outbound_pending` subscription (`MeshOutboundPending` in the schema) emits the payload-free `mesh_outbound_pending` event only after committed work becomes available. It is a transient wake hint, not custody evidence; durable rows remain the source of truth. The relay coalesces these events into `{"push":"mesh.wake"}` at most once per second, independently of summary pushes. The wake worker re-subscribes after a local server restart or dropped subscription, with bounded backoff and one log per outage. Wakes are emitted only for inbound-only neighbors. The dialer pulls through its existing outbound collection lane; wakes never bypass a failed poll’s backoff. The existing peer summary also signals pending outbound work; idle and failed polls back off from 5 seconds to 60 seconds to 5 minutes with jitter.
+
+Pending delivery and read receipts on the hub also trigger collection work, even after the spoke's outbox has drained. A healthy edge returns those receipts without waiting for the idle polling backoff; failed edges keep their retry backoff. A failed local receipt acknowledgement write also keeps the retry backoff, even when the edge and store reads remain healthy.
+
+Permanent delivery refusals, including `invalid_signature` and `msg_not_allowed`, terminate origin custody as `refused` with the reason in `msg.status.detail` and emit `message_delivered` with `delivered: false`. They are not retried. Transport failures, fleet pause, and mailbox or store backpressure remain queued for retry.
+
+A refusal by the owning node behind a forwarding hub reaches the origin too. When the owner refuses a forwarded message with `msg_not_allowed` or `recipient_gone`, it signs a receipt bound to that message's return binding and returns it with the refusal, in the `mesh.deliver` error's `data.receipt` or in the `receipt` field of an outbound-collection acknowledgement. The hub takes custody of the receipt before it records the refusal, and routes it back the same way as delivery and read receipts. If the hub cannot keep the receipt, or the receipt names a different message, the hub treats that as a transient protocol error and keeps the original for retry. The origin accepts it only when the recipient node signed it, so a hub cannot mint a refusal for another node. The origin then reports `refused`, with the owner's reason in `detail`, or `recipient_gone`. A `read` outcome stays final, and replaying a receipt changes nothing. Recipient-signed receipts add the optional `receipt` acknowledgement field and the `refused` receipt state, so they require mesh protocol 5; a version 4 peer is refused at `mesh.hello` with `upgrade flk on <peer>`.
+
+The owner never sees a message that a forwarding hub cannot deliver, so the hub reports that outcome itself. When a hub's custody of a forwarded message ends without passing it on and without a recipient-signed receipt, the hub signs an `undeliverable` receipt and routes it to the origin like any other receipt. That happens in three cases. The hub, or a node after it, refuses the message permanently, and `detail` carries the refusal reason. Or every route the hub has left runs back through a node the message already crossed, and stays that way for 30 seconds, long enough for a flapping edge to come back; `detail` is then `loop_detected`, and the report arrives well before either deadline. Or the hub's custody deadline passes, and `detail` is the route refusal it last saw (`loop_detected`, `hop_budget_exhausted`), `no_route` when it had no next hop, or `custody_expired` when a next hop never took the message. A refused route still keeps custody for a route change until that deadline. The origin reports `undeliverable` in `msg.status`, with `detail` naming the reason and the hub, for example `hop_budget_exhausted at nodeb`. For a hub refusal this arrives before the origin's own deadline, and `msg.wait_reply` returns `undeliverable`. For an expiry, the hub's deadline passes just after the origin's own, so `msg.wait_reply` has usually already returned `expired`, and `undeliverable` then appears in `msg.status`. For that reason `expired` is no longer final at an origin whose message went through a hub: it can become `undeliverable`, and a later recipient receipt can still change it to `delivered` or `read`. A recipient outcome always replaces `undeliverable`, and `undeliverable` never replaces a recipient outcome. The origin authenticates the hub by its signature, and checks that the hub held this message by its collection token. It does not check the hub against the visited path, which the origin never receives; the token only travels the custody path before the recipient has an outcome. This trusts the hubs on the path. A hub that forwards a message and also signs `undeliverable` for it can make the sender's `msg.wait_reply` return `undeliverable` for a message that was delivered, until the recipient's receipt corrects `msg.status`. The origin never takes a recipient state (`delivered`, `read`, `refused`, `recipient_gone`) from any node but the recipient, and it never takes `undeliverable` from the recipient. No protocol version change is needed. An origin running v1.0.0 refuses a hub's `undeliverable` receipt once, permanently, as `invalid reply binding`, and the hub records that refusal as final. Mixed fleets keep working; a v1.0.0 origin just keeps reporting `custody` and then `expired`, as before.
+
+Answers and receipts cross hubs the same way, so they get the same report. When a hub's custody of a forwarded answer ends without passing it on, the hub signs `undeliverable` for the answer and routes it to the replier, whose `msg.status` on the answer's correlation then reports `undeliverable` with the reason and the hub in `detail`. A delivery or read receipt that dies at a hub is reported to the node that signed it. That node routes the receipt once more, on the current route, and if the retry dies too it stops: its `msg.status` on `receipt:<message id>:<state>` reports `undeliverable`, and the sender keeps its last known state. A hub never signs `undeliverable` for an `undeliverable` receipt, so these reports cannot bounce between hubs. A recipient does not keep the refusal receipt it returns with a refusal, so it refuses a hub's report for one permanently, once, and that receipt is simply lost. Answers and receipts carry the request's collection token, so for a receipt the token proves only that the hub held the request, not the receipt. A hub on the request's path that never held the receipt can therefore report it `undeliverable` anyway; the worst it costs is one extra resend and a lost receipt. A v1.0.0 replier or signer refuses the hub's receipt once, as above.
+
+The owning node routes every later outcome of a forwarded message back the same way: `delivered`, `read`, `expired` when the inbox deadline passes unread, and `outcome_retention_elapsed` once it stops retaining the outcome. A read that happens before the inbox deadline is still routed as `read` when the owner sends it after that deadline. A `recipient_gone` outcome is final: the owner routes it even when it is first sent after retention ends, and never follows it with `outcome_retention_elapsed`.
+
+Known limitation, fixed in v1.1.0: terminal failures decided at an intermediate node (hop budget, loop, no route) are not routed back to the sender ([#876](https://github.com/gerchowl/flock/issues/876)).
+
+Replies use the request's stored return binding and travel down the hub's dialed edge with `mesh.deliver`. When disconnected, the hub retains the answer and pushes it after re-enrollment. There is no in-memory message uplink queue, `msg.uplink_take`, or `msg.uplink_result`. Removed configuration keys warn with file-and-line migration instructions; startup, live handoff, and reload ignore them while applying the remaining settings. Each inbound relay binds its process identity through `mesh.hello` and authenticates independently. Up to 32 inbound edges may coexist, including several hubs dialing the same node. At capacity, `inbound_edges_full` is transient; dead edges are pruned every second. The newer completed handshake supersedes an older edge for the same node ID. Relays carry summary requests, summary pushes, and `peers.hub_fleet` directory updates under their own enrolled identity. Mesh delivery and collection require that edge's enrollment; unrelated socket callers cannot collect mail. The former `peers.relay_attach` method is removed.
+
+Relayed directory claims from summary polls and `peers.hub_fleet` pushes stay cached under the normal expiry policy. The receiver suppresses redundant server rows and `+via` annotations only while it holds a fresh, successful, protocol-compatible direct reading verified by its local node binding. This decision is recomputed when projecting the rows. An absent, stale, failed or refused direct reading keeps the relayed claim visible; a healthy owner relay can still supply node status while preserving the direct-link diagnostic. Node IDs are compared against local bindings; ID-less rows use the exact configured SSH target, never a display name or shortened hostname. Unknown bindings cannot suppress claims. Spokes and nodes outside the configured dial set retain their usual visibility. The existing claim fold remains the fallback, and mesh protocol 5 is unchanged. Sender-side filtering and the proposed per-peer `relay_to` policy remain follow-up work ([#3033](https://github.com/gerchowl/flock/issues/3033)); no relay policy option is introduced here.
+
+`agent.restart` schedules a restart and returns `agent_restart_queued { pane_id, session, stop_only }` immediately. Params are `target` (default `self`), required `reason`, optional `continue_with`, and `when` (only `after_turn`). Duplicate requests return `restart_pending`; disabled policy returns `restart_disabled`; missing confirmed session-reporting hooks, ambiguous launch options or a mismatched executable return `restart_unsupported`. A runtime-less hibernated or deferred-resume binding returns `parked` (`retry: never`, CLI/MCP exit 2): call `agent resume` first. A binding that still has a runtime and is hibernating, resuming or compacting, or has an in-flight wake, returns `restart_busy`. Explicit requests at the rate cap return `restart_rate_limited` with a `retry_after_secs` in the error message; they leave the agent running. MCP accepts only `target: "self"`; arbitrary targets are CLI/API-only.
+
+```json
+{"id":"req_restart","method":"agent.restart","params":{"target":"self","reason":"reload MCP configuration","continue_with":"finish the assigned task","when":"after_turn"}}
+```
+
+Flock waits for settled idle or a hard limit, stops the whole snapshotted process tree, and resumes the stored native session with original launch settings. Continuation is queued through `msg` only after a fresh session report and empty idle prompt are verified. Durable `agent_restart` events carry `phase` (`restart_stopping`, `restarted`, `restart_stuck`, `restart_stopped`, or `restart_cancelled`), old/new PID, session, reason, forced status, `stop_only` (only for forced hard-limit stops at the rate cap), RSS before/after, and detail. Operator notifications and messages to the spawning supervisor report outcomes. Failures release the lock and retain a resume plan for `agent.resume`; failed replacement processes report their last output. Server handoff cancels waiting/verifying requests with durable reports and requester inbox messages; teardown in progress temporarily refuses handoff. No quit command is typed into a harness. Unknown dialogs and login prompts are never answered automatically.
 
 `agent.hibernate` parks a pane: the agent's child process is asked to exit, the resume plan is stashed on the terminal, and the pane is kept. `AgentStatus::Hibernated` appears on the record and a durable `agent_hibernated` event is emitted. Panes without a resumable session are refused with `hibernate_unsupported` (data-loss guard); a pane that is already hibernated returns `already_hibernated`. `agent.resume` respawns the stashed argv into the same terminal and clears the plan (`not_hibernated` if the pane is not parked); the next `focus` of a hibernated pane triggers the same resume implicitly. Both verbs emit durable events (`agent_hibernated`, `agent_resumed_from_hibernation`).
+
+A failed resume retains the AgentId, native session binding and pending mail. The agent reports `agent_status: "offline"` and `blocked_reason: "resume_failed"` until a successful resume. Hibernation, restart and temporary disconnection do not remove an agent.
+
+Explicit kill (`worktree.kill`, kill-all, or worktree remove) tombstones even a resumable session. Closing a Claude or Codex pane with a persisted session does not tombstone it: its pending mail waits until expiry. A deliberate agent exit with a resumable session returns to the shell as usual without a tombstone.
+
+An explicit kill, or a permanent pane close/exit without a resumable session, records an owner-authoritative tombstone and emits metadata-only `agent_removed { agent_id, session, reason }` (`killed`, `closed` or `exited`). A terminal whose agent is removed receives a fresh, persisted AgentId for the next agent; the tombstone continues to match the old identity. Pending mail for that identity reports `recipient_gone` and is removed from the pane’s queued inbox, including Stop-hook wake counts. Reads also reject stale projections of removed or expired mail. New sends are refused with `recipient_gone`. Store failures never block teardown and are retried in bounded batches. Replies to a removed sender remain in the origin's conversation status/wait store and do not enter a replacement agent's inbox. Existing read and delivery evidence is retained.
 
 ```json
 {"id":"req_h","method":"agent.hibernate","params":{"target":"1-1"}}
@@ -126,6 +677,10 @@ A server with no edge to the recipient's host — a spoke, which by design has n
 ```
 
 `checks.list` enumerates every enrolled script check plus the built-in checks (`blocked_alert`, `hibernation`, `issue_guard`), showing coarse state (`enabled` / `disabled` / `acked` / `errored`), the last outcome, and consecutive Fire count. `checks.ack <name>` silences a check — for a script check, that suppresses fires until the next debounce window elapses; for the built-in `blocked_alert`, it marks every currently-Blocked pane's episode as acked (a re-block starts a fresh episode that can fire again). `checks.run <name>` forces a script check due right now, out of cadence. Errors: `check_not_found`.
+
+`delegate.rebind` accepts `name`, the exact live PTY `agent_id`, and optional `previous_agent_id` (audit metadata). Only an authenticated local operator may call it; agents, relays, and unattested callers receive `operator_only`. It returns the selected `agent` record only after the durable `delegate_rebind_authorized` event is appended and synced. Missing audit persistence or an append/sync failure with a durably completed rollback returns `delegate_audit_unavailable` (retry `after_human`, CLI exit 1), without a binding payload or client record change. Rollback failure instead returns [`audit_indeterminate`](#required-audit-outcomes). A failed audit writer is closed, while intact prior journal history remains readable through lineage, digest history, and cold `events.read` calls, including rotated files. Best-effort event producers continue to log append failures, publish to the live ring, advance their normal sequence/cursor counters, and wake subscribers. New events published while the writer is unavailable exist only in memory and can be lost on ring eviction or restart; counter advancement alone does not prove persistence. Required audits remain refused until storage is repaired and the server restarts. This authorizes the CLI to update its local registry; the server does not write client files or create delegation edges, and the event does not assert completion of that write. No unique exact live agent ID yields `session_unbound`. Clients require protocol **34** before sending this mutation.
+
+`delegate.list` (`architect`: `self` by default, `all`, or an agent id; optional `branch` and `repo`) returns `delegates`, one row per open `agent_delegated` edge: `architect`, `delegate`, `name`, `via`, `state`, `label`, `harness`, `agent_status`, `status_age_secs`, `edge_age_secs`, `workspace_id`, `pane_id`, `worktree`, `branch`, `repo`, and `pr` (`number`, `state`) from the PR poller's cache. `state` is `live`, `hibernated, awaiting merge`, `gone`, `gone, worktree retained`, `orphaned`, or `closed, not merged`. It is answered from cached state only, with no git or `gh` call. `self` is resolved from the caller's process ancestry; a caller in no agent pane gets `no_caller_pane`.
 
 `agent.lineage` walks a target's fork ancestry from the durable event log, so it answers "why does this worktree exist" across server restarts and after the panes are gone.
 
@@ -135,6 +690,80 @@ A server with no edge to the recipient's host — a spoke, which by design has n
 {"id":"req_n1","method":"notification.list","params":{"unread_only":true,"limit":20}}
 {"id":"req_n2","method":"notification.ack","params":{"notification_id":"ntf:19a2f:3"}}
 ```
+
+### Completed input writes
+
+`pane.send_keys` and `pane.send_input`, and their contract-bound counterparts
+`pane.write_keys` and `pane.write_input`, return the existing `Ok` envelope only
+once every encoded byte has reached the PTY master through successful writes.
+This does not prove the child read the input or accepted a command. Empty input
+completes without a write. Text and keys in one `pane.write_input` request share
+one ordered payload and one final outcome, including UTF-8 and bracketed-paste
+encoding. Target, key and raw-input policy refusals still happen before admission.
+
+These methods, `pane.send_text`, `pane.write_text` and non-submit `agent.send`
+accept optional `write_timeout_ms`: an integer from `1` to
+`30000`, default `10000`. Queue, injection-lease and write time consume that same
+budget. Choose a value strictly below the remaining caller response budget minus
+`1000` ms for the reply. A caller timeout or lost connection leaves the effect
+unknown; it does not prove cancellation, and input must not be automatically
+replayed. An unobserved caller disconnect remains bounded by the write deadline,
+so bytes can still reach the PTY before expiry.
+
+At most 32 input requests per terminal and 1024 per server can remain outstanding.
+An admission refusal or expired untouched request returns `input_write_cancelled`
+with zero bytes and its payload retired. A positive prefix returns
+`input_write_failed`; inspect the pane before taking another action. Both include
+`error.data.input_write` with exact `bytes_written`, `bytes_total`, `reason` and
+`remainder_discarded`. Retirement removes the unsent payload, including input held
+by an injection, so it cannot appear when that lease releases. Completion by the
+deadline remains successful if the writer subsequently fails.
+
+`pane.send_text`, `pane.write_text` and non-submit `agent.send` retain the existing
+`Paste` result envelope. Only a timely completed write starts observation; a
+repaint while the payload is held or partially written cannot produce a paste
+result. Writer failure or expiry bypasses observation and returns the typed byte
+evidence above. After writing, observation may take up to `2000` ms and can return
+`delivered` or `unconfirmed`. A completed write remains completed even if later
+observation is interrupted. Requests remain counted against admission limits
+until their final response, including the observation phase. Handoff or shutdown
+settles completed observations as unconfirmed and cancels incomplete writes.
+
+For text/paste, reserve those additional `2000` ms as well as the `1000` ms reply
+margin inside the remaining caller budget. The write timeout covers writing,
+not observation. `agent.send` with `submit: true` keeps its guarded-submission
+budget and refuses a supplied raw-write timeout before any input.
+
+The server advertises `pane_input_write_ack: true`. Current clients probe it
+for each operation and bind raw input to `pane.write_*`; an absent capability
+or an unknown write method refuses with `server_version_gap` (exit 78), without
+falling back to a legacy send. Older wire clients can keep using `pane.send_*`.
+Raw CLI/MCP writes use a bounded 10-second response cap, select at most
+8000 ms for the write, and reduce it further to leave a strict 1000 ms reply
+margin (plus 2000 ms observation for paste). Explicit write timeouts are upper
+bounds within that effective caller budget.
+
+Guarded `pane.submit` uses a separate, server-derived 11470 ms client cap:
+9470 ms for all configured server waits, 1000 ms for capability admission and
+1000 ms for the final reply. The conservative server sum includes draft clear
+and two restoration steps (3 × 1000 ms), paste completion and both Enter
+confirmations (3 × 2000 ms), the 120 ms post-paste gap, and seven 50 ms poll
+overshoots. The 7-second injection lease can end work earlier; it is not the
+complete flow budget. A caller with 10470 ms or less remaining refuses before
+input instead of shortening that flow. OS/app scheduling stalls can exceed the
+configured waits; a lost final receipt still means unknown effect. Exhausted
+raw-write budgets likewise refuse before dispatch with `invalid_params`.
+
+After a dispatched input loses its reply, clients return `input_write_unknown`
+(exit 8, retry `after_inspecting`), with null byte counts and
+`remainder_discarded: false`. These calls are never automatically retried, even
+on connect failure. A lost paste reply is unknown even when its writer completed;
+inspect the pane before another action. MCP preserves the same evidence and
+retry classification. Delegate start/send retain the workspace, round and cursor
+on unknown or partially applied writes, including when `--keep-on-failure` was
+not requested; startup recovery never replays these uncertain writes.
+This contract does not introduce cross-host pane-input
+forwarding or change mesh VERSION 5.
 
 ## Checks
 
@@ -146,11 +775,28 @@ Built-in checks:
 - **`hibernation`** — pure fold, OFF by default. Selects Idle-past-`idle_threshold_secs` or Done-past-`done_threshold_secs` panes and dispatches `agent.hibernate` server-side. Never touches Blocked / Working / Unknown / Idle-unseen. Failures (no resume plan) emit `check_errored` once per episode.
 - **`issue_guard`** — polls the configured GitHub repos via the `gh` CLI, parses a `flk-trigger` fenced block from ISSUE BODIES only (never comments), and dispatches the trigger's action when the author matches the configured `owner`. Non-owner bodies are audited via `trigger_ignored`; broken blocks emit `trigger_errored` and post a comment back on the issue. Dedupe by `run_id` (when set on the block) or hash of the body; the dedupe set persists across server restarts by seeding from the durable log's `trigger_fired` events. The target can be a pane id, agent name, worktree path or basename, or branch name; the response is a `chain` of fork edges, deepest first. Lifecycle and fork events are mirrored to a per-session append-only log (rotated, crash-tolerant); the per-revision pane-output events stay in memory only.
 
-Use at most one of `workspace_id` or `cwd` for `worktree.list`, `worktree.create`, and `worktree.open`; omit both to use the active workspace. Use exactly one of `path` or `branch` for `worktree.open`, and exactly one of `workspace_id` or `path` for `worktree.kill`. Raw socket `cwd` and `path` values must be absolute; the CLI expands relative `--cwd` and `--path` values before sending requests. Workspace responses include optional `worktree` provenance when a workspace belongs to a Flock worktree group. Worktree commands can emit `workspace.updated` when an existing workspace gains or changes worktree provenance.
+Use at most one of `workspace_id` or `cwd` for `worktree.list`, `worktree.create`, and `worktree.open`; omit both to use the active workspace. Use exactly one of `path` or `branch` for `worktree.open`, and exactly one of `workspace_id` or `path` for `worktree.kill`. Raw socket `cwd` and `path` values must be absolute, and a relative one is refused with `invalid_request` naming the field (`cwd must be an absolute path, got "repo"`); the CLI expands relative `--cwd` and `--path` values before sending requests. Workspace responses include optional `worktree` provenance when a workspace belongs to a Flock worktree group. Worktree commands can emit `workspace.updated` when an existing workspace gains or changes worktree provenance.
 
-`worktree.list` rows carry `last_commit_at` (unix seconds of the last commit on the branch) and are ordered stale-first: the repo's own checkout, then linked checkouts oldest work first. Pass `"scan": true` to also resolve each linked row's `kill_verdict` — `{"verdict": "merged" | "not_merged" | "checkout_missing", "evidence": ..., "protected": ..., "timed_out": ...}` — through the same gate `worktree.kill` enforces. Both fields are omitted rather than null when unknown: an absent `kill_verdict` means the row was not scanned, NOT that the branch is unmerged, and an absent `last_commit_at` means Git could not date it.
+A registered checkout directory that is present but has no valid `.git` link
+back to this repository's worktree admin entry is refused with
+`worktree_checkout_unreachable` (exit 10, retry `after_human`). `--force` cannot
+override it. The TUI kill dialog gives the same recovery: remount and retry, or,
+if the checkout is really gone, remove the directory yourself and retry. Flock
+never runs `git worktree prune` during removal or kill: pruning is repo-wide
+and can unlink other checkouts that are only temporarily absent. A completely
+absent directory still permits Git to remove that single registration.
 
-`worktree.kill` accepts `path` as well as `workspace_id`, so a checkout no workspace has open is still killable through the gate instead of by hand. A path that IS open resolves to its workspace and closes it with the checkout; the response's `workspace_id` is omitted when no workspace held the checkout.
+The refusal's `error.data` has `path` (the checkout path), `recovery` (the
+recovery text), and `possible_unmounted_mount_point` (`true` for the same device
+as its parent, `false` for a different device, or `null` if stat failed). This
+is a best-effort hint only; device identity never decides whether removal is
+allowed. Kill-by-path can use a remembered repository's registered worktree
+list when the checkout cannot identify itself; without a verified repository
+registration it still refuses `not_git_worktree`.
+
+`worktree.list` rows carry `last_commit_at` (unix seconds of the last commit on the branch) and are ordered stale-first: the repo's own checkout, then linked checkouts oldest work first. Pass `"scan": true` to also resolve each linked row's `kill_verdict` — `{"verdict": "merged" | "not_merged" | "open_pr" | "unknown" | "checkout_missing", "evidence": ..., "protected": ..., "timed_out": ...}` — through the same gate `worktree.kill` enforces. Both fields are omitted rather than null when unknown: an absent `kill_verdict` means the row was not scanned, NOT that the branch is unmerged, and an absent `last_commit_at` means Git could not date it.
+
+`worktree.kill` accepts `path` as well as `workspace_id`, so a checkout no workspace has open is still killable through the gate instead of by hand. A path that IS open resolves to its workspace and closes it with the checkout; the response's `workspace_id` is omitted when no workspace held the checkout. A branch that heads an open PR is live work (#1278): a dry run reports `open_pr: true` with `merged` and `would_delete_branch` false, and a real kill without `keep_branch` is refused with `worktree_open_pr` (retry class `later`) before anything is removed, whatever `force` says. A `gh` that could not answer for a repo with a github.com remote gives verdict `unknown` (`merge_unknown: true`, reason in `evidence`) and the same refusal as `worktree_merge_unknown`. Containment in a remote branch outside the landing set is never merge evidence.
 
 ## Socket transport
 
@@ -167,6 +813,33 @@ A successful response includes the same `id`:
 ```json
 {"id":"req_1","result":{"type":"pong"}}
 ```
+
+`ping` reports the server's persistent `capabilities.node_id`; `peers.summary`
+reports the same value as `node_id`. It is the lowercase SHA-256 digest of an
+Ed25519 public key, shared by named sessions for the same user and state
+directory. This field identifies the node; it does not advertise mesh messaging
+or peer enrollment support.
+
+The key and machine binding live in `mesh/identity.json` beneath Flock's per-user
+state directory (`$XDG_STATE_HOME/flock`, or `~/.local/state/flock`; development
+builds use `flock-dev`). Creation is locked and durable, with mode `0600`.
+Keep this directory local rather than syncing it with dotfiles. Startup refuses
+a key copied from another machine or OS user when both stored and current
+machine bindings are available. Missing, empty, `uninitialized`, or invalid Linux
+machine IDs disable clone detection. IDs created or modified during the current
+boot are also treated as unverified, so an impermanent root that regenerates
+`/etc/machine-id` each boot does not prevent startup. A persistent ID becomes
+eligible after surviving a boot. An identity originally created without a
+binding remains unbound until the operator replaces it.
+
+When clone detection is unavailable, the server retains its node ID and logs
+one startup warning. `flk status` displays `clone detection unavailable: <reason>`;
+Pong capabilities and `peers.summary` expose it as `clone_detection_warning`.
+Identity files must belong to the current OS user. New files receive mode `0600`
+regardless of umask. On the destination machine, move
+the copied identity file aside to generate a new identity; peers must re-enroll
+a replaced identity with `flk peers enroll --reset <peer>`. Restore the original
+file to preserve an existing identity on its original machine.
 
 Event subscriptions keep the connection open after the initial response.
 
@@ -287,7 +960,7 @@ The result carries the turns plus the cursor that resumes after them:
 
 Two properties are deliberate. `agent.history` touches **no pane state** — it does not mark the pane seen and does not move the operator's attention ordering, which is what makes polling it safe. And it renders at the `detail` the *caller* asked for, never at whatever level the operator's prompt-history panel happens to be showing.
 
-Refusals: `unsupported_for_agent` (the pane's agent writes no conversation Flock reads), `no_agent_session` (no session known for the pane), `transcript_not_found` (nothing on disk for that session yet, or no opencode database under `$XDG_DATA_HOME/opencode` / `~/.local/share/opencode`), `transcript_unreadable`.
+Refusals: `unsupported_for_agent` (the pane's agent writes no conversation Flock reads), `session_unconfirmed` (a Claude or OpenCode session Flock restored that no hook from the running agent has confirmed since; retry after the agent's next turn), `no_agent_session` (no session known for the pane), `transcript_not_found` (nothing on disk for that session yet, or no opencode database under `$XDG_DATA_HOME/opencode` / `~/.local/share/opencode`), `transcript_unreadable`.
 
 ### The result of a turn
 
@@ -301,7 +974,7 @@ Refusals: `unsupported_for_agent` (the pane's agent writes no conversation Flock
 {
   "type": "agent_result",
   "result": {
-    "pane_id": "1-2", "workspace_id": "1", "agent": "opencode", "session_id": "ses_...",
+    "pane_id": "1-2", "terminal_id": "term_example", "workspace_id": "1", "agent": "opencode", "session_id": "ses_...",
     "finished": true, "status": "verdict", "status_text": "approve",
     "text": "Read the diff; the tests cover it.\nVERDICT: approve",
     "offset": 0, "total_chars": 52, "at_ms": 1756300000000
@@ -309,7 +982,19 @@ Refusals: `unsupported_for_agent` (the pane's agent writes no conversation Flock
 }
 ```
 
-`status`/`status_text` come from a final `DONE: …`, `BLOCKED: …` or `VERDICT: …` line, after the markdown dressing the recap hook also peels (`**`, `- `, `> `) and skipping a trailing `※ recap:` line; both are absent when the reply ends on none of them. `finished` is false while the newest turn is still going: for Claude, while the newest transcript entry is not assistant text (the Stop hook's "settled" rule); for opencode, while the newest message is not an assistant message opencode marked completed. `text` is then the reply of the turn before. The reply is the text after the newest assistant message's last tool call, joined with the text-only entries just before it (Claude writes one entry per content block). `max_chars` (default 4000, at most 65536) and `offset` page it by characters, and `next_offset` is present until the last page. Reads are bounded: the last 1 MiB of a Claude transcript, or the newest 64 opencode messages. Like `agent.history` it touches no pane state. Refusals: the same as `agent.history`, plus `no_result` when the session has no assistant reply yet.
+`terminal_id` identifies the terminal resolved with the session for this read. Older servers omit it. Delegate wait binds each result read to its settled terminal and restarts settling if the delegate changes terminal during the read.
+
+`status`/`status_text` come from a final `DONE: …`, `BLOCKED: …` or `VERDICT: …` line, after the markdown dressing the recap hook also peels (`**`, `- `, `> `) and skipping a trailing `※ recap:` line; both are absent when the reply ends on none of them. `finished` is false while the newest turn is still going: for Claude, until the transcript records the turn's end, by the rules below; for opencode, while the newest message is not an assistant message opencode marked completed. `text` is then the reply of the turn before. The reply is the text after the newest assistant message's last tool call, joined with the text-only entries just before it (Claude writes one entry per content block). `max_chars` (default 4000, at most 65536) and `offset` page it by characters, and `next_offset` is present until the last page. Reads are bounded: the last 1 MiB of a Claude transcript, or the newest 64 opencode messages. Like `agent.history` it touches no pane state. Refusals: the same as `agent.history`, plus `no_result` when the session has no assistant reply yet. While a Claude turn is still going by that rule, the result carries `turn_open_at_ms`, when its prompt was written, and so does a `no_result` refusal as `data.turn_open_at_ms`: a supervisor can tell "this turn is still running" from "nothing was written" without trusting a screen that may read idle mid-turn. It is absent when the turn is over, when the prompt lies outside the 1 MiB read, or when its entry carries no time; older servers never send it.
+
+A Claude turn is over, read from the transcript Claude Code writes (2.1.28x–2.1.29x), when any of these holds:
+
+- a `turn_duration` entry follows the newest prompt: the ordinary end of a model turn, Stop-hook continuations included;
+- the newest message is Claude's own `No response requested.`, which closes a resumed session (after its hidden `Continue from where you left off.`) and some local commands, with no `turn_duration`;
+- the newest prompt is the `[Request interrupted by user…]` notice, which Claude writes instead of `turn_duration` after an interrupt;
+- the newest prompt is an entry the harness wrote (a local slash command or its output, such as `/compact`, `/model` or `/exit`; a `!` shell command or its output; a `<task-notification>`), and no assistant entry follows it. A local command never runs the model. A notification, or a custom slash command, that the model then answers reopens the turn with the model's first entry;
+- a compaction summary is the newest entry after the newest prompt.
+
+The last two are ambiguous for a notification or a command the model is about to answer, and for an automatic compaction inside a turn. They are read as over, because reading them as running would hold open a turn that may never run. Otherwise, in a transcript that holds any `turn_duration` entry, the turn is still running, even when the newest entry is assistant text: Claude writes a narration between two tool calls as text too. In a transcript without one (a one-shot session, or a first turn not yet over), the turn is over when the newest entry is assistant text.
 
 ## Reading a handed-over file
 
@@ -349,6 +1034,8 @@ The result carries `encoding` — `utf8` with the text in `content`, or `base64`
 Both verbs are read-only: neither marks a pane seen, so an agent may poll them. Records survive the client connection that handed the file over and a server restart; retention is 128 records (oldest evicted first, and eviction deletes the file) plus the staging directory's 24-hour age sweep.
 
 Pane and agent records also carry `seen` (whether the operator has viewed the agent's latest completed turn — `agent_status` folds this bit into `done`) and `status_age_secs` (seconds since the semantic agent state last changed; omitted when no transition has been observed). Records from older servers parse as seen with no age.
+
+`agent.get`, `agent.list` and `agent.result` also carry `settled_with_background_shells: true` when the agent is `idle` or `done` because its Claude turn ended (the completion line shows `done <time>`) while background shells or agents it started are still running. The server reads this from the same screen detector that decides the agent's state, so a supervisor on the socket or MCP (`flock_agent_get`) can tell that settle apart from one with nothing left running without reading the pane. The field is omitted when false, and older servers never send it.
 
 Use `pane.report_metadata` when a user hook wants to customize presentation without taking over lifecycle state from a Flock integration.
 
@@ -393,11 +1080,248 @@ Subscribe to events when you need a long-lived stream:
 
 The first response acknowledges the subscription. Later lines are pushed events.
 
+A subscription without a cursor starts at `event_hub.current_sequence()` when it
+attaches, as it already did on dev since #1030. It streams subsequent events
+without replaying retained events. Current-state predicates, such as an
+already-matching agent status, still report current state.
+
+For retained events, `after` requests events strictly after that cursor using the
+legacy contract. An omitted cursor or `after` keeps the documented loss frame:
+
+```json
+{"event":"lagged","data":{"skipped_to":19},"subscription_index":0,"subscription":{"type":"msg.queued","pane":"ws_1:p1"}}
+```
+
+Before sending `after_sequence`, check
+`ping.result.capabilities.events_live_start`. Missing or false support must
+produce a typed `server_version_gap` refusal; never silently omit the cursor or
+start live. The shared Rust client performs this bounded capability check.
+`after_sequence` is a distinct, explicit opt-in to typed loss, not an alias for
+`after`. Supplying both returns `invalid_params`. Either cursor past the newest
+event returns `cursor_ahead`. No protocol version bump is required.
+
+An opted-in request whose cursor falls behind the 4,096-entry ring receives:
+
+```json
+{"id":"sub_1","subscription_index":0,"subscription":{"type":"msg.queued","pane":"ws_1:p1"},"error":{"code":"events_lost","message":"Events were lost. Resync with per-verb reads ...","data":{"requested_sequence":12,"oldest_available_sequence":20,"current_sequence":4115}}}
+```
+
+Each loss notice and event identifies its zero-based `subscription_index` and
+original `subscription` descriptor, including when a stream has several
+subscriptions of the same type. Every event also carries `seq`, the hub sequence
+it covers. Hub events use their committed sequence; current-state predicates
+carry their observation cursor and do not provide historical predicate replay.
+The acknowledgement includes `result.start_sequence`, the common initial cursor
+captured for hub-backed filters before polling begins. For example:
+
+```json
+{"id":"sub_1","result":{"type":"subscription_started","start_sequence":49}}
+```
+
+Initialize **one applied cursor per subscription** to that acknowledged floor,
+including filters that have emitted nothing. After applying an event, advance
+only the cursor named by its `subscription_index` to that line's `seq`. Resume
+with `after_sequence` equal to the **minimum** of these applied cursors. Keep the
+same filter positions, or associate saved cursors with the corresponding
+original descriptors. Never use the maximum sequence seen across the stream:
+filters poll independently and one can emit sequence 100 before another emits
+sequence 50. A quiet filter retains the floor until it emits an applied event;
+if that conservative cursor is evicted, resumption reports loss and requires
+resync, even when no matching event was known to be lost. A client relying on
+resumable live-start must require the acknowledged floor; an older acknowledgement
+without it cannot supply a safe initial cursor.
+
+For hub-backed facts, deduplicate by subscription and `seq`. A current-state
+predicate is an observation, not historical replay: its `seq` is an observation
+watermark rather than a unique observation id. In particular,
+`pane.output_matched` samples `current_sequence()` and
+`pane.agent_status_changed` seeds from the current hub head, ignoring a supplied
+history cursor. Both observe current pane state rather than replaying historical
+predicates, and advance only their own applied cursor. The minimum rule protects
+hub events not yet applied by the other filters. Loss notices are not applied
+event cursors.
+
+`events_lost` has retry class `after_inspecting`: resync before treating the stream
+as complete. Use `workspace.list`, `pane.list`, `agent.list` and `msg.list` as
+appropriate. The unified `session.snapshot` resync remains #2163. Both loss
+contracts continue at the retained boundary; later overflow produces another
+notice. Other ring errors close the stream after the diagnostic.
+`msg.wait_reply` rereads retained facts into its existing state on a ring gap and
+continues waiting, so a retained or later reply still completes the wait.
+
+Use `events.read` for durable history from a cursor; its disk retention and `gap`
+contract are unchanged. In-process bounded state folds are explicitly named
+`ring_snapshot_after`; they do not claim complete history.
+
 Workspace event subscriptions include `workspace.created`, `workspace.updated`, `workspace.renamed`, `workspace.closed`, and `workspace.focused`.
 
 `{"type":"msg.queued","pane":"<public pane id>"}` streams each `message_queued` event for one inbox (#438). It starts at the moment of subscribing, because mail already waiting is `msg.list`'s to report. It wakes on the event itself rather than on a poll tick. `flk mcp serve` uses it for the experimental channel push, and learns its own pane from the `pane` field that `msg.wake` now returns.
 
 Use `events.wait` when you want one matching event and then a response.
+
+### Directory discovery
+
+`directory_changed` is a durable, payload-free event. Its `seq` versions changes
+in merged local PTY, local structured and accepted remote agent directory rows:
+identity, name, harness, membership and location/route. Repeated summaries with
+only latency, freshness or status changes do not emit it. The event reports
+accepted local state; it does not bypass the existing peer refresh cadence.
+
+Capture `next_after` from `events.read` before reading `agent.list`, then wait
+with `events.read {after, kinds: ["directory_changed"], wait_ms}` and no
+`subjects` filter (the event carries no row IDs). On a matching
+event or `gap`, re-read the listing and resume from `next_after`. This ordering
+avoids missing a change between listing and waiting. Apply a bounded deadline
+and handle producer failure; a timeout does not prove discovery succeeded.
+
+CLI/MCP raw JSON clients preserve unknown kinds. Persisted-log readers skip
+unknown kinds; strict Rust response enums do not, so typed clients must filter
+to known kinds or upgrade. No mesh protocol change is required.
+
+### Supervisor events
+
+The server derives four durable kinds from each local agent's `state` (the one `agent.get` reports), so a supervisor reads facts instead of re-deriving them from `pane_agent_status_changed` (ADR-0028 §2):
+
+| Kind | Emitted when |
+| --- | --- |
+| `agent.phase_changed` | the agent's `phase` settled into a different supervisor phase |
+| `agent.needs_human` | that phase is `needs_human` |
+| `agent.limit_reached` | that phase is `limit_reached` |
+| `agent.gone` | no pane carries the agent any more, a pane this server read as an agent stopped being one (it left `agent.list`), or, after a restart, an agent's restored pane is still a plain shell once the settle window has passed |
+
+All four carry `agent_id`, `pane`, `from`, `to`, `state` (the `state` that settled, with the prompt's `reason` or the limit's `retry_after_ms` under `attention`) and `held_ms`. `agent.needs_human`, `agent.limit_reached` and `agent.gone` repeat the `agent.phase_changed` they accompany, so route on whichever you need. Read them with `events.read` (`"kinds": ["agent.phase_changed"]`, `"subjects": ["<agent id>"]`); they share its cursor, `gap` and at-least-once delivery.
+
+A phase is announced only once it has held for the server's settle window: 20 s, a fixed server constant that is not configurable yet (`[events] settle_ms` is [#1152](https://github.com/gerchowl/flock/issues/1152)). A prompt answered or a turn that ends within the window emits nothing. The window is applied once. `finished`, `finished_with_background` and `waiting_on_event` already include it, because the idle turn must hold that long before `phase` reads them, so moving into one of them from a working, prompt or limit phase is announced as soon as the server sees it. A move between two of them, such as a background shell or a registered wait coming and going, must hold for the window itself. `settling` and `unknown` are never announced. `gone` is announced at once.
+
+The server does not poll for these. It re-reads an agent's `state` when the detector or a hook reports a change on its pane or a pane lifecycle event fires, and otherwise only when a pending phase's window closes. Codex and opencode count background jobs from the process tree, which raises no event, so a job ending while nothing else on the pane changes is seen at the pane's next change ([#1163](https://github.com/gerchowl/flock/issues/1163)).
+
+`from` is the phase this server last announced for the agent, read back from the log after a restart or a live handoff, so neither repeats an announcement. When the server starts, once it has restored its session or imported a handoff, an agent the log announced that no pane carries any more (it was closed while the server was down, or not restored) is announced `gone`. A restored agent whose pane is back is never `gone` for lack of detection: a hand-launched agent is not in `agent.list` until its detector reports again, and until then it keeps the phase the log announced and emits nothing. Its pane is judged once the settle window has passed since the restore: if the pane is a plain shell by then (the server spawned it with the default shell, and that shell holds the terminal's foreground with nothing running in front of it), the agent's process did not survive the restart, and it is announced `gone` once. That is a hand-launched agent after a cold restart, whose pane comes back as a shell under the same id. A pane that cannot be judged keeps the logged phase: one adopted over a live handoff (its agent kept running), one without a live child, or one running another command in front of its shell, which is judged again the next time the server reads its agents. An agent whose last announcement has rotated out of the log starts again from `unknown`. Agents on mesh peers are not covered: each server announces its own. A server older than these kinds skips them in its log rather than quarantining it.
+
+### Open questions
+
+When an agent's screen shows a harness choice dialog, its `state` says what the dialog asks (ADR-0028 §8a). `attention` reads `{"needs_human": {"reason": "question", "question": {…}}}`:
+
+```json
+{
+  "question_id": "q_1f1bfdbef4278496",
+  "source": "screen",
+  "harness": "claude",
+  "state": "open",
+  "header": "Colour",
+  "prompt": "Which colour should the probe use?",
+  "options": [
+    {"id": "1", "label": "Red", "description": "A red probe"},
+    {"id": "2", "label": "Blue", "description": "A blue probe"}
+  ],
+  "multi_select": false,
+  "allow_other": true
+}
+```
+
+- `harness` is `claude` (Claude Code's `AskUserQuestion` form) or `codex` (`request_user_input`). opencode is not read yet ([#1243](https://github.com/gerchowl/flock/issues/1243)).
+- An option's `id` is the number the dialog shows beside it. `description` is left out when the dialog shows none. Wrapped lines are joined with one space.
+- `allow_other` means the dialog accepts free text: Claude's "Type something", or Codex's "None of the above". That entry is not listed as an option, and neither is Claude's "Chat about this".
+- `state` is `open` while the question waits, and `withdrawn` on the `agent.question_closed` that ends it. `expired` is for message questions ([#1242](https://github.com/gerchowl/flock/issues/1242)). `answered` comes with `question.answer` ([#1039](https://github.com/gerchowl/flock/issues/1039)); a build without it reads that state as `unknown`.
+- `header` is the form's tag. It is read only when the form has one question tab, because the screen marks the current tab by styling alone.
+- `question_id` is derived from the agent, the pane's `turn_cursor` and the event log's sequence when the dialog opened, and what the dialog asks, with whitespace collapsed. It never depends on where the dialog is drawn. Moving the cursor, toggling a checkbox, or a resize that rewraps the prompt keeps it. Every new open gets an id that was never used before, whether it is a different question, a tab revisited, or the same question asked again, including after a restart or a live handoff. The log sequence is durable and only grows, so an id that was ever closed is never opened again.
+- A frame whose form cannot be read, such as a torn read, an overlay or a form's review page, keeps the open question. Only a screen that no longer asks a question closes it. A prompt whose form never reads still reads `needs_human{reason: "question"}`, just without `question`.
+- A form with several questions shows one at a time, so it reads as one question per tab. Moving back to an earlier tab opens that question again under a new id.
+
+Two durable kinds follow the same reads. Unlike the phase kinds, they are emitted at once, with no settle window:
+
+| Kind | Carries | Emitted when |
+| --- | --- | --- |
+| `agent.question_opened` | `agent_id`, `pane`, `question_id`, `question` | a read shows a `question_id` the previous read did not |
+| `agent.question_closed` | `agent_id`, `pane`, `question_id`, `reason`, `question` (its `state` `withdrawn`) | that question left the screen, was replaced by the next one, or its agent went |
+
+`question_id` is a top-level field of both, so `"subjects": ["<question id>"]` matches the pair. On a screen, `reason` is always `withdrawn`. An answer typed at the pane also closes the question as `withdrawn`, because on screen it cannot be told apart from a cancel. Answered questions are reported by `question.answer` ([#1039](https://github.com/gerchowl/flock/issues/1039)) and by the harness hook ([#1194](https://github.com/gerchowl/flock/issues/1194)). Moving to the next tab of a form closes the previous tab's question the same way. `expired` is reserved for message questions ([#1242](https://github.com/gerchowl/flock/issues/1242)).
+
+A restart or a live handoff takes each agent's open question back from the log, so a dialog still on screen keeps its `question_id` and emits nothing. If the dialog is gone when its pane is read again, it closes then, once, as `withdrawn`. A server older than these kinds skips them in its log.
+
+## Channel adapters
+
+An external channel (a Telegram bot, a Slack app) reaches flk through an **adapter process** that speaks this socket like any other client (ADR-0028 §8). It gets no private path. This release ships the first part of the contract: binding config, the capability token and the start-up handshake. Inbound mail from a channel (#1153) and the filtered, coalesced outbound feed (#1154) come next. Bindings are configured as described in [Channel bindings](/configuration/#channel-bindings).
+
+**Start-up.** Before an adapter touches its chat, it calls `channel.hello` and starts only when that succeeds:
+
+```json
+{"id":"a1","method":"channel.hello","params":{"binding":"phone","token":"<contents of phone.token>"}}
+```
+
+```json
+{"id":"a1","result":{"type":"channel_hello","binding":"phone","owner_node":"atlas","target":"agent:agent_atlas_1","scopes":["notify","reply"]}}
+```
+
+`flk adapter hello <binding> [--token-file PATH]` does the same from a shell. It reads the token from the binding's token file unless `--token-file` names another one, prints the reply, and returns the exit codes below. An adapter that shells out to it gets the version check for free.
+
+**Version check.** `channel.hello` is new in protocol 29 and counts as state-changing for the skew gate (#868). `flk adapter hello` sends `ping` first, and against an older server exits 78 with `server_version_gap` without sending the hello. An adapter that speaks the socket directly must do the same: send `ping`, and refuse to start unless `protocol` is 29 or higher. An older server answers `channel.hello` itself with `invalid_request` ("unknown variant"), which an adapter must also treat as "this server has no channel support".
+
+**Failure modes.** Each one is a refusal from the [error-code registry](#response-shapes), and the adapter must not start:
+
+| Code | Exit | Meaning | Fix |
+| --- | --- | --- | --- |
+| `channel_unauthorized` | 1 | No binding by that name on this server, or the token does not match the issued one. These two cases share one answer. A token file that is not trusted (see [Channel bindings](/configuration/#channel-bindings)) matches nothing. | Use the binding's current token file. After a rotation, the old token is refused. |
+| `channel_not_owner` | 1 | The binding exists, but its `owner_node` is a different node. | Run the adapter on the owner node, or move the binding by changing `owner_node`. |
+| `channel_token_unavailable` | 1 | The token file could not be read for a reason other than trust (too many open files, an I/O error). The file is left untouched. | Retry once the reported condition clears. |
+| `server_version_gap` | 78 | The server is older than protocol 29. | Hand the server off with `flk server live-handoff`, or restart it. |
+
+`channel_not_owner` is answered before the token is checked, so anyone who can reach the socket can learn which binding names exist on a node and which node owns each one. Tokens can't be learned this way. Socket access is already the trust boundary: the socket is private to the user running the server.
+
+`channel_unauthorized` and `channel_not_owner` are in the `never` retry class: sending the same hello again can't succeed until the config or the token changes. `channel_token_unavailable` is in the `later` class: nothing changed, so retry once the condition clears. Every hello is logged in the server log as `channel.hello.accepted` or `channel.hello.refused`, with the binding name as presented and, on refusal, a reason (`unknown_binding`, `not_owner`, `bad_token`, `token_unavailable`). The token itself never appears in a log, an event or a response.
+
+**Known limits of this release.** A token proves only that the adapter can read the token file, so treat the file like an SSH key. `channel.hello` checks the adapter and reports scopes, but no inbound or outbound channel method exists yet, so nothing enforces scopes. One token per binding, with no expiry. Rotation is manual (see [Channel bindings](/configuration/#channel-bindings)).
+
+## Owner bindings
+
+A repo's resident owner (ADR-0035 §1) is a **binding**, not a session: server state on its home node, keyed by the repo's GitHub slug. Four methods, new in protocol 30:
+
+```json
+{"id":"o1","method":"owner.bind","params":{"repo":"example/widgets","checkout":"/srv/widgets","harness":"claude","model":"opus","profiles":["main","spare"]}}
+```
+
+```json
+{"id":"o1","result":{"type":"owner_bound","rebound":false,"binding":{"repo":"example/widgets","node":"atlas","agent_id":"agent_atlas_1","checkout":"/srv/widgets","harness":"claude","model":"opus","profiles":["main","spare"],"since_ms":1760000000000}}}
+```
+
+- `owner.bind` records the binding. `node` is the serving node and `agent_id` is minted by the server; neither is a parameter. `harness` is `claude`, `codex` or `opencode`. `checkout` must be an absolute path to a git checkout on the node, and `repo` must be `owner/name`; otherwise the answer is `invalid_params`. Binding a bound repo again replaces `checkout`, `harness`, `model` and `profiles`, keeps `agent_id` and `since_ms`, and answers `rebound: true`.
+- `owner.unbind` (`{"repo"}`) ends the binding and answers `owner_unbound` with the binding that ended.
+- `owner.list` answers `owner_list` with `bindings`, ordered by repo. `owner.show` (`{"repo"}`) answers `owner_show` with `binding`. Both are reads, and `owner.show` is the MCP tool `flock_owner_show`.
+
+`owner.bind` and `owner.unbind` append their audit event, sync the file and sync the journal directory before changing the live binding. Missing persistence or an append/sync failure with a durably completed rollback returns `audit_unavailable` (retry `after_human`, CLI exit 1), with no live binding change or success payload. Rollback failure instead returns [`audit_indeterminate`](#required-audit-outcomes). Required audit writes remain unavailable until storage is repaired and the server restarts.
+
+`owner.bind` and `owner.unbind` are operator verbs: an owner holds merge and teardown authority over its delegates, so no agent may appoint itself (the ADR-0014 boundary). They are refused with `operator_only` when the caller is agent-attested, which today means its process ancestry reaches an agent's pane or the request was relayed from a mesh peer, and also when the server could not read the caller's pid. This is **cooperative only** until agents run as their own Unix user and the server attests by uid (ADR-0035 §6.3 points 1 and 6, #1208, #1177): a child an agent detaches with `setsid` has no agent pane in its ancestry and passes as the operator. Both count as state-changing for the skew gate (#868). `owner.unbind` and `owner.show` answer `not_found` for a repo with no binding. Through `flk owner` (see the [CLI reference](/cli-reference/)), `operator_only` exits 13 and `not_found` exits 4. Repo slugs are case-insensitive, as on GitHub: the server records and looks them up in lowercase, so `Example/Widgets` and `example/widgets` are one binding.
+
+The binding is recorded as durable events: `owner_bound` (`binding`, `reissued`) and `owner_unbound` (`repo`). The server folds them once per start, in the same log read as delegation edges and goals, and emits every binding again as `owner_bound` with `reissued: true` on every start and after every log rotation, so an owner that stays quiet cannot rotate out. A server older than 2.0.0 quarantines a log that holds these kinds; servers from 2.0.0 skip them.
+
+**Known limits of this release.** Bindings are per node: nothing yet stops a second node from binding the same repo (#1234, after owner addresses resolve over the mesh, #1212). The binding carries no adopted policy yet (#1195), and no owner session runs from it yet (episodes, #1200).
+
+## Goals
+
+Five methods, new in protocol 30, arm, read, pause, resume and stop an agent's goal (ADR-0030 §1). Each takes `target`: `self` (also when empty or absent) is the agent whose pane runs the caller, an `agent_id` that has a goal names it even after its pane is gone, and anything else resolves as an agent target does (name, terminal id, pane id). Every answer is `{"type":"goal","agent_id","goal"}`, with `goal` the record as the `goal_*` events above fold it.
+
+```json
+{"id":"g1","method":"goal.arm","params":{"target":"self","goal":"ship the parser","checks":["just check"]}}
+```
+
+```json
+{"id":"g1","result":{"type":"goal","agent_id":"agent_atlas_1","goal":{"goal":"ship the parser","checks":["just check"],"met":false}}}
+```
+
+- `goal.arm` (`target`, `goal`, optional `checks`) records `goal_armed` with a fresh record. The goal text is trimmed. A blank goal or check is `invalid_params`; an agent whose goal is armed and not met is `goal_already_armed` (stop it first). Arming over a met goal starts a new one.
+- `goal.status` (`target`) answers the record, met or open. It is a read.
+- `goal.pause` (`target`, optional `minutes`) records `goal_paused`. With `minutes` the server sets `until_ms` to its own clock plus that many minutes; without it the goal stays paused until resumed. `minutes: 0` is `invalid_params`. Pausing a paused goal records the new pause.
+- `goal.resume` (`target`) records `goal_resumed`; a goal that is not paused is `goal_not_paused`.
+- `goal.stop` (`target`, optional `reason`) records `goal_disarmed` with the reason, drops the record, met or open, and answers it as it was.
+
+An agent with no goal is `goal_not_armed`, and so is a met goal for `pause` and `resume`. `self` from a caller in no agent pane is `no_caller_pane`.
+
+**Who may call** (ADR-0030 §1, amendment of 2026-10-13). `goal.status` is open to every caller. The goal's own agent may `goal.arm` its goal but may not pause, resume or stop it, so it cannot walk out of the done gate. The operator and the agent's supervisor may do all four. The supervisor is the architect on the agent's `AgentDelegated` edge, matched by restart-stable `agent_id`, so it keeps that right across a server restart. Anyone else is refused with `goal_caller_refused` (retry `never`, exit 13 `POLICY_REFUSED`, the class `operator_only` has), and so is a caller the server cannot attest (it could not read the caller's pid, or the request was relayed from a mesh peer; goals are per host and peers relay none of it). Like `owner.bind`, the agent check reads process ancestry and is cooperative only until uid attestation (O19a, #1208, #1177): a child an agent detaches with `setsid` has no agent pane in its ancestry and passes as the operator, so `setsid flk goal stop` lets an agent out of its own goal. `goal_caller_refused` exits 13 from the CLI, every other refusal exits 1, and none writes anything.
+
+**Skew (#868).** `goal.arm`, `goal.pause`, `goal.resume` and `goal.stop` are state-changing: a CLI refuses them locally with `server_version_gap` and exit 78 against an older server, before sending. `goal.status` reaches an older server, and its unknown-method answer is turned into the same exit 78.
+
+A timed pause is over once its `until_ms` passes: every `goal` answer leaves an expired `paused` out of the record it shows, and `goal.resume` answers `goal_not_paused`, the reading the stop ladder will take. The `goal_paused` event stays in the log.
+
+**Known limits of this release.** Nothing reads the record to decide a stop yet (the ladder, #1157).
 
 ## Reading panes
 
@@ -430,7 +1354,16 @@ flk wait reply "$id" --timeout 600000     # prints the reply body
 flk msg send 1-1 "which branch?" --intent needs-reply --await   # the same, in one command
 ```
 
-`msg.wait_reply` (`{"correlation_id": "...", "timeout_ms": N}`) is held on the socket thread and woken by the event hub, not a poll, until the message is answered (`outcome: "replied"`), a muted recipient defers it (`deferred`), it is dropped unread (`expired`), or `timeout_ms` passes (`timeout`, with the message's last delivery `state`, so "read but unanswered" shows). It needs no inbox: the answer is read from the server's event window by correlation id, so a reply held for an ssh-originated send reaches the waiter. When a message has several answers, a real reply outranks a mute's deferral (so a question deferred and later answered shows the answer from then on), and the first reply stands. The window is the in-memory ring `msg.status` reads (the newest 4096 events), so the two never disagree; a message older than that is refused with `message_not_found`, as an unknown correlation id is. The default and maximum wait is 24 hours, the age at which an unread message is dropped anyway. The reply's `from_agent`/`from_pane` are the sender stamp: routing and audit metadata, never authorization — any process on the server can answer a message with `msg.send --reply-to`. `flk wait reply` exits 0 when replied, 3 when deferred or expired, 124 on timeout, and 1 on an error; it prints the reply body on stdout and the reply's metadata on stderr, or the whole result with `--json`. `flk msg send --await [--timeout MS]` (needs `--intent needs-reply` or `blocking`) sends and then waits the same way, with the send's own result on stderr, so a harness that runs it as a background task is handed the answer alone.
+Native replies use the same `message_replied` event as pane replies, emitted only after the native queue journal accepts admission. Refused admission emits no reply event. Durable `msg.status` and `msg.wait_reply` include retained native answers before harness delivery and after queue commitment (`delivered`), independently of consuming the native tool inbox. This does not extend payload or outcome retention, and does not turn refused or expired admission into a reply.
+
+`msg.wait_reply` accepts `correlation_id`, optional `timeout_ms`, and an optional signed `reference` previously returned by `msg.status`. It reads the local custody store, without remote polling or status writes. Imported replies wake the waiter through the event hub; receipt and expiry changes are checked on the socket's bounded wait interval. Outcomes are `replied`, `deferred`, `expired`, `refused` (the receiver declined custody; its reason is in `detail`), `undeliverable` (a forwarding hub could not deliver it; its reason is in `detail`), `recipient_gone`, `outcome_retention_elapsed`, or `timeout` with the last delivery `state`. A real reply outranks a deferral. A sender needs no inbox, and mesh results survive audit rotation, restart and handoff. Older pre-mesh messages still use retained local events. Unknown correlations return `message_not_found`; a valid signed reference whose outcome has been collected returns `outcome_retention_elapsed`. The default and maximum wait is 24 hours. `flk wait reply` exits 0 for a reply, 3 for deferral, expiry, an undeliverable message, recipient removal or elapsed outcome retention, 4 for a refusal, 124 on timeout, and 1 on an error. `--json` prints the full result; otherwise the body goes to stdout and metadata to stderr. `flk msg send --await` uses the same waiter.
+
+Mesh `msg.status` reports `queued` (origin custody awaiting transport), `custody` (transferred custody), `delivered` (durable inbox import), `read`, `held` (answer awaiting return), `collected` (answer transferred to its origin), `refused` (including a recipient-signed refusal routed back from behind a hub), `undeliverable` (a forwarding hub could not deliver it), `recipient_gone`, `expired`, or `outcome_retention_elapsed`. Refusals, undeliverable messages and collection failures include `detail`. `reply` contains the best imported answer independently of the original message state. Queries do not commit store changes. Read receipts return over authenticated collection, including the hub's collection exchange with a spoke.
+
+A status result includes a signed `reference`. Retain it and pass it as `reference` to socket/MCP status or reply-wait calls, or as `--reference JSON` to `flk msg status` and `flk wait reply`, to query an exact message after outcome cleanup. A correlation alone cannot distinguish an unknown message from one whose retention elapsed. Status by correlation only answers for messages this node sent; a correlation another node reused for its own mail never stands in. `msg status` exits 0 for known nonfailure states, 3 for expiry, an undeliverable message, removal, elapsed retention or collection failure, 4 when the receiver refused the message, and 1 for API errors.
+
+`replyable` means a reply can be routed: a same-host sender pane, a sender agent the directory can resolve, or a durable mesh return binding. `msg.read` and the MCP channel push compute it the same way. `reply_contract` says which promise that is: `durable_return_binding` survives the sender being offline; `best_effort_local_or_directory` depends on the sender still being reachable.
+
 `--status idle` matches `idle` **or** `done`: an agent nobody has looked at goes
 quiet as `done`, which is an effective idle, so that is the status to wait for
 when nobody is watching the pane. `--status done` matches exactly `done`. The
@@ -438,6 +1371,58 @@ when nobody is watching the pane. `--status done` matches exactly `done`. The
 [Waiting for an agent to go quiet](/docs/cli-reference/#waiting-for-an-agent-to-go-quiet);
 it is a CLI concept and has no socket method of its own — the server publishes
 the states it observes, and the settle window is applied by the client.
+
+### Registered waits
+
+An agent that waits through flk is visibly waiting (ADR-0028 §5). The server records each open wait against the **attested caller**: the agent whose pane the calling process runs in, found by the same process-ancestry walk `msg.send` uses. There are two ways to open one:
+
+- **A held `events.read`.** A read with `wait_ms` that finds nothing yet is a wait for as long as the server holds it, and closes when the read answers, times out, or the client hangs up. `flk events wait` and MCP `flock_events_read` with `wait_ms` are this form. A wait run under the harness's background mechanism (Claude `run_in_background`) counts the same way, so that pane reads `waiting_on_event`, not `finished_with_background`.
+- **`wait.park`.** Opens a wait on a predicate and returns at once, so the agent can end its turn.
+
+```json
+{"id":"p1","method":"wait.park","params":{"until":"delegate:agent_atlas_7 phase in [finished, needs_human, gone]","deadline_ms":1800000}}
+```
+
+```json
+{"id":"p1","result":{"type":"wait_parked","wait_id":"w_1760342400000_1","agent_id":"agent_atlas_3","predicate":"delegate:agent_atlas_7 phase in [gone, needs_human, finished]","deadline":1760344200000}}
+```
+
+`until` is a predicate text, parsed and validated by the server. This release supports:
+
+| Predicate | Waits for |
+| --- | --- |
+| `delegate:<agent id> phase in [<phase>, ...]` | a local agent's `phase` (ADR-0028 §1 vocabulary, except `unknown`) reaching one of the listed phases |
+| `reply:<correlation id>` | the answer to a message you sent |
+
+The reply echoes the predicate in its **canonical form**: phases deduplicated and listed in the phase table's order, single spaces. `deadline_ms` is mandatory and relative, at most 86 400 000 (24 h, the longest reply wait). An agent holds at most 16 open parks; held reads do not count.
+
+`agent.get` and `agent.list` report the oldest open wait on the agent's `state` as `waiting`, sourced to `wait_registry`, with the predicate in canonical form:
+
+```json
+"waiting": {"on": {"wait_id": "w_1760342400000_1", "predicate": "delegate:agent_atlas_7 phase in [gone, needs_human, finished]", "since": 1760342400000, "deadline": 1760344200000}}
+```
+
+A held read reports its filter as `events after <seq> [kinds <k>,...] [subjects <id>,...]`. `waiting` reads `"none"` when nothing is open, and `"unknown"` for a row whose server reports no wait registry (a remote mesh agent, an older server). While a wait is open and the idle turn has held for the settle window, `phase` is `waiting_on_event` (ADR-0028 §1), whatever runs in the background.
+
+**How a park ends.** In this release a park closes only at its deadline: it is removed and announced once as the durable event `wait.expired { wait_id, agent_id, predicate, since, deadline }` (`since` and `deadline` in Unix ms). Opening a park when its predicate becomes true, and waking the agent, is #1032. A held read closes when it returns, so it expires only if that close never reached the server.
+
+**Failure modes.** Each refusal leaves nothing parked:
+
+| Code | Exit | Meaning |
+| --- | --- | --- |
+| `wait_predicate_invalid` | 2 | `until` is not a predicate of the grammar above: an unknown form (including a held read's `events ...` text), a phase outside the vocabulary or `unknown`, tokens not separated by whitespace (`phasein[...]`), anything but one pair of brackets (`[[finished]]`), an empty list or item, or a bad id. |
+| `wait_predicate_unsupported` | 2 | A predicate ADR-0028 names that this release cannot register: `pr:<n> ci_completed` and `any-delegate-of-mine changed` (#1250). |
+| `wait_deadline_too_long` | 2 | `deadline_ms` is over 24 h. Park again when it expires. |
+| `invalid_params` | 1 | `deadline_ms` is 0 or missing. |
+| `too_many_waits` | 10 | The agent already holds 16 open parks. Retry after one expires. |
+| `peer_incompatible` | 1 | The delegate runs on another host. This server cannot observe it (ADR-0028 §3a); park on that host. |
+| `agent_not_found` | 1 | No agent or delegation edge on this server has that id. |
+| `no_caller_pane` | 1 | The caller runs in no agent pane, so there is no agent to put the wait on. |
+| `server_version_gap` | 78 | The server speaks an older protocol than the client (for `wait.park`, below 30, so a v29 server too): `flk wait park` refuses before sending (#868). |
+
+A held read from outside an agent pane is served as before and records no wait.
+
+**Known limits.** `pr:<n> ci_completed` and `any-delegate-of-mine changed` are refused until #1250. A park ends at its deadline only, until #1032. Open parks are held in memory, so a server restart or live handoff drops them (#1240). A wait whose agent left stays until its deadline.
 
 ## The turn cursor
 
@@ -510,8 +1495,231 @@ Errors look like this:
 }
 ```
 
+Structured failure details use `error.data`, for example:
+
+```json
+{
+  "id": "handoff_1",
+  "error": {
+    "code": "handoff_failed",
+    "message": "Connection reset by peer",
+    "data": { "kind": "connection_reset" }
+  }
+}
+```
+
+The CLI JSON envelope preserves `data` and adds `retry` and `exit` alongside it.
+
 ## Protocol stability
 
 Flock has a protocol version for client/server compatibility. Protocol changes are reviewed with release compatibility in mind.
 
 Check the server protocol with `ping` or `flk status` before depending on new behavior. Handle unknown fields gracefully.
+
+## Removed mesh settings and methods
+
+Upgrade the fleet together for mesh transport. Removed config keys are ignored with a warning naming the file, line, and key; all other settings still apply on startup, live handoff, and reload. Delete the named lines. Warnings appear in `flk status` and once per CLI invocation on stderr.
+
+Remove these settings and callers:
+
+- `[msg] uplink_timeout_secs`, `uplink_heartbeat_secs`, and `deferral_relay_concurrency`: delete these lines. Custody pushes use a fixed concurrency of four.
+- `[[peers]] summary_command`: delete this line; peers now always hold a mesh edge. Use `relay_command` if the remote executable needs a custom path.
+- `flk msg send --from-host` and the `msg.send` fields `from_host` and `intent_unrecognised`: remote origins come from authenticated mesh envelopes. `--from-agent` remains available for operator tooling.
+- The old `msg.uplink_*` and `peers.relay_attach` methods: use per-edge `mesh.hello` enrollment, delivery and collection.
+- The `forward_limit` and `peer_not_configured` routing refusals: known owners route through the mesh or queue while offline; unknown owners without a stored hint are refused as unknown.
+
+Removed config keys and unknown future keys produce warnings. Run `flk config check --json` before a rollout to list removed and unknown keys with file and line locations; exit `1` means warnings, including removed keys. Startup, live handoff, and reload ignore removed keys and apply the remaining settings.
+
+### Explicit Codex lock resolution
+
+`pane.resolve_codex_lock {pane_id, choice: "retry" | "fork", write_timeout_ms?}`
+checks the pane's live `codex_conversation_locked` screen before admitting one
+`r` or `f` without Enter. `write_timeout_ms` has the same 1..=30000 validation
+and 10000 ms default as `pane.send_keys`. A pane no longer showing the lock
+refuses with `agent_not_ready`, without input. This is an explicit keyboard
+operation, not an automatic reply or an MCP tool. Use `delegate send
+--resolve-lock` for a recorded choice and bounded screen confirmation. Older
+servers reject the method; clients must not fall back to raw keys.
+
+### Structured session read/control contracts
+
+`agent.list` adds `structured_agents` (defaulting to `[]` when absent in an older
+response) alongside unchanged PTY `agents` and `fleet`. Each structured entry has
+`runtime: "structured"`, `agent_id`, `name`, `harness`, `lifecycle`, presentation
+`status`, canonical `state`, `session_id`, `cwd`, `model`, and `lease_state`.
+`name` and `model` can be null. `view` is omitted when no attached view exists;
+there are no fabricated `pane_id`, `terminal_id`, workspace or tab fields.
+`lease_state` is `absent`, `reserved`, `bound`, or `uncertain`; this is binding
+evidence, not proof of process liveness or caller authority.
+
+`agent.get` and `agent.status` accept `{"target":"<agent id or unique name>"}`.
+For structured targets the response type is `structured_agent_info`, containing
+`agent`. A name shared with a PTY target is `agent_target_ambiguous`; use an id.
+`agent.stop` takes the same target shape and returns the current structured
+record while cancellation and cleanup run asynchronously. It requires operator
+or structured-self authority. Offline stop is idempotent; Unknown ownership refuses
+with `structured_recovery_required` (retry `after_human`, CLI exit 1).
+Pane-only operations return `runtime_unsupported` (retry `never`, CLI exit 2).
+`agent.send` instead uses structured queue admission: `submit:false` returns
+`structured_submit_required`; `submit:true` acknowledges the durable lifecycle ID.
+A name or ID shared with a terminal still returns `agent_target_ambiguous`.
+Structured start retains its launcher and credential-protection gates.
+Mesh VERSION remains 5.
+
+Structured `agent.start` creates and focuses one native view in the active tab,
+or a native-only workspace when none exists. `agent.focus` reuses that placement
+without starting another worker. `StructuredAgentInfo.view` is the real
+`{workspace_id, tab_id, pane_id}`, absent while detached; closing the view does not
+stop its runtime. A resumed generation rebinds the same placement. Explicit
+workspace/tab/split selectors, `here`, labels and dry runs remain unsupported
+for structured starts. Native views allocate no PTY or terminal identity.
+A launch admitted before placement fails returns the typed result
+`structured_agent_started_unplaced {agent_id, generation, placement_error}`.
+The registered cause is in `placement_error.code`. CLI/MCP report exit 1 while
+preserving this result, since the launch remains owned and discoverable.
+Inspect `agent.get`, then focus or stop that ID; do not repeat start blindly.
+Duplicate native placements or invalid layout membership make `agent.get` and
+`agent.focus` refuse with `internal_error` without changing the layout.
+
+
+Structured socket resume continues to use `agent.start` with an existing agent
+identity and operator authority. The wire `agent.restart` command additionally
+allows an operator app-session token with `operate` to resume a stopped
+structured agent on its home node through the same launch funnel, preserving
+its session ID. Wire structured stop uses the same app-session authority.
+File tokens retain their existing refusals. See
+[wire lifecycle commands](./structured-wire-minimal.mdx#agent-lifecycle-commands)
+for admission, asynchronous stop completion and typed refusals.
+
+### Queue item lifecycle facts
+
+`queue_item_state` is a durable, local event emitted after an existing queue
+item changes state. It carries `agent`, `item_id`, optional `batch_id`, the typed
+`producer`, `from`, `to`, `stream` (`queue/<agent>`) and `stream_seq`. The last
+field identifies the original committed queue transition; the event log's `seq`
+is a separate cursor and orders facts across agents.
+
+Known states are `queued`, `held`, `stashed`, `delivered`, `done`, `cancelled` and
+`dropped`. A reader skips a fact with an unknown state, just as an older reader
+skips an unknown event kind, while preserving the global cursor high-water.
+Adding, editing, reordering or checkpointing items does not emit lifecycle
+facts. Recovery from `delivered` to `held` does. These facts use the existing
+event-log retention and rotation and are not relayed over the mesh.
+
+
+## App-session credentials
+
+A native operator console can mint a process-bound bearer with
+`{"id":"mint","method":"client.app.mint","params":{}}`. The response is
+`{"id":"mint","result":{"type":"client_token_issued","issued":{"info":{"name":"app:…","principal":"…","scopes":["read","send","answer","operate"],"expires_in_ms":43200000},"token":"…"}}}`.
+The server chooses all scopes and identity. Supplying scopes, PID, origin port
+or any other parameter returns `invalid_params`.
+
+Minting requires LocalOperator: the socket's kernel-attested operator UID and
+PID, no flk pane (including a shell pane) in its ancestry, and no mesh edge or
+agent lease. The exit watch is armed before the accepted process start identity
+is rechecked. Unknown operator evidence returns `operator_only`; changed birth
+or an unavailable exit watch returns `peer_process_changed` (never retry stale
+connection evidence). The native process must mint directly: a short-lived
+subprocess's exit revokes its credential.
+
+The credential lives only in server memory, is not listed among file tokens,
+and grants exactly `read`, `send`, `answer`, `operate` for a fixed 12 hours.
+`issued.info.expires_in_ms` is the server-computed remaining lifetime at
+issuance, as an unsigned integer number of milliseconds. It uses the same
+clock and deadline as the store enforces: suspend-inclusive elapsed time
+(`CLOCK_BOOTTIME` on Linux, `mach_continuous_time` on macOS, per #2489).
+Machine sleep counts toward the TTL; changes to the wall clock cannot extend
+it. Absolute timers use that same clock, including for idle socket expiry.
+Use it to renew before expiry instead of hard-coding the TTL. This optional
+additive field is absent for persistent file tokens and may be absent from
+older servers. It is an issuance snapshot, not a sliding lifetime.
+App-session `issued.info.principal` is exactly `app:operator:<uid>`, with the
+decimal UID taken from the kernel-attested LocalOperator. It remains the same
+across re-mint, restart, handoff and relaunch. Each token name, bearer, process
+watch, expiry and revocation remains independent: revoking one mint does not
+revoke another. File-token identities are unchanged.
+
+Re-mint preserves `(principal, cmd_id)` for command resend/dedupe and does not
+force the operator outbox to be dropped. Existing server-epoch, retention and
+resume-only rules still apply; a stable identity does not extend the lifetime
+of a cached outcome or authorize an automatic second dispatch after restart.
+
+Socket capacity is per credential (authenticated bearer digest), not per
+principal: each mint has four registered slots, including pending welcome.
+A live old mint can occupy all four without blocking a fresh mint's own four.
+The sixteen upgraded-socket slots and four unauthenticated hello slots remain
+global. Minting still consumes one of the store's 128 credential entries.
+Permission-decision audit records identify the operator principal and token
+source, but cannot distinguish app mints; no token name or digest reaches the
+decision capability.
+
+Renewal issues an independent credential. There are at most 128 live entries;
+capacity/contention returns `session_busy`, and storage failures return
+`internal_error`. Store the bearer only in memory and never log it.
+
+Use the bearer in the structured WebSocket `hello`. Idle sockets close with
+the existing authentication close 4403 at expiry, process exit, revocation,
+restart or handoff; there are no new authentication error names. A command that detects revocation receives its
+`auth_revoked` error acknowledgement before closure. Persistent file tokens
+are unaffected. The existing same-UID secret-extraction risk remains (#1177).
+Shell-origin admission is a separate #2442 slice.
+
+### Native shell upgrade origin
+
+The local shell's exact `tauri://localhost` Origin with
+`Sec-Fetch-Site: cross-site` is accepted only on `/v1/ws`. Numeric Host and
+loopback checks remain required. Exchange, GUI and other paths retain their
+strict existing Origin/fetch checks; `null`, duplicate headers and lookalike
+origins are refused. Mint parameters stay empty: there is no registered port
+option. A valid bearer in `hello` is still required.
+
+Existing pending-hello and connection limits are unchanged. The error registry
+reserves `preauth_capacity` (HTTP 503, retry `later`) and `auth_rate_limited`
+(HTTP 429, retry `later`); this does not add a new per-user budget or failure
+window. Revised pre-auth isolation remains under owner review in #2500.
+
+On Linux, the native shell must refuse local mint when `ptrace_scope=0`, explain
+that other processes could read its operator credential, and offer explicit
+remote pairing or administrator-enabled `ptrace_scope ≥ 1`. G9a owns that
+native check and fallback presentation; there is no silent fallback.
+
+Every authenticated structured-wire refusal (commands, subscriptions and protocol) emits
+best-effort `wire_refused` events through the event hub. See the
+[structured wire refusal audit contract](../structured-wire-minimal/#refusal-audit-events)
+for fields, exact suppression summaries, the shared 60-second per-key/global
+budgets, graceful shutdown flushing, and the limits at capacity, crash and
+journal failure. Refusal reporting does not replace required mutation audits.
+
+
+## Destination gateway grants
+
+`client.grant.add`, `client.grant.list`, and `client.grant.revoke` require the
+same kernel-attested local operator as client-token management. Agent panes,
+relays and non-operator callers receive `operator_only`. An enrolled home or a
+client bearer alone cannot manage grants.
+
+Add params are `{name, home_node_id, principals, verbs, scopes, targets}` with
+explicit string arrays for each set. `home_node_id` is the enrolled home's
+pinned digest. Names follow token naming rules; existing names refuse. List
+params are `{}`; revoke params are `{name}`. All three return
+`{type:"client_grant_list", listing:{generation, entries}}`, where `entries`
+maps names to grant records. Invalid/future entries have null authority, remain
+preserved on disk, and may be revoked by name. Revoke of an absent name and
+invalid adds return `invalid_params`; unavailable storage returns
+`internal_error`.
+
+Targets are the union of `agent:<AgentId>`, `workspace:<WorkspaceId>`, and `*`.
+An empty array denies all; `*` is explicit in list output. Workspace membership
+comes from current destination state at admission. Structured start can match
+only `workspace:` or `*`. Display names and filesystem paths are refused.
+Authority is the intersection of current home-token scopes, one matching grant,
+and existing local verb checks. Principals are namespaced by home NodeId.
+`agent.decide` requires `operate`; `send` and `answer` never promote to it.
+The durable generation and admission lock fence revocation against new claims.
+An admitted effect is not undone by a later revoke.
+
+This slice provides dormant evaluation and management; M2 has not connected it
+to mesh commands. Remote `config.*` evaluation returns `unsupported` before
+claim. Remote structured start/stop/restart/resume require `operate` and remain
+`unsupported_for_agent` pending the ADR-0036 §1a / Q9 owner ruling.

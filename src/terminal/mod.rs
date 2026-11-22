@@ -1,5 +1,7 @@
 mod agent_id;
+pub(crate) mod agent_name;
 mod id;
+pub(crate) mod lifecycle;
 mod runtime;
 mod runtime_registry;
 pub mod state;
@@ -11,5 +13,5 @@ pub(crate) use runtime_registry::TerminalRuntimeRegistry;
 pub use state::{
     compact_header_fields, middle_truncate_chars, validate_header_field, AgentMetadataReport,
     EffectivePresentation, EffectiveStateChange, HeaderFieldError, PromptHistoryEntry,
-    PromptHistoryKind, TerminalState, TerminalStateMutation,
+    PromptHistoryKind, StateAuthority, TerminalState, TerminalStateMutation,
 };

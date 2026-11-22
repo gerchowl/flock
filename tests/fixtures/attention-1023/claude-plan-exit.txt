@@ -1,0 +1,15 @@
+ ▐▛███▛█   Claude Code v2.1.296
+▝▜██████▀  Sonnet 5.5 · API Usage Billing
+ ▝▝   ▝▝   /fixture/attention-1023/repo
+
+
+❯ PLAN please
+
+──────────────────────────────────────────────────────
+ Exit plan mode?
+
+  Claude wants to exit plan mode
+
+  ❯ 1. Yes, and switch to default (ask each time) for
+       this session
+    2. No

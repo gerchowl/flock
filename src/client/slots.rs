@@ -62,7 +62,7 @@ impl SlotTarget {
     }
 
     /// Build a slot target from a switch-target string (the inverse of
-    /// [`key`]): the reserved sentinel maps to home, anything else to an ssh
+    /// [`Self::key`]): the reserved sentinel maps to home, anything else to an ssh
     /// peer.
     pub(crate) fn from_key(key: &str) -> Self {
         if key == HOME_SWITCH_TARGET {
@@ -151,7 +151,7 @@ pub(crate) struct SlotRegistry {
 
 impl SlotRegistry {
     /// Create a registry over `targets` with `home` already active. Every other
-    /// target starts cold; [`pending_dials`] yields them (bounded by the cap)
+    /// target starts cold; [`Self::pending_dials`] yields them (bounded by the cap)
     /// for the warm-all dialer to warm in the background.
     pub(crate) fn new(active: SlotTarget, targets: Vec<SlotTarget>, max_warm: usize) -> Self {
         let mut slots = HashMap::new();
@@ -212,7 +212,7 @@ impl SlotRegistry {
 
     /// Cold targets eligible to be warmed now: under the cap, and past their
     /// backoff if a prior dial failed. The warm-all dialer drives these, then
-    /// reports each result back via [`mark_warm`] / [`mark_dial_failed`].
+    /// reports each result back via [`Self::mark_warm`] / [`Self::mark_dial_failed`].
     pub(crate) fn pending_dials(&self, now: Instant) -> Vec<SlotEffect> {
         let mut budget = self.max_warm.saturating_sub(self.warm_count());
         let mut effects = Vec::new();
@@ -662,7 +662,7 @@ impl SlotManager {
 
     /// Register a freshly-dialed warm connection and pause its frames at the
     /// server. The connection joins the registry as warm. The caller must only
-    /// call this for a slot with no existing connection (see [`has_connection`]),
+    /// call this for a slot with no existing connection (see [`Self::has_connection`]),
     /// so a racing dial can never replace a live transport.
     pub(crate) fn add_warm(&mut self, conn: SlotConnection) -> std::io::Result<()> {
         let key = conn.target.key().to_string();

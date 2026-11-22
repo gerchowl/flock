@@ -84,8 +84,8 @@ pub fn notification_toast_for_state_change(
     }
 }
 
-fn toast_agent_label(agent_label: &str) -> &str {
-    agent_label
+fn toast_agent_label(agent_label: &str) -> std::borrow::Cow<'_, str> {
+    crate::terminal::agent_name::display(agent_label)
 }
 
 pub(crate) fn toast_event_text(kind: ToastKind) -> &'static str {
@@ -295,7 +295,7 @@ impl AppState {
     }
 
     /// Cycle the prompt-history panel's detail level to the next of
-    /// [`TranscriptDetail::Reply`] → `Collapsed` → `Full`. Returns the focus
+    /// [`crate::agent_transcript::TranscriptDetail::Reply`] → `Collapsed` → `Full`. Returns the focus
     /// target whose transcript the caller must re-read at the new level, or
     /// `None` when the panel is closed or the focused pane has no known
     /// Claude session yet (#246).
@@ -622,7 +622,7 @@ impl AppState {
     }
 
     /// Geometry for the open prompt-history panel over `info`. Mirrors the
-    /// renderer's [`ui::panes::prompt_history_panel_rect`] so mouse routing
+    /// renderer's [`crate::ui::prompt_history_panel_rect`] so mouse routing
     /// and rendering speak the same coordinates.
     pub(crate) fn prompt_history_panel_rect_for(
         &self,
@@ -885,7 +885,12 @@ impl AppState {
         let mut rows = Vec::new();
         for (peer_ref, peer) in self.visible_remote_peers() {
             for (peer_ws_idx, summary) in peer.workspaces.iter().enumerate() {
-                let label = crate::ui::grammar::solo_remote_label(self.server_label, peer, summary);
+                let label = crate::ui::grammar::solo_remote_label(
+                    self.server_label,
+                    peer,
+                    summary,
+                    &self.server_peer_host(peer),
+                );
                 let (status, seen) = crate::ui::status::remote_state(summary.status);
                 let activity = summary.activity.clone().unwrap_or_default();
                 let search_text = format!("{label} {activity}").to_lowercase();
@@ -1017,9 +1022,7 @@ impl AppState {
                     terminal
                         .and_then(|terminal| terminal.manual_label.as_deref().map(str::to_string))
                 })
-                .or_else(|| {
-                    terminal.and_then(|terminal| terminal.agent_name.as_deref().map(str::to_string))
-                })
+                .or_else(|| terminal.and_then(|terminal| terminal.agent_name().map(str::to_string)))
                 .or_else(|| {
                     terminal
                         .and_then(|terminal| terminal.effective_agent_label().map(str::to_string))
@@ -1028,22 +1031,19 @@ impl AppState {
                     launch_label(terminal.and_then(|terminal| terminal.launch_argv.as_ref()))
                 })
                 .unwrap_or_else(|| format!("pane {pane_number}"));
-            let display_agent = terminal.and_then(|terminal| terminal.effective_display_agent());
-            let agent_label = display_agent.as_deref().or_else(|| {
-                terminal
-                    .and_then(|terminal| terminal.agent_name.as_deref())
-                    .or_else(|| terminal.and_then(|terminal| terminal.effective_agent_label()))
-            });
+            let label = crate::terminal::agent_name::display(&label).into_owned();
+            let display_agent = terminal.and_then(|terminal| terminal.display_agent_label());
+            let agent_label = display_agent.as_deref();
             let custom_status = terminal.and_then(|terminal| terminal.effective_custom_status());
-            let state = terminal
-                .map(|terminal| terminal.state)
-                .unwrap_or(AgentState::Unknown);
+            let (state, seen) = terminal
+                .map(|terminal| terminal.presentation_state(pane.seen))
+                .unwrap_or((AgentState::Unknown, true));
             let status_label = terminal
                 .map(|terminal| terminal.effective_presentation().state_labels)
-                .and_then(|labels| labels.get(state_label_text(state, pane.seen)).cloned());
+                .and_then(|labels| labels.get(state_label_text(state, seen)).cloned());
             let status = custom_status
                 .or(status_label)
-                .or_else(|| agent_label.map(|_| state_label_text(state, pane.seen).to_string()));
+                .or_else(|| agent_label.map(|_| state_label_text(state, seen).to_string()));
             let mut meta = match (agent_label, status.as_deref()) {
                 (Some(agent_label), Some(status)) => format!("{agent_label} · {status}"),
                 (Some(agent_label), None) => agent_label.to_string(),
@@ -1072,7 +1072,7 @@ impl AppState {
                 label,
                 meta,
                 status: state,
-                seen: pane.seen,
+                seen,
                 is_current,
                 is_workspace: false,
                 is_tab: false,
@@ -1277,6 +1277,7 @@ fn state_label_text(state: AgentState, seen: bool) -> &'static str {
     }
 }
 
+// Tabs share workspace attention ordering: unseen done precedes Working (#1679).
 fn tab_aggregate_state(
     tab: &crate::workspace::Tab,
     terminals: &std::collections::HashMap<
@@ -1284,28 +1285,14 @@ fn tab_aggregate_state(
         crate::terminal::TerminalState,
     >,
 ) -> (AgentState, bool) {
-    let mut aggregate = AgentState::Unknown;
-    let mut seen = true;
-    for pane in tab.panes.values() {
-        let Some(terminal) = terminals.get(&pane.attached_terminal_id) else {
-            continue;
-        };
-        if state_priority(terminal.state, pane.seen) > state_priority(aggregate, seen) {
-            aggregate = terminal.state;
-            seen = pane.seen;
-        }
-    }
-    (aggregate, seen)
-}
-
-fn state_priority(state: AgentState, seen: bool) -> u8 {
-    match (state, seen) {
-        (AgentState::Blocked, _) => 5,
-        (AgentState::Working, _) => 4,
-        (AgentState::Idle, false) => 3,
-        (AgentState::Idle, true) => 2,
-        (AgentState::Unknown, _) => 1,
-    }
+    tab.pane_states(terminals)
+        .max_by_key(|(state, seen)| {
+            (
+                crate::workspace::pane_attention_priority(*state, *seen),
+                !*seen,
+            )
+        })
+        .unwrap_or((AgentState::Unknown, true))
 }
 
 fn tab_activity_summary(
@@ -1342,7 +1329,7 @@ fn activity_summary_for_panes<'a>(
         let Some(terminal) = terminals.get(&pane.attached_terminal_id) else {
             continue;
         };
-        match (terminal.state, pane.seen) {
+        match terminal.presentation_state(pane.seen) {
             (AgentState::Blocked, _) => blocked += 1,
             (AgentState::Working, _) => working += 1,
             (AgentState::Idle, false) => done += 1,
@@ -2617,7 +2604,7 @@ impl AppState {
     /// `remote.is_none()` rows in render order). Remote rows are interleaved
     /// with locals by the panel sort, so the pressed digit and the number
     /// rendered on the row would otherwise disagree — quick-jump routes here
-    /// so the mapping matches [`nth_local_agent_entry_index`], which the
+    /// so the mapping matches [`crate::ui::nth_local_agent_entry_index`], which the
     /// render also uses to number local rows contiguously.
     pub fn focus_local_agent_entry(&mut self, n: usize) -> bool {
         let Some(idx) = crate::ui::nth_local_agent_entry_index(self, n) else {
@@ -2753,6 +2740,17 @@ impl AppState {
                 .floats
                 .values()
                 .any(|float| float.terminal_id == terminal_id);
+            if !still_attached {
+                if let Some(removal) = self.terminals.get(&terminal_id).and_then(|terminal| {
+                    super::agent_removal::capture(
+                        terminal,
+                        super::agent_removal::RemovalEvent::Close,
+                    )
+                }) {
+                    self.pending_ui_events
+                        .push(super::state::PendingUiEvent::AgentRemoved(removal));
+                }
+            }
             if !still_attached
                 && self.terminals.remove(&terminal_id).is_some()
                 && !self.terminal_runtime_shutdowns.contains(&terminal_id)
@@ -2791,7 +2789,7 @@ impl AppState {
     }
 
     /// Close every member of `ws_idx`'s space, or just `ws_idx` when it has no
-    /// space membership. The index-named twin of [`Self::close_selected_space`].
+    /// space membership. The test-only `close_selected_space` delegates here.
     pub(crate) fn close_space_of(&mut self, ws_idx: usize) {
         if ws_idx >= self.workspaces.len() {
             return;
@@ -3333,6 +3331,7 @@ impl AppState {
 
         // Copy the token and keep its selection visible as short-lived feedback.
         let mut selection = Selection::range(pane_id, viewport_row, start_col, end_col, metrics);
+        rt.pin_selection(&mut selection, None);
         if !selection.finish() {
             return false;
         }
@@ -3374,7 +3373,8 @@ impl AppState {
             .into_iter()
             .find(|((x, y), _, _)| *x == screen_col && *y == screen_row)
         {
-            return safe_web_url(&uri).map(str::to_owned);
+            // The opener validates OSC8 targets and reports refusals to the operator.
+            return Some(uri);
         }
 
         let metrics = self.pane_scroll_metrics(terminal_runtimes, pane_id);
@@ -3407,6 +3407,7 @@ impl AppState {
         // rendered lines, not the PTY grid — the panel isn't a runtime
         // surface. Resolve to the pane's TerminalState + PaneInfo and hand
         // off to the panes helper that mirrors the renderer's geometry.
+        let mut pane_closed = false;
         let text = if sel.source == crate::selection::SelectionSource::PromptPanel {
             let info = self.pane_info_by_id(sel.pane_id).cloned();
             let terminal_id = self
@@ -3427,20 +3428,32 @@ impl AppState {
                 .visible_float_for_active_workspace()
                 .filter(|float| float.pane_id == sel.pane_id)
                 .map(|float| float.terminal_id.clone());
-            match float_terminal {
-                Some(terminal_id) => terminal_runtimes
-                    .get(&terminal_id)
-                    .and_then(|rt| rt.extract_selection(&sel)),
-                None => self
-                    .runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, sel.pane_id)
-                    .and_then(|rt| rt.extract_selection(&sel)),
-            }
+            let runtime = match float_terminal {
+                Some(terminal_id) => terminal_runtimes.get(&terminal_id),
+                None => self.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, sel.pane_id),
+            };
+            pane_closed = runtime.is_none();
+            runtime.and_then(|rt| rt.extract_selection(&sel))
         };
         if let Some(text) = text {
             if !text.is_empty() {
                 self.request_clipboard_write = Some(text.into_bytes());
                 info!("copied selection to clipboard");
             }
+        } else if sel.content_revision.is_some() {
+            crate::logging::selection_content_unavailable(pane_closed);
+            self.toast = Some(ToastNotification {
+                kind: ToastKind::NeedsAttention,
+                title: "Cannot copy selection".into(),
+                context: if pane_closed {
+                    "Selected pane closed"
+                } else {
+                    "Selected content was evicted, erased or is unavailable"
+                }
+                .into(),
+                position: None,
+                target: None,
+            });
         }
 
         self.clear_selection();
@@ -3895,14 +3908,24 @@ impl AppState {
                 agent,
                 state,
                 activity,
+                provider_limit,
                 visible_blocker,
                 visible_idle,
                 visible_working,
+                settled_with_background_shells,
+                background_tasks,
+                needs_human,
+                question: _,
                 process_exited,
                 observed_at,
             } => self
                 .update_terminal_state(pane_id, |terminal| {
+                    terminal.provider_limit = provider_limit.clone();
+                    terminal.needs_human = needs_human;
                     terminal.update_live_activity(activity.clone(), state);
+                    terminal.settled_with_background_shells =
+                        settled_with_background_shells && state == AgentState::Idle;
+                    terminal.background_tasks = background_tasks;
                     let mutation = terminal.set_detected_state_with_screen_signals_at(
                         agent,
                         state,
@@ -3982,7 +4005,8 @@ impl AppState {
             | AppEvent::PeerPollDue
             | AppEvent::PeerSummaryFetched(_)
             // #410: delivered at the App layer, which owns the mailbox.
-            | AppEvent::UplinkForwarded { .. }
+            | AppEvent::PasteConfirm { .. }
+            | AppEvent::AgentSubmit { .. }
             // Cross-machine checkout (#125) legs are handled at the App layer
             // (it owns the git side-effects); they never reach state-level.
             | AppEvent::PeerCheckoutProbed { .. }
@@ -4099,6 +4123,7 @@ impl AppState {
             }
             AppEvent::AgentSessionReported {
                 pane_id,
+                transcript_path,
                 source,
                 agent_label,
                 seq,
@@ -4106,13 +4131,20 @@ impl AppState {
                 session_start_source,
             } => self
                 .update_terminal_state(pane_id, |terminal| {
-                    terminal.set_agent_session_ref_for_session_start(
+                    let report = if source == "flock:codex" && agent_label == "codex" {
+                        session_ref.as_ref().map(|session| crate::agent_resume::CodexSessionStart {
+                            thread: session.value.clone(), transcript_path, source: session_start_source.clone(),
+                        })
+                    } else { None };
+                    let mutation = terminal.set_agent_session_ref_for_session_start(
                         source,
                         agent_label,
                         session_ref,
                         seq,
                         session_start_source,
-                    )
+                    );
+                    if mutation.is_some() { terminal.codex_session_start = report; }
+                    mutation
                 })
                 .into_iter()
                 .collect(),
@@ -4192,8 +4224,9 @@ impl AppState {
             AppEvent::WorktreeAddFinished(_) => Vec::new(),
             AppEvent::WorktreeRemoveFinished(_) => Vec::new(),
             AppEvent::WorktreeKillGateFinished(_) => Vec::new(),
+            AppEvent::IntegrationsInstalled(_) => Vec::new(),
             // Applied at the App layer, which owns the mailboxes.
-            AppEvent::MsgDeferralRelayed(_) => Vec::new(),
+            AppEvent::MeshStoreRecovered(_) | AppEvent::MeshRoutesCompleted(_) | AppEvent::MeshCollected(_) | AppEvent::MsgRelayCompleted(_) => Vec::new(),
             AppEvent::WorktreeBranchDeleteFinished(_) => Vec::new(),
             AppEvent::WorktreeKillAllFinished(_) => Vec::new(),
             // #175 phase 4: intercepted in App::handle_internal_event
@@ -4464,6 +4497,14 @@ impl AppState {
         .filter(|_| self.sound_config().allows(known_agent));
 
         let workspace_id = self.workspaces.get(ws_idx)?.id.clone();
+        let provider_detail = self.workspaces[ws_idx]
+            .pane_state(pane_id)
+            .and_then(|pane| self.terminals.get(&pane.attached_terminal_id))
+            .filter(|terminal| {
+                new_state == AgentState::Blocked && terminal.provider_limit.is_some()
+            })
+            .and_then(|terminal| terminal.provider_limit.as_ref())
+            .map(|wait| wait.description());
         let build_toast = || {
             let workspace_label = match terminal_runtimes {
                 Some(runtimes) => {
@@ -4476,7 +4517,7 @@ impl AppState {
                 title: format!(
                     "{} {}",
                     toast_agent_label(agent_label),
-                    toast_event_text(kind)
+                    provider_detail.as_deref().unwrap_or(toast_event_text(kind))
                 ),
                 context: notification_context(
                     &self.workspaces[ws_idx],
@@ -5536,6 +5577,58 @@ mod tests {
     }
 
     #[test]
+    fn navigator_tab_done_outranks_working_1679() {
+        let mut state = app_with_workspaces(&["attention"]);
+        let done = state.workspaces[0].tabs[0].root_pane;
+        let working = state.workspaces[0].test_split(Direction::Horizontal);
+        state.workspaces[0].test_add_tab(Some("other"));
+        state.ensure_test_terminals();
+        for (pane, agent_state, seen) in [
+            (done, AgentState::Idle, false),
+            (working, AgentState::Working, true),
+        ] {
+            let id = state.workspaces[0].terminal_id(pane).unwrap().clone();
+            state
+                .terminals
+                .get_mut(&id)
+                .unwrap()
+                .set_detected_state(Some(Agent::Codex), agent_state);
+            state.workspaces[0].tabs[0]
+                .panes
+                .get_mut(&pane)
+                .unwrap()
+                .seen = seen;
+        }
+        state.open_navigator();
+        state
+            .navigator
+            .expanded_workspaces
+            .insert(state.workspaces[0].id.clone());
+        let rows = state.navigator_rows();
+        let tab = rows
+            .iter()
+            .find(|row| {
+                matches!(
+                    row.target,
+                    NavigatorTarget::Tab {
+                        ws_idx: 0,
+                        tab_idx: 0
+                    }
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            (tab.status, tab.seen),
+            (AgentState::Idle, false),
+            "an unseen finished pane needs attention before a working pane"
+        );
+        assert_eq!(
+            state.workspaces[0].aggregate_state(&state.terminals),
+            (tab.status, tab.seen)
+        );
+    }
+
+    #[test]
     fn navigator_rows_show_tab_nodes_only_for_multi_tab_workspaces() {
         let mut state = app_with_workspaces(&["single", "multi"]);
         state.workspaces[1].test_add_tab(Some("tests"));
@@ -5722,7 +5815,10 @@ mod tests {
             })
             .expect("fleet-wide navigator should surface the peer workspace");
         // Same self-contained grammar the sidebar shows: `owner/repo · host:branch`.
-        assert_eq!(remote.label, "gerchowl/flock \u{00b7} atlas:main");
+        assert_eq!(
+            remote.label,
+            "gerchowl/flock \u{00b7} [unverified] atlas:main"
+        );
         assert_eq!(remote.status, AgentState::Working);
     }
 
@@ -6009,7 +6105,8 @@ mod tests {
             .terminals
             .get_mut(&shell_terminal_id)
             .unwrap()
-            .set_manual_label("wheel notes".into());
+            .set_manual_label("wheel notes".into())
+            .unwrap();
         let working_terminal_id = state.workspaces[0].terminal_id(working).cloned().unwrap();
         state
             .terminals
@@ -6056,7 +6153,8 @@ mod tests {
             .terminals
             .get_mut(&terminal_id)
             .unwrap()
-            .set_manual_label("weekly review".into());
+            .set_manual_label("weekly review".into())
+            .unwrap();
         state.open_navigator();
         state.navigator.query = "weekly".into();
 
@@ -6823,9 +6921,14 @@ mod tests {
             agent: Some(Agent::Pi),
             state: AgentState::Working,
             activity: None,
+            provider_limit: None,
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
+            settled_with_background_shells: false,
+            background_tasks: None,
+            needs_human: None,
+            question: None,
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });
@@ -6862,9 +6965,14 @@ mod tests {
             agent: Some(Agent::Pi),
             state: AgentState::Idle,
             activity: None,
+            provider_limit: None,
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
+            settled_with_background_shells: false,
+            background_tasks: None,
+            needs_human: None,
+            question: None,
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });
@@ -6916,9 +7024,14 @@ mod tests {
                 agent: Some(Agent::Pi),
                 state: agent_state,
                 activity: None,
+                provider_limit: None,
                 visible_blocker: false,
                 visible_idle: false,
                 visible_working: false,
+                settled_with_background_shells: false,
+                background_tasks: None,
+                needs_human: None,
+                question: None,
                 process_exited: false,
                 observed_at: std::time::Instant::now(),
             });
@@ -7075,9 +7188,14 @@ mod tests {
             agent: Some(Agent::Pi),
             state: AgentState::Idle,
             activity: None,
+            provider_limit: None,
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
+            settled_with_background_shells: false,
+            background_tasks: None,
+            needs_human: None,
+            question: None,
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });
@@ -7099,9 +7217,14 @@ mod tests {
             agent: Some(Agent::Pi),
             state: AgentState::Idle,
             activity: None,
+            provider_limit: None,
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
+            settled_with_background_shells: false,
+            background_tasks: None,
+            needs_human: None,
+            question: None,
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });
@@ -7154,6 +7277,7 @@ mod tests {
 
         let report = |pane_id| AppEvent::AgentSessionReported {
             pane_id,
+            transcript_path: None,
             source: "flock:claude".into(),
             agent_label: "claude".into(),
             seq: Some(1),
@@ -7193,6 +7317,56 @@ mod tests {
     }
 
     #[test]
+    fn provider_limit_event_sets_sidebar_status_and_attention_reason() {
+        let mut state = app_with_workspaces(&["active", "background"]);
+        state.active = Some(0);
+        state.config.ui.toast.delivery = crate::config::ToastDelivery::Flock;
+        let pane_id = *state.workspaces[1].panes.keys().next().unwrap();
+        let detection = crate::detect::detect_agent(
+            Some(Agent::OpenCode),
+            "■■⬝⬝⬝⬝⬝⬝ rate limit [retrying in 46m 15s attempt #1] esc interrupt",
+        );
+        state.handle_app_event(AppEvent::StateChanged {
+            pane_id,
+            agent: Some(Agent::OpenCode),
+            state: detection.state,
+            activity: detection.activity,
+            provider_limit: detection.provider_limit,
+            visible_blocker: detection.visible_blocker,
+            visible_idle: false,
+            visible_working: false,
+            settled_with_background_shells: false,
+            background_tasks: None,
+            needs_human: None,
+            question: None,
+            process_exited: false,
+            observed_at: std::time::Instant::now(),
+        });
+        let detail = state.workspaces[1]
+            .pane_details(&state.terminals)
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(
+            detail.custom_status.as_deref(),
+            Some("rate-limited, retry in 46m 15s")
+        );
+        deliver_due_agent_notifications(&mut state);
+        assert!(state
+            .toast
+            .as_ref()
+            .unwrap()
+            .title
+            .contains("rate-limited, retry in 46m 15s"));
+        assert!(!state
+            .toast
+            .as_ref()
+            .unwrap()
+            .title
+            .contains("needs attention"));
+    }
+
+    #[test]
     fn background_waiting_sets_attention_toast() {
         let mut state = app_with_workspaces(&["active", "background"]);
         state.active = Some(0);
@@ -7204,9 +7378,14 @@ mod tests {
             agent: Some(Agent::Pi),
             state: AgentState::Blocked,
             activity: None,
+            provider_limit: None,
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
+            settled_with_background_shells: false,
+            background_tasks: None,
+            needs_human: None,
+            question: None,
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });
@@ -7243,9 +7422,14 @@ mod tests {
             agent: Some(Agent::Pi),
             state: AgentState::Blocked,
             activity: None,
+            provider_limit: None,
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
+            settled_with_background_shells: false,
+            background_tasks: None,
+            needs_human: None,
+            question: None,
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });
@@ -7300,9 +7484,14 @@ mod tests {
             agent: Some(Agent::Pi),
             state: AgentState::Blocked,
             activity: None,
+            provider_limit: None,
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
+            settled_with_background_shells: false,
+            background_tasks: None,
+            needs_human: None,
+            question: None,
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });
@@ -7355,9 +7544,14 @@ mod tests {
             agent: Some(Agent::Pi),
             state: AgentState::Blocked,
             activity: None,
+            provider_limit: None,
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
+            settled_with_background_shells: false,
+            background_tasks: None,
+            needs_human: None,
+            question: None,
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });
@@ -7381,9 +7575,14 @@ mod tests {
                 agent: Some(Agent::Pi),
                 state: agent_state,
                 activity: None,
+                provider_limit: None,
                 visible_blocker: false,
                 visible_idle: false,
                 visible_working: false,
+                settled_with_background_shells: false,
+                background_tasks: None,
+                needs_human: None,
+                question: None,
                 process_exited: false,
                 observed_at: std::time::Instant::now(),
             });
@@ -7418,9 +7617,14 @@ mod tests {
             agent: Some(Agent::Pi),
             state: AgentState::Blocked,
             activity: None,
+            provider_limit: None,
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
+            settled_with_background_shells: false,
+            background_tasks: None,
+            needs_human: None,
+            question: None,
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });
@@ -7453,9 +7657,14 @@ mod tests {
             agent: Some(Agent::Pi),
             state: AgentState::Blocked,
             activity: None,
+            provider_limit: None,
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
+            settled_with_background_shells: false,
+            background_tasks: None,
+            needs_human: None,
+            question: None,
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });
@@ -7490,9 +7699,14 @@ mod tests {
             agent: Some(Agent::Droid),
             state: AgentState::Idle,
             activity: None,
+            provider_limit: None,
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
+            settled_with_background_shells: false,
+            background_tasks: None,
+            needs_human: None,
+            question: None,
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });
@@ -7524,6 +7738,17 @@ mod tests {
             state.toast.as_ref().map(|toast| toast.kind),
             Some(ToastKind::Finished)
         );
+    }
+
+    #[test]
+    fn security_label_toast_sink_escapes_untrusted_label() {
+        for (case, label) in crate::test_support::hostile_agent_names() {
+            assert_ne!(
+                toast_agent_label(&label).to_string(),
+                label,
+                "raw toast label: {case}"
+            );
+        }
     }
 
     #[test]
@@ -7570,9 +7795,14 @@ mod tests {
             agent: Some(Agent::Codex),
             state: AgentState::Idle,
             activity: None,
+            provider_limit: None,
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
+            settled_with_background_shells: false,
+            background_tasks: None,
+            needs_human: None,
+            question: None,
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });
@@ -7591,9 +7821,14 @@ mod tests {
             agent: Some(Agent::Codex),
             state: AgentState::Blocked,
             activity: None,
+            provider_limit: None,
             visible_blocker: true,
             visible_idle: false,
             visible_working: false,
+            settled_with_background_shells: false,
+            background_tasks: None,
+            needs_human: None,
+            question: None,
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });
@@ -7625,9 +7860,14 @@ mod tests {
             agent: Some(Agent::Claude),
             state: AgentState::Working,
             activity: None,
+            provider_limit: None,
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
+            settled_with_background_shells: false,
+            background_tasks: None,
+            needs_human: None,
+            question: None,
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });
@@ -7651,9 +7891,14 @@ mod tests {
             agent: Some(Agent::Claude),
             state: AgentState::Idle,
             activity: None,
+            provider_limit: None,
             visible_blocker: false,
             visible_idle: true,
             visible_working: false,
+            settled_with_background_shells: false,
+            background_tasks: None,
+            needs_human: None,
+            question: None,
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });
@@ -7679,9 +7924,14 @@ mod tests {
             agent: Some(Agent::Claude),
             state: AgentState::Working,
             activity: None,
+            provider_limit: None,
             visible_blocker: false,
             visible_idle: false,
             visible_working: true,
+            settled_with_background_shells: false,
+            background_tasks: None,
+            needs_human: None,
+            question: None,
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });
@@ -7750,9 +8000,14 @@ mod tests {
             agent: Some(Agent::Droid),
             state: AgentState::Idle,
             activity: None,
+            provider_limit: None,
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
+            settled_with_background_shells: false,
+            background_tasks: None,
+            needs_human: None,
+            question: None,
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });
@@ -7799,9 +8054,14 @@ mod tests {
             agent: Some(Agent::Pi),
             state: AgentState::Blocked,
             activity: None,
+            provider_limit: None,
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
+            settled_with_background_shells: false,
+            background_tasks: None,
+            needs_human: None,
+            question: None,
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });
@@ -7829,9 +8089,14 @@ mod tests {
             agent: Some(Agent::Pi),
             state: AgentState::Blocked,
             activity: None,
+            provider_limit: None,
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
+            settled_with_background_shells: false,
+            background_tasks: None,
+            needs_human: None,
+            question: None,
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });
@@ -7856,9 +8121,14 @@ mod tests {
             agent: Some(Agent::Pi),
             state: AgentState::Blocked,
             activity: None,
+            provider_limit: None,
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
+            settled_with_background_shells: false,
+            background_tasks: None,
+            needs_human: None,
+            question: None,
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });
@@ -7879,9 +8149,14 @@ mod tests {
             agent: Some(Agent::Pi),
             state: AgentState::Blocked,
             activity: None,
+            provider_limit: None,
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
+            settled_with_background_shells: false,
+            background_tasks: None,
+            needs_human: None,
+            question: None,
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });

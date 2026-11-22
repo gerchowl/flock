@@ -1,21 +1,59 @@
+#[cfg(test)]
+mod peer_uid_tests;
+#[cfg(test)]
+mod profile_tests;
+mod profiles;
+#[cfg(test)]
+mod scoped_mcp_tests;
+#[cfg(test)]
+mod structured_lease_tests;
+#[cfg(test)]
+mod structured_relay_tests;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 mod agents;
+#[cfg(test)]
+mod caller_pane_tests;
+mod channels;
 mod checks;
+mod client_tokens;
+mod delegates;
 mod digest;
+mod edges;
 mod fleet;
+mod goals;
 mod handoffs;
-mod integrations;
+pub(super) mod integrations;
 mod lineage;
+mod mesh;
+mod mesh_forward;
+pub(super) mod mesh_mail;
+mod mesh_receipts;
+mod mesh_replies;
+pub(crate) mod mesh_routes;
+mod mesh_spokes;
 pub(super) mod messages;
+mod native_inbox;
+#[cfg(test)]
+mod native_inbox_caller_tests;
+mod owner;
+mod owners;
 mod panes;
 pub(crate) mod peers;
-mod responses;
+pub(super) mod responses;
+mod retained;
 mod revert;
 mod spawn;
+mod structured_agents;
+mod structured_grants;
+pub(crate) mod structured_messages;
+pub(crate) mod structured_queue;
+mod structured_relay;
+mod structured_start;
 mod tabs;
-mod uplink;
+#[cfg(feature = "web")]
+mod wire_lifecycle;
 pub(crate) mod workspaces;
 mod worktrees;
 
@@ -91,7 +129,7 @@ fn pr_poll_targets(state: &super::AppState) -> Vec<PrPollTarget> {
 /// nobody counted.
 fn run_pr_poll_round(
     targets: Vec<PrPollTarget>,
-) -> Result<Vec<(String, Option<crate::worktree::PrStateInfo>)>, crate::pr_poll::PrPollErrorKind> {
+) -> Result<crate::events::PrPollRound, crate::pr_poll::PrPollErrorKind> {
     use std::collections::HashMap;
 
     let mut repo_for_root: HashMap<std::path::PathBuf, Option<String>> = HashMap::new();
@@ -125,14 +163,58 @@ fn run_pr_poll_round(
 
     let mut results: Vec<(String, Option<crate::worktree::PrStateInfo>)> = Vec::new();
     for (query, workspace_ids) in fanout {
-        let state = found.get(&query).copied();
+        let state = found.get(&query).map(|obs| obs.info);
         results.extend(workspace_ids.into_iter().map(|id| (id, state)));
     }
     results.extend(unresolved.into_iter().map(|id| (id, None)));
-    Ok(results)
+    Ok(crate::events::PrPollRound {
+        states: results,
+        observed: found.into_values().collect(),
+        seed: None,
+    })
+}
+
+/// Local-operator evidence borrowed from a classified API request or sealed TUI peer.
+/// Only this module can construct it; it cannot outlive or mutate its caller.
+pub(crate) struct LocalOperator<'a> {
+    _app: &'a mut App,
+    peer: crate::platform::peer::Credentials,
+}
+
+impl LocalOperator<'_> {
+    /// Accepted kernel evidence from this proof's connection, never a caller argument.
+    pub(crate) fn peer_credentials(&self) -> crate::platform::peer::Credentials {
+        self.peer
+    }
 }
 
 impl App {
+    pub(super) fn api_peer_credentials(&self) -> crate::platform::peer::Credentials {
+        crate::platform::peer::Credentials {
+            pid: self.current_api_peer_pid,
+            uid: self.current_api_peer_uid.flatten(),
+            birth: self.current_api_peer_birth.flatten(),
+        }
+    }
+    /// Mint token-management authority only from the existing kernel/lease policy.
+    pub(crate) fn client_token_authority(
+        &mut self,
+    ) -> Result<LocalOperator<'_>, crate::api::error_code::ErrorCode> {
+        if !self.caller_is_local_operator() {
+            return Err(crate::api::error_code::ErrorCode::OperatorOnly);
+        }
+        let peer = self.api_peer_credentials();
+        Ok(LocalOperator { _app: self, peer })
+    }
+
+    /// Reuse sealed transport admission for a TUI attach, without replacing API scope.
+    pub(crate) fn native_client_authority(&mut self, peer: &super::LocalPeer) -> LocalOperator<'_> {
+        LocalOperator {
+            peer: peer.credentials(),
+            _app: self,
+        }
+    }
+
     /// Arm and spawn a transcript read for `pane_id` at the currently
     /// selected panel detail (#246). Idempotent — the terminal's own guard
     /// short-circuits when the same `(session, detail)` pair is already
@@ -162,14 +244,28 @@ impl App {
     }
 
     pub(crate) fn handle_internal_event(&mut self, ev: AppEvent) {
-        if let AppEvent::UplinkForwarded {
-            spoke,
-            message,
+        self.handle_internal_event_at(ev, std::time::Instant::now());
+    }
+
+    /// Apply an owner event with one observation instant shared by poll health
+    /// and every directly or indirectly delivered reading.
+    pub(crate) fn handle_internal_event_at(
+        &mut self,
+        ev: AppEvent,
+        observed_at: std::time::Instant,
+    ) {
+        if let AppEvent::PasteConfirm { paste, respond_to } = ev {
+            self.advance_paste(paste, respond_to);
+            return;
+        }
+        if let AppEvent::AgentSubmit {
+            request_id,
+            pane_id,
+            attempt,
             respond_to,
         } = ev
         {
-            let response = self.forward_uplinked_message(&spoke, message);
-            let _ = respond_to.send(response);
+            self.advance_guarded_request(request_id, pane_id, *attempt, respond_to);
             return;
         }
         if let AppEvent::ClipboardWrite { content } = ev {
@@ -260,9 +356,13 @@ impl App {
             let targets = pr_poll_targets(&self.state);
             if !targets.is_empty() {
                 let event_tx = self.event_tx.clone();
+                let seed_from = (!self.pr_events.seeded).then(|| self.event_hub.clone());
                 self.pr_poll_health.mark_started(std::time::Instant::now());
                 std::thread::spawn(move || {
-                    let outcome = run_pr_poll_round(targets);
+                    let outcome = run_pr_poll_round(targets).map(|mut round| {
+                        round.seed = seed_from.map(|hub| crate::pr_poll::logged_pr_events(&hub));
+                        round
+                    });
                     let _ = event_tx.blocking_send(AppEvent::PrStatesUpdated(outcome));
                 });
             }
@@ -275,10 +375,10 @@ impl App {
             // clearing them: the data is stale, not known-absent, and blanking
             // every badge on a transient network blip would be a worse lie
             // than showing the last known state marked degraded.
-            let results = match outcome {
-                Ok(results) => {
+            let round = match outcome {
+                Ok(round) => {
                     self.pr_poll_health.mark_success(now);
-                    results
+                    round
                 }
                 Err(err) => {
                     // An auth failure is the one error a restart would fix, so
@@ -291,8 +391,9 @@ impl App {
                     return;
                 }
             };
+            self.emit_pr_events(round.seed, &round.observed);
             let mut changed = false;
-            for (workspace_id, pr_state) in results {
+            for (workspace_id, pr_state) in round.states {
                 if let Some(ws) = self
                     .state
                     .workspaces
@@ -351,7 +452,6 @@ impl App {
                 let event_tx = self.event_tx.clone();
                 // #410: where a held relay hands the frames its spoke pushes
                 // up. Refreshed every round, so it always points at this loop.
-                crate::peer_stream::set_uplink_sink(event_tx.clone());
                 // #410: what this hub knows about the REST of the fleet, for
                 // the spoke it is about to poll. Gossip used to flow only up,
                 // so a spoke — which polls nobody — never learned anything.
@@ -407,7 +507,7 @@ impl App {
             // still proves the local poller is alive — dropping the health
             // update here would silently turn a config edit into a "poller
             // stopped" alert.
-            let now = std::time::Instant::now();
+            let now = observed_at;
             match &fetch.result {
                 Ok(_) => self.peer_poll_health.mark_success(now),
                 Err(msg) => self
@@ -415,6 +515,12 @@ impl App {
                     .mark_failure(now, crate::health::PeerPollErrorKind::classify(msg)),
             }
             let summary_every = self.state.config.gossip.dial_failure_summary();
+            let pinned = self
+                .state
+                .peers
+                .iter()
+                .find(|p| p.name == fetch.peer)
+                .and_then(|p| crate::peer_stream::enrollment(p).node_id);
             let Some(summary) = self
                 .state
                 .peer_summaries
@@ -429,16 +535,23 @@ impl App {
             // independently of this poll's outcome.
             summary.stream_error = fetch.stream_error;
             match fetch.result {
-                Ok(payload) => {
-                    // Gossip v3 (#101): merge the polled peer's relayed_fleet
-                    // into our cache BEFORE we mutate `summary`. Loop
-                    // prevention rides on the origin field: we drop entries
-                    // whose origin is us (the ONE full-cycle we could see —
-                    // hub A polls hub B, hub B relayed A's own peers back).
+                Ok(mut payload) => {
+                    payload.node_id =
+                        crate::peers::validated_summary_node(payload.node_id, pinned.as_deref());
+                    summary.bind_node(payload.node_id.clone());
+                    if payload.outbound_pending {
+                        self.mesh_outbound_polls
+                            .entry(fetch.peer.clone())
+                            .or_default()
+                            .note_wake();
+                        self.mesh_collect_at = None;
+                    }
                     crate::peers::merge_relayed_fleet(
                         &mut self.state.relayed_fleet_cache,
                         payload.relayed_fleet,
                         &fetch.peer,
+                        payload.node_id.as_deref(),
+                        now,
                     );
                     summary.host = (!payload.host.is_empty()).then_some(payload.host);
                     summary.version = payload.version;
@@ -461,7 +574,8 @@ impl App {
                     }
                     summary.latency_ms = Some(payload.latency_ms);
                     summary.workspaces = payload.workspaces;
-                    summary.last_ok = Some(std::time::Instant::now());
+                    summary.structured_agents = payload.structured_agents;
+                    summary.last_ok = Some(now);
                     summary.error = None;
                     if let crate::peers::DialLog::Recovered {
                         failures,
@@ -488,6 +602,11 @@ impl App {
                 // #418: and say it in the log without saying it every poll —
                 // the edges, plus one summary per window while it lasts.
                 Err(error) => {
+                    // A failed transport proves no identity change. Only a known
+                    // replacement pin can rebind the cached owner facts.
+                    if pinned.is_some() {
+                        summary.bind_node(pinned);
+                    }
                     let reason = crate::peers::SshFailureReason::classify(&error);
                     let log = summary.dial.record_failure(reason, now, summary_every);
                     let consecutive = summary.dial.consecutive_failures;
@@ -527,7 +646,10 @@ impl App {
             // re-addressed keeps its row for the process lifetime, keeps
             // rendering, and keeps riding outgoing snapshots to other servers.
             // Only meaningful now that carried freshness decays.
+            self.note_mesh_owners();
+            self.state.trace_redundant_relay_claims(&fetch.peer, now);
             self.state.evict_expired_relayed_entries();
+            self.sync_directory_events();
             self.render_dirty.store(true, Ordering::Release);
             self.render_notify.notify_one();
             return;
@@ -548,13 +670,34 @@ impl App {
             return;
         }
 
-        if let AppEvent::MsgDeferralRelayed(relay) = ev {
-            self.handle_msg_deferral_relayed(relay);
+        if let AppEvent::MeshRoutesCompleted(completion) = ev {
+            self.finish_mesh_routes(*completion);
+            return;
+        }
+        if let AppEvent::MeshStoreRecovered(result) = ev {
+            self.finish_mesh_recovery(result);
+            return;
+        }
+        if let AppEvent::MeshCollected(completion) = ev {
+            self.collection_relays.complete();
+            self.collection_peers.remove(&completion.peer.name);
+            self.finish_mesh_collection(*completion);
+            return;
+        }
+
+        if let AppEvent::MsgRelayCompleted(completion) = ev {
+            self.handle_msg_relay_completed(*completion);
+            self.finish_message_relay();
             return;
         }
 
         if let AppEvent::WorktreeKillGateFinished(result) = ev {
             self.handle_worktree_kill_gate_finished(result);
+            return;
+        }
+
+        if let AppEvent::IntegrationsInstalled(messages) = ev {
+            self.finish_recommended_integrations(messages);
             return;
         }
 
@@ -572,9 +715,10 @@ impl App {
             name,
             outcome,
             duration_ms,
+            capture_notes,
         } = ev
         {
-            self.handle_check_completed(name, outcome, duration_ms);
+            self.handle_check_completed(name, outcome, duration_ms, capture_notes);
             return;
         }
 
@@ -588,6 +732,14 @@ impl App {
                 self.render_dirty.store(true, Ordering::Release);
                 self.render_notify.notify_one();
                 return;
+            }
+            if self.handle_restart_runtime_exit(*pane_id) {
+                self.render_dirty.store(true, Ordering::Release);
+                self.render_notify.notify_one();
+                return;
+            }
+            if let Some((ws, _)) = self.find_pane(*pane_id) {
+                self.remove_agent_for_pane(ws, *pane_id, super::agent_removal::RemovalEvent::Exit);
             }
             match self.runtime_exit_action(*pane_id) {
                 RuntimeExitAction::RespawnShell => {
@@ -661,6 +813,15 @@ impl App {
         {
             self.arm_transcript_read_for(*pane_id);
         }
+        // ADR-0028 §2: a detector or hook report may move an agent's state
+        // axes without a status change event (a background count, a prompt's
+        // kind), so it marks the pane for the derived events.
+        if let AppEvent::StateChanged { pane_id, .. }
+        | AppEvent::HookStateReported { pane_id, .. } = &ev
+        {
+            self.touch_agent_phase(*pane_id);
+        }
+        self.observe_question(&ev);
         let pane_updates = self.state.handle_app_event(ev);
         for update in &pane_updates {
             self.refresh_new_flock_toast_context_for_update(update, &previous_toast);
@@ -883,7 +1044,10 @@ impl App {
         // #175 C3: hibernation wins over the respawn-shell path. The stashed
         // resume plan means the child died BECAUSE we asked it to; keeping
         // the pane empty is the whole point.
-        if terminal.hibernated_resume_plan.is_some() {
+        if terminal.hibernated_resume_plan.is_some()
+            || terminal.pending_agent_resume_plan.is_some()
+            || terminal.restart_in_progress
+        {
             RuntimeExitAction::HoldHibernated
         } else if terminal.respawn_shell_on_exit {
             RuntimeExitAction::RespawnShell
@@ -951,19 +1115,33 @@ impl App {
                 data: crate::api::schema::EventData::PaneAgentDetected {
                     pane_id: pane_id.clone(),
                     workspace_id: workspace_id.clone(),
-                    agent: update.agent_label.clone(),
+                    agent: crate::terminal::agent_name::received(
+                        update.agent_label.clone(),
+                        "gui_event",
+                    ),
                 },
             });
         }
 
-        let previous_agent_status = pane_agent_status(update.previous_state, update.previous_seen);
-        let agent_status = self
+        let pane = self
             .state
             .workspaces
             .get(update.ws_idx)
-            .and_then(|ws| ws.pane_state(update.pane_id))
-            .map(|pane| pane_agent_status(update.state, pane.seen))
-            .unwrap_or_else(|| pane_agent_status(update.state, update.seen));
+            .and_then(|ws| ws.pane_state(update.pane_id));
+        let project = |state, seen| {
+            pane.and_then(|pane| self.state.terminals.get(&pane.attached_terminal_id))
+                .map(|terminal| {
+                    super::api_helpers::pane_agent_status_for_state(
+                        terminal,
+                        state,
+                        seen,
+                        self.terminal_runtimes.get(&terminal.id).is_some(),
+                    )
+                })
+                .unwrap_or_else(|| pane_agent_status(state, seen))
+        };
+        let previous_agent_status = project(update.previous_state, update.previous_seen);
+        let agent_status = project(update.state, pane.map_or(update.seen, |pane| pane.seen));
 
         if previous_agent_status != agent_status
             || update.previous_presentation != update.presentation
@@ -975,7 +1153,10 @@ impl App {
                     pane_id,
                     workspace_id,
                     agent_status,
-                    agent: update.agent_label.clone(),
+                    agent: crate::terminal::agent_name::received(
+                        update.agent_label.clone(),
+                        "gui_event",
+                    ),
                     title: presentation.title,
                     display_agent: presentation.display_agent,
                     custom_status: presentation.custom_status,
@@ -1043,6 +1224,10 @@ impl App {
         }
         for pending in std::mem::take(&mut self.state.pending_ui_events) {
             let envelope = match pending {
+                crate::app::state::PendingUiEvent::AgentRemoved(removal) => {
+                    self.record_agent_removal(removal);
+                    continue;
+                }
                 crate::app::state::PendingUiEvent::PaneCreated {
                     workspace_id,
                     pane_id,
@@ -1177,7 +1362,26 @@ impl App {
         }
     }
 
+    /// Record the `pr.*` facts a round adds (#1020). The ledger is seeded from
+    /// the durable log on the first round, so a restart re-announces nothing.
+    /// Without a seed nothing is emitted: deduplication would be a guess.
+    fn emit_pr_events(
+        &mut self,
+        seed: Option<Vec<crate::api::schema::EventEnvelope>>,
+        observed: &[crate::pr_poll::PrObservation],
+    ) {
+        if !self.pr_events.seeded {
+            let Some(logged) = seed else { return };
+            self.pr_events.seed(&logged, observed);
+        }
+        for event in self.pr_events.derive(observed) {
+            self.emit_event(event);
+        }
+    }
+
     pub(super) fn emit_event(&self, event: crate::api::schema::EventEnvelope) {
+        // ADR-0028 §2: derived agent events fold on what the server emits.
+        self.agent_phases.touch_event(&event);
         self.event_hub.push(event);
     }
 
@@ -1257,17 +1461,238 @@ impl App {
         // ADR-0005) before the response goes out, so a socket caller sees its
         // own event on the stream.
         self.drain_pending_ui_events();
+        self.sync_directory_events();
         response
+    }
+
+    /// Apply ADR-0036 §1a before normal dispatch or headless lifecycle fast paths.
+    pub(crate) fn peer_uid_refusal(
+        &mut self,
+        request: &crate::api::schema::Request,
+    ) -> Option<String> {
+        use crate::api::{error_code::ErrorCode, schema::Method};
+        // Mint validates kernel evidence before any generic start-time recheck.
+        if matches!(request.method, Method::ClientAppMint(_)) {
+            return None;
+        }
+        if self
+            .current_api_scope
+            .as_ref()
+            .is_some_and(|scope| scope.caller() == crate::structured::lease::Caller::Uncertain)
+        {
+            return Some(responses::encode_error(
+                request.id.clone(),
+                ErrorCode::NotAuthorized.as_str(),
+                "scoped caller authentication refused",
+            ));
+        }
+        // Relay origin outranks account identity, even before enrollment or UID evidence.
+        if matches!(
+            request.method,
+            Method::AgentStop(_)
+                | Method::DelegateRebind(_)
+                | Method::ProfilePlan(_)
+                | Method::ProfileBind(_)
+                | Method::ProfileRevoke(_)
+                | Method::ProfileEnable(_)
+                | Method::MsgOperatorList(_)
+                | Method::MsgOperatorRead(_)
+                | Method::AgentFork(_)
+                | Method::ServerStop(_)
+                | Method::ServerReloadConfig(_)
+                | Method::ServerLiveHandoff(_)
+        ) && self
+            .inbound
+            .edge(
+                self.current_api_peer_pid,
+                crate::platform::process_start_time,
+            )
+            .is_some()
+            && !self.caller_is_local_operator()
+        {
+            return Some(responses::encode_error(
+                request.id.clone(),
+                ErrorCode::OperatorOnly.as_str(),
+                "this operation requires local authority, not a mesh relay",
+            ));
+        }
+        // Status has no non-operator fields; origin is resolved again at projection.
+        if matches!(request.method, Method::ProfileStatus(_)) {
+            return None;
+        }
+        let uid = self.current_api_peer_uid?;
+        let code = if matches!(
+            request.method,
+            Method::StructuredGrantsList(_)
+                | Method::DelegateRebind(_)
+                | Method::ProfilePlan(_)
+                | Method::ProfileBind(_)
+                | Method::ProfileRevoke(_)
+                | Method::ProfileEnable(_)
+                | Method::MsgOperatorList(_)
+                | Method::MsgOperatorRead(_)
+                | Method::StructuredGrantsRevoke(_)
+                | Method::ServerStop(_)
+                | Method::ServerReloadConfig(_)
+                | Method::ServerLiveHandoff(_)
+                | Method::SessionRetainedList(_)
+                | Method::SessionRetainedPurge(_)
+                | Method::ClientGrantAdd(_)
+                | Method::ClientGrantList(_)
+                | Method::ClientGrantRevoke(_)
+                | Method::ClientTokenAdd(_)
+                | Method::ClientTokenRemove(_)
+                | Method::ClientTokenList(_)
+                | Method::ClientOpen(_)
+                | Method::ClientAppMint(_)
+        ) && !matches!(self.spawn_caller(), spawn::SpawnCaller::Operator { .. })
+        {
+            Some(ErrorCode::OperatorOnly)
+        } else {
+            let uid = if self.current_api_peer_pid.is_some() && self.socket_birth_valid() {
+                uid
+            } else {
+                None
+            };
+            let attributed = self.runtime_config.uid_policy.classify(uid)
+                == crate::structured::identity::Principal::Agent
+                && self.lease_caller() != crate::structured::lease::Caller::Uncertain;
+            self.runtime_config
+                .uid_policy
+                .refusal(uid, attributed, &request.method)
+        }?;
+        let code = if matches!(&request.method, Method::AgentSend(p)
+            if matches!(self.structured_send_target(&p.target), Ok(Some(_))))
+        {
+            ErrorCode::NotAuthorized
+        } else {
+            code
+        };
+        Some(responses::encode_error(
+            request.id.clone(),
+            code.as_str(),
+            "socket caller lacks authority for this operation",
+        ))
     }
 
     fn dispatch_api_request(&mut self, request: crate::api::schema::Request) -> String {
         use crate::api::schema::{
             ErrorBody, ErrorResponse, Method, ResponseResult, SuccessResponse,
         };
-        // #410: a park is only ever for the request that set it.
-        let _ = self.uplink.take_pending_park();
+        self.structured_sends.staged = None;
+        self.input_writes.abandon_staged();
+        self.pending_integration_install = None;
+        self.detach_pending_message_relay();
+        debug_assert!(
+            self.pending_agent_submit.is_none(),
+            "deferred agent submit must be consumed by respond_or_park before the next request"
+        );
+        if let Some((_, pane, mut attempt)) = self.pending_agent_submit.take() {
+            self.conclude_guarded_attempt(
+                &pane,
+                &mut attempt,
+                &super::guarded_submit::Outcome::Abandoned("request_dropped"),
+            );
+            self.active_submissions.remove(&pane);
+        }
+        self.pending_recovery_park = None;
+        if let Some(response) = self.peer_uid_refusal(&request) {
+            return response;
+        }
+        if matches!(request.method, Method::ProfileStatus(_)) {
+            let operator = self.caller_is_local_operator();
+            return responses::encode_success(
+                request.id,
+                ResponseResult::ProfileStatus {
+                    status: self.structured_profiles.status(operator),
+                },
+            );
+        }
+        if self.waits_for_mesh_recovery(&request.method) {
+            self.pending_recovery_park = Some((
+                request,
+                super::ApiCaller {
+                    scope: self.current_api_scope.clone(),
+                    pid: self.current_api_peer_pid,
+                    birth: self.current_api_peer_birth,
+                    uid: self.current_api_peer_uid,
+                },
+            ));
+            return String::new();
+        }
 
+        if matches!(
+            &request.method,
+            Method::SessionRetainedList(_) | Method::SessionRetainedPurge(_)
+        ) {
+            return self.handle_retained(request.id, request.method);
+        }
+
+        if !matches!(
+            &request.method,
+            Method::MeshHello(_) | Method::PeersEnrollReset(_)
+        ) && self
+            .inbound
+            .edge(
+                self.current_api_peer_pid,
+                crate::platform::process_start_time,
+            )
+            .is_some_and(|edge| !edge.enrolled())
+        {
+            return responses::encode_error(
+                request.id,
+                "mesh_not_enrolled",
+                "mesh edge is not enrolled; repeat mesh.hello",
+            );
+        }
         let response = match request.method {
+            Method::ProfileStatus(_) => unreachable!("status projected before relay dispatch"),
+            method @ (Method::ProfilePlan(_)
+            | Method::ProfileBind(_)
+            | Method::ProfileRevoke(_)) => {
+                return self.handle_profile_mutation(request.id, method);
+            }
+            Method::ProfileEnable(_) => {
+                if !self.caller_is_local_operator() {
+                    return responses::encode_error(
+                        request.id,
+                        crate::api::error_code::ErrorCode::OperatorOnly.as_str(),
+                        "profile enable requires the local operator",
+                    );
+                }
+                if let Err(refusal) = self.structured_profiles.enable() {
+                    return responses::encode_error(
+                        request.id,
+                        refusal.code().as_str(),
+                        refusal.message(),
+                    );
+                }
+                SuccessResponse {
+                    id: request.id,
+                    result: ResponseResult::Ok {},
+                }
+            }
+            Method::StructuredGrantsList(p) => {
+                return self.handle_structured_grants(
+                    request.id,
+                    p.agent_id,
+                    None,
+                    None,
+                    p.show_input,
+                )
+            }
+            Method::StructuredGrantsRevoke(p) => {
+                return self.handle_structured_grants(
+                    request.id,
+                    p.agent_id,
+                    Some(p.generation),
+                    Some(crate::structured::permissions::grants::GrantHandle {
+                        request_id: p.request_id,
+                        request_seq: p.request_seq,
+                    }),
+                    false,
+                )
+            }
             Method::ServerStop(_) => {
                 self.state.should_quit = true;
                 SuccessResponse {
@@ -1279,6 +1704,7 @@ impl App {
                 let response = ErrorResponse {
                     id: request.id,
                     error: ErrorBody {
+                        data: None,
                         code: "unsupported_in_app_mode".into(),
                         message: "live handoff is only supported by the headless server".into(),
                     },
@@ -1350,6 +1776,7 @@ impl App {
             Method::TabClose(target) => return self.handle_tab_close(request.id, target),
             Method::AgentList(_) => return self.handle_agent_list(request.id),
             Method::AgentGet(target) => return self.handle_agent_get(request.id, target),
+            Method::AgentStop(target) => return self.handle_structured_stop(request.id, target),
             Method::AgentFocus(target) => return self.handle_agent_focus(request.id, target),
             Method::AgentRename(params) => return self.handle_agent_rename(request.id, params),
             Method::AgentStart(params) => return self.handle_agent_start(request.id, params),
@@ -1359,24 +1786,73 @@ impl App {
                 return self.handle_agent_hibernate(request.id, target)
             }
             Method::AgentResume(target) => return self.handle_agent_resume(request.id, target),
+            Method::AgentRestart(params) => return self.handle_agent_restart(request.id, params),
             Method::AgentLineage(params) => return self.handle_agent_lineage(request.id, params),
+            Method::DelegateList(params) => return self.handle_delegate_list(request.id, params),
+            Method::DelegateRebind(params) => {
+                return self.handle_delegate_rebind(request.id, params)
+            }
             Method::MsgSend(params) => return self.handle_msg_send(request.id, params),
+            Method::ClientGrantAdd(_)
+            | Method::ClientGrantList(_)
+            | Method::ClientGrantRevoke(_)
+            | Method::ClientTokenAdd(_)
+            | Method::ClientTokenRemove(_)
+            | Method::ClientTokenList(_)
+            | Method::ClientOpen(_)
+            | Method::ClientAppMint(_) => {
+                return self.handle_client_token(request.id, request.method);
+            }
+            Method::ChannelHello(params) => return self.handle_channel_hello(request.id, params),
+            Method::WaitPark(params) => return self.handle_wait_park(request.id, params),
+            Method::WaitHold(predicate, hold_ms) => {
+                return self.handle_wait_hold(request.id, predicate, hold_ms)
+            }
+            Method::WaitRelease(wait_id) => return self.handle_wait_release(request.id, &wait_id),
+            Method::OwnerBind(params) => return self.handle_owner_bind(request.id, params),
+            Method::OwnerUnbind(params) => return self.handle_owner_unbind(request.id, params),
+            Method::OwnerList(_) => return self.handle_owner_list(request.id),
+            Method::OwnerShow(params) => return self.handle_owner_show(request.id, params),
+            Method::GoalArm(p) => return self.goal_arm(&request.id, p).unwrap_or_else(|e| e),
+            Method::GoalStatus(p) => return self.goal_status(&request.id, p).unwrap_or_else(|e| e),
+            Method::GoalPause(p) => return self.goal_pause(&request.id, p).unwrap_or_else(|e| e),
+            Method::GoalResume(p) => return self.goal_resume(&request.id, p).unwrap_or_else(|e| e),
+            Method::GoalStop(p) => return self.goal_stop(&request.id, p).unwrap_or_else(|e| e),
             Method::MsgReply(params) => return self.handle_msg_reply(request.id, params),
             Method::MsgList(params) => return self.handle_msg_list(request.id, params),
             Method::MsgRead(params) => return self.handle_msg_read(request.id, params),
+            Method::MsgOperatorList(params) => {
+                return self.handle_operator_inbox(request.id, params, false)
+            }
+            Method::MsgOperatorRead(params) => {
+                return self.handle_operator_inbox(request.id, params, true)
+            }
             Method::MsgStatus(params) => return self.handle_msg_status(request.id, params),
             Method::MsgWake(params) => return self.handle_msg_wake(request.id, params),
+            Method::HookDecide(params) => return self.handle_hook_decide(request.id, params),
             Method::MsgMute(params) => return self.handle_msg_mute(request.id, params),
-            Method::MsgUplinkTake(params) => {
-                return self.handle_msg_uplink_take(request.id, params)
+            Method::MeshRoutes { adverts } => return self.handle_mesh_routes(request.id, adverts),
+            Method::MeshHello(params) => return self.handle_mesh_hello(request.id, params),
+            Method::MeshDeliver(params) => {
+                return self.handle_mesh_payload(request.id, params, true)
             }
-            Method::PeersRelayAttach(_) => return self.handle_peers_relay_attach(request.id),
-            Method::MsgUplinkResult(params) => {
-                return self.handle_msg_uplink_result(request.id, params)
+            Method::MeshCollect(params) => {
+                return self.handle_mesh_payload(request.id, params, false)
+            }
+            Method::PeersEnrollReset(params) => {
+                return self.handle_peers_enroll_reset(request.id, params)
+            }
+            Method::PeersEnrollment(_) => return self.handle_peers_enrollment(request.id),
+            Method::OwnerPolicyShow(params) => {
+                return self.handle_owner_policy_show(request.id, params)
+            }
+            Method::OwnerPolicyAdopt(params) => {
+                return self.handle_owner_policy_adopt(request.id, params)
             }
             Method::AgentRead(params) => return self.handle_agent_read(request.id, params),
             Method::AgentHistory(params) => return self.handle_agent_history(request.id, params),
             Method::AgentResult(params) => return self.handle_agent_result(request.id, params),
+            Method::PaneSubmit(params) => return self.handle_pane_submit(request.id, params),
             Method::AgentSend(params) => return self.handle_agent_send(request.id, params),
             Method::PaneSplit(params) => return self.handle_pane_split(request.id, params),
             Method::PaneMove(params) => return self.handle_pane_move(request.id, params),
@@ -1414,12 +1890,25 @@ impl App {
             Method::PaneReleaseAgent(params) => {
                 return self.handle_pane_release_agent(request.id, params);
             }
-            Method::PaneSendText(params) => return self.handle_pane_send_text(request.id, params),
-            Method::PaneSendInput(params) => {
+            Method::PaneSendText(params) | Method::PaneWriteText(params) => {
+                return self.handle_pane_send_text(request.id, params)
+            }
+            Method::PaneSendInput(params) | Method::PaneWriteInput(params) => {
                 return self.handle_pane_send_input(request.id, params)
             }
             Method::PaneClose(target) => return self.handle_pane_close(request.id, target),
-            Method::PaneSendKeys(params) => return self.handle_pane_send_keys(request.id, params),
+            Method::PaneStashShow(target) => {
+                return self.handle_pane_stash_show(request.id, target)
+            }
+            Method::PaneStashRestore(target) => {
+                return self.handle_pane_stash_restore(request.id, target)
+            }
+            Method::PaneResolveCodexLock(params) => {
+                return self.handle_resolve_codex_lock(request.id, params)
+            }
+            Method::PaneSendKeys(params) | Method::PaneWriteKeys(params) => {
+                return self.handle_pane_send_keys(request.id, params)
+            }
             Method::PaneArmSelfCompact(params) => {
                 return self.handle_pane_arm_self_compact(request.id, params);
             }
@@ -1720,6 +2209,9 @@ mod tests {
                 peer: "kiln".into(),
                 stream_error: None,
                 result: Ok(crate::peers::PeerSummaryPayload {
+                    structured_agents: Vec::new(),
+                    node_id: None,
+                    outbound_pending: false,
                     host: "kiln-host".into(),
                     version: Some("0.6.8".into()),
                     protocol: Some(crate::protocol::PROTOCOL_VERSION),
@@ -1879,6 +2371,9 @@ mod tests {
                 crate::peers::PeerSummaryFetch {
                     peer: "atlas".into(),
                     result: Ok(crate::peers::PeerSummaryPayload {
+                        structured_agents: Vec::new(),
+                        node_id: None,
+                        outbound_pending: false,
                         host: "atlas".into(),
                         version: None,
                         protocol: None,
@@ -1942,6 +2437,9 @@ mod tests {
                 peer: "kiln".into(),
                 stream_error: None,
                 result: Ok(crate::peers::PeerSummaryPayload {
+                    structured_agents: Vec::new(),
+                    node_id: None,
+                    outbound_pending: false,
                     host: "kiln-host".into(),
                     version: None,
                     protocol: None,
@@ -2070,7 +2568,7 @@ mod tests {
         terminal.detected_agent = Some(Agent::Claude);
         // Exactly what `flock_agent_start` does when the calling model supplies
         // one: `agent_name` outranks the detected harness in `pane_details`.
-        terminal.set_agent_name("researcher".into());
+        terminal.set_agent_name("researcher".into()).unwrap();
         terminal.state = AgentState::Working;
 
         let response = app.handle_peers_summary("req_peers".into());
@@ -2113,11 +2611,90 @@ mod tests {
             .terminals
             .get_mut(&terminal_id)
             .unwrap()
-            .set_agent_name("researcher".into());
+            .set_agent_name("researcher".into())
+            .unwrap();
 
         let response = app.handle_peers_summary("req_peers".into());
         let value: serde_json::Value = serde_json::from_str(&response).unwrap();
         assert_eq!(value["result"]["workspaces"][0]["agent"], "researcher");
+    }
+
+    #[tokio::test]
+    async fn codex_session_report_retains_fork_path_without_changing_resume_id() {
+        let mut app = notification_test_app();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("segment")];
+        app.state.ensure_test_terminals();
+        let pane = app.state.workspaces[0].tabs[0].root_pane;
+        let id = app.state.workspaces[0].terminal_id(pane).cloned().unwrap();
+        app.state.terminals.get_mut(&id).unwrap().detected_agent = Some(Agent::Codex);
+        let route = app.public_pane_id(0, pane).unwrap();
+        let root =
+            crate::structured::launch::SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+        let path = root
+            .path()
+            .join("physical.jsonl")
+            .to_string_lossy()
+            .into_owned();
+        for (seq, thread, source) in [(1, "original", "startup"), (2, "child", "fork")] {
+            let request = serde_json::from_value(serde_json::json!({
+                "id":"report", "method":"pane.report_agent_session", "params":{
+                    "pane_id":route,"source":"flock:codex","agent":"codex","seq":seq,
+                    "agent_session_id":thread,"agent_session_path":path,"session_start_source":source
+                }
+            })).unwrap();
+            let response = app.handle_api_request(request);
+            assert!(!response.contains("\"error\""), "{response}");
+            let terminal = &app.state.terminals[&id];
+            let report = terminal.codex_session_start.as_ref().unwrap();
+            assert_eq!(report.thread, thread);
+            assert_eq!(report.source.as_deref(), Some(source));
+            assert_eq!(report.transcript_path.as_deref(), Some(path.as_str()));
+            assert_eq!(
+                terminal
+                    .persisted_agent_session
+                    .as_ref()
+                    .unwrap()
+                    .session_ref
+                    .value,
+                thread
+            );
+            assert_eq!(
+                terminal
+                    .persisted_agent_session
+                    .as_ref()
+                    .unwrap()
+                    .session_ref
+                    .kind,
+                crate::agent_resume::AgentSessionRefKind::Id
+            );
+        }
+        assert_eq!(
+            crate::agent_resume::normalize_session_start_source("claude", Some("fork".into())),
+            None
+        );
+        // An older hook cannot overwrite the newer report or its path.
+        let response = app.handle_pane_report_agent_session(
+            "stale".into(),
+            crate::api::schema::PaneReportAgentSessionParams {
+                rebind_agent_id: None,
+                pane_id: route,
+                source: "flock:codex".into(),
+                agent: "codex".into(),
+                seq: Some(1),
+                agent_session_id: Some("original".into()),
+                agent_session_path: None,
+                session_start_source: Some("fork".into()),
+            },
+        );
+        assert!(!response.contains("\"error\""));
+        assert_eq!(
+            app.state.terminals[&id]
+                .codex_session_start
+                .as_ref()
+                .unwrap()
+                .thread,
+            "child"
+        );
     }
 
     fn notification_test_app() -> App {
@@ -2217,7 +2794,7 @@ mod tests {
 
         let published: Vec<crate::api::schema::EventEnvelope> = app
             .event_hub
-            .events_after(0)
+            .ring_snapshot_after(0)
             .into_iter()
             .map(|(_, envelope)| envelope)
             .collect();
@@ -2475,9 +3052,14 @@ mod tests {
             agent: Some(Agent::Codex),
             state: AgentState::Working,
             activity: None,
+            provider_limit: None,
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
+            settled_with_background_shells: false,
+            background_tasks: None,
+            needs_human: None,
+            question: None,
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });
@@ -2486,9 +3068,14 @@ mod tests {
             agent: Some(Agent::Codex),
             state: AgentState::Idle,
             activity: None,
+            provider_limit: None,
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
+            settled_with_background_shells: false,
+            background_tasks: None,
+            needs_human: None,
+            question: None,
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });
@@ -2553,23 +3140,29 @@ mod tests {
                 agent: Some(Agent::Codex),
                 state,
                 activity: None,
+                provider_limit: None,
                 visible_blocker: false,
                 visible_idle: false,
                 visible_working: false,
+                settled_with_background_shells: false,
+                background_tasks: None,
+                needs_human: None,
+                question: None,
                 process_exited: false,
                 observed_at: std::time::Instant::now(),
             });
         }
 
-        let reports_done = |app: &App| {
-            app.event_hub.events_after(0).iter().any(|(_, event)| {
+        let reports_done =
+            |app: &App| {
+                app.event_hub.ring_snapshot_after(0).iter().any(|(_, event)| {
                 matches!(
                     &event.data,
                     crate::api::schema::EventData::PaneAgentStatusChanged { agent_status, .. }
                         if *agent_status == crate::api::schema::AgentStatus::Done
                 )
             })
-        };
+            };
         // At the deferring edge the pane is Idle but `seen` is still true → it
         // reports `Idle`, never `Done`.
         assert!(
@@ -2622,7 +3215,7 @@ mod tests {
             .get_mut(&terminal_id)
             .expect("test terminal should exist");
         terminal.respawn_shell_on_exit = true;
-        terminal.set_agent_name("codex".into());
+        terminal.set_agent_name("codex".into()).unwrap();
         terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
             source: "flock:codex".into(),
             agent: "codex".into(),
@@ -2643,7 +3236,7 @@ mod tests {
             .expect("terminal should survive respawn");
         assert!(!terminal.respawn_shell_on_exit);
         assert!(terminal.persisted_agent_session.is_none());
-        assert!(terminal.agent_name.is_none());
+        assert!(terminal.agent_name().is_none());
 
         for (_, runtime) in app.terminal_runtimes.drain() {
             runtime.shutdown();
@@ -2681,9 +3274,14 @@ mod tests {
             agent: Some(Agent::Codex),
             state: AgentState::Working,
             activity: None,
+            provider_limit: None,
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
+            settled_with_background_shells: false,
+            background_tasks: None,
+            needs_human: None,
+            question: None,
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });
@@ -2703,9 +3301,14 @@ mod tests {
             agent: Some(Agent::Codex),
             state: AgentState::Idle,
             activity: None,
+            provider_limit: None,
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
+            settled_with_background_shells: false,
+            background_tasks: None,
+            needs_human: None,
+            question: None,
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });
@@ -2728,13 +3331,19 @@ mod tests {
         app.state.workspaces = vec![crate::workspace::Workspace::test_new("wt")];
         let id = app.state.workspaces[0].id.clone();
 
-        app.handle_internal_event(crate::events::AppEvent::PrStatesUpdated(Ok(vec![(
-            id,
-            Some(crate::worktree::PrStateInfo {
-                state: crate::worktree::PrState::Merged,
-                number: 6,
-            }),
-        )])));
+        app.handle_internal_event(crate::events::AppEvent::PrStatesUpdated(Ok(
+            crate::events::PrPollRound {
+                states: vec![(
+                    id,
+                    Some(crate::worktree::PrStateInfo {
+                        state: crate::worktree::PrState::Merged,
+                        number: 6,
+                    }),
+                )],
+                observed: Vec::new(),
+                seed: None,
+            },
+        )));
 
         assert_eq!(
             app.state.workspaces[0].pr_state(),
@@ -2743,6 +3352,72 @@ mod tests {
                 number: 6,
             })
         );
+    }
+
+    /// #1020 acceptance: one `pr.ci_completed` per head SHA and one
+    /// `pr.merged` per PR in the durable log, across repeated rounds AND
+    /// server restarts on the same log. A PR the first round after a start
+    /// already sees merged is history: its merge and its CI are seeded
+    /// silently.
+    #[tokio::test]
+    async fn pr_events_persist_once_across_rounds_and_a_restart() {
+        use crate::api::schema::{EventData, EventKind};
+        use crate::worktree::PrState;
+        let dir = std::env::temp_dir().join(format!("flock-pr-events-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let log = dir.join("event-log.jsonl");
+        let observe = |number, state| crate::pr_poll::PrObservation {
+            repo: "o/n".into(),
+            branch: format!("feat-{number}"),
+            info: crate::worktree::PrStateInfo { state, number },
+            head_sha: Some("abc".into()),
+            ci: Some(crate::pr_poll::CiConclusion {
+                conclusion: "failure".into(),
+                failed_checks: vec!["test".into()],
+            }),
+        };
+        // One server start per entry; each start runs its rounds in order.
+        let starts: [&[(u64, PrState)]; 3] = [
+            &[(7, PrState::Open), (7, PrState::Open)],
+            &[(7, PrState::Open), (7, PrState::Merged)],
+            &[(8, PrState::Merged), (8, PrState::Merged)],
+        ];
+        for rounds in starts {
+            let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+            let hub = crate::api::EventHub::with_persistence(log.clone());
+            let mut app = App::new(
+                &crate::config::Config::default(),
+                true,
+                None,
+                api_rx,
+                hub.clone(),
+            );
+            for &(number, state) in rounds {
+                app.handle_internal_event(crate::events::AppEvent::PrStatesUpdated(Ok(
+                    crate::events::PrPollRound {
+                        states: Vec::new(),
+                        observed: vec![observe(number, state)],
+                        seed: Some(crate::pr_poll::logged_pr_events(&hub)),
+                    },
+                )));
+            }
+        }
+        let events: Vec<(EventKind, u64)> = crate::api::EventHub::with_persistence(log)
+            .persisted_events_after(0)
+            .into_iter()
+            .filter_map(|(_, _, envelope)| match envelope.data {
+                EventData::PrCiCompleted { pr, .. } | EventData::PrMerged { pr, .. } => {
+                    Some((envelope.event, pr))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            events,
+            vec![(EventKind::PrCiCompleted, 7), (EventKind::PrMerged, 7)],
+            "#8 had ended before its start: neither its merge nor its CI is announced"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The 120s PR poll covers ALL workspaces with a branch (#42): linked
@@ -2853,18 +3528,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_never_succeeded_git_refresh_reads_broken_not_ok() {
-        // The empty-poller-must-not-render-healthy rule (#300). A brand-new
-        // server hasn't refreshed yet — the answer to "when did it last
-        // succeed?" is unknown, and the status is Broken.
+    async fn git_refresh_without_a_viewer_is_idle_even_after_eight_hours() {
+        let (_, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(&Default::default(), true, None, rx, Default::default());
+        app.state.app_client_attached = false;
+        app.git_refresh_health
+            .mark_success(Instant::now() - Duration::from_secs(29_656));
+        let row = &peers_summary_pollers(&mut app)["git_refresh"];
+        assert_eq!(row["status"], "idle");
+        assert_eq!(row["reason"], "no_viewer");
+        assert_eq!(row["consecutive_failures"], 0);
+        assert_eq!(row["in_flight"], false);
+        assert_eq!(row["skipped_rounds"], 0);
+    }
+
+    #[tokio::test]
+    async fn git_refresh_without_workspaces_has_its_own_idle_reason() {
+        let (_, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(&Default::default(), true, None, rx, Default::default());
+        let row = &peers_summary_pollers(&mut app)["git_refresh"];
+        assert_eq!(row["status"], "idle");
+        assert_eq!(row["reason"], "no_workspaces");
+    }
+
+    #[tokio::test]
+    async fn git_refresh_without_an_eligible_cwd_reports_its_gate() {
+        let (_, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(&Default::default(), true, None, rx, Default::default());
+        let mut workspace = crate::workspace::Workspace::test_new("no-git-cwd");
+        workspace.identity_cwd.clear();
+        workspace.tabs.clear();
+        app.state.workspaces.push(workspace);
+        app.start_git_status_refresh_if_due(Instant::now());
+        let row = &peers_summary_pollers(&mut app)["git_refresh"];
+        assert_eq!(row["status"], "idle");
+        assert_eq!(row["reason"], "no_eligible_workspaces");
+        assert_eq!(row["in_flight"], false);
+    }
+
+    #[tokio::test]
+    async fn a_never_succeeded_gated_git_refresh_reads_idle() {
+        // #1722: no workspace is an idle gate, not evidence of a failed round.
+        // Preserve unknown freshness instead of inventing a successful refresh.
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let config = crate::config::Config::default();
         let mut app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
 
         let pollers = peers_summary_pollers(&mut app);
         assert_eq!(
-            pollers["git_refresh"]["status"], "broken",
-            "a poller that has never succeeded must not render as healthy: {pollers}"
+            pollers["git_refresh"]["status"], "idle",
+            "an empty poller must identify its idle gate: {pollers}"
         );
         assert!(
             pollers["git_refresh"]["last_success_age_secs"].is_null(),
@@ -2904,6 +3617,9 @@ mod tests {
         let config = crate::config::Config::default();
         let mut app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
 
+        app.state
+            .workspaces
+            .push(crate::workspace::Workspace::test_new("git-health"));
         let now = std::time::Instant::now();
         app.git_refresh_health
             .mark_success(now - std::time::Duration::from_secs(5));
@@ -2921,6 +3637,35 @@ mod tests {
             pollers["git_refresh"]["last_error"], "timeout",
             "the classified error kind is on the wire, never a free-text message: {pollers}"
         );
+    }
+
+    #[tokio::test]
+    async fn stale_git_refresh_without_failure_is_pending_not_broken() {
+        let (_, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(&Default::default(), true, None, rx, Default::default());
+        app.state
+            .workspaces
+            .push(crate::workspace::Workspace::test_new("git-health"));
+        app.git_refresh_health
+            .mark_success(Instant::now() - Duration::from_secs(29_656));
+        let row = &peers_summary_pollers(&mut app)["git_refresh"];
+        assert_eq!(row["status"], "degraded");
+        assert_eq!(row["reason"], "awaiting_refresh");
+        assert!(row["last_error"].is_null());
+    }
+
+    #[tokio::test]
+    async fn stuck_git_refresh_is_broken_with_a_typed_error_even_without_viewers() {
+        let (_, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(&Default::default(), true, None, rx, Default::default());
+        app.state.app_client_attached = false;
+        app.git_refresh_health.mark_success(Instant::now());
+        app.git_refresh_health
+            .mark_started(Instant::now() - Duration::from_secs(61));
+        let row = &peers_summary_pollers(&mut app)["git_refresh"];
+        assert_eq!(row["status"], "broken");
+        assert_eq!(row["last_error"], "round_stalled");
+        assert!(row["reason"].is_null());
     }
 
     #[tokio::test]
@@ -2988,6 +3733,9 @@ mod tests {
                 peer: "kiln".into(),
                 stream_error: None,
                 result: Ok(crate::peers::PeerSummaryPayload {
+                    structured_agents: Vec::new(),
+                    node_id: None,
+                    outbound_pending: false,
                     host: "kiln-host".into(),
                     version: Some("0.6.8".into()),
                     protocol: Some(crate::protocol::PROTOCOL_VERSION),

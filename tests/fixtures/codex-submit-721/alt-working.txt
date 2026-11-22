@@ -1,0 +1,22 @@
+│                                                    │
+│ See full release notes:                            │
+│ https://github.com/openai/codex/releases/latest    │
+╰────────────────────────────────────────────────────╯
+
+
+  >_ OpenAI Codex (v0.160.1)
+     /fixture/codex-721/work
+
+  A new prompt awakens.
+
+
+› Reply exactly ALT_CAPTURE_721. Do not use tools.
+
+
+• Working (0s • esc to interrupt)
+
+
+› Ask Codex to do anything
+
+  GPT-6.1-Sol default · /fixture/codex-721/wo…
+  ? for shortcuts

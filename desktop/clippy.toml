@@ -1,0 +1,11 @@
+# desktop/ is its own crate under flk's tree, and clippy reads the nearest
+# clippy.toml only, so this file replaces the root one for it. It keeps the
+# root's settings that apply here:
+too-many-arguments-threshold = 11
+allow-print-in-tests = true
+
+# It leaves out the root's `disallowed-methods`. That rule funnels every
+# subprocess through flk's `crate::process::TracedCommand` (logging redesign
+# PR-3), which this crate cannot link: it is never linked with flk (#1601).
+# Its one subprocess, starting `flk server` (src/mint.rs), is visible in flk's
+# own log once the server starts.

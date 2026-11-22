@@ -1,0 +1,237 @@
+# guardrails-ok(ci-shim): host-bound build/test legs of ci.yml use zig 0.15 + macos-15 SDK constraints; lint and archived tests run in the dev shell through `just` recipes
+name: CI leg
+
+# One platform's test run, split across parallel jobs (#991). ci.yml calls this
+# once per platform and reports `check (<leg>)` from the result, so a red
+# shard on one platform never fails the other platform's required check.
+#
+#   lint    fmt, clippy and rustdoc, from the start, alongside build
+#   build   compile every test binary once into a nextest archive, and fail
+#           unless the shards partition the leg's tests exactly
+#   test    one job per shard of .config/ci-shards.toml: the serial ones
+#           run their serial-pty binaries one at a time, as the single job
+#           used to, and the others run everything else in parallel
+#
+# Shards run the archive rather than rebuilding, which is what makes a shard
+# cost minutes of tests and not minutes of compile.
+
+on:
+  workflow_call:
+    inputs:
+      leg:
+        description: Runner image, and the leg's key in .config/ci-shards.toml
+        required: true
+        type: string
+      run-tests:
+        description: Run full test shards; macOS PR builds also run native suspend timers
+        type: boolean
+        default: true
+    outputs:
+      shards:
+        description: JSON list of the test shards this leg builds (expected junit set)
+        value: ${{ jobs.build.outputs.shards }}
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ${{ inputs.leg }}
+    # Cold macOS lint measured 12m56s on #2989 after removing unused tool
+    # builds. 28m is about twice that initial upper sample, including setup
+    # and rustdoc. Recheck the week-long p95 after landing. Linux keeps 30m.
+    timeout-minutes: ${{ inputs.leg == 'macos-15' && 28 || 30 }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31.11.3
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            always-allow-substitutes = true
+
+      - name: Restore Nix store
+        uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7.0.2
+        with:
+          primary-key: nix-v1-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**') }}
+          restore-prefixes-first-match: nix-v1-${{ runner.os }}-
+          save: ${{ github.ref == 'refs/heads/dev' }}
+          gc-max-store-size-linux: 2G
+          gc-max-store-size-macos: 2G
+
+      # Both platforms retain every lint target and feature combination.
+      # macOS additionally checks its cfg-selected implementation and tests,
+      # which Linux cannot compile. The shell omits only unused nextest and
+      # patched sccache, whose source builds added 13–18 minutes (#2970).
+      - name: Lint in the dev shell
+        run: nix develop .#ci-lint -c just lint
+
+      - name: Check Rust documentation
+        run: nix develop .#ci-lint -c just doc-check
+
+  build:
+    name: build
+    runs-on: ${{ inputs.leg }}
+    timeout-minutes: 30
+    outputs:
+      shards: ${{ steps.archive.outputs.shards }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Read nextest version
+        id: nextest-version
+        shell: bash
+        run: |
+          version="$(python3 scripts/nextest_version.py)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust tools
+        uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2
+        with:
+          tool: just,cargo-nextest@${{ steps.nextest-version.outputs.version }}
+
+      # Pinned to 0.15.2, and the macOS leg to macos-15 rather than
+      # macos-latest: the vendored libghostty-vt zig build cannot link against
+      # the macOS 26 SDK (see ci.yml).
+      - name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.15.2
+          use-cache: false
+
+      # setup-zig's own cache adds a run ID. Reuse its directory and old
+      # dev entries, but save only one key per compiler/source generation.
+      - name: Restore Zig build cache
+        id: zig-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ github.workspace }}/.zig-cache
+          key: setup-zig-cache-v2-${{ github.job }}-zig-${{ runner.arch == 'X64' && 'x86_64' || 'aarch64' }}-${{ runner.os == 'Linux' && 'linux' || 'macos' }}-0.15.2--dev-${{ hashFiles('vendor/libghostty-vt/**', 'build.rs') }}
+          restore-keys: setup-zig-cache-v2-${{ github.job }}-zig-${{ runner.arch == 'X64' && 'x86_64' || 'aarch64' }}-${{ runner.os == 'Linux' && 'linux' || 'macos' }}-0.15.2--
+
+      - name: Install macOS build tools
+        if: runner.os == 'macOS'
+        run: brew install cmake ninja
+
+      - name: Restore cargo cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/dev' }}
+          cache-bin: false
+
+      - name: Build test archive and verify the shard partition
+        id: archive
+        run: just ci-archive '${{ inputs.leg }}' nextest-archive.tar.zst
+
+      # Exercise native continuous-time timers even when PR policy skips the full matrix.
+      - name: Check native macOS suspend timers
+        if: inputs.leg == 'macos-15'
+        run: cargo nextest run --archive-file nextest-archive.tar.zst -E 'binary(=flk) & test(platform::suspend_clock::tests::)' --retries 0
+
+      # Reuse the build toolchain and cache for both GUI feature variants.
+      # The required Linux leg includes this result; macOS PR policy is unchanged.
+      - name: Check GUI embedding and feature exclusion
+        if: runner.os == 'Linux' && inputs.run-tests
+        run: just gui-check
+
+      - name: Save Zig build cache from dev
+        if: github.ref == 'refs/heads/dev' && steps.zig-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ github.workspace }}/.zig-cache
+          key: ${{ steps.zig-cache.outputs.cache-primary-key }}
+
+      - name: Upload test archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: nextest-archive-${{ inputs.leg }}
+          path: nextest-archive.tar.zst
+          retention-days: 1
+          # Already zstd.
+          compression-level: 0
+
+  test:
+    # Job conditions run before matrix expansion, so false schedules no shards.
+    if: ${{ inputs.run-tests }}
+    name: ${{ matrix.shard.name }} (${{ matrix.shard.label }})
+    needs: build
+    runs-on: ${{ inputs.leg }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.build.outputs.shards) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # Archived binaries still spawn dev-shell tools (including Bun for the
+      # real client wire fixture). Use the same runtime on every platform.
+      - name: Install Nix
+        uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31.11.3
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            always-allow-substitutes = true
+
+      - name: Restore Nix store
+        uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7.0.2
+        with:
+          primary-key: nix-v1-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**') }}
+          restore-prefixes-first-match: nix-v1-${{ runner.os }}-
+          save: ${{ github.ref == 'refs/heads/dev' }}
+          gc-max-store-size-linux: 2G
+          gc-max-store-size-macos: 2G
+
+      - name: Download test archive
+        uses: actions/download-artifact@v8
+        with:
+          name: nextest-archive-${{ inputs.leg }}
+
+      # Archive consumers need runtime tools, not source-built nextest/sccache.
+      # Use the same pinned prebuilt nextest as the archive producer (#3024).
+      - name: Read nextest version
+        id: nextest-version
+        shell: bash
+        run: |
+          version="$(python3 scripts/nextest_version.py)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust tools
+        uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2
+        with:
+          tool: just,cargo-nextest@${{ steps.nextest-version.outputs.version }}
+
+      - name: Run shard
+        # The Nix installer sets TMPDIR under HOME on the Linux runner.
+        # Test state must stay outside HOME, including fallback CLI sandboxes.
+        env:
+          TMPDIR: /tmp
+        run: nix develop .#ci-lint -c just ci-shard '${{ inputs.leg }}' '${{ matrix.shard.name }}' nextest-archive.tar.zst
+
+      - name: Summarize
+        continue-on-error: true
+        if: always()
+        run: python3 scripts/ci_shards.py summary --title '${{ matrix.shard.name }} (${{ inputs.leg }})' '${{ matrix.shard.name }}=target/nextest/ci/junit.xml' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload JUnit report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: junit-${{ inputs.leg }}-${{ matrix.shard.name }}
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: ignore
+          overwrite: true

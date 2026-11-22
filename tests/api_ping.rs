@@ -1,4 +1,5 @@
 mod support;
+use support::composer::Composer;
 
 use std::fs;
 use std::io::{Read, Write};
@@ -90,17 +91,6 @@ fn test_lock() -> MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn wait_for_socket(path: &Path, timeout: Duration) {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if path.exists() && UnixStream::connect(path).is_ok() {
-            return;
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
-    panic!("socket did not appear at {}", path.display());
-}
-
 fn wait_for_path(path: &Path, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
@@ -147,11 +137,13 @@ fn spawn_flock_with_options(
     path_override: Option<&Path>,
     shell: &str,
 ) -> SpawnedFlock {
-    fs::create_dir_all(config_home.join("flock")).unwrap();
+    fs::create_dir_all(config_home.join(support::paths::app_dir_name())).unwrap();
     fs::create_dir_all(runtime_dir).unwrap();
     register_runtime_dir(runtime_dir);
     fs::write(
-        config_home.join("flock/config.toml"),
+        config_home
+            .join(support::paths::app_dir_name())
+            .join("config.toml"),
         "onboarding = false\n",
     )
     .unwrap();
@@ -167,8 +159,9 @@ fn spawn_flock_with_options(
 
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flk"));
     cmd.arg("server");
-    cmd.env("XDG_CONFIG_HOME", config_home);
-    cmd.env("XDG_RUNTIME_DIR", runtime_dir);
+    for (key, value) in support::environment::isolated_env(config_home, runtime_dir) {
+        cmd.env(key, value);
+    }
     cmd.env("FLOCK_SOCKET_PATH", socket_path);
     cmd.env_remove("FLOCK_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", shell);
@@ -177,8 +170,11 @@ fn spawn_flock_with_options(
         cmd.env("PATH", path);
     }
 
-    let child = pair.slave.spawn_command(cmd).unwrap();
+    support::environment::assert_pty_isolated(&cmd);
+    let child = support::environment::spawn_pty(pair.slave.as_ref(), cmd).unwrap();
     register_spawned_flock_pid(child.process_id());
+    drop(pair.slave);
+    support::readiness::wait_for_server(&*pair.master, socket_path);
 
     SpawnedFlock {
         _master: pair.master,
@@ -189,6 +185,7 @@ fn spawn_flock_with_options(
 struct JsonLineReader {
     stream: UnixStream,
     buf: Vec<u8>,
+    pending_events: Vec<serde_json::Value>,
 }
 
 impl JsonLineReader {
@@ -196,6 +193,7 @@ impl JsonLineReader {
         Self {
             stream: UnixStream::connect(socket_path).unwrap(),
             buf: Vec::new(),
+            pending_events: Vec::new(),
         }
     }
 
@@ -247,7 +245,7 @@ impl JsonLineReader {
 // the harness spawning flock, which is the funnel's own subject.
 #[allow(clippy::disallowed_methods)]
 fn run_flk(socket_path: &Path, args: &[&str]) -> std::process::Output {
-    std::process::Command::new(env!("CARGO_BIN_EXE_flk"))
+    support::environment::Command::new(env!("CARGO_BIN_EXE_flk"))
         .args(args)
         .env("FLOCK_SOCKET_PATH", socket_path)
         .env_remove("FLOCK_CLIENT_SOCKET_PATH")
@@ -307,14 +305,72 @@ fn wait_for_event_matching<F>(
 where
     F: FnMut(&serde_json::Value) -> bool,
 {
+    // Creation and focus events can interleave while the server drains work.
+    // Preserve other subscribed events for the test's later assertions.
+    if let Some(index) = reader
+        .pending_events
+        .iter()
+        .position(|value| value["event"] == expected && matches(value))
+    {
+        return reader.pending_events.remove(index);
+    }
     let deadline = Instant::now() + timeout;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
-        let value = reader.read_json_line(remaining.max(Duration::from_millis(1)));
+        let value = reader
+            .try_read_json_line(remaining.max(Duration::from_millis(1)))
+            .unwrap_or_else(|| panic!("timed out waiting for {expected}"));
         if value["event"] == expected && matches(&value) {
             return value;
         }
+        reader.pending_events.push(value);
     }
+}
+
+#[test]
+fn event_wait_preserves_interleaved_creation_events() {
+    let (stream, mut sender) = UnixStream::pair().unwrap();
+    sender
+        .write_all(b"{\"event\":\"tab_created\"}\n{\"event\":\"workspace_focused\"}\n")
+        .unwrap();
+    let mut reader = JsonLineReader {
+        stream,
+        buf: Vec::new(),
+        pending_events: Vec::new(),
+    };
+    let timeout = Duration::from_secs(1);
+    assert_eq!(
+        wait_for_event(&mut reader, "workspace_focused", timeout)["event"],
+        "workspace_focused"
+    );
+    assert_eq!(
+        wait_for_event(&mut reader, "tab_created", timeout)["event"],
+        "tab_created"
+    );
+}
+
+#[test]
+fn server_state_is_isolated_between_fixtures() {
+    let _lock = test_lock();
+    let first = unique_test_dir();
+    let second = unique_test_dir();
+    let mut servers = Vec::new();
+    for base in [&first, &second] {
+        let config = base.join("config");
+        let runtime = base.join("runtime");
+        let socket = runtime.join("flock.sock");
+        servers.push(spawn_flock(&config, &runtime, &socket));
+
+        let app = support::paths::app_dir_name();
+        wait_for_path(
+            &config.join("state").join(app).join("mesh-mail.sqlite"),
+            Duration::from_secs(5),
+        );
+        assert!(config.join("home").is_dir());
+    }
+    drop(servers);
+    cleanup_test_base(&first);
+    cleanup_test_base(&second);
 }
 
 #[test]
@@ -326,7 +382,6 @@ fn ping_over_socket_returns_version() {
     let socket_path = runtime_dir.join("flock.sock");
 
     let child = spawn_flock(&config_home, &runtime_dir, &socket_path);
-    wait_for_socket(&socket_path, Duration::from_secs(5));
 
     let value = send_request(
         &socket_path,
@@ -334,10 +389,142 @@ fn ping_over_socket_returns_version() {
     );
     assert_eq!(value["id"], "req_1");
     assert_eq!(value["result"]["type"], "pong");
+    assert_eq!(
+        value["result"]["capabilities"]["pane_input_write_ack"],
+        true
+    );
     assert_eq!(value["result"]["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(value["result"]["capabilities"]["events_live_start"], true);
     // Intentionally hardcoded so wire protocol bumps require updating this test.
     // Changing this value means old clients/servers are no longer compatible.
     assert_eq!(value["result"]["protocol"], support::PROTOCOL_VERSION);
+
+    cleanup_spawned_flock(child, base);
+}
+
+/// #1029: `flk events wait` returns the first matching durable event with its
+/// cursor, or exits 124, and `flk events read` filters by subject. Driven
+/// through the real binary against an isolated server, from the event's
+/// actual source (a socket `workspace.create`).
+#[test]
+fn events_wait_returns_the_matching_event_or_times_out() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("flock.sock");
+    let child = spawn_flock(&base.join("config"), &runtime_dir, &socket_path);
+
+    let quiet = run_flk(
+        &socket_path,
+        &[
+            "events",
+            "wait",
+            "--kinds",
+            "workspace.created",
+            "--timeout",
+            "300ms",
+        ],
+    );
+    assert_eq!(quiet.status.code(), Some(124), "{quiet:?}");
+
+    let head = run_flk(&socket_path, &["events", "read", "--json"]);
+    assert_eq!(head.status.code(), Some(0), "{head:?}");
+    let head: serde_json::Value = serde_json::from_slice(&head.stdout).unwrap();
+    let after = head["next_after"].as_u64().unwrap().to_string();
+    let waiter = {
+        let socket_path = socket_path.clone();
+        thread::spawn(move || {
+            run_flk(
+                &socket_path,
+                &[
+                    "events",
+                    "wait",
+                    "--kinds",
+                    "workspace_created",
+                    "--after",
+                    &after,
+                    "--timeout",
+                    "20s",
+                ],
+            )
+        })
+    };
+    let created = send_request(
+        &socket_path,
+        &format!(
+            r#"{{"id":"ev","method":"workspace.create","params":{{"cwd":"{}","focus":false}}}}"#,
+            base.display()
+        ),
+    );
+    let workspace_id = created["result"]["workspace"]["workspace_id"]
+        .as_str()
+        .unwrap();
+    let woke = waiter.join().unwrap();
+    assert_eq!(woke.status.code(), Some(0), "{woke:?}");
+    let event: serde_json::Value = serde_json::from_slice(&woke.stdout).unwrap();
+    assert_eq!(event["event"], "workspace_created");
+    assert!(event["seq"].as_u64().unwrap() > head["next_after"].as_u64().unwrap());
+
+    let read = run_flk(&socket_path, &["events", "read", "--subject", workspace_id]);
+    assert_eq!(read.status.code(), Some(0), "{read:?}");
+    let lines: Vec<serde_json::Value> = String::from_utf8_lossy(&read.stdout)
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(!lines.is_empty());
+    for line in &lines {
+        assert_eq!(line["data"]["workspace_id"], workspace_id, "{lines:?}");
+    }
+
+    cleanup_spawned_flock(child, base);
+}
+
+/// #1029: a wait with no `--after` starts at the log's head and is woken by an
+/// event that lands after it. The creates repeat until the waiter returns,
+/// because a create racing the waiter's head read is history, not news.
+#[test]
+fn events_wait_without_a_cursor_receives_a_live_event() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("flock.sock");
+    let child = spawn_flock(&base.join("config"), &runtime_dir, &socket_path);
+
+    let head = run_flk(&socket_path, &["events", "read", "--json"]);
+    let head: serde_json::Value = serde_json::from_slice(&head.stdout).unwrap();
+    let head = head["next_after"].as_u64().unwrap();
+    let waiter = {
+        let socket_path = socket_path.clone();
+        thread::spawn(move || {
+            run_flk(
+                &socket_path,
+                &[
+                    "events",
+                    "wait",
+                    "--kinds",
+                    "workspace_created",
+                    "--timeout",
+                    "20s",
+                ],
+            )
+        })
+    };
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !waiter.is_finished() && Instant::now() < deadline {
+        send_request(
+            &socket_path,
+            &format!(
+                r#"{{"id":"ev","method":"workspace.create","params":{{"cwd":"{}","focus":false}}}}"#,
+                base.display()
+            ),
+        );
+        thread::sleep(Duration::from_millis(300));
+    }
+    let woke = waiter.join().unwrap();
+    assert_eq!(woke.status.code(), Some(0), "{woke:?}");
+    let event: serde_json::Value = serde_json::from_slice(&woke.stdout).unwrap();
+    assert_eq!(event["event"], "workspace_created");
+    assert!(event["seq"].as_u64().unwrap() > head, "{event}");
 
     cleanup_spawned_flock(child, base);
 }
@@ -351,7 +538,6 @@ fn workspace_list_and_create_round_trip() {
     let socket_path = runtime_dir.join("flock.sock");
 
     let child = spawn_flock(&config_home, &runtime_dir, &socket_path);
-    wait_for_socket(&socket_path, Duration::from_secs(5));
 
     let empty = send_request(
         &socket_path,
@@ -452,7 +638,7 @@ fn workspace_list_and_create_round_trip() {
             pane_id
         ),
     );
-    assert_eq!(send_text["result"]["type"], "ok");
+    assert_eq!(send_text["result"]["type"], "paste");
 
     let send_enter = send_request(
         &socket_path,
@@ -491,6 +677,35 @@ fn workspace_list_and_create_round_trip() {
         .as_str()
         .unwrap()
         .contains("gamma"));
+
+    for text in [
+        "y",
+        "y",
+        "q",
+        "q",
+        "1",
+        "1",
+        "make test",
+        "make test",
+        &"wrapped words ".repeat(12),
+    ] {
+        let pasted = send_request(
+            &socket_path,
+            &serde_json::json!({
+                "id":"repeat", "method":"pane.send_text", "params":{"pane_id":pane_id,"text":text}
+            })
+            .to_string(),
+        );
+        assert_eq!(pasted["result"]["outcome"], "delivered", "{pasted}");
+        assert_eq!(
+            pasted["result"]["evidence"]["level"], "text_matched",
+            "{pasted}"
+        );
+    }
+    let cleared = send_request(&socket_path, &serde_json::json!({
+        "id":"clear_draft", "method":"pane.send_keys", "params":{"pane_id":pane_id,"keys":["C-c"]}
+    }).to_string());
+    assert_eq!(cleared["result"]["type"], "ok", "{cleared}");
 
     let send_input = send_request(
         &socket_path,
@@ -548,7 +763,6 @@ fn tab_methods_round_trip_over_socket() {
     let socket_path = runtime_dir.join("flock.sock");
 
     let child = spawn_flock(&config_home, &runtime_dir, &socket_path);
-    wait_for_socket(&socket_path, Duration::from_secs(5));
 
     let created = send_request(
         &socket_path,
@@ -682,8 +896,7 @@ fn pane_info_reports_foreground_cwd_without_changing_pane_cwd() {
     // this unwrapped on a missing field. Nothing below needs bash semantics:
     // the pane shell only has to accept a typed command line, and the work is
     // done by the `/bin/sh -c` it launches.
-    let child = spawn_flock_with_shell(&config_home, &runtime_dir, &socket_path, "/bin/sh");
-    wait_for_socket(&socket_path, Duration::from_secs(5));
+    let mut child = spawn_flock_with_shell(&config_home, &runtime_dir, &socket_path, "/bin/sh");
 
     let created = send_request(
         &socket_path,
@@ -697,14 +910,15 @@ fn pane_info_reports_foreground_cwd_without_changing_pane_cwd() {
         .unwrap()
         .to_string();
 
-    // `pwd > {cwd_marker}` is how the foreground process states its own
-    // directory. `/proc/<pid>/cwd` said the same thing but only exists on Linux,
-    // which is the whole reason this test used to be gated off macOS.
+    // Publish readiness only after pwd's redirection has closed: file existence
+    // alone does not prove its contents have been written. Builtin read then
+    // holds this shell in the foreground until teardown, without forking or
+    // execing a different process while the APIs sample its cwd.
     let command = format!(
-        "/bin/sh -c 'cd {} && touch {} && pwd > {} && sleep 30'",
+        "/bin/sh -c 'cd {} && pwd > {} && : > {} && read -r release'",
         foreground.display(),
-        marker.display(),
-        cwd_marker.display()
+        cwd_marker.display(),
+        marker.display()
     );
     let send_text = send_request(
         &socket_path,
@@ -718,7 +932,7 @@ fn pane_info_reports_foreground_cwd_without_changing_pane_cwd() {
         })
         .to_string(),
     );
-    assert_eq!(send_text["result"]["type"], "ok");
+    assert_eq!(send_text["result"]["type"], "paste");
     let send_enter = send_request(
         &socket_path,
         &format!(
@@ -727,24 +941,41 @@ fn pane_info_reports_foreground_cwd_without_changing_pane_cwd() {
         ),
     );
     assert_eq!(send_enter["result"]["type"], "ok");
-    wait_for_path(&marker, Duration::from_secs(5));
-    wait_for_path(&cwd_marker, Duration::from_secs(5));
-
-    // The foreground process is in `foreground`, by its own account. Compared
-    // with `assert_same_dir` because the shell reports the path as typed while
-    // the server reports it resolved, and on macOS `/tmp` is a symlink to
-    // `/private/tmp`.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    // The marker orders the shell's own cwd evidence before API sampling.
+    // The foreground group can still be changing, so wait for the actual API
+    // observation, bounded by the original deadline and server liveness.
+    let expected = foreground.canonicalize().unwrap();
+    let pane = loop {
+        assert!(
+            child.child.try_wait().unwrap().is_none(),
+            "server exited before foreground readiness"
+        );
+        let mut reader = JsonLineReader::connect(&socket_path);
+        reader.send_line(&format!(
+            r#"{{"id":"fg_pane","method":"pane.get","params":{{"pane_id":"{}"}}}}"#,
+            pane_id
+        ));
+        let pane = reader.read_json_line(deadline.saturating_duration_since(Instant::now()));
+        assert!(pane.get("error").is_none(), "pane.get failed: {pane}");
+        if marker.exists()
+            && pane["result"]["pane"]["foreground_cwd"]
+                .as_str()
+                .and_then(|cwd| Path::new(cwd).canonicalize().ok())
+                .as_ref()
+                == Some(&expected)
+        {
+            break pane;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "foreground cwd did not settle: {pane}"
+        );
+    };
     assert_same_dir(
         &serde_json::json!(fs::read_to_string(&cwd_marker).unwrap().trim()),
         &foreground,
-    );
-
-    let pane = send_request(
-        &socket_path,
-        &format!(
-            r#"{{"id":"fg_pane","method":"pane.get","params":{{"pane_id":"{}"}}}}"#,
-            pane_id
-        ),
     );
     assert_same_dir(&pane["result"]["pane"]["cwd"], &base);
     assert_same_dir(&pane["result"]["pane"]["foreground_cwd"], &foreground);
@@ -779,6 +1010,89 @@ fn pane_info_reports_foreground_cwd_without_changing_pane_cwd() {
 }
 
 #[test]
+fn opencode_provider_limit_screen_reaches_agent_get_and_recovers() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("flock.sock");
+    let bin_dir = base.join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let screen_path = base.join("screen");
+    fs::write(
+        &screen_path,
+        "■■⬝⬝⬝⬝⬝⬝ Free usage exceeded [retrying in 46m 15s attempt #1] esc interrupt",
+    )
+    .unwrap();
+    let fake = bin_dir.join("opencode");
+    fs::write(&fake, format!(
+        "#!/bin/sh\nlast=\nwhile :; do\nnow=$(cat '{}')\nif [ \"$now\" != \"$last\" ]; then\nprintf '\\033[2J\\033[H%s\\n' \"$now\"\nlast=$now\nfi\nsleep 0.1\ndone\n",
+        screen_path.display())).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+    let child = spawn_flock(&config_home, &runtime_dir, &socket_path);
+
+    let started = send_request(
+        &socket_path,
+        &serde_json::json!({
+            "id": "provider_start", "method": "agent.start", "params": {
+                "name": "quota", "cwd": base, "argv": [fake]
+            }
+        })
+        .to_string(),
+    );
+    assert_eq!(started["result"]["type"], "agent_started", "{started}");
+    let target = serde_json::json!({
+        "id": "provider_get", "method": "agent.get", "params": {"target": "quota"}
+    })
+    .to_string();
+    for (screen, expected) in [
+        (None, "blocked"),
+        (
+            Some("■■⬝⬝⬝⬝⬝⬝ Free usage exceeded [retrying in 46m 14s attempt #1] esc interrupt"),
+            "blocked",
+        ),
+        (Some("■■⬝⬝⬝⬝⬝⬝ esc interrupt"), "working"),
+        (Some("ctrl+p commands"), "idle"),
+    ] {
+        if let Some(screen) = screen {
+            fs::write(&screen_path, screen).unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let record = send_request(&socket_path, &target);
+            let agent = &record["result"]["agent"];
+            if agent["agent_status"] == expected
+                && (expected != "blocked"
+                    || screen.is_none()
+                    || agent["retry_after_ms"] == 2_774_000)
+            {
+                if expected == "blocked" {
+                    assert_eq!(agent["blocked_reason"], "provider_limit");
+                    let eta = if screen.is_some() {
+                        2_774_000
+                    } else {
+                        2_775_000
+                    };
+                    assert_eq!(agent["retry_after_ms"], eta);
+                    assert!(agent["custom_status"]
+                        .as_str()
+                        .unwrap()
+                        .contains("rate-limited, retry in 46m"));
+                } else {
+                    assert!(agent.get("blocked_reason").is_none());
+                    assert!(agent.get("retry_after_ms").is_none());
+                }
+                break;
+            }
+            assert!(Instant::now() < deadline, "expected {expected}: {record}");
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+    cleanup_spawned_flock(child, base);
+}
+
+#[test]
 fn agent_start_creates_named_terminal_over_socket() {
     let _lock = test_lock();
     let base = unique_test_dir();
@@ -787,7 +1101,6 @@ fn agent_start_creates_named_terminal_over_socket() {
     let socket_path = runtime_dir.join("flock.sock");
 
     let child = spawn_flock(&config_home, &runtime_dir, &socket_path);
-    wait_for_socket(&socket_path, Duration::from_secs(5));
 
     let started = send_request(
         &socket_path,
@@ -847,7 +1160,6 @@ fn agent_wait_ready_reports_booting_then_returns_on_the_first_real_status() {
     let socket_path = runtime_dir.join("flock.sock");
 
     let child = spawn_flock(&config_home, &runtime_dir, &socket_path);
-    wait_for_socket(&socket_path, Duration::from_secs(5));
 
     let started = send_request(
         &socket_path,
@@ -928,7 +1240,6 @@ fn agent_wait_ready_gives_up_immediately_when_the_agent_exits() {
     let socket_path = runtime_dir.join("flock.sock");
 
     let child = spawn_flock(&config_home, &runtime_dir, &socket_path);
-    wait_for_socket(&socket_path, Duration::from_secs(5));
 
     let started = send_request(
         &socket_path,
@@ -976,7 +1287,6 @@ fn agent_methods_round_trip_over_socket() {
     let socket_path = runtime_dir.join("flock.sock");
 
     let child = spawn_flock(&config_home, &runtime_dir, &socket_path);
-    wait_for_socket(&socket_path, Duration::from_secs(5));
 
     let created = send_request(
         &socket_path,
@@ -1062,11 +1372,20 @@ fn agent_methods_round_trip_over_socket() {
     let sent = send_request(
         &socket_path,
         &format!(
-            r#"{{"id":"agent_send","method":"agent.send","params":{{"target":"{}","text":"echo agent-send-ok\n"}}}}"#,
+            r#"{{"id":"agent_send","method":"agent.send","params":{{"target":"{}","text":"echo agent-send-ok"}}}}"#,
             terminal_id
         ),
     );
-    assert_eq!(sent["result"]["type"], "ok");
+    assert_eq!(sent["result"]["type"], "paste");
+    let enter = send_request(
+        &socket_path,
+        &serde_json::json!({
+            "id": "agent_enter", "method": "pane.send_keys",
+            "params": {"pane_id": pane_id, "keys": ["Enter"]}
+        })
+        .to_string(),
+    );
+    assert_eq!(enter["result"]["type"], "ok");
 
     let tab_created = send_request(
         &socket_path,
@@ -1140,7 +1459,6 @@ fn tab_create_with_no_focus_preserves_active_tab() {
     let socket_path = runtime_dir.join("flock.sock");
 
     let child = spawn_flock(&config_home, &runtime_dir, &socket_path);
-    wait_for_socket(&socket_path, Duration::from_secs(5));
 
     let created = send_request(
         &socket_path,
@@ -1221,7 +1539,6 @@ fn events_subscribe_streams_workspace_tab_and_agent_events() {
         &socket_path,
         Some(Path::new(&path_override)),
     );
-    wait_for_socket(&socket_path, Duration::from_secs(5));
 
     let mut reader = open_subscription(
         &socket_path,
@@ -1275,7 +1592,7 @@ fn events_subscribe_streams_workspace_tab_and_agent_events() {
             pane_id
         ),
     );
-    assert_eq!(send_pi["result"]["type"], "ok");
+    assert_eq!(send_pi["result"]["outcome"], "delivered", "{send_pi}");
     let send_enter = send_request(
         &socket_path,
         &format!(
@@ -1331,7 +1648,6 @@ fn events_subscribe_streams_pane_split_and_close_events() {
     let socket_path = runtime_dir.join("flock.sock");
 
     let child = spawn_flock(&config_home, &runtime_dir, &socket_path);
-    wait_for_socket(&socket_path, Duration::from_secs(5));
 
     let created = send_request(
         &socket_path,
@@ -1404,7 +1720,6 @@ fn events_subscribe_streams_tab_and_workspace_close_events() {
     let socket_path = runtime_dir.join("flock.sock");
 
     let child = spawn_flock(&config_home, &runtime_dir, &socket_path);
-    wait_for_socket(&socket_path, Duration::from_secs(5));
 
     let created = send_request(
         &socket_path,
@@ -1508,7 +1823,6 @@ fn pane_report_agent_updates_effective_state() {
         &socket_path,
         Some(Path::new(&path_override)),
     );
-    wait_for_socket(&socket_path, Duration::from_secs(5));
 
     let created = send_request(
         &socket_path,
@@ -1529,7 +1843,7 @@ fn pane_report_agent_updates_effective_state() {
             pane_id
         ),
     );
-    assert_eq!(send_pi["result"]["type"], "ok");
+    assert_eq!(send_pi["result"]["outcome"], "delivered", "{send_pi}");
     let send_enter = send_request(
         &socket_path,
         &format!(
@@ -1697,7 +2011,6 @@ fn pane_report_agent_accepts_unknown_agent_labels() {
     let runtime_dir = base.join("runtime");
     let socket_path = runtime_dir.join("flock.sock");
     let child = spawn_flock(&config_home, &runtime_dir, &socket_path);
-    wait_for_socket(&socket_path, Duration::from_secs(5));
 
     let created = send_request(
         &socket_path,
@@ -1769,7 +2082,6 @@ fn pane_release_agent_suppresses_reacquire_during_graceful_exit() {
         &socket_path,
         Some(Path::new(&path_override)),
     );
-    wait_for_socket(&socket_path, Duration::from_secs(5));
 
     let created = send_request(
         &socket_path,
@@ -1790,7 +2102,7 @@ fn pane_release_agent_suppresses_reacquire_during_graceful_exit() {
             pane_id
         ),
     );
-    assert_eq!(send_pi["result"]["type"], "ok");
+    assert_eq!(send_pi["result"]["outcome"], "delivered", "{send_pi}");
     let send_enter = send_request(
         &socket_path,
         &format!(
@@ -1908,7 +2220,6 @@ fn pane_clear_agent_authority_restores_fallback_state() {
         &socket_path,
         Some(Path::new(&path_override)),
     );
-    wait_for_socket(&socket_path, Duration::from_secs(5));
 
     let created = send_request(
         &socket_path,
@@ -1929,7 +2240,7 @@ fn pane_clear_agent_authority_restores_fallback_state() {
             pane_id
         ),
     );
-    assert_eq!(send_pi["result"]["type"], "ok");
+    assert_eq!(send_pi["result"]["outcome"], "delivered", "{send_pi}");
     let send_enter = send_request(
         &socket_path,
         &format!(
@@ -1986,7 +2297,7 @@ fn pane_clear_agent_authority_restores_fallback_state() {
             pane_id
         ),
     );
-    assert_eq!(cleared["result"]["type"], "ok");
+    assert_eq!(cleared["result"]["type"], "ok", "{cleared}");
 
     let pane = send_request(
         &socket_path,
@@ -2033,7 +2344,6 @@ fn events_subscribe_streams_output_and_agent_status_events() {
         &socket_path,
         Some(Path::new(&path_override)),
     );
-    wait_for_socket(&socket_path, Duration::from_secs(5));
 
     let created = send_request(
         &socket_path,
@@ -2072,7 +2382,7 @@ fn events_subscribe_streams_output_and_agent_status_events() {
             pane_id
         ),
     );
-    assert_eq!(send_text["result"]["type"], "ok");
+    assert_eq!(send_text["result"]["type"], "paste");
     let send_enter = send_request(
         &socket_path,
         &format!(
@@ -2101,7 +2411,7 @@ fn events_subscribe_streams_output_and_agent_status_events() {
             pane_id
         ),
     );
-    assert_eq!(send_pi["result"]["type"], "ok");
+    assert_eq!(send_pi["result"]["outcome"], "delivered", "{send_pi}");
     let send_enter = send_request(
         &socket_path,
         &format!(
@@ -2156,7 +2466,6 @@ fn pane_info_and_subscriptions_expose_done_agent_status() {
         &socket_path,
         Some(Path::new(&path_override)),
     );
-    wait_for_socket(&socket_path, Duration::from_secs(5));
 
     let created = send_request(
         &socket_path,
@@ -2201,7 +2510,7 @@ fn pane_info_and_subscriptions_expose_done_agent_status() {
             background_pane_id
         ),
     );
-    assert_eq!(send_pi["result"]["type"], "ok");
+    assert_eq!(send_pi["result"]["outcome"], "delivered", "{send_pi}");
     let send_enter = send_request(
         &socket_path,
         &format!(
@@ -2279,7 +2588,6 @@ fn metadata_status_subscription_filter_and_ttl_expiry_are_observable() {
     let socket_path = runtime_dir.join("flock.sock");
 
     let child = spawn_flock(&config_home, &runtime_dir, &socket_path);
-    wait_for_socket(&socket_path, Duration::from_secs(5));
 
     let created = send_request(
         &socket_path,
@@ -2363,4 +2671,457 @@ fn metadata_status_subscription_filter_and_ttl_expiry_are_observable() {
     assert!(expiry_event["data"]["custom_status"].is_null());
 
     cleanup_spawned_flock(child, base);
+}
+
+/// Socket -> PTY -> fake composer: text uses negotiated paste, submission is a
+/// separate negotiated key after the paste has settled.
+#[test]
+fn agent_send_and_pane_send_text_use_bracketed_paste() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    fs::create_dir_all(&base).unwrap();
+    let config_home = base.join("config");
+    for (key, _) in std::env::vars().filter(|(key, _)| key.starts_with("FLOCK_")) {
+        std::env::remove_var(key);
+    }
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("flock.sock");
+    let script = base.join("composer.py");
+    let shell = base.join("composer-shell");
+    let log = base.join("input.jsonl");
+    let gate = std::os::unix::net::UnixListener::bind(base.join("gate.sock")).unwrap();
+    fs::write(
+        &script,
+        r#"import json, os, sys, time, tty
+from pathlib import Path
+import socket
+gate = socket.socket(socket.AF_UNIX)
+gate.connect(str(Path(__file__).with_name('gate.sock')))
+gate.sendall(b'boot\n')
+assert gate.recv(1) == b'G'
+tty.setraw(0)
+log = Path(__file__).with_name('input.jsonl')
+os.write(1, b'\x1b[?2004h\x1b[>9uREADY')
+with log.open('w') as out:
+    while True:
+        data = os.read(0, 4096)
+        if not data:
+            break
+        out.write(json.dumps({'bytes': list(data), 'at': time.monotonic()}) + '\n')
+        out.flush()
+        if b'NOECHO' not in data:
+            os.write(1, data.replace(b'\x1b[200~', b'').replace(b'\x1b[201~', b'').replace(b'\n', b'\r\n'))
+"#,
+    )
+    .unwrap();
+    fs::write(
+        &shell,
+        format!("#!/bin/sh\nexec python3 '{}'\n", script.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&shell, fs::Permissions::from_mode(0o755)).unwrap();
+    let child = spawn_flock_with_shell(
+        &config_home,
+        &runtime_dir,
+        &socket_path,
+        shell.to_str().unwrap(),
+    );
+
+    let mut readiness = Composer::watch(&socket_path).unwrap();
+    let created = send_request(
+        &socket_path,
+        &serde_json::json!({
+            "id": "create", "method": "workspace.create",
+            "params": {"cwd": base, "focus": true}
+        })
+        .to_string(),
+    );
+    let pane = created["result"]["root_pane"]["pane_id"].as_str().unwrap();
+    readiness.wait(&gate, &socket_path, pane, false).unwrap();
+    let pasted = send_request(
+        &socket_path,
+        &serde_json::json!({
+            "id": "paste", "method": "agent.send", "params": {"target": pane, "text": "Ship it!\nworld!"}
+        })
+        .to_string(),
+    );
+    assert_eq!(pasted["result"]["outcome"], "delivered");
+    let read_log = || -> Vec<serde_json::Value> {
+        fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while read_log().is_empty() {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(10));
+    }
+    thread::sleep(Duration::from_millis(180));
+    let bytes = |rows: &[serde_json::Value]| -> Vec<u8> {
+        rows.iter()
+            .flat_map(|row| {
+                row["bytes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|byte| byte.as_u64().unwrap() as u8)
+            })
+            .collect()
+    };
+    assert_eq!(bytes(&read_log()), b"\x1b[200~Ship it!\nworld!\x1b[201~");
+    let plain_cli = run_flk(
+        &socket_path,
+        &["agent", "send", "--no-submit", pane, "cli!"],
+    );
+    assert!(
+        plain_cli.status.success(),
+        "status={:?} stdout={} stderr={}",
+        plain_cli.status.code(),
+        String::from_utf8_lossy(&plain_cli.stdout),
+        String::from_utf8_lossy(&plain_cli.stderr)
+    );
+    let pane_cli = run_flk(&socket_path, &["pane", "send-text", pane, "pane!\ntext"]);
+    assert!(pane_cli.status.success());
+    for command in [
+        &["agent", "send", "--no-submit"][..],
+        &["pane", "send-text"],
+    ] {
+        let failed = run_flk(&socket_path, &[command, &[pane, "NOECHO"]].concat());
+        assert_eq!(failed.status.code(), Some(8));
+        let response: serde_json::Value = serde_json::from_slice(&failed.stderr).unwrap();
+        assert_eq!(response["result"]["outcome"], "unconfirmed");
+        assert_eq!(response["result"]["reason"], "confirm_timeout");
+        assert_eq!(
+            response["result"]["evidence"]["before_digest"],
+            response["result"]["evidence"]["after_digest"]
+        );
+    }
+    let submitted = send_request(
+        &socket_path,
+        &serde_json::json!({
+            "id": "submit", "method": "agent.send",
+            "params": {"target": pane, "text": "socket prompt", "submit": true}
+        })
+        .to_string(),
+    );
+    assert!(
+        submitted.get("error").is_some(),
+        "unknown composers must refuse: {submitted}"
+    );
+    // A plain send is the guarded submit now (#995), and `--submit` is its
+    // alias: both refuse an unknown composer before typing.
+    for args in [
+        &["agent", "send", pane, "cli prompt"][..],
+        &["agent", "send", "--submit", pane, "cli prompt"],
+    ] {
+        let cli = run_flk(&socket_path, args);
+        assert!(!cli.status.success(), "unknown composers must refuse");
+    }
+    let expected =
+        b"\x1b[200~Ship it!\nworld!\x1b[201~\x1b[200~cli!\x1b[201~\x1b[200~pane!\ntext\x1b[201~\x1b[200~NOECHO\x1b[201~\x1b[200~NOECHO\x1b[201~";
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while bytes(&read_log()).len() < expected.len() {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        bytes(&read_log()),
+        expected,
+        "guarded submission must send no bytes to an unknown composer"
+    );
+    cleanup_spawned_flock(child, base);
+}
+
+#[test]
+fn guarded_submit_socket_paste_precedes_enter_and_starts_turn() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    fs::create_dir_all(&base).unwrap();
+    let config_home = base.join("config");
+    for (key, _) in std::env::vars().filter(|(key, _)| key.starts_with("FLOCK_")) {
+        std::env::remove_var(key);
+    }
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("flock.sock");
+    let script = base.join("codex");
+    let shell = base.join("composer-shell");
+    let log = base.join("input.jsonl");
+    let gate = std::os::unix::net::UnixListener::bind(base.join("gate.sock")).unwrap();
+    fs::write(
+        &script,
+        r#"import json, os, sys, tty
+from pathlib import Path
+import socket
+gate = socket.socket(socket.AF_UNIX)
+gate.connect(str(Path(__file__).with_name('gate.sock')))
+gate.sendall(b'boot\n')
+assert gate.recv(1) == b'G'
+tty.setraw(0)
+log = Path(__file__).with_name('input.jsonl')
+os.write(1, b'\x1b[?2004h\x1b[2J\x1b[HOpenAI Codex\r\nREADY\r\n\xe2\x80\xba \r\n  ? for shortcuts\r\n')
+with log.open('w') as out:
+    while True:
+        data = os.read(0, 4096)
+        if not data:
+            break
+        out.write(json.dumps({'bytes': list(data)}) + '\n')
+        out.flush()
+        if b'\r' in data: os.write(1, b'\x1b[2J\x1b[HOpenAI Codex\r\n\xe2\x80\xa2 Working (1s \xe2\x80\xa2 esc to interrupt)\r\n\xe2\x80\xba socket prompt\r\n  ? for shortcuts\r\n')
+"#,
+    )
+    .unwrap();
+    fs::write(
+        &shell,
+        format!("#!/bin/sh\nexec python3 '{}'\n", script.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&shell, fs::Permissions::from_mode(0o755)).unwrap();
+    let child = spawn_flock_with_shell(
+        &config_home,
+        &runtime_dir,
+        &socket_path,
+        shell.to_str().unwrap(),
+    );
+
+    let mut readiness = Composer::watch(&socket_path).unwrap();
+    let created = send_request(
+        &socket_path,
+        &serde_json::json!({
+            "id": "create", "method": "workspace.create",
+            "params": {"cwd": base, "focus": true}
+        })
+        .to_string(),
+    );
+    let pane = created["result"]["root_pane"]["pane_id"].as_str().unwrap();
+    readiness.wait(&gate, &socket_path, pane, true).unwrap();
+    let read_log = || -> Vec<serde_json::Value> {
+        fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    };
+    let bytes = |rows: &[serde_json::Value]| -> Vec<u8> {
+        rows.iter()
+            .flat_map(|row| {
+                row["bytes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|byte| byte.as_u64().unwrap() as u8)
+            })
+            .collect()
+    };
+    let submitted = send_request(
+        &socket_path,
+        &serde_json::json!({
+            "id": "submit", "method": "agent.send",
+            "params": {"target": pane, "text": "socket prompt", "submit": true}
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        submitted["result"]["outcome"], "observed_accepted",
+        "{submitted}"
+    );
+    let rows = read_log();
+    assert_eq!(bytes(&rows), b"\x1b[200~socket prompt\x1b[201~\r");
+    // Child read times include scheduling delay. The write-to-Enter interval
+    // is checked at the actor receipt seam in guarded_submit's clock test.
+    cleanup_spawned_flock(child, base);
+}
+
+#[cfg(test)]
+mod composer_stages_tests {
+    use super::*;
+    use std::io;
+    use std::io::Write;
+    use support::readiness::Stages;
+
+    #[test]
+    fn producer_exit_fails() {
+        let (mut reader, writer) = UnixStream::pair().unwrap();
+        drop(writer);
+        assert_eq!(
+            Stages::new(Duration::from_secs(1))
+                .expect(&mut reader, "boot")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+    }
+
+    #[test]
+    fn unexpected_stage_fails() {
+        let (mut reader, mut writer) = UnixStream::pair().unwrap();
+        writer.write_all(b"wrong\n").unwrap();
+        assert_eq!(
+            Stages::new(Duration::from_secs(1))
+                .expect(&mut reader, "boot")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn live_silent_producer_fails() {
+        let (mut reader, _live_writer) = UnixStream::pair().unwrap();
+        assert_eq!(
+            Stages::new(Duration::from_millis(10))
+                .expect(&mut reader, "boot")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+    }
+
+    #[test]
+    fn stage_arrival_succeeds() {
+        let (mut reader, mut writer) = UnixStream::pair().unwrap();
+        writer.write_all(b"boot\n").unwrap();
+        Stages::new(Duration::from_secs(1))
+            .expect(&mut reader, "boot")
+            .unwrap();
+    }
+}
+
+/// Both pre-connect and post-release deaths must interrupt the 120s ceiling.
+fn assert_composer_death_is_observed(after_release: bool) {
+    use std::os::unix::fs::PermissionsExt;
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    fs::create_dir_all(&base).unwrap();
+    for (key, _) in std::env::vars().filter(|(key, _)| key.starts_with("FLOCK_")) {
+        std::env::remove_var(key);
+    }
+    let config = base.join("config");
+    let runtime = base.join("runtime");
+    let socket = runtime.join("flock.sock");
+    let script = base.join("composer.py");
+    let shell = base.join("composer-shell");
+    let gate = std::os::unix::net::UnixListener::bind(base.join("gate.sock")).unwrap();
+    let mut source = String::from("import os, signal, socket\nfrom pathlib import Path\n");
+    if after_release {
+        source.push_str("gate = socket.socket(socket.AF_UNIX)\ngate.connect(str(Path(__file__).with_name('gate.sock')))\ngate.sendall(b'boot\\n')\nassert gate.recv(1) == b'G'\n");
+    }
+    source.push_str("os.kill(os.getpid(), signal.SIGKILL)\n");
+    fs::write(&script, source).unwrap();
+    fs::write(
+        &shell,
+        format!("#!/bin/sh\nexec python3 '{}'\n", script.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&shell, fs::Permissions::from_mode(0o755)).unwrap();
+    let child = spawn_flock_with_shell(&config, &runtime, &socket, shell.to_str().unwrap());
+    let mut readiness = Composer::watch(&socket).unwrap();
+    let created = send_request(
+        &socket,
+        &serde_json::json!({
+            "id":"create", "method":"workspace.create", "params":{"cwd":base,"focus":true}
+        })
+        .to_string(),
+    );
+    let pane = created["result"]["root_pane"]["pane_id"].as_str().unwrap();
+    let exit_wait = support::timing::wait("composer fixture exit");
+    let error = readiness.wait(&gate, &socket, pane, false).unwrap_err();
+    let phase = if after_release {
+        "READY and idle/done"
+    } else {
+        "connecting"
+    };
+    assert!(
+        error
+            .to_string()
+            .contains(&format!("fixture exited before {phase}")),
+        "{error}"
+    );
+    assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+    // Exit evidence must interrupt the wait with EOF, not its silence timeout.
+    drop(exit_wait);
+    cleanup_spawned_flock(child, base);
+}
+
+#[test]
+fn composer_killed_before_connect_fails_promptly() {
+    assert_composer_death_is_observed(false);
+}
+
+#[test]
+fn composer_killed_after_release_fails_promptly() {
+    assert_composer_death_is_observed(true);
+}
+
+#[test]
+fn composer_readiness_accepts_repeated_idle_and_done_before_output() {
+    for status in ["idle", "done"] {
+        let mut state = support::composer::ReadyState::new(true);
+        let event = serde_json::json!({"event":"pane.agent_status_changed", "data":{"pane_id":"w1:p1", "agent_status":status}});
+        assert!(!state.observe(&event, "w1:p1").unwrap());
+        assert!(!state.observe(&event, "w1:p1").unwrap());
+        let output = serde_json::json!({"event":"pane.output_matched", "data":{"pane_id":"w1:p1", "read":{"text":"READY"}}});
+        assert!(state.observe(&output, "w1:p1").unwrap());
+    }
+}
+
+#[test]
+fn composer_server_event_eof_is_not_fixture_exit() {
+    for close_exit_monitor in [false, true] {
+        let (exits, mut exit_writer) = UnixStream::pair().unwrap();
+        let (mut events, event_writer) = UnixStream::pair().unwrap();
+        let retained_writer = if close_exit_monitor {
+            writeln!(
+                exit_writer,
+                "{}",
+                serde_json::json!({
+                    "event":"pane_exited", "data":{"pane_id":"w2:p1"}
+                })
+            )
+            .unwrap();
+            drop(exit_writer);
+            event_writer
+        } else {
+            drop(event_writer);
+            exit_writer
+        };
+        let mut composer = Composer::with_exit_stream(
+            support::readiness::Stages::new(Duration::from_secs(1)),
+            exits,
+        );
+        let error = composer
+            .event_line(&mut events, "w1:p1", "READY")
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert_eq!(error.to_string(), "server event stream closed before READY");
+        drop(retained_writer);
+    }
+}
+
+#[test]
+fn composer_matching_exit_event_is_fixture_exit() {
+    let (exits, mut exit_writer) = UnixStream::pair().unwrap();
+    let (mut events, _event_writer) = UnixStream::pair().unwrap();
+    writeln!(
+        exit_writer,
+        "{}",
+        serde_json::json!({
+            "event":"pane_exited", "data":{"pane_id":"w1:p1"}
+        })
+    )
+    .unwrap();
+    let mut composer = Composer::with_exit_stream(
+        support::readiness::Stages::new(Duration::from_secs(1)),
+        exits,
+    );
+    let error = composer
+        .event_line(&mut events, "w1:p1", "READY")
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+    assert_eq!(error.to_string(), "fixture exited before READY");
 }

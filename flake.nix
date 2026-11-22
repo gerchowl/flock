@@ -12,7 +12,11 @@
   };
 
   outputs =
-    { self, nixpkgs, guardrails }:
+    {
+      self,
+      nixpkgs,
+      guardrails,
+    }:
     let
       lib = nixpkgs.lib;
       systems = [
@@ -23,6 +27,26 @@
       ];
       forAllSystems = lib.genAttrs systems;
       pkgsFor = system: import nixpkgs { inherit system; };
+      sccacheFor = pkgs: pkgs.callPackage ./nix/sccache.nix { };
+      patchedSccacheFor =
+        pkgs:
+        assert lib.assertMsg (
+          (sccacheFor pkgs).version == "0.18.0"
+        ) "Re-evaluate the #1411 startup patch when sccache changes version";
+        (sccacheFor pkgs).overrideAttrs (old: {
+          patches = (old.patches or [ ]) ++ [ ./nix/patches/sccache-0.18.0-startup.patch ];
+        });
+      stableSccacheFor =
+        pkgs:
+        pkgs.writeShellScriptBin "sccache" ''
+          set -eu
+          SCCACHE_REAL=${patchedSccacheFor pkgs}/bin/sccache
+          SCCACHE_PYTHON=${pkgs.python3}/bin/python3
+          SCCACHE_CACHE_SUFFIX=${
+            if pkgs.stdenv.hostPlatform.isDarwin then "Library/Caches/Mozilla.sccache" else ".cache/sccache"
+          }
+          ${builtins.readFile ./nix/sccache.sh}
+        '';
     in
     {
       packages = forAllSystems (
@@ -30,21 +54,28 @@
         let
           pkgs = pkgsFor system;
           flock = pkgs.callPackage ./nix/package.nix {
-            buildChannel = "fork";
-            buildId = self.shortRev or self.dirtyShortRev or null;
+            buildCommit = self.rev or self.dirtyRev or null;
           };
           # Same binary plus the `web` feature (the `flk web` xterm bridge,
           # gerchowl/flock#131). Kept out of `default` so a stock build stays
           # lean; hosts that serve the web terminal pin this output.
           flock-web = pkgs.callPackage ./nix/package.nix {
-            buildChannel = "fork";
-            buildId = self.shortRev or self.dirtyShortRev or null;
+            buildCommit = self.rev or self.dirtyRev or null;
             withWeb = true;
+            # Until #1731 lands, missing assets receive the typed HTTP 503.
+            guiDist = self.packages.${system}.flock-client or null;
           };
+          # The web client's production bundle (web/client/dist), built offline
+          # from a fixed-output fetch of bun.lock (#1731). Only the bundle:
+          # S7-min slice 7a embeds it in `flk`.
+          flock-client = pkgs.callPackage ./nix/client.nix { };
         in
         {
-          inherit flock flock-web;
+          inherit flock flock-web flock-client;
           default = flock;
+        }
+        // lib.optionalAttrs pkgs.stdenv.hostPlatform.isDarwin {
+          flock-desktop = pkgs.callPackage ./nix/desktop.nix { inherit flock-client; };
         }
       );
 
@@ -63,6 +94,24 @@
         in
         {
           flock = self.packages.${system}.default;
+          flock-client = self.packages.${system}.flock-client;
+          sccache =
+            pkgs.runCommand "flock-sccache-probe"
+              {
+                nativeBuildInputs = [
+                  pkgs.python3
+                  pkgs.rustc
+                  (stableSccacheFor pkgs)
+                ];
+                RUSTC_WRAPPER = "${stableSccacheFor pkgs}/bin/sccache";
+                FLOCK_TEST_SCCACHE_WRAPPER = "${stableSccacheFor pkgs}/bin/sccache";
+                FLOCK_TEST_SCCACHE_RAW = "${patchedSccacheFor pkgs}/bin/sccache";
+                FLOCK_TEST_SCCACHE_SCRIPT = ./nix/sccache.sh;
+              }
+              ''
+                python3 ${./scripts/probe_sccache.py}
+                touch "$out"
+              '';
           # The guardrails gate sweep, with the SAME env knobs as
           # .pre-commit-config.yaml — `nix flake check` ≡ `prek run --all-files`
           # for the gate layer; divergence means one of the two is misconfigured.
@@ -96,10 +145,23 @@
                   && env GUARDRAILS_CI_SHIM_ENFORCE=1 guardrails-ci-shim .github/workflows \
                   && guardrails-log-budget \
                   && python3 scripts/fixture_hosts.py $(find . -name '*.rs' -not -path './vendor/*') \
+                  && python3 scripts/journal_io_gate.py \
                   && python3 scripts/exec_name_gate.py \
                   && touch $out
               '';
           default = self.checks.${system}.flock;
+        }
+        // lib.optionalAttrs pkgs.stdenv.hostPlatform.isDarwin {
+          flock-desktop = self.packages.${system}.flock-desktop;
+          macos-process-facts =
+            pkgs.runCommand "flock-process-c-toolchain-check"
+              {
+                nativeBuildInputs = self.packages.${system}.default.nativeBuildInputs;
+                SDKROOT = self.packages.${system}.default.SDKROOT;
+              }
+              ''
+                "$CC" -Werror -c ${./src/platform/macos_process.c} -o "$out"
+              '';
         }
       );
 
@@ -107,32 +169,65 @@
         system:
         let
           pkgs = pkgsFor system;
+          stableSccache = stableSccacheFor pkgs;
+          lintTools = with pkgs; [
+            cargo
+            clippy
+            cmake
+            # Maintenance tests exercise Git fixtures and workflow/doc scripts.
+            git
+            jq
+            just
+            ninja
+            nodejs
+            bun
+            perl
+            pkg-config
+            rustc
+            rustfmt
+            # Maintenance tests parse hook YAML with Ruby’s standard library.
+            ruby
+            zig_0_15
+          ];
+          ghosttyHook = ''
+            export LIBGHOSTTY_VT_OPTIMIZE=Debug
+            export LIBGHOSTTY_VT_SIMD=true
+          '';
         in
         {
           # guardrails brings the governance toolbelt (prek/gitleaks/cargo-deny/
           # …) and auto-installs the pre-commit hooks; `extra` carries flock's
           # own build toolchain. SDKROOT comes from the darwin stdenv for free,
           # so the only env we restore is the libghostty-vt build tuning.
+          # Lint and archive consumers do not need source-built nextest or the
+          # patched sccache daemon. Both dominated CI shell startup (#2970,
+          # #3024). Shards install prebuilt nextest at the shared pin separately.
+          # Keep the same Rust/JS runtime tools and Zig settings.
+          ci-lint = guardrails.lib.${system}.mkDevShell {
+            inherit pkgs;
+            extra = lintTools;
+            hook = ghosttyHook;
+          };
           default = guardrails.lib.${system}.mkDevShell {
             inherit pkgs;
-            extra = with pkgs; [
-              cargo
-              cargo-nextest
-              clippy
-              cmake
-              just
-              ninja
-              pkg-config
-              rustc
-              rustfmt
-              zig_0_15
-            ];
-            # sccache (worktree/compile-cache inheritance) comes from the
-            # guardrails toolbelt + shellHook — fleet-shared ~/.cache/sccache.
+            extra = lintTools ++ [ (pkgs.callPackage ./nix/nextest.nix { }) ];
+            # Use the account's platform artifact cache and give the daemon a
+            # persistent TMPDIR and its own socket (#1325). A wrapper covers
+            # lazy startup and idle restarts without changing the shell TMPDIR.
+            # SCCACHE_DIR alone only controls artifacts, not temporary files.
+            # sccache 0.18 endpoint contract: https://github.com/mozilla/sccache/blob/v0.18.0/README.md#usage
             hook = ''
-              export LIBGHOSTTY_VT_OPTIMIZE=Debug
-              export LIBGHOSTTY_VT_SIMD=true
-            '';
+              export PATH="${stableSccache}/bin:$PATH"
+              # The isolated cache-reuse probe also needs the unwrapped binary.
+              export FLOCK_TEST_SCCACHE_WRAPPER="${stableSccache}/bin/sccache"
+              export FLOCK_TEST_SCCACHE_RAW="${patchedSccacheFor pkgs}/bin/sccache"
+              case "$RUSTC_WRAPPER" in
+                sccache|*/sccache)
+                  export RUSTC_WRAPPER="${stableSccache}/bin/sccache"
+                  ;;
+              esac
+            ''
+            + ghosttyHook;
           };
         }
       );
@@ -141,8 +236,7 @@
 
       overlays.default = final: _prev: {
         flock = final.callPackage ./nix/package.nix {
-          buildChannel = "fork";
-          buildId = self.shortRev or self.dirtyShortRev or null;
+          buildCommit = self.rev or self.dirtyRev or null;
         };
       };
     };

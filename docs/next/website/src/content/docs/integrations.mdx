@@ -12,6 +12,7 @@ Use integrations when you want native agent session restore, direct state report
 Open settings inside Flock and use the integrations tab to install recommended integrations for agents found on your `PATH`, or run commands manually:
 
 ```bash
+flk integration sync [--dry-run] [--json]
 flk integration install pi
 flk integration install omp
 flk integration install claude
@@ -22,6 +23,22 @@ flk integration install opencode
 flk integration install hermes
 flk integration install qodercli
 ```
+
+Claude, Codex, and OpenCode installation also adds an MCP entry named flock when none exists. Its command is an absolute launch path, retaining profile symlinks instead of resolving them into `/nix/store`. Claude uses `~/.claude.json`, or `$CLAUDE_CONFIG_DIR/.claude.json` for a selected profile; Codex uses `$CODEX_HOME/config.toml` (default `~/.codex/config.toml`); OpenCode uses `~/.config/opencode/opencode.json` or an existing `opencode.jsonc`.
+
+Structured sessions use a separate private MCP configuration with a credential tied to one live lease generation. The MCP child captures its structured mode, socket endpoint and credential at startup and uses them for tool calls, compatibility checks and channel reconnects. Missing or invalid configuration refuses startup; an expired lease refuses subsequent admission. Neither path retries with operator authority. The credential is absent from Claude's launch environment and command arguments. Ordinary MCP registrations retain their existing behavior. Structured session starts remain gated on the registry/start implementation (#1439).
+
+Existing MCP entries, including custom commands, arguments and environment, are preserved. Symlinked or read-only MCP configs receive guidance for their configuration owner. Initial registration in JSONC with comments requires an owner-managed edit; sync preserves JSONC comments when updating a registered command. `flk integration status` and `--outdated-only` flag flock MCP commands pinned to `/nix/store`; update the owning configuration to an absolute profile/user-local launch path and reconnect the harness. Already-running bridges retain their executable and tool catalog. Uninstall removes hooks/plugins and leaves MCP entries under their configuration owner's control.
+
+MCP registration failures print guidance and leave successful hook/plugin installation intact, including installations launched only from `/nix/store` and commented OpenCode JSON files. Pane hooks use their own server executable; when no stable profile path exists, they retain its store path so hook calls still work. The existing macOS TCC copy behavior remains the same.
+
+Claude profiles that register a shared hook script in `settings.json` report that script's version. Reinstalling reuses the shared registration without adding a second profile copy.
+
+## Inbox authority at turn end
+
+The Stop hook asks the server whether the caller may read the inbox before asking the agent to read waiting mail. If native inbox authority is refused, the hook allows the turn to end and reports the refusal once per socket, pane and session. A successful wake check clears that notice, so a later refusal can be reported again.
+
+As a workaround, the operator can read the inbox from their own interactive shell with `flk msg operator-read --pane <pane-id>` (or peek with `flk msg operator-list --pane <pane-id>`). These audited commands refuse agent panes, structured agents and mesh relays with `operator_only`. Reading clears the mail but does not re-attest the agent process. This is the interim path until migration to structured agents ([#3066](https://github.com/gerchowl/flock/issues/3066)).
 
 ## Uninstall integrations
 
@@ -99,6 +116,24 @@ The hook reports Claude Code session identity to the local Flock socket on sessi
 
 Flock uses `~/.claude` by default, or `CLAUDE_CONFIG_DIR` when set. The Claude config directory must already exist. Install writes `hooks/flock-agent-state.sh` and updates `settings.json` with Flock hook entries. Uninstall removes the matching hook entries and deletes the hook script.
 
+Install and uninstall replace both files atomically, and refuse when `settings.json` or `hooks/flock-agent-state.sh` is a symlink, for example into a read-only Home Manager store. The error names the path, and the link is left untouched. Merge the fragment from `flk integration manifest claude` into the file's source instead.
+
+### Delegate questions
+
+Install also adds a `PreToolUse` entry on Claude's question tools, `AskUserQuestion|ExitPlanMode` plus any `[questions] human_tools` (ADR-0034 §3). No other tool call starts a process. The entry asks the server for a verdict with `hook.decide`, and the server answers from the policy on the agent's record:
+
+| Policy | Verdict |
+| --- | --- |
+| `ask_human` (an operator start) | pass: the dialog draws as before |
+| `route` (started by another agent) or `ask_operator` (`--unattended`) | refused with `state the question and options in your final message and end your turn` |
+| `deny` | refused with `Questions are disabled for this agent. Choose the most conservative option, state the assumption in your result, or end your turn with a blocked report.` |
+
+Routing the question to the architect and returning its answer into the same tool call comes in a later release. Until then, the refused agent puts its question in its final message, which is what its architect reads.
+
+When the server cannot decide (it is stopped, does not answer, predates `hook.decide`, or cannot attest the pane), the pane's `FLOCK_QUESTIONS` hint decides. A pane without one, a root, passes within 500 ms, so its dialog draws as before. A pane with one is refused with a fixed sentence: `flk could not reach your architect. …` for `route`, `flk could not reach the operator's question queue …` for `ask_operator`, and the `deny` sentence above. The hook script does the same itself when `flk` is missing, exits non-zero, prints nothing or anything but JSON, or runs longer than its 10 s watchdog. The entry's `timeout` is 30 s. On Claude Code 2.1.295 or newer it also carries `onFailure: "block"`, so a hook script that cannot start, or a shell stuck past the timeout, refuses the call too. Older Claude Code has no `onFailure`. There the entry is installed without it, and both install and `flk integration status` print `question hook: fails open on timeout (claude < 2.1.295, or its version unreadable at install)`. The same happens when `claude --version` cannot be read. An install started from the TUI or the socket API probes `claude --version` on a worker thread, never on the server's loop, and uses the server's live `[questions]` config.
+
+Known limits: a managed policy that disables user hooks disables this entry too, and a deleted hook script fails open on Claude Code older than 2.1.295. In both cases the dialog draws in the delegate's pane, as it did before this hook. The `onFailure` decision comes from the `claude` on the PATH of whatever runs the install, the server for a TUI or socket install: if the panes run a different Claude Code, reinstall from a shell whose `claude` is theirs.
+
 ## Codex
 
 Install the Codex hook:
@@ -122,6 +157,8 @@ flk integration install copilot
 Copilot state is reported through the same local socket API used by other integrations.
 
 Flock uses `~/.copilot` by default, or `COPILOT_HOME` when set. The Copilot config directory must already exist. Install writes `hooks/flock-agent-state.sh` and updates `settings.json` with Flock hook entries. The hook maps prompt submission, tool use, post-tool progress after approvals, `ask_user` prompts, `exit_plan_mode` plan review prompts, permission notifications, agent idle notifications, turn stops, and session exits into Flock state. Uninstall removes Flock entries from `settings.json` and deletes the hook script.
+
+The shell hooks for Claude, Codex, Copilot, Kimi, and Qoder CLI delegate to `flk hook` and require no Python interpreter. Inside a Flock pane, a missing or non-executable Flock binary prints a stderr diagnostic on each hook call. Reinstall the integration to update an older hook script.
 
 After Copilot emits a session-bearing event, Flock can use the reported session id to resume the pane with `copilot --resume=<id>`.
 
@@ -196,7 +233,7 @@ A hook running inside the pane's agent can leave the pane id out: `report-agent`
 User hooks that run next to a Flock-managed integration should use metadata instead of `report-agent`. Metadata changes presentation without taking over the integration's `idle`, `working`, `blocked`, or session restore authority. `--agent` guards the report so it only applies while that authoritative agent is active. `--applies-to-source` guards the report so it only applies while that lifecycle authority source is active. `--display-agent` changes the visible name.
 
 ```bash
-flk pane report-metadata "$FLOCK_PANE_ID" \
+flk pane report-metadata \
   --source user:claude-title \
   --agent claude \
   --title "Refactor auth middleware" \
@@ -205,6 +242,8 @@ flk pane report-metadata "$FLOCK_PANE_ID" \
   --state-label working="refactoring auth" \
   --ttl-ms 3600000
 ```
+
+`report-metadata` defaults to the calling pane. Pass `--pane <pane_id>` or a legacy leading pane id when reporting from outside the pane.
 
 Custom status and state labels are visual-only. Waits, notifications, and workspace rollups still use the semantic state.
 
@@ -223,3 +262,11 @@ flk pane read 1-1 --source recent --lines 50
 ```
 
 If integration state looks wrong, first confirm the agent is running inside Flock and that the relevant hook or plugin was installed for the same user account.
+
+### Sync after an upgrade
+
+Run `flk integration sync --dry-run` to review the plan, then `flk integration sync` with the newly installed binary to refresh installed Claude, Codex and OpenCode hook assets and flock MCP launch paths. This works for package-manager installs and when the binary is already current. Each target reports `updated` (`would-update` in dry-run, including JSON output), `already-current`, `skipped-declarative`, or `failed`; failures return exit code 1 and do not prevent other targets from being checked.
+
+Sync uses the selected `CLAUDE_CONFIG_DIR` and `CODEX_HOME` profiles (or their defaults) and the user OpenCode config; it does not search other homes or profiles. Only MCP entries named flock launching a store-pinned flk executable (including the legacy flock name) with `mcp serve` are migrated; bare PATH commands and explicit stable custom paths are preserved. Claude project-local registrations under `projects.*.mcpServers` are reported and updated individually. The chosen launch path is printed first; development executable fallbacks are refused, and a missing stable path fails MCP targets while allowing hook refreshes. Custom commands and unrelated entries are preserved, as are arguments, environment, permissions, comments and Codex hook trust. Symlinked or read-only configs are skipped with a fragment to merge through their Nix/Home Manager configuration owner.
+
+Sync reports client, installed binary and server drift but does not perform a server handoff or stop sessions. Use `flk server live-handoff` when needed. Running agents need `flk agent restart` or an MCP reconnect to load the new bridge and tool catalog.

@@ -2,19 +2,13 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::api::schema::{EventData, EventEnvelope, MsgIntent};
 
-/// Per-pane message queues (#175 M1). The durable event log (ADR-0005) is
-/// the source of truth: every admit emits `MessageQueued`, every settle
-/// emits `MessageDelivered`, and [`MailboxRegistry::seed_from_events`]
-/// reconstructs undelivered queues plus the dedupe set at boot — that is
-/// the at-least-once + dedupe-across-restarts contract (§8.4, §8.6).
-/// Queues are keyed by the recipient's *public pane id*, the identity that
-/// survives restarts; panes are re-resolved at drain time.
+/// In-memory projection of per-pane mail. Mesh custody and deduplication live
+/// in the SQLite store, which rebuilds this projection at server startup.
+/// `seed_from_events` stages legacy queued messages for the one-time import.
 ///
-/// Dedupe is BOUNDED, not eternal: the seen-set holds the newest
-/// `MAX_SEEN` correlation ids (and the boot seed only sees what log
-/// rotation kept), so a duplicate older than both windows can be accepted
-/// again. Evicting a seen id also drops its reply-routing history — replies
-/// to sufficiently old messages return `message_not_found`.
+/// Legacy messages still use the bounded correlation seen-set. Mesh imports
+/// are deduplicated by their immutable message key before reaching enqueue,
+/// so distinct sends may share a caller-selected correlation id.
 #[derive(Default)]
 pub(crate) struct MailboxRegistry {
     queues: HashMap<String, VecDeque<PendingMessage>>,
@@ -49,10 +43,6 @@ pub(crate) struct MailboxRegistry {
     /// mute answered it again. Queue lifetime bounds the set just as well:
     /// it can never hold more than the queues do.
     deferred: HashSet<String>,
-    /// Cross-host deferral hops waiting for a slot, and how many are running.
-    /// See `App::pump_deferral_hops`.
-    deferral_hops: VecDeque<DeferralHop>,
-    deferral_hops_running: usize,
     /// Sender → recent `blocking` send timestamps (ms), for the tier's own
     /// hourly budget (ADR-0018 §1). Separate from `rate` so a sender's
     /// ordinary traffic cannot spend its escalation budget, or vice versa.
@@ -76,15 +66,11 @@ pub(crate) struct MailboxRegistry {
     /// newest `MAX_SEEN` no longer wakes, exactly as a reply to a delivered
     /// message that aged out of `history` does not.
     relayed_questions: HashSet<String>,
+    /// Questions whose SSH result is pending. A reply can arrive before the
+    /// sending SSH process exits. Counts cover concurrent retries of one id.
+    relaying_questions: HashMap<String, usize>,
     /// Insertion order of `relayed_questions`, for eviction.
     relayed_questions_order: VecDeque<String>,
-}
-
-/// One cross-host deferral waiting to be sent (ADR-0018 §3).
-pub(crate) struct DeferralHop {
-    pub peer: crate::config::PeerConfig,
-    pub body: String,
-    pub relay: crate::events::MsgDeferralRelay,
 }
 
 /// A live receiver-side mute: when it lifts, and why, in the muter's words.
@@ -119,8 +105,10 @@ impl BlockingMail {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct PendingMessage {
+    #[serde(default)]
+    pub message_key: Option<crate::mesh::key::MessageKey>,
     pub correlation_id: String,
     pub body: String,
     pub from_pane: Option<String>,
@@ -145,9 +133,9 @@ pub(crate) struct PendingMessage {
 #[derive(Debug, Clone)]
 pub(crate) struct DeliveredMeta {
     pub from_pane: Option<String>,
-    /// Fleet-global sender, so a reply can be routed after the original has
-    /// left the queue.
     pub from_agent: Option<String>,
+    pub from_host: Option<String>,
+    pub message_key: Option<crate::mesh::key::MessageKey>,
     pub enqueued_at_ms: u64,
     /// Correlation id of the thread root (self for a fresh message).
     pub root: String,
@@ -167,7 +155,7 @@ pub(crate) enum EnqueueOutcome {
 
 pub(crate) const MAX_QUEUED_PER_PANE: usize = 32;
 pub(crate) const RATE_LIMIT_PER_MINUTE: usize = 20;
-const MAX_SEEN: usize = 4096;
+pub(crate) const MAX_SEEN: usize = 4096;
 /// Undelivered messages older than this are dropped as undeliverable
 /// (hibernated-forever panes must not grow the queue without bound).
 pub(crate) const UNDELIVERED_TTL_MS: u64 = 24 * 60 * 60 * 1000;
@@ -189,6 +177,7 @@ impl MailboxRegistry {
         for envelope in events {
             match &envelope.data {
                 EventData::MessageQueued {
+                    message_key,
                     correlation_id,
                     from_pane,
                     from_repo,
@@ -202,10 +191,14 @@ impl MailboxRegistry {
                     intent,
                     ..
                 } => {
+                    if message_key.is_some() {
+                        continue;
+                    }
                     self.mark_seen(correlation_id.clone());
                     queued.insert(
                         correlation_id.clone(),
                         PendingMessage {
+                            message_key: None,
                             correlation_id: correlation_id.clone(),
                             body: body.clone(),
                             from_pane: from_pane.clone(),
@@ -236,6 +229,8 @@ impl MailboxRegistry {
                             DeliveredMeta {
                                 from_pane: message.from_pane.clone(),
                                 from_agent: message.from_agent.clone(),
+                                from_host: message.from_host.clone(),
+                                message_key: message.message_key.clone(),
                                 enqueued_at_ms: message.enqueued_at_ms,
                                 root,
                                 round_trips: 0,
@@ -358,8 +353,19 @@ impl MailboxRegistry {
             .push_back(now_ms);
     }
 
+    pub(crate) fn pending_messages(&self) -> Vec<PendingMessage> {
+        self.queues
+            .values()
+            .flat_map(|queue| queue.iter().cloned())
+            .collect()
+    }
+
+    pub(crate) fn clear_queued_projection(&mut self) {
+        self.queues.clear();
+    }
+
     pub(crate) fn enqueue(&mut self, message: PendingMessage) -> EnqueueOutcome {
-        if self.seen.contains(&message.correlation_id) {
+        if message.message_key.is_none() && self.seen.contains(&message.correlation_id) {
             return EnqueueOutcome::Duplicate;
         }
         if self
@@ -415,6 +421,30 @@ impl MailboxRegistry {
         Some(message)
     }
 
+    /// Remove custody rows that can no longer be delivered to any pane.
+    pub(crate) fn discard_mesh_messages(&mut self, keys: &[crate::mesh::key::MessageKey]) {
+        let keys: HashSet<_> = keys
+            .iter()
+            .map(|key| (&key.origin_node, &key.message_id))
+            .collect();
+        for queue in self.queues.values_mut() {
+            queue.retain(|message| {
+                if message
+                    .message_key
+                    .as_ref()
+                    .is_some_and(|key| keys.contains(&(&key.origin_node, &key.message_id)))
+                {
+                    self.deferred.remove(&message.correlation_id);
+                    self.escalated.remove(&message.correlation_id);
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        self.queues.retain(|_, queue| !queue.is_empty());
+    }
+
     pub(crate) fn record_delivered(&mut self, message: &PendingMessage) {
         let root = message
             .in_reply_to
@@ -425,8 +455,10 @@ impl MailboxRegistry {
         self.history.insert(
             message.correlation_id.clone(),
             DeliveredMeta {
-                from_agent: message.from_agent.clone(),
                 from_pane: message.from_pane.clone(),
+                from_agent: message.from_agent.clone(),
+                from_host: message.from_host.clone(),
+                message_key: message.message_key.clone(),
                 enqueued_at_ms: message.enqueued_at_ms,
                 root,
                 round_trips: 0,
@@ -437,6 +469,15 @@ impl MailboxRegistry {
 
     pub(crate) fn reply_meta(&self, correlation_id: &str) -> Option<&DeliveredMeta> {
         self.history.get(correlation_id)
+    }
+
+    /// All local inboxes, for one bounded delivery-attempt admission check.
+    pub(super) fn queued_correlation_ids(&self) -> HashSet<&str> {
+        self.queues
+            .values()
+            .flat_map(|queue| queue.iter())
+            .map(|message| message.correlation_id.as_str())
+            .collect()
     }
 
     /// Metadata for a message that is still queued (reply-before-delivery).
@@ -556,29 +597,6 @@ impl MailboxRegistry {
         self.deferred.insert(correlation_id.to_string())
     }
 
-    pub(crate) fn push_deferral_hop(&mut self, hop: DeferralHop) {
-        self.deferral_hops.push_back(hop);
-    }
-
-    /// Hand out as many queued hops as fit under `cap` running at once, and
-    /// count them as running.
-    pub(crate) fn start_deferral_hops(&mut self, cap: usize) -> Vec<DeferralHop> {
-        let free = cap.saturating_sub(self.deferral_hops_running);
-        let take = free.min(self.deferral_hops.len());
-        self.deferral_hops_running += take;
-        self.deferral_hops.drain(..take).collect()
-    }
-
-    pub(crate) fn finish_deferral_hop(&mut self) {
-        self.deferral_hops_running = self.deferral_hops_running.saturating_sub(1);
-    }
-
-    /// Withdraw a claim whose answer never left: a cross-host deferral the
-    /// peer could not be reached for. Unclaimed, the next mute retries it.
-    pub(crate) fn unmark_deferred(&mut self, correlation_id: &str) {
-        self.deferred.remove(correlation_id);
-    }
-
     /// The pane's live mute expiry, or `None` when it is not muted. Expired
     /// entries are dropped as they are read, so a pane that muted once does
     /// not hold an entry for the life of the server.
@@ -643,6 +661,23 @@ impl MailboxRegistry {
             .or_else(|| self.queued_message(correlation_id).map(|m| m.intent))
             .is_some_and(MsgIntent::wakes)
             || self.relayed_questions.contains(correlation_id)
+            || self.relaying_questions.contains_key(correlation_id)
+    }
+
+    pub(crate) fn start_relaying_question(&mut self, correlation_id: &str) {
+        *self
+            .relaying_questions
+            .entry(correlation_id.to_string())
+            .or_default() += 1;
+    }
+
+    pub(crate) fn finish_relaying_question(&mut self, correlation_id: &str) {
+        if let Some(count) = self.relaying_questions.get_mut(correlation_id) {
+            *count -= 1;
+            if *count == 0 {
+                self.relaying_questions.remove(correlation_id);
+            }
+        }
     }
 
     /// Remember a waking message that left for another host, so its answer
@@ -744,6 +779,7 @@ impl MailboxRegistry {
             .filter(|(to_pane, _)| pane.is_none_or(|filter| filter == to_pane.as_str()))
             .flat_map(|(_, queue)| queue.iter())
             .map(|message| crate::api::schema::QueuedMessageInfo {
+                attempts: Vec::new(),
                 correlation_id: message.correlation_id.clone(),
                 to_pane: message.to_pane.clone(),
                 from_pane: message.from_pane.clone(),
@@ -778,6 +814,28 @@ fn sender_identity(message: &PendingMessage) -> String {
                 .map(|host| format!("unknown@{host}"))
         })
         .unwrap_or_else(|| "unknown sender".to_string())
+}
+
+/// Whether a reply to a message can be routed, and on which contract. The
+/// one rule `msg.read` and the MCP channel push share, so a push never
+/// promises a reply `flock_msg_reply` would refuse (#213). `replyable` means
+/// routable: a same-host pane, a directory-resolvable agent, or a durable
+/// mesh return binding. Only the contract says whether that return survives
+/// the sender being offline (#623).
+pub(crate) fn reply_route(
+    from_pane: Option<&str>,
+    from_agent: Option<&str>,
+    durable: bool,
+) -> (bool, &'static str) {
+    let contract = if durable {
+        "durable_return_binding"
+    } else {
+        "best_effort_local_or_directory"
+    };
+    (
+        durable || from_pane.is_some() || from_agent.is_some(),
+        contract,
+    )
 }
 
 /// Suffix that marks a mute's automatic deferral reply (ADR-0018 §3): the
@@ -818,6 +876,7 @@ mod tests {
 
     fn message(correlation: &str, to: &str) -> PendingMessage {
         PendingMessage {
+            message_key: None,
             from_agent: None,
             from_host: None,
             correlation_id: correlation.into(),
@@ -833,10 +892,30 @@ mod tests {
         }
     }
 
+    #[test]
+    fn discard_mesh_messages_matches_keys_not_panes_or_correlations() {
+        let mut mailboxes = MailboxRegistry::default();
+        let mut removed = message("shared-correlation", "pane");
+        let key = crate::mesh::key::MessageKey::mint("origin.example".into(), 0).unwrap();
+        removed.message_key = Some(key.clone());
+        let mut retained = removed.clone();
+        retained.message_key =
+            Some(crate::mesh::key::MessageKey::mint("other.example".into(), 0).unwrap());
+        mailboxes.enqueue(removed);
+        mailboxes.enqueue(retained.clone());
+        mailboxes.discard_mesh_messages(&[key]);
+        assert_eq!(mailboxes.queued_len("pane"), 1);
+        assert_eq!(
+            mailboxes.pop_next("pane").unwrap().message_key,
+            retained.message_key
+        );
+    }
+
     fn queued_event(message: &PendingMessage) -> EventEnvelope {
         EventEnvelope {
             event: EventKind::MessageQueued,
             data: EventData::MessageQueued {
+                message_key: None,
                 from_agent: None,
                 from_host: None,
                 correlation_id: message.correlation_id.clone(),
@@ -1084,46 +1163,6 @@ mod tests {
     /// Review of #411: one mute can owe a whole inbox of cross-host
     /// deferrals. They go out at most `cap` at a time, in order, and a
     /// finished hop frees exactly one slot.
-    #[test]
-    fn deferral_hops_are_capped_and_start_in_order() {
-        let hop = |correlation: &str| DeferralHop {
-            peer: crate::config::PeerConfig::default(),
-            body: String::new(),
-            relay: crate::events::MsgDeferralRelay {
-                correlation_id: correlation.into(),
-                deferral_correlation_id: format!("{correlation}:deferred"),
-                pane: "w1:p2".into(),
-                muted_until_ms: 0,
-                reason: None,
-                from_agent: "agent_a".into(),
-                to_agent: "agent_b".into(),
-                to_host: "far".into(),
-                route: "far".into(),
-                result: Ok(()),
-            },
-        };
-        let ids = |hops: Vec<DeferralHop>| -> Vec<String> {
-            hops.into_iter()
-                .map(|hop| hop.relay.correlation_id)
-                .collect()
-        };
-        let mut registry = MailboxRegistry::default();
-        for index in 0..5 {
-            registry.push_deferral_hop(hop(&format!("c-{index}")));
-        }
-
-        assert_eq!(ids(registry.start_deferral_hops(2)), ["c-0", "c-1"]);
-        assert!(
-            registry.start_deferral_hops(2).is_empty(),
-            "no slot until one finishes"
-        );
-        registry.finish_deferral_hop();
-        assert_eq!(ids(registry.start_deferral_hops(2)), ["c-2"]);
-        registry.finish_deferral_hop();
-        registry.finish_deferral_hop();
-        assert_eq!(ids(registry.start_deferral_hops(2)), ["c-3", "c-4"]);
-        assert!(registry.start_deferral_hops(2).is_empty(), "queue drained");
-    }
 
     #[test]
     fn expire_drops_only_past_ttl_and_reports_them() {

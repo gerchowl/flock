@@ -1,10 +1,10 @@
 #![expect(
     clippy::print_stdout,
-    reason = "the stop nudge is written to stdout as the agent-facing hook contract"
+    reason = "the stop nudge and the delegate table are written to stdout as the agent-facing hook contract"
 )]
 //! `flk hook <agent> <action>` — the single-source-of-truth agent hook body.
 //!
-//! The per-agent shim assets (claude `sh`+`python`, opencode `js`, pi/omp `ts`,
+//! The per-agent shim assets (claude/copilot `sh`, opencode `js`, pi/omp `ts`,
 //! …) each reimplement the same wire protocol — parse the hook JSON, open the
 //! flock socket, speak `pane.report_*`, and (for Claude's Stop) scrape the
 //! transcript and emit a self-heal nudge. That logic belongs in the binary
@@ -15,7 +15,8 @@
 //! Contract carried over verbatim from the shims: a hook must NEVER block or
 //! fail the parent agent. Every socket error is swallowed; a malformed payload
 //! degrades to a no-op. The only stdout this ever writes is Claude's
-//! `decision:block` nudge on Stop.
+//! `decision:block` nudge or nonblocking authority notice on Stop, and an
+//! architect's delegate table after a compaction or resume (#962).
 //!
 //! Testability: each action plans a [`HookOutcome`] (the `pane.report_*`
 //! methods to send + any stdout) as a pure function of the parsed input. The
@@ -27,7 +28,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::api::client::ApiClient;
 use crate::api::schema::{
-    Method, PaneAgentState, PaneReleaseAgentParams, PaneReportAgentParams,
+    DelegateListParams, Method, PaneAgentState, PaneReleaseAgentParams, PaneReportAgentParams,
     PaneReportAgentSessionParams, PaneReportPromptParams, PaneReportRecapParams,
     PaneReportReplyParams, Request,
 };
@@ -37,7 +38,7 @@ use crate::api::schema::{
 /// `connect` leg is not covered (std `UnixStream` has no connect timeout), but
 /// the failure mode #158 cares about — no server listening — fails `connect`
 /// immediately with ENOENT/ECONNREFUSED, so it stays fire-and-forget.
-const HOOK_TIMEOUT: Duration = Duration::from_millis(500);
+pub(super) const HOOK_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// The line an agent ends its turn with; the Stop hook lifts it verbatim.
 const RECAP_SENTINEL: &str = "※ recap:";
@@ -69,6 +70,7 @@ enum Agent {
     Codex,
     Kimi,
     Qodercli,
+    Copilot,
 }
 
 impl Agent {
@@ -79,6 +81,7 @@ impl Agent {
             "codex" => Some(Self::Codex),
             "kimi" => Some(Self::Kimi),
             "qodercli" => Some(Self::Qodercli),
+            "copilot" => Some(Self::Copilot),
             _ => None,
         }
     }
@@ -90,6 +93,7 @@ impl Agent {
             Self::Codex => "flock:codex",
             Self::Kimi => "flock:kimi",
             Self::Qodercli => "flock:qodercli",
+            Self::Copilot => "flock:copilot",
         }
     }
 
@@ -100,6 +104,7 @@ impl Agent {
             Self::Codex => "codex",
             Self::Kimi => "kimi",
             Self::Qodercli => "qodercli",
+            Self::Copilot => "copilot",
         }
     }
 
@@ -119,6 +124,8 @@ impl Agent {
 
 #[derive(Clone, Copy)]
 enum Action {
+    /// Copilot supplies the lifecycle event in its JSON payload.
+    Event,
     Session,
     Prompt,
     Stop,
@@ -130,11 +137,19 @@ enum Action {
     /// not).
     State(PaneAgentState),
     Release,
+    /// opencode's `experimental.session.compacting` plugin hook: print the
+    /// delegate table as plain text for the plugin to add to the compaction
+    /// context (#962).
+    Compacting,
+    /// The question point of ADR-0034: a `PreToolUse` hook on the harness's
+    /// question tools, answered with the server's verdict.
+    Question,
 }
 
 impl Action {
     fn parse(raw: &str) -> Option<Self> {
         match raw {
+            "event" => Some(Self::Event),
             "session" => Some(Self::Session),
             "prompt" => Some(Self::Prompt),
             "stop" => Some(Self::Stop),
@@ -142,6 +157,8 @@ impl Action {
             "idle" => Some(Self::State(PaneAgentState::Idle)),
             "blocked" => Some(Self::State(PaneAgentState::Blocked)),
             "release" => Some(Self::Release),
+            "compacting" => Some(Self::Compacting),
+            "question" => Some(Self::Question),
             _ => None,
         }
     }
@@ -166,12 +183,16 @@ pub(super) fn run_hook_command(args: &[String]) -> std::io::Result<i32> {
     if super::help::asks_for_help(args) {
         // stdout, like `flk --help`: the request was honoured, so this is the
         // command's output and can be redirected or paged.
-        println!("usage: flk hook <agent> <session|prompt|stop|working|idle|blocked|release>");
+        println!(
+            "usage: flk hook <agent> <event|session|prompt|stop|working|idle|blocked|release|compacting|question>"
+        );
         return Ok(0);
     }
 
     let (Some(agent), Some(action)) = (args.first(), args.get(1)) else {
-        eprintln!("usage: flk hook <agent> <session|prompt|stop|working|idle|blocked|release>");
+        eprintln!(
+            "usage: flk hook <agent> <event|session|prompt|stop|working|idle|blocked|release|compacting|question>"
+        );
         return Ok(2);
     };
 
@@ -192,6 +213,14 @@ pub(super) fn run_hook_command(args: &[String]) -> std::io::Result<i32> {
     };
 
     let input = read_stdin_json();
+    // ADR-0034 §3: the question point prints a verdict and reports nothing.
+    // Only Claude's entry is installed so far (Codex is #1185).
+    if matches!(action, Action::Question) {
+        return Ok(match agent {
+            Agent::Claude => super::hook_question::run(&input, seq()),
+            _ => super::exit::SUCCESS,
+        });
+    }
     let hook_event_name = str_field(&input, "hook_event_name").unwrap_or_default();
 
     // SubagentStop is a completion event Claude can emit after the main turn
@@ -199,6 +228,8 @@ pub(super) fn run_hook_command(args: &[String]) -> std::io::Result<i32> {
     if hook_event_name == "SubagentStop" {
         return Ok(0);
     }
+
+    crate::agent_restart::record_checkpoint(&input, &hook_event_name);
 
     // ADR-0008: the inbox is pull, so an idle agent would never learn mail
     // arrived. The stop hook is the wake — a peek (never a consume; the agent
@@ -209,11 +240,8 @@ pub(super) fn run_hook_command(args: &[String]) -> std::io::Result<i32> {
     // The count comes from `msg.wake`, not `msg.list`: the server decides
     // whether a wake may fire at all (a paused fleet, a muted recipient) and
     // answers with a number rather than message previews (#316).
-    let pending_messages = if matches!(action, Action::Stop) {
-        wake_message_count(&pane_id)
-    } else {
-        0
-    };
+    let wake = matches!(action, Action::Stop).then(wake_messages).flatten();
+    let pending_messages = wake.as_ref().map_or(0, wake_count_from_response);
     // #415: an older harness hands the hook no `last_assistant_message`, so
     // `plan_stop` has only the transcript — and the turn's final reply may not
     // have landed there yet. Give it a bounded window here, at the IO edge,
@@ -231,10 +259,10 @@ pub(super) fn run_hook_command(args: &[String]) -> std::io::Result<i32> {
             );
         }
     }
-    // The account profile the session is running under (g-fleet's claude-auth):
+    // The account profile the session is running under (an account switcher):
     // read here, at the IO edge, so `plan` stays a pure function of its inputs.
     let config_dir = env_nonempty("CLAUDE_CONFIG_DIR");
-    let outcome = plan(
+    let mut outcome = plan(
         agent,
         action,
         &input,
@@ -243,6 +271,17 @@ pub(super) fn run_hook_command(args: &[String]) -> std::io::Result<i32> {
         pending_messages,
         config_dir.as_deref(),
     );
+    // ADR-0027 §4: the architect's delegate table comes back as hook output,
+    // never typed into the pane, so armed and unarmed compactions alike get it.
+    if let Some(shape) = delegate_table_shape(agent, action, &input, &hook_event_name) {
+        if let Some(table) = own_delegate_table() {
+            outcome.stdout = Some(table_stdout(shape, &table));
+        }
+    }
+    if let Some(wake) = wake {
+        let marker = inbox_refusal_marker(&pane_id, &input);
+        apply_wake_authority(&mut outcome, &wake, &marker);
+    }
     emit(outcome);
     Ok(0)
 }
@@ -259,6 +298,8 @@ fn plan(
     config_dir: Option<&str>,
 ) -> HookOutcome {
     match action {
+        Action::Event if matches!(agent, Agent::Copilot) => plan_copilot(input, pane_id),
+        Action::Event => HookOutcome::default(),
         Action::Session => plan_session(agent, input, hook_event_name, pane_id, config_dir),
         Action::Prompt => plan_prompt(agent, input, pane_id),
         // Only Claude carries a scrapable transcript + nudge protocol on Stop.
@@ -272,6 +313,190 @@ fn plan(
         Action::State(_) | Action::Release if !agent.reports_state() => HookOutcome::default(),
         Action::State(state) => plan_state(agent, state, input, pane_id),
         Action::Release => plan_release(agent, input, pane_id),
+        Action::Compacting | Action::Question => HookOutcome::default(),
+    }
+}
+
+/// How a delegate table is handed back to the harness (#962).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TableShape {
+    /// Claude Code and Codex: SessionStart `hookSpecificOutput.additionalContext`.
+    /// Both parse the same object, and Codex rejects unknown fields, so it
+    /// carries nothing else.
+    SessionStartContext,
+    /// opencode's compaction hook: the plugin appends stdout to the context.
+    PlainText,
+}
+
+/// Whether this invocation hands the agent its delegate table back, and in
+/// which shape. Only a session that lost or is reloading its context gets
+/// it: `compact` and `resume`. A fresh `startup` or `clear` has no prior
+/// work to recover, and a harness without one of these hooks gets nothing
+/// here (its architect calls `flock_delegate_list` itself).
+fn delegate_table_shape(
+    agent: Agent,
+    action: Action,
+    input: &serde_json::Value,
+    hook_event_name: &str,
+) -> Option<TableShape> {
+    match (agent, action) {
+        (Agent::Claude | Agent::Codex, Action::Session)
+            if hook_event_name == "SessionStart"
+                && matches!(
+                    str_field(input, "source").as_deref(),
+                    Some("compact" | "resume")
+                ) =>
+        {
+            Some(TableShape::SessionStartContext)
+        }
+        (Agent::Opencode, Action::Compacting) => Some(TableShape::PlainText),
+        _ => None,
+    }
+}
+
+fn table_stdout(shape: TableShape, table: &str) -> String {
+    match shape {
+        TableShape::SessionStartContext => serde_json::json!({
+            "hookSpecificOutput": {
+                "hookEventName": "SessionStart",
+                "additionalContext": table,
+            }
+        })
+        .to_string(),
+        TableShape::PlainText => table.trim_end().to_string(),
+    }
+}
+
+/// The calling agent's own delegate table, from `delegate.list` with
+/// `architect: self`. The server resolves `self` from this process's
+/// ancestry, so the hook names no agent and cannot ask for another's.
+/// `None` on no edges and on any failure: a hook never blocks its agent.
+fn own_delegate_table() -> Option<String> {
+    let request = Request {
+        id: format!("flock:hook:{}", seq()),
+        method: Method::DelegateList(DelegateListParams {
+            architect: "self".to_string(),
+            branch: None,
+            repo: None,
+        }),
+    };
+    let response = ApiClient::local()
+        .request_value_with_timeout(&request, HOOK_TIMEOUT)
+        .ok()?;
+    let rows = super::delegate_list::rows(response.get("result")?).ok()?;
+    super::delegate_list::session_table(&rows, super::delegate_list::SESSION_TABLE_ROWS)
+}
+
+/// Copilot's event vocabulary and inference order match its installed hook.
+/// Explicit event names win over payload clues, including unknown events.
+fn plan_copilot(input: &serde_json::Value, pane_id: &str) -> HookOutcome {
+    let field = |snake, camel| str_field(input, snake).or_else(|| str_field(input, camel));
+    let tool = field("tool_name", "toolName");
+    let notification = field("notification_type", "notificationType");
+    let stop_reason = field("stop_reason", "stopReason");
+    let reason = str_field(input, "reason");
+    let session_id = field("session_id", "sessionId");
+    let event = field("hook_event_name", "hookEventName").unwrap_or_else(|| {
+        if notification.is_some() {
+            "notification"
+        } else if input.get("toolResult").is_some() || input.get("tool_result").is_some() {
+            "postToolUse"
+        } else if input.get("error").is_some() && tool.is_some() {
+            "postToolUseFailure"
+        } else if tool.is_some() {
+            "preToolUse"
+        } else if stop_reason.is_some() {
+            "agentStop"
+        } else if reason.is_some() {
+            "sessionEnd"
+        } else if input.get("prompt").is_some() {
+            "userPromptSubmitted"
+        } else if input.get("initial_prompt").is_some()
+            || input.get("initialPrompt").is_some()
+            || input.get("source").is_some()
+            || session_id.is_some()
+        {
+            "sessionStart"
+        } else {
+            ""
+        }
+        .to_string()
+    });
+    let event: String = event
+        .chars()
+        .filter(|c| !matches!(c, '_' | '-'))
+        .flat_map(char::to_lowercase)
+        .collect();
+    let state = match event.as_str() {
+        "sessionstart" => {
+            let has_prompt = input
+                .get("initial_prompt")
+                .or_else(|| input.get("initialPrompt"))
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|prompt| !prompt.trim().is_empty());
+            if has_prompt {
+                PaneAgentState::Working
+            } else {
+                PaneAgentState::Idle
+            }
+        }
+        "userpromptsubmit" | "userpromptsubmitted" => PaneAgentState::Working,
+        "pretooluse" => match tool.as_deref() {
+            Some("ask_user" | "exit_plan_mode") => PaneAgentState::Blocked,
+            _ => PaneAgentState::Working,
+        },
+        "posttooluse" | "posttoolusefailure" => {
+            // report_intent may follow ask_user before the user has answered.
+            if tool.as_deref() == Some("report_intent") {
+                return HookOutcome::default();
+            }
+            PaneAgentState::Working
+        }
+        "notification" => match notification.as_deref() {
+            Some("permission_prompt" | "elicitation_dialog") => PaneAgentState::Blocked,
+            Some("agent_idle") => PaneAgentState::Idle,
+            _ => return HookOutcome::default(),
+        },
+        "stop" | "agentstop" | "sessionstop" => {
+            if stop_reason
+                .as_deref()
+                .is_some_and(|reason| reason != "end_turn")
+            {
+                return HookOutcome::default();
+            }
+            PaneAgentState::Idle
+        }
+        "sessionend" => {
+            // complete is a turn boundary, not an ownership release.
+            return if matches!(reason.as_deref(), Some("user_exit" | "abort")) {
+                HookOutcome {
+                    reports: vec![Method::PaneReleaseAgent(PaneReleaseAgentParams {
+                        pane_id: pane_id.to_string(),
+                        source: Agent::Copilot.source().to_string(),
+                        agent: Agent::Copilot.agent().to_string(),
+                        seq: Some(seq()),
+                    })],
+                    ..HookOutcome::default()
+                }
+            } else {
+                HookOutcome::default()
+            };
+        }
+        _ => return HookOutcome::default(),
+    };
+    HookOutcome {
+        reports: vec![Method::PaneReportAgent(PaneReportAgentParams {
+            pane_id: pane_id.to_string(),
+            source: Agent::Copilot.source().to_string(),
+            agent: Agent::Copilot.agent().to_string(),
+            state,
+            message: None,
+            custom_status: None,
+            seq: Some(seq()),
+            agent_session_id: session_id,
+            agent_session_path: None,
+        })],
+        ..HookOutcome::default()
     }
 }
 
@@ -340,12 +565,17 @@ fn plan_session(
     let Some(session_id) = str_field(input, "session_id") else {
         return HookOutcome::default();
     };
-    // Only a genuine SessionStart may forward `source` (startup/resume/clear/
-    // compact); other lifecycle actions can't spoof an identity change. Claude
-    // is the only agent that reports it today.
-    let session_start_source = (matches!(agent, Agent::Claude)
+    // Only a genuine SessionStart may forward a rebind source and Codex path.
+    // Other lifecycle actions cannot spoof a replacement binding.
+    // Codex fork source/transcript_path are hints, not reader authority. Their
+    // runtime integration belongs to https://github.com/gerchowl/flock/issues/1664.
+    let session_start_source = (matches!(agent, Agent::Claude | Agent::Codex)
         && hook_event_name == "SessionStart")
         .then(|| str_field(input, "source"))
+        .flatten();
+
+    let agent_session_path = (matches!(agent, Agent::Codex) && hook_event_name == "SessionStart")
+        .then(|| str_field(input, "transcript_path"))
         .flatten();
 
     // Remember which account profile (CLAUDE_CONFIG_DIR) this Claude session is
@@ -360,12 +590,13 @@ fn plan_session(
     HookOutcome {
         reports: vec![Method::PaneReportAgentSession(
             PaneReportAgentSessionParams {
+                rebind_agent_id: None,
                 pane_id: pane_id.to_string(),
                 source: agent.source().to_string(),
                 agent: agent.agent().to_string(),
                 seq: Some(seq()),
                 agent_session_id: Some(session_id),
-                agent_session_path: None,
+                agent_session_path,
                 session_start_source,
             },
         )],
@@ -468,8 +699,8 @@ fn plan_stop(
 
 /// The `decision:block` payload that wakes an agent at its turn boundary.
 ///
-/// ADR-0008: this names the COUNT and the tool, never a body. Message content
-/// reaches the recipient only through `flock_msg_read`, so nothing another
+/// ADR-0008: this names the count and inbox readers, never a body.
+/// Message content is pulled through MCP or the CLI, so nothing another
 /// agent wrote can arrive dressed as the operator's instruction — the wake
 /// channel carries no attacker-controlled text.
 ///
@@ -488,8 +719,8 @@ fn mail_nudge(pending_messages: usize, want_recap: bool) -> Option<String> {
             .to_string(),
         (n, _) => format!(
             "You have {n} unread message{} from other agents. Read {} with the \
-             `flock_msg_read` tool and act on any that need a reply before you end \
-             your turn.",
+             `flock_msg_read` tool (or `flk msg read` if the tool is \
+             unavailable) and act on any that need a reply before you end your turn.",
             if n == 1 { "" } else { "s" },
             if n == 1 { "it" } else { "them" }
         ),
@@ -506,22 +737,68 @@ fn mail_nudge(pending_messages: usize, want_recap: bool) -> Option<String> {
 /// decision belongs to the server, where the fleet pause and the recipient's
 /// own mute are known.
 ///
-/// Any failure counts as zero. A hook must never block or fail the parent
-/// agent, so an unreachable or older server means no nudge.
-fn wake_message_count(pane_id: &str) -> usize {
+/// Failures contribute no mail count. Authority refusals also suppress the
+/// recap nudge and produce one nonblocking notice; transport failures remain quiet.
+fn wake_messages() -> Option<serde_json::Value> {
+    // A fork/resume can inherit a stale pane claim. Count only the inbox
+    // the server attests for this process, just as an implicit read does.
     let request = Request {
         id: format!("flock:hook:{}", seq()),
-        method: Method::MsgWake(crate::api::schema::MsgWakeParams {
-            pane: Some(pane_id.to_string()),
-        }),
+        method: Method::MsgWake(crate::api::schema::MsgWakeParams { pane: None }),
     };
     ApiClient::local()
         .request_value_with_timeout(&request, HOOK_TIMEOUT)
         .ok()
-        .map_or(0, |value| wake_count_from_response(&value))
 }
 
-/// Pure half of [`wake_message_count`]: read the count out of a `msg.wake`
+/// Keep the once-only notice separate for each server, pane and harness session.
+fn inbox_refusal_marker(pane_id: &str, input: &serde_json::Value) -> std::path::PathBuf {
+    use sha2::{Digest, Sha256};
+    let key = serde_json::json!([
+        env_nonempty("FLOCK_SOCKET_PATH"),
+        pane_id,
+        str_field(input, "session_id")
+    ]);
+    let digest = Sha256::digest(key.to_string().as_bytes());
+    let name: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    crate::session::data_dir()
+        .join("hook-inbox-refusals")
+        .join(name)
+}
+
+/// An unreadable inbox must suppress both mail demands and recap continuations.
+fn apply_wake_authority(
+    outcome: &mut HookOutcome,
+    wake: &serde_json::Value,
+    marker: &std::path::Path,
+) {
+    if let Some(
+        code @ ("not_authorized" | "inbox_not_owner" | "caller_pane_unresolved" | "operator_only"),
+    ) = wake
+        .pointer("/error/code")
+        .and_then(serde_json::Value::as_str)
+    {
+        outcome.stdout = None;
+        let first = marker.parent().is_some_and(|parent| {
+            std::fs::create_dir_all(parent).is_ok()
+                && std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(marker)
+                    .is_ok()
+        });
+        if first {
+            outcome.stdout = Some(serde_json::json!({
+                "systemMessage": format!("Inbox authority unavailable for this process ({code}). Ask the operator to read this pane's inbox from their own interactive shell with `flk msg operator-read --pane <pane-id>` (peek with `flk msg operator-list --pane <pane-id>`). For a legacy handoff pane, ask the operator to migrate this agent to a structured agent, resuming its harness session (#3066). Reading the inbox does not restore agent authority; see #3000.")
+            }).to_string());
+        }
+    } else if wake.get("result").is_some() {
+        // Successful authority checks end the refusal episode.
+        let _ = std::fs::remove_file(marker);
+    }
+}
+
+/// Pure half of [`wake_messages`]: read the count out of a `msg.wake`
 /// response.
 ///
 /// Split out so a test can pin it against a response built from the server's
@@ -750,6 +1027,79 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn stop_hook_authority_refusal_reports_once_without_blocking_and_resets_after_recovery() {
+        let root =
+            crate::structured::launch::SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+        let marker = root.path().join("notices").join("session");
+        for code in [
+            "not_authorized",
+            "inbox_not_owner",
+            "caller_pane_unresolved",
+            "operator_only",
+        ] {
+            let refused = json!({"error": {"code": code}});
+            let mut outcome = HookOutcome {
+                stdout: mail_nudge(3, true),
+                ..Default::default()
+            };
+            apply_wake_authority(&mut outcome, &refused, &marker);
+            let notice: serde_json::Value =
+                serde_json::from_str(outcome.stdout.as_ref().unwrap()).unwrap();
+            assert!(notice.get("decision").is_none(), "{notice}");
+            assert!(notice["systemMessage"].as_str().unwrap().contains(code));
+            assert!(notice["systemMessage"]
+                .as_str()
+                .unwrap()
+                .contains("operator"));
+            assert!(notice["systemMessage"]
+                .as_str()
+                .unwrap()
+                .contains("flk msg operator-read --pane"));
+            assert!(notice["systemMessage"].as_str().unwrap().contains("#3000"));
+            assert!(notice["systemMessage"].as_str().unwrap().contains("#3066"));
+            assert!(notice["systemMessage"]
+                .as_str()
+                .unwrap()
+                .contains("migrate"));
+            for count in [0, 3] {
+                outcome.stdout = mail_nudge(count, true);
+                apply_wake_authority(&mut outcome, &refused, &marker);
+                assert!(
+                    outcome.stdout.is_none(),
+                    "neither unread mail nor recap may loop"
+                );
+            }
+            let readable = json!({"result": {"count": 3, "type": "msg_wake"}});
+            outcome.stdout = mail_nudge(wake_count_from_response(&readable), false);
+            let original = outcome.stdout.clone();
+            apply_wake_authority(&mut outcome, &readable, &marker);
+            assert_eq!(
+                outcome.stdout, original,
+                "authorized mail still blocks for a read"
+            );
+            assert!(!marker.exists());
+        }
+    }
+
+    #[test]
+    fn stop_hook_authority_refusal_cannot_block_when_notice_storage_fails() {
+        let root =
+            crate::structured::launch::SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+        let parent = root.path().join("file");
+        std::fs::write(&parent, "fixture").unwrap();
+        let mut outcome = HookOutcome {
+            stdout: mail_nudge(2, true),
+            ..Default::default()
+        };
+        apply_wake_authority(
+            &mut outcome,
+            &json!({"error": {"code": "not_authorized"}}),
+            &parent.join("notice"),
+        );
+        assert!(outcome.stdout.is_none());
+    }
+
     /// ADR-0018 §1, from where the value starts to where it is observed: a
     /// `msg.send` as a client puts it on the socket, the `msg.wake` the stop
     /// hook asks, and the hook's own decision about whether to block the turn.
@@ -770,6 +1120,8 @@ mod tests {
         ];
         app.state.ensure_test_terminals();
         app.state.active = Some(0);
+        // These explicit cross-pane queries model an identified local operator.
+        app.current_api_peer_pid = Some(std::process::id());
         let pane = {
             let pane_id = app.state.workspaces[1].focused_pane_id().expect("pane");
             app.state.public_pane_id(1, pane_id).expect("public id")
@@ -1009,8 +1361,47 @@ mod tests {
         };
         assert_eq!(params.agent_session_id.as_deref(), Some("sess-abc"));
         assert_eq!(params.source, "flock:codex");
-        // Only Claude may forward SessionStart's `source`; codex must not.
+        // Missing source/path fields are not invented by the session planner.
         assert!(params.session_start_source.is_none());
+    }
+
+    #[test]
+    fn codex_sessionstart_forwards_every_source_and_transcript_path() {
+        for source in ["startup", "resume", "clear", "compact", "fork"] {
+            let out = plan(
+                Agent::Codex,
+                Action::Session,
+                &json!({"session_id":"child", "source":source, "transcript_path":"/fixture/rollout.jsonl"}),
+                "SessionStart",
+                "p_9",
+                0,
+                None,
+            );
+            let Method::PaneReportAgentSession(params) = &out.reports[0] else {
+                panic!("session report")
+            };
+            assert_eq!(params.session_start_source.as_deref(), Some(source));
+            assert_eq!(
+                params.agent_session_path.as_deref(),
+                Some("/fixture/rollout.jsonl")
+            );
+        }
+    }
+
+    #[test]
+    fn codex_other_events_cannot_forward_binding_claims() {
+        let out = plan_session(
+            Agent::Codex,
+            &json!({"session_id":"child", "source":"fork", "transcript_path":"/fixture/rollout.jsonl"}),
+            "Stop",
+            "p_9",
+            None,
+        );
+        let Method::PaneReportAgentSession(params) = &out.reports[0] else {
+            panic!("session report")
+        };
+        assert!(params.session_start_source.is_none());
+        assert!(params.agent_session_path.is_none());
     }
 
     #[test]
@@ -1067,14 +1458,148 @@ mod tests {
             ("codex", "flock:codex", "codex"),
             ("kimi", "flock:kimi", "kimi"),
             ("qodercli", "flock:qodercli", "qodercli"),
+            ("copilot", "flock:copilot", "copilot"),
         ] {
             let parsed = Agent::parse(raw).expect("agent parses");
             assert_eq!(parsed.source(), source);
             assert_eq!(parsed.agent(), agent);
         }
-        // copilot still ships its own shim (its event state machine is not
-        // ported yet) — it must NOT resolve here and silently do nothing.
-        assert!(Agent::parse("copilot").is_none());
+    }
+
+    #[test]
+    fn copilot_event_reports_preserve_state_and_session_identity() {
+        for (input, state) in [
+            (json!({"session_id": "s"}), PaneAgentState::Idle),
+            (
+                json!({"sessionId": "s", "initialPrompt": "go"}),
+                PaneAgentState::Working,
+            ),
+            (
+                json!({"sessionId": "s", "initialPrompt": "  "}),
+                PaneAgentState::Idle,
+            ),
+            (
+                json!({"session_id": "s", "prompt": "go"}),
+                PaneAgentState::Working,
+            ),
+            (
+                json!({"session_id": "s", "tool_name": "ask_user"}),
+                PaneAgentState::Blocked,
+            ),
+            (
+                json!({"sessionId": "s", "toolName": "exit_plan_mode"}),
+                PaneAgentState::Blocked,
+            ),
+            (
+                json!({"session_id": "s", "tool_name": "bash"}),
+                PaneAgentState::Working,
+            ),
+            (
+                json!({"sessionId": "s", "toolName": "ask_user", "toolResult": null}),
+                PaneAgentState::Working,
+            ),
+            (
+                json!({"session_id": "s", "tool_name": "exit_plan_mode", "error": null}),
+                PaneAgentState::Working,
+            ),
+            (
+                json!({"session_id": "s", "notification_type": "permission_prompt"}),
+                PaneAgentState::Blocked,
+            ),
+            (
+                json!({"sessionId": "s", "notificationType": "elicitation_dialog"}),
+                PaneAgentState::Blocked,
+            ),
+            (
+                json!({"session_id": "s", "notification_type": "agent_idle"}),
+                PaneAgentState::Idle,
+            ),
+            (
+                json!({"sessionId": "s", "stopReason": "end_turn"}),
+                PaneAgentState::Idle,
+            ),
+            (
+                json!({"session_id": "s", "hook_event_name": "Stop"}),
+                PaneAgentState::Idle,
+            ),
+            (
+                json!({"session_id": "s", "hook_event_name": "agentStop", "stop_reason": ""}),
+                PaneAgentState::Idle,
+            ),
+            (
+                json!({"session_id": "s", "hookEventName": "agentStop", "stopReason": ""}),
+                PaneAgentState::Idle,
+            ),
+            (
+                json!({"session_id": "s", "hookEventName": "USER-PROMPT_SUBMITTED"}),
+                PaneAgentState::Working,
+            ),
+        ] {
+            let out = plan(Agent::Copilot, Action::Event, &input, "", "p_1", 0, None);
+            assert_eq!(out.reports.len(), 1, "{input}");
+            let Method::PaneReportAgent(report) = &out.reports[0] else {
+                panic!("expected state report for {input}");
+            };
+            assert_eq!(report.state, state, "{input}");
+            assert_eq!(report.agent_session_id.as_deref(), Some("s"));
+            assert_eq!(report.source, "flock:copilot");
+            assert_eq!(report.agent, "copilot");
+            assert_eq!(report.pane_id, "p_1");
+            assert!(report.seq.is_some());
+            assert!(out.stdout.is_none());
+        }
+    }
+
+    #[test]
+    fn copilot_ignores_incidental_events_and_keeps_turn_ownership() {
+        for input in [
+            json!({}),
+            json!(null),
+            json!({"hookEventName": "unknown", "prompt": "go"}),
+            json!({"tool_name": "report_intent", "tool_result": {}}),
+            json!({"toolName": "report_intent", "error": "failed"}),
+            json!({"notification_type": "other"}),
+            json!({"stop_reason": "tool_use"}),
+            json!({"reason": "complete"}),
+            json!({"reason": "other"}),
+        ] {
+            assert!(plan_copilot(&input, "p_1").reports.is_empty(), "{input}");
+        }
+        for reason in ["user_exit", "abort"] {
+            let out = plan_copilot(&json!({"reason": reason}), "p_1");
+            assert_eq!(out.reports.len(), 1);
+            let Method::PaneReleaseAgent(report) = &out.reports[0] else {
+                panic!("expected release for {reason}");
+            };
+            assert_eq!(report.source, "flock:copilot");
+            assert_eq!(report.agent, "copilot");
+            assert_eq!(report.pane_id, "p_1");
+        }
+    }
+
+    #[test]
+    fn copilot_field_precedence_matches_the_shell_hook() {
+        let out = plan_copilot(
+            &json!({
+                "hook_event_name": "session-start", "hookEventName": "PreToolUse",
+                "session_id": "snake", "sessionId": "camel",
+                "initial_prompt": null, "initialPrompt": "go", "tool_name": "ask_user"
+            }),
+            "p_1",
+        );
+        let Method::PaneReportAgent(report) = &out.reports[0] else {
+            panic!("expected state report");
+        };
+        assert_eq!(report.state, PaneAgentState::Idle);
+        assert_eq!(report.agent_session_id.as_deref(), Some("snake"));
+        let out = plan_copilot(
+            &json!({"hookEventName": "SessionStop", "session_id": 42}),
+            "p_1",
+        );
+        let Method::PaneReportAgent(report) = &out.reports[0] else {
+            panic!("expected state report without session id");
+        };
+        assert_eq!(report.agent_session_id, None);
     }
 
     // --- run_hook_command guards (all trip before stdin is read) ---------
@@ -1116,6 +1641,55 @@ mod tests {
     // --- session ---------------------------------------------------------
 
     #[test]
+    fn only_a_compacted_or_resumed_session_asks_for_its_delegate_table() {
+        let shape = |agent, action, source: &str, event: &str| {
+            let input = json!({"hook_event_name": event, "session_id": "s", "source": source});
+            delegate_table_shape(agent, action, &input, event)
+        };
+        let start = Some(TableShape::SessionStartContext);
+        for source in ["compact", "resume"] {
+            assert_eq!(
+                shape(Agent::Claude, Action::Session, source, "SessionStart"),
+                start
+            );
+            assert_eq!(
+                shape(Agent::Codex, Action::Session, source, "SessionStart"),
+                start
+            );
+        }
+        for source in ["startup", "clear"] {
+            assert_eq!(
+                shape(Agent::Claude, Action::Session, source, "SessionStart"),
+                None
+            );
+        }
+        assert_eq!(
+            shape(Agent::Claude, Action::Session, "compact", "SessionEnd"),
+            None
+        );
+        assert_eq!(
+            shape(Agent::Kimi, Action::Session, "compact", "SessionStart"),
+            None
+        );
+        assert_eq!(
+            shape(Agent::Opencode, Action::Compacting, "", ""),
+            Some(TableShape::PlainText)
+        );
+        assert_eq!(shape(Agent::Claude, Action::Compacting, "", ""), None);
+    }
+
+    #[test]
+    fn the_session_start_table_is_exactly_the_shape_claude_and_codex_parse() {
+        let out: serde_json::Value =
+            serde_json::from_str(&table_stdout(TableShape::SessionStartContext, "t\n")).unwrap();
+        assert_eq!(
+            out,
+            json!({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": "t\n"}})
+        );
+        assert_eq!(table_stdout(TableShape::PlainText, "t\n"), "t");
+    }
+
+    #[test]
     fn session_reports_id_and_forwards_source_only_on_sessionstart() {
         let input =
             json!({"hook_event_name": "SessionStart", "session_id": "sid-1", "source": "resume"});
@@ -1152,11 +1726,11 @@ mod tests {
             "SessionStart",
             "p_1",
             0,
-            Some("/home/u/.claude-profiles/work"),
+            Some("/home/u/.config/profile-a"),
         );
         assert_eq!(
             out.config_dir_record,
-            Some(("sid-9".into(), "/home/u/.claude-profiles/work".into()))
+            Some(("sid-9".into(), "/home/u/.config/profile-a".into()))
         );
     }
 
@@ -1184,7 +1758,7 @@ mod tests {
             "",
             "p_1",
             0,
-            Some("/home/u/.claude-profiles/work"),
+            Some("/home/u/.config/profile-a"),
         )
         .config_dir_record
         .is_none());
@@ -1361,6 +1935,7 @@ mod tests {
         assert!(nudge.contains("\"decision\":\"block\""), "{nudge}");
         assert!(nudge.contains("2 unread messages"), "{nudge}");
         assert!(nudge.contains("flock_msg_read"), "{nudge}");
+        assert!(nudge.contains("`flk msg read`"), "{nudge}");
 
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
@@ -1379,6 +1954,7 @@ mod tests {
         assert!(nudge.contains("1 unread message"), "{nudge}");
         assert!(!nudge.contains("1 unread messages"), "singular: {nudge}");
         assert!(nudge.contains("flock_msg_read"), "{nudge}");
+        assert!(nudge.contains("`flk msg read`"), "{nudge}");
         assert!(nudge.contains("act on"), "{nudge}");
         assert!(
             !nudge.contains("recap"),
@@ -1393,6 +1969,28 @@ mod tests {
         }
 
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn mail_fallback_uses_attested_self_even_without_a_transcript() {
+        for pane_id in ["p_1", "w2:p3"] {
+            for pending in [1, 3] {
+                let out = plan(
+                    Agent::Claude,
+                    Action::Stop,
+                    &json!({"hook_event_name": "Stop"}),
+                    "Stop",
+                    pane_id,
+                    pending,
+                    None,
+                );
+                let nudge: serde_json::Value =
+                    serde_json::from_str(&out.stdout.expect("mail wakes")).unwrap();
+                let reason = nudge["reason"].as_str().unwrap();
+                assert!(reason.contains("`flk msg read`"), "{reason}");
+                assert!(reason.contains("if the tool is unavailable"), "{reason}");
+            }
+        }
     }
 
     #[test]

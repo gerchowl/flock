@@ -1,0 +1,5798 @@
+# ADR 0036 — An agent can run as a structured session: flk owns its process and its one input queue, translates its typed event stream into flk's state, questions and waits, serves every frontend one wire contract, and forks it at any message boundary
+
+- Status: Accepted (2026-10-13, owner decisions recorded); amended
+  2026-10-14 with the S0 probe findings (#1324, "S0 findings for the
+  architect" says where each landed), and with the A.13 controls, the A.16
+  login results and the owner's narrowing of decision 1 (#1404); amended
+  2026-10-16 (#1606, ADR-0038): the Vite client build (§7), the `synced`
+  frame and the `gap` frame's `snapshot_to` (§4, §5), and the owner's
+  decision that flk's log, metric and trace output goes through vig-os/vigil,
+  which resolves #1323 so it no longer gates S7 (§5, decision 6, S7);
+  transport liveness and recovery are specified in §5a
+- Amendment accepted by the architect, 2026-10-16 (#1546, #1641): §4/§5/§7
+  define transport recovery, snapshot bootstrap and `synced` before S7a.
+  Numeric parameters in §5a are proposals with rationale for review; no
+  transport implementation or deployment decision is claimed.
+- S6e amendment Accepted (2026-10-29, #2242/#2731): the owner typed
+  "accept all rec with star". All S6e recommendations are decided; no
+  question-thread implementation is claimed.
+- §1a amendment Accepted 2026-11-19 (owner decision, #3135; not yet
+  implemented):
+  §1a lets operator app-session `operate` tokens stop and restart structured
+  agents on their home node; file tokens stay refused.
+- Implemented: the S0 probes (#1356); the slices are tracked in #1307.
+- Date: 2026-10-13
+- Issues: #1299 (the spike this records, with the owner decisions of
+  2026-10-13). Composes with ADR-0005 / ADR-0028 (the durable event log, seq
+  cursors, §3a unknown kinds, the state axes of §1, waits of §5, channel
+  tokens of §8, questions of §8a), ADR-0034 (`hook.decide`, the question
+  policy, routing to the architect), ADR-0010 (`flk report`), ADR-0019 (push
+  delivery into a Claude session), ADR-0029 (exit codes, the JSON error
+  envelope), ADR-0032 (compiled context), ADR-0014 (the operator authority
+  boundary), ADR-0035 §6.3 and #1177 / O19a #1208 (agents run as the separate
+  `flk-agent` user, attested by uid), ADR-0026 (mesh delivery, which
+  superseded the delivery contracts of ADR-0008, ADR-0018 and ADR-0019),
+  ADR-0001 (the web bridge hosting rules), #868 (protocol gating). Designs
+  #1301 (non-blocking questions, §2a) and the turn-end half of #697
+  (self-compact and its continuation, §3a); records the owner decision of
+  #1300 for unknown-event logging (§8); reserves the extension points that
+  the follow-up spike #1310 designs (§12). Extends `agent.fork` /
+  `agent.lineage` (`flock_agent_fork`, `flock_agent_lineage`) rather than
+  adding verbs. Designs the permission presets of #1321 (P25, §10b).
+- Follow-ups: #1307 (slice tracking), #1305 (the cache tests; test 4 is
+  measured in A.7.1, test 6 in A.7.2), #1308
+  (TUI parity gaps P16, P17), #1309 (live Codex and opencode runs), #1323
+  (the Grafana Labs stack versus our own for the stream and history, §5;
+  resolved 2026-10-16 in favour of vig-os/vigil for telemetry, #1614).
+- Decision owner: operator.
+- Evidence: Appendix A was measured on 2026-10-13 against Claude Code
+  2.1.296 (this host's `latest` channel; the fleet `stable` pin is 2.1.287,
+  which carries the same hidden flags, see A.4), codex-cli 0.160.1 and
+  opencode 1.18.35, in throwaway sessions under a scratch working directory
+  with every `FLOCK_*` and `CLAUDE_CODE_*` variable removed. No flk server was
+  started, reached or restarted. Total spend: about 1.6M tokens, 76% of them
+  cache reads (A.9).
+
+## Context
+
+flk drives every agent through a terminal. Input reaches an agent through
+several doors that do not know about each other: the operator typing into the
+pane, `flk agent send`, `msg.send` / `msg.reply` delivery, channel replies,
+and hook injections such as the Stop-hook recap. Output is a screen that the
+detector (ADR-0028 §1, `src/detect/`) reads back into state. That costs
+ordering and attribution of inputs, invites TTY races (the paste-trap class),
+ships repaints rather than meaning to remote clients, makes transcripts hard
+to query, and lets a fork start only from the latest point
+(`agent.fork` today is `claude --resume <sid> --fork-session` in a new
+worktree, `src/agent_resume.rs:187`, `src/app/api/worktrees.rs:227`).
+
+`claude -p --input-format stream-json --output-format stream-json` gives a
+typed event stream out and exclusive ownership of stdin in. The owner decided
+on 2026-10-13 (#1299):
+
+1. The structured session surface and runtime live fully in flk,
+   independent of any private client.
+2. One backend, several frontends: one frontend-neutral wire contract that
+   the Rust TUI and a Bun/TypeScript web frontend shipped in flock both
+   consume; TS types are generated from the Rust schema and drift fails CI.
+3. The parser never drops or crashes on an event it does not know: it passes
+   it through as a raw `unknown` event that every frontend can show as a
+   collapsible JSON dump.
+4. Each unknown shape is recorded once (kind, harness, version, redacted
+   sample) and can be turned into a bug report through `flk report`, which a
+   human submits (ADR-0010).
+
+The owner then answered this record's questions on 2026-10-13; the answers
+are in "Owner decisions (2026-10-13)" and the body follows them. This record
+decides the design and the slices. It changes no code.
+
+## What the probes established
+
+Each line cites Appendix A. Items the issue marked "verify" are settled here.
+
+- **E1 Event model.** One `claude -p` process emits, per turn:
+  `command_lifecycle` (queued, started, completed, cancelled; keyed by the
+  input message's `uuid`), `system/init` (once per turn, not once per
+  process), `system/status` (`requesting`, `compacting`), `stream_event`
+  (raw Anthropic SSE: `message_start` … `message_stop`, deltas `text_delta`,
+  `thinking_delta`, `signature_delta`, `input_json_delta`), `assistant` (one
+  per content block), `user` (tool results; with `--replay-user-messages`
+  also the replayed input), `system/thinking_tokens`, `rate_limit_event`,
+  `system/permission_denied`, `system/compact_boundary`,
+  `system/hook_started` / `hook_response` (with `--include-hook-events`),
+  `control_request` / `control_response`, and `result`. A turn ends with
+  exactly one `result`. (A.2, A.3)
+- **E2 Truthful status comes from events, never the exit code.** A clean
+  stdin close after an interrupted turn exits 1. An unknown model exits 1
+  with a `result` whose `subtype` is `success` but `is_error` is true,
+  `terminal_reason: "api_error"`, `api_error_status: 404`. An interrupted
+  turn ends `subtype: "error_during_execution"`,
+  `terminal_reason: "aborted_streaming"`. (A.5)
+- **E3 Input identity and acknowledgement exist.** A `uuid` supplied on a
+  stream-json `user` line is kept: it is the `command_uuid` of the
+  `command_lifecycle` events, the replayed message's `uuid`, the
+  `user_message_uuids` of `system/status` and `message_start`, and the
+  transcript entry's `uuid`. flk can make it the idempotency key. (A.5)
+- **E4 A message written mid-turn is folded into the running turn** at the
+  next model step: it reports `queued`, then `started` while the first input
+  is still running, and both inputs complete under one `result`. Holding a
+  message until `result` is therefore flk's decision, not the harness's. (A.5)
+- **E5 Hooks leak, and isolation works without a private config dir.** A
+  default `-p` session runs the fleet's user-level SessionStart,
+  UserPromptSubmit and Stop hooks (two each, observed as `hook_started` /
+  `hook_response`). `--safe-mode` runs none but also ignores `--mcp-config`.
+  `--setting-sources local` drops the user hooks while hooks passed through
+  `--settings` still run; claude.ai connectors still attach unless
+  `--strict-mcp-config` is given. (A.1)
+- **E6 An isolated `CLAUDE_CONFIG_DIR` loses the login on macOS.** OAuth
+  lives in the keychain under a service named for the first eight hex digits
+  of sha256(config dir), so a fresh dir prints `Not logged in · Please run
+  /login` and exits 1. Copying the entry would share a rotating refresh token
+  between two dirs, which can log the original out. (A.1)
+- **E7 `AskUserQuestion` is available in `-p`, but only when a host answers
+  prompts.** With `--permission-prompt-tool stdio` the tool is listed in
+  `system/init` and arrives as `control_request{subtype: can_use_tool,
+  tool_name: AskUserQuestion, requires_user_interaction: true}`; the host
+  answers with `updatedInput.answers` and the model continues with them.
+  Without a host it is absent, even from deferred tool search. The issue's
+  premise "AskUserQuestion is not available in -p" holds only for a session
+  nobody answers. (A.6)
+- **E8 Permissions round-trip over stdio or MCP.** Both
+  `--permission-prompt-tool stdio` (a `can_use_tool` control request with
+  `permission_suggestions`) and an MCP tool (`--permission-prompt-tool
+  mcp__<server>__<tool>`) deny with flk's message, and the denial lands in
+  `result.permission_denials`. With no host, anything that would prompt is
+  denied automatically. Read-only shell commands such as `cat` never prompt.
+  (A.6)
+- **E9 A resume-at-message option exists.** `--resume-session-at <message
+  uuid>` is a hidden CLI flag (in 2.1.287 and 2.1.296; the CLI form of the
+  Agent SDK's `resumeSessionAt`), requires `--resume`, keeps the transcript
+  up to and including that message, and composes with `--fork-session`. The
+  original transcript is not touched. Stream `uuid`s of `assistant` and
+  tool-result `user` events are the transcript's uuids, so a client can name
+  a fork point straight from the stream. (A.4, A.7)
+- **E10 Boundary forks read the cache.** Forks at the latest point, at a turn
+  boundary, and between two tool calls of one turn read 99.3–99.7% of their
+  input from cache. Ten concurrent forks of one warm point each read 100%.
+  (A.7)
+- **E11 A fork cannot reach behind the last compaction through the CLI.** The
+  loader starts at the latest `compact_boundary` and keeps only the preserved
+  messages; `--resume-session-at` a pre-compaction uuid that was preserved
+  resumes the compacted context (7.3k tokens, not 40k). A copy of the
+  transcript's byte prefix ending before the boundary, resumed with
+  `--fork-session`, restores the full pre-compaction context with a 99.6%
+  cache read. (A.7)
+- **E12 Resume pins the tool schemas; tool changes do not invalidate the
+  cache.** A fork with `--tools` reduced to `Bash` read 100% of the prefix;
+  the model still saw `Read` and called it, and Claude Code refused it
+  client-side ("No such tool available: Read. Read is disabled for this
+  session"). Adding an MCP server on resume, or removing one, kept the hit
+  (98.3–99.6%), and the added tool was callable. The issue's expectation "MCP
+  server added or removed, `--tools` reduced: miss" does not hold at
+  2.1.296. (A.7)
+- **E13 The date is a recorded message, not part of the system prompt.**
+  "Today's date is …" is a `<system-reminder>` attachment in the transcript,
+  and the binary carries a "The date has changed …" attachment for a later
+  date. A fork across a day boundary therefore keeps its cache: forked
+  across local midnight, it read 98.1% from cache, and the harness appended
+  a date-change reminder after the new prompt while the recorded date
+  stayed as it was (A.7.2). The model need not act on that reminder
+  (A.7.2, caveats). (A.7)
+- **E14 Hot reload is cheap without compaction and resets the prefix with
+  it.** Resuming a 41k-token session with a new MCP server read 98.9% from
+  cache (first-token time 2.26 s). After `/compact` (40,032 → 1,237 tokens)
+  the first turn read 0 and wrote 7,815. The `/compact` turn reports zero
+  usage in `result.usage`; its cost (13.9k uncached input, 1.4k output)
+  shows only in `modelUsage`. (A.3)
+- **E15 Concurrent cold writes are not deduplicated.** Ten concurrent fresh
+  sessions with identical new content each wrote 13,808 cache tokens; an
+  eleventh, after them, read it all. Subscription sessions write the 1-hour
+  cache (`ephemeral_1h_input_tokens`), which Anthropic prices at twice the
+  base input rate (5-minute writes 1.25×, reads 0.1×; "Prompt caching",
+  docs.claude.com/en/docs/build-with-claude/prompt-caching, pricing table).
+  (A.7)
+- **E16 The harness opens a messaging socket of its own, and
+  `--restricted` closes it.** Every `-p` process opens a socket under
+  `/tmp/cc-socks/` and reports it as `system/init.messaging_socket_path`.
+  On macOS it runs unauthenticated `user` lines from any process of the
+  session's uid as turns, and every child process of the session gets its
+  path and token. `--restricted` (or `CLAUDE_CODE_RESTRICTED=1`) binds no
+  socket and sets neither variable, while `--settings` hooks,
+  `--mcp-config` servers and the stdio prompt keep working. flk launches
+  with it and never uses the socket (§1, owner decision 5). (A.2, A.11)
+- **E17 Bytes.** Over all probe runs, tool results were 41.7% of stdout
+  bytes, partial deltas 28.8%, `system/init` (repeated every turn) 10.6%,
+  complete `assistant` events 7.8%. (A.8)
+- **E18 Harness neutrality.** Codex (`app-server`, JSON-RPC, thread / turn /
+  item) and opencode (`serve`, HTTP + SSE, session / message / part) carry
+  every concept flk needs, including approvals, user questions, interrupt,
+  resume, fork at a turn or message, compaction and cache token counts, but
+  only in their server modes; their one-shot JSON modes (`codex exec
+  --json`, `opencode run --format json`) stream no deltas and have no
+  approval path. Approvals, user questions, errors, interrupts and reasoning
+  of the server modes were read from their generated schemas only, not run
+  live (#1309). (A.10)
+
+## Decision
+
+### 1. The agent-session runtime: `pty` or `structured`, per agent
+
+An agent record gains `runtime: pty | structured`. `pty` is today's
+behaviour and stays the default. `structured` is opt-in per start
+(`flk agent start --runtime structured`, the MCP and socket equivalents) and
+first ships for Claude Code only.
+
+A structured agent is a child process of the flk server: `claude -p
+--input-format stream-json --output-format stream-json --verbose
+--include-partial-messages --replay-user-messages --include-hook-events
+--permission-prompt-tool stdio --setting-sources local --strict-mcp-config
+--restricted --settings <flk file> --mcp-config <flk file> --session-id
+<uuid>` (or `--resume <id>`), started as the `flk-agent` user (§1a) with that user's
+private config dir for the agent's profile as `CLAUDE_CONFIG_DIR`, and the
+compiled context of ADR-0032 passed through `--append-system-prompt-file`
+and `--add-dir`. The server owns stdin and stdout exclusively.
+
+- **Isolation and login (E5, E6, ADR-0035 §6.3 point 1).** A structured
+  agent never runs as the operator's uid. Its `CLAUDE_CONFIG_DIR` is a
+  private dir per profile in the `flk-agent` user's `HOME`
+  (`~flk-agent/.flk/claude/<profile>`). The login is a `claude setup-token`
+  token only (owner decision 1, narrowed 2026-10-14): the fleet configuration repo renders it
+  from sops as a 0600 file owned by `flk-agent`, and flk
+  passes it into the session's environment as `CLAUDE_CODE_OAUTH_TOKEN`
+  and never logs it. `claude /login` is not used for agents: as a macOS
+  user with no GUI session it cannot save its login (no keychain, and no
+  plaintext fallback on 2.1.287), while the token path works for that user
+  (A.16). The operator's config dir and keychain are never read or copied:
+  sharing them would share a rotating refresh token between two dirs (E6). Inside that
+  dir the session is still isolated by flags: `--setting-sources local` (no
+  user-level hooks, permissions or plugins), `--strict-mcp-config` (no
+  claude.ai connectors arriving late and shifting the tool set) and flk's
+  own `--settings` and `--mcp-config`, so nothing that lands in the dir by
+  accident changes the session. `--restricted` closes the harness's
+  messaging socket (see "No second input door" below); it also reads no
+  user settings, turns off auto memory and refuses cloud sessions (A.11),
+  which this isolation wants anyway. Because user-level permission rules are
+  dropped, flk passes the agent's permission policy explicitly, as the
+  agent's permission preset (§10b). The fleet
+  Stop hook never runs in a structured session; what it did there is done
+  by the server on `result` (§3a). The probes ran in the operator's profile
+  only because O19a is not live yet; the flag behaviour of E5 does not
+  depend on the user.
+- **One process per session id.** The server holds a session lease (agent id,
+  session id, pid, start time) in its state and refuses a second spawn,
+  resume or fork-in-place for a leased id with `session_busy` (a new
+  `ErrorCode`, retry class `Later`). Forks always take a new id
+  (`--fork-session`), so they never contend.
+- **Truthful status (E2).** The turn's outcome is the `result` event: `ok`
+  when `is_error` is false; otherwise `api_error{status}`,
+  `aborted{reason}` or `failed{errors}`. The exit code is recorded and shown
+  but never decides the outcome. A process that dies without a `result` for
+  a started input is `crashed`, and the input is re-queued as `held` (§3),
+  never silently retried.
+- **Stall and waiting.** `waiting_on_human` is exact: a `can_use_tool`
+  control request is open. S0 observed only one open at a time: no later
+  call of the same message ran until the open one was answered, a
+  concurrency-safe `Read` included (A.13, §2b). flk still does not rely on
+  one open request at a time, because the probed shapes are few. It
+  tracks open control
+  requests by `request_id`, and the agent stays `waiting_on_human` until
+  every one of them is answered. Working is `system/status: requesting` or
+  an open `message_start`. A stall is an accepted or started input with no stdout event for
+  `[sessions] stall_ms` while no control request and no tool call is open.
+  This optional setting defaults to **120000 ms** (2 minutes), with an inclusive
+  range of **5000..=3600000 ms**. Out-of-range values, including zero, are config
+  validation errors; there is no disabled value or silent clamping. A stall is
+  an observation that leaves the phase unchanged, so false positives are cheap.
+  Provider retries and rate-limit backoff can produce tens of seconds of silence;
+  two minutes avoids reporting those as stalls while exposing a hung harness.
+  The production worker caller passes the loaded value, without another default;
+  a long-running tool is not a stall (its `tool_use` is open). A stall is
+  reported as `agent.session_stalled{since}` and leaves the phase as it is
+  (ADR-0028 §1 derivation is unchanged); it is an observation, not a timeout
+  that kills anything.
+- **No second input door (E16, owner decision 5).** flk owns the session's
+  stdin, so every input, from a human or from another agent, is an item of
+  the one queue of §3. flk has no "messaging socket" concept: it never
+  writes to the harness's socket, never advertises its path to agents, and
+  agent-to-agent messages travel as `msg.send` into the queue. The
+  harness's own socket is closed by the launch profile: with `--restricted`
+  no socket is bound, `system/init` carries no `messaging_socket_path`, and
+  neither `CLAUDE_CODE_MESSAGING_SOCKET` nor `CLAUDE_CODE_MESSAGING_TOKEN`
+  reaches the agent's tool processes (A.11). Without it, the socket would
+  take unauthenticated `user` lines from any `flk-agent` process, so any
+  structured agent could start turns in any other one past the queue
+  (A.11). S3 diffs the `system/init` of the restricted profile against the
+  same profile without `--restricted` (tools, MCP servers, skills, slash
+  commands, capabilities, permission mode) and records the result before
+  it ships; S0 found `tools`, `slash_commands` and `capabilities`
+  unchanged (A.11). S3 also refuses to run a session whose `system/init`
+  reports a `messaging_socket_path` (see "Failure modes").
+- **Hot reload.** On a config change (MCP server, skill, settings) the
+  server waits for idle (no started input, no open control request), closes
+  stdin, waits for exit, and respawns with `--resume <id>` and the new
+  config. The first `system/init` of the new process is diffed against the
+  last one of the old (tools, MCP servers, skills, plugins, slash commands,
+  model, permission mode) and recorded as `agent.session_reloaded{diff}`;
+  the diff is also queued to the agent as a `reload_notice` item (§3) so that it knows
+  which tools appeared or went (E12: a removed tool's schema can still be
+  visible and is refused when called). Compaction before a reload is not
+  automatic: it costs a full uncached pass and resets the prefix (E14), so it
+  is a separate operator choice. A fleet-wide reload is staged: one agent
+  first, the rest after its first turn succeeds; agents that share a prefix
+  reload together so they warm one entry (E15 shows simultaneous cold writes
+  are paid per process, so "together" means one first, then the rest).
+
+### 1a. Identity and the operator boundary for structured agents
+
+**Resume authority (#2047 review amendment).** Resuming an existing structured
+record is operator-only (`operator_only`), including an agent resuming itself.
+The original parent and depth survive every resume and lease generation; resume
+never re-parents a conversation. This rule is adjacent to the `may_stop` policy:
+stop remains available only to the operator and the structured agent itself
+(an app-session `operate` token counts as the operator under the accepted
+amendment below).
+MCP spawn is fresh-only. Mesh relays cannot carry structured start/spawn, and the
+server independently refuses recorded mesh edges. Client token scopes, including
+`operate`, grant permission decisions, not local socket operator identity or
+resume authority (**the amendment below, Accepted 2026-11-19 (owner decision),
+narrows this for operator app-session tokens**). The current WebSocket terminal bridge does not dispatch the
+structured `cmd` frame; future command admission must preserve this boundary.
+The cooperative same-UID limitation of #1177 still applies.
+
+#### Amendment, Accepted 2026-11-19 (owner decision): operate app-session tokens may stop and restart structured agents
+
+**Status: Accepted 2026-11-19 (owner decision).** Not yet implemented.
+Until implemented, the `agent.start`, `agent.restart`
+and `agent.stop` wire verbs refuse structured stop/restart for every token with a
+typed error.
+
+*Need.* The GUI must restart (resume the same session) and stop a structured
+agent. It reaches only its home node's wire, authenticated by an app-session
+token (§5). Without this amendment those controls and their end-to-end coverage
+(#3096, #3098) cannot work.
+
+*Decision.* Tokens split by origin, not by who minted them (only the local
+operator can mint any token). An **app-session token** (`Source::App`, minted
+for the operator's own GUI shell under a fresh LocalOperator check; always
+`operate`, principal `app:operator:<uid>`) carries structured **stop** and
+**restart (resume)** authority for structured agents on its **home node**. Per
+§5 an `operate` token *is* the operator's identity for ADR-0014's operator-only
+verbs; `agent.start` already relies on that. An app-session token is therefore
+the operator for the old-rule passages in this section and in the `agent.stop`
+paragraph ("the operator and the structured agent itself only").
+
+*Unchanged.*
+- **File** operate tokens (`Source::File`; `flk client open`,
+  `flk client token add`) stay refused. They are portable bearer credentials
+  that may be used off-host and, with `--allow-non-loopback`, over TCP, so they
+  cannot be tied to the local operator's process.
+- `read`, `send` and `answer` scopes get none.
+- Mesh-relayed frames and lineage parents get none; mesh relays still cannot
+  carry structured start/spawn.
+- Remote targets stay refused until ADR-0043.
+- ADR-0052 profile admission still applies to every resume.
+- The structured agent itself keeps its existing self-stop authority; resume of
+  a record by an agent stays refused.
+- This is consistent with ADR-0052 §1 ("existing operator-only resume authority
+  in ADR-0036 §1a remains in force"), ADR-0044 ("operator-only resume
+  authority") and ADR-0049 (resume is never delegable):
+  the authority belongs to the operator identity, not to any delegate.
+- Every stop or restart is audited with the per-mint credential `app:<nonce>`
+  (the fresh random name of that mint), not only the shared principal
+  `app:operator:<uid>`.
+
+*Threat considered.* App-session bearers are never admitted over TCP. On the
+local unix socket only the minting process may use one, after a fresh
+LocalOperator check and bearer authentication (see "App-session tokens and
+shell origins"). A stolen bearer is therefore not usable by another process.
+The residual risk is control of the GUI shell process itself, for example by
+modifying its memory (#1177); the bounded lifetime and ADR-0038 §6 shell
+hardening narrow it but do not close it. A compromised shell can already start
+agents and act as operator for every ADR-0014 operator-only verb; this adds
+stop/resume of structured agents to that same blast radius.
+
+*Rejected alternative.* Keep §1a as is and give the GUI a separate socket-only
+privileged path for structured stop/resume. The GUI's wire connection already
+runs over the local unix socket, so this would not add isolation; it would add
+a second privileged API surface for the GUI shell and duplicate the authority
+checks the app-session token already performs.
+
+*Follow-up implementation slice.* Larger than lifting a
+refusal:
+- The wire lifecycle handler has no token or session context today
+  (`wire_agent_lifecycle`, `src/app/api/wire_lifecycle.rs`); plumb the
+  authenticated source through it and refuse everything but `Source::App`
+  operate.
+- Wire `agent.restart` is terminal-only and returns `runtime_unsupported` for
+  structured targets, so structured resume over the wire is a new path, not a
+  lifted refusal. Update the "structured resume authority remains socket-only"
+  doc comment in `src/structured_wire/lifecycle.rs`.
+- Add restart and stop steps to `gui-e2e-fleet`.
+
+Part of #3096.
+
+`caller_is_local_operator()` (`src/app/api/mesh.rs:182`) treats a local
+caller with no flk pane in its process ancestry as the operator. A
+structured agent has no pane, so its tool calls (`flk msg send`, `flk
+question answer`, any `flk` it runs through Bash) would pass. And a
+WebSocket over TCP carries no peer pid at all. Three rules close that:
+
+- **Structured agents require O19a (#1208).** A structured agent is started
+  only on a host where `flk-agent` exists; elsewhere `agent.start --runtime
+  structured` is refused with `structured_needs_agent_user` (a new
+  `ErrorCode`, retry class `AfterHuman`). The server reads the peer uid on
+  its socket (`getpeereid` / `SO_PEERCRED`, ADR-0035 §6.3); a `flk-agent`
+  caller is never the operator, whatever its ancestry, so the operator-only
+  verbs of ADR-0014 and ADR-0035 are refused with `operator_only` (exit 13).
+  `caller_is_local_operator()` gains that uid check first; a detached
+  (`setsid`) child of a structured agent is still `flk-agent` and still
+  refused.
+  **Account policy (owner decisions, #1795).** File-only
+  `[security] agent_account = "flk-agent" | "none"` defaults to `"flk-agent"`.
+  Recognition is independent of `structured.run_as`: opting into operator-mode
+  launch does not disable it. With recognition enabled, a pending or failed
+  directory lookup classifies socket callers as `Unknown`, including callers
+  with the server UID: reads remain available but operator mutations, including
+  server stop, are refused. A resolved dedicated UID distinct from the server
+  UID permits the server UID to proceed to the existing ancestry checks; a
+  resolved absent account does too. A dedicated UID equal to the server UID
+  is a §1a misconfiguration, never operator authority. Report
+  `agent_account_uid_collision` once in the log and retain the typed diagnostic
+  in server status until restart. Each server owns its account cache and
+  collision-reporting state; its app and API listener share the same policy.
+
+  Explicit `agent_account = "none"` declares that no dedicated account is used.
+  The server never starts the dedicated-account NSS lookup, and callers with
+  its own UID immediately pass the UID boundary. Lease, pane, birth and relay
+  checks still apply: known same-UID agents remain non-operator. Other or missing
+  UIDs remain unknown/read-only. This opt-in avoids the default directory-service
+  availability cost but gives up recognizing anonymous/detached callers as
+  `flk-agent` by UID. It cannot provide a dedicated-account isolation boundary;
+  same-UID callers without lease/pane ancestry remain cooperative under #1177.
+  Changing the setting requires a server restart; reload keeps the active policy
+  and reports that requirement.
+
+- **Which agent is calling.** The session lease (§1) records the process's
+  pid and start time. A socket caller whose ancestry reaches a leased pid
+  (with a matching `process_start_time`, so pid reuse cannot impersonate)
+  is that agent: it is the `msg.send` sender and the `agent:<id>` producer
+  of §3, exactly as a pane id attributes a `pty` agent today (ADR-0008,
+  with ADR-0026's authenticated origin). A `flk-agent` caller that reaches
+  no lease and no pane is an anonymous agent: it may read, and every send is
+  refused with `msg_not_allowed`.
+- **WebSocket clients always present a token** (§5). Loopback is not an
+  identity: the operator's own browser is a client with an `operator`-scoped
+  token that only the local operator can mint over the unix socket, and the
+  `principal` in `welcome` names the token, never the address.
+
+**Scoped session MCP requests (#1734).** Every structured-session MCP API request carries a server-issued credential scoped to one lease reservation generation. The server verifies it against current kernel peer identity and the live bound lease root, and derives only an agent principal. Failed or revoked session authentication never falls back to operator ancestry classification. This applies independently to every connection, queued request and channel attachment; lease/root loss refuses subsequent admission. Already admitted work never acquires operator authority. Parent-change exit is defense in depth. Unscoped arbitrary same-UID programs retain the explicitly cooperative #1177 limitation; dedicated-account policy remains mandatory unless the operator opts out.
+
+Slice A adds the scoped local request envelope and server admission. Slice B of #1734 supplies mandatory generated MCP credentials and immutable transport propagation; public structured starts remain gated until both land. Legacy unscoped CLI/MCP requests retain their existing policy. Credentials are not operator/client tokens and never appear in logs, errors or status. Failed scoped decoding or authentication cannot be retried through legacy dispatch. Revocation precedes cleanup and lease removal; scoped subscriptions close on revoked or unreadable identity. Operations admitted before root loss may finish with agent authority only. The scoped verifier requires a living kernel process, not merely a matching birth time: zombies cannot authorize admission. The local envelope is `{"request": <Request>, "credential": <LeaseCredential>}`; malformed scoped envelopes return `invalid_request`, authentication failures return `not_authorized`, and neither path retries as a legacy request.
+
+Slice B of #1734 provisions each generation credential only in the generated private MCP configuration's child environment (`FLOCK_MCP_LEASE_CREDENTIAL`), alongside an explicit `mcp serve --structured` mode. It never enters Claude's launch environment or process arguments. Before reading stdin, the MCP child captures that mode, the absolute socket endpoint and the credential into immutable client state. Calls, compatibility probes, subscriptions and reconnects use that same state. Missing, malformed or inconsistent configuration fails startup; authentication failure never selects unscoped transport. Ordinary unscoped MCP remains compatible. Public structured starts still require the registry/start slice (#1439).
+
+Scoped verification never waits for the lease registry lock: contention has a typed refusal and no snapshot fallback. Each admission performs at most sixteen kernel process-fact reads, refusing ancestry beyond that budget. This is a bounded supported ancestry depth, not permission to trust partial evidence. Credential comparison uses opaque accumulation (`core::hint::black_box`) to prevent optimizer replacement with an early-exit comparison. Encoded credential length is public format information. Legacy unscoped malformed requests retain serde diagnosis; scoped schema failures keep their fixed, secret-free error. JSON syntax diagnostics contain no field values.
+
+**Operator shell sends (#2494, owner option a).** The structured `agent.send`
+adapter alone may authenticate an operator via a pane. This is affirmative
+server evidence, not `AgentState::Unknown` or absence of agent detection. On
+every request it requires the unix socket's kernel PID and UID, the operator
+UID, and an unrelated lease identity. The pane must retain `created_as_root_shell`
+provenance (no argv override) and a runtime spawned with the default shell,
+with no agent name/label or launch argv. The caller's immediate kernel parent
+must equal that runtime's original root-shell PID. Both processes must be
+living, and the caller's socket-captured birth and the shell's spawn-captured
+birth must still match. A reaped shell, missing process facts, unknown UID,
+restored pane without provenance, scoped session or enrolled relay cannot grant
+this exception. Evidence is never cached. Scripts, `sh -c`, and agent children
+with an intervening process are refused; dedicated structured agents continue
+to use their native authenticated path. This does not broaden the shared
+`caller_is_local_operator` helper or other privileged verbs.
+
+Admission stamps the server-owned numeric `operator_via_pane` in durable queue
+history. Section 3 input framing renders it as `operator via pane <id>` in the
+producer header, outside the nonce-delimited body. Request metadata cannot
+supply or replace the stamp. The existing explicit native-command exception
+still sends the command alone; its durable queue record retains the stamp.
+This is the cooperative same-UID boundary of #1177, not proof of a physical
+keyboard: a direct child deliberately launched by the root shell satisfies the
+rule. Shell functions and exec-style commands can likewise preserve immediate
+parentage; no broader human-presence claim is made.
+
+### 2. Mapping session events onto flk state, questions and waits
+
+A new `StateSource::Session` joins `Screen`, `Hook`, `Plugin`,
+`ProcessTree` and `WaitRegistry` (`src/api/agent_state.rs:169`). For a
+structured agent it is authoritative for the turn and attention axes; the
+screen detector is not run.
+
+| Session event | flk effect |
+|---|---|
+| `command_lifecycle{started}` | queue item `delivered`; `Turn::Working` |
+| `system/status{requesting}`, `stream_event/message_start` | `Turn::Working`; `ttft_ms` recorded |
+| `system/status{compacting}`, `system/compact_boundary` | `agent.compacted{pre_tokens, post_tokens, trigger}` |
+| `control_request{can_use_tool, tool_name: AskUserQuestion}` | a question record (§2a), `source: session`, options from `input.questions`; answered at once if the policy allows, otherwise held or deferred by the System-One check (§2a); routed per ADR-0034 §2 |
+| `control_request{can_use_tool}` (any other tool) | `hook.decide{point: permission.request}` (ADR-0034 §1); `pass` answers allow, `deny` answers deny with the reason; `defer` holds the request open and makes it a question |
+| `control_request{other subtype}` | answered with an error and logged as an unknown shape (§8) |
+| flk's own `deny` answer to a `can_use_tool`; `system/permission_denied`, `result.permission_denials` | `agent.permission_denied{tool, reason}`, once per `tool_use_id`. A stdio `deny` that flk sends emits no `system/permission_denied` event (A.12, A.17), so for those the fact comes from flk's own answer; `system/permission_denied` and `result.permission_denials` add only the denials the harness made itself. Carve-out: the `deny` that carries a question deferral (§2a) is not a permission denial. flk records the `tool_use_id` of every deferral, and neither its answer nor that id's entry in `result.permission_denials` emits anything here |
+| `rate_limit_event{status: rejected}` | `Attention::Blocked{ProviderLimit, retry_after_ms}` from `resetsAt` |
+| `rate_limit_event{status: allowed or allowed_warning}` | clear provider-limit attention; a warning does not block |
+| `rate_limit_event{unknown status}` | ignore the status, preserving the last known observation (ADR-0028 §3a) |
+| `control_cancel_request{request_id}` | close that incoming permission/question request only |
+| `result` | close open permission/question requests; queue items `done`; `Turn::Idle`; usage recorded; outcome per §1 |
+| process exit without `result` | close open permission/question requests; `Lifecycle` unchanged, `Attention::Blocked{crashed}` |
+| anything unknown | §8 |
+
+S4 integration boundary (architect ruling, #1427). One pure reducer per
+`agent_id` and launch generation consumes S1 events and explicit host facts.
+Its `StateSink` publishes `AgentState` snapshots, immediate phase transitions,
+all open needs-human request ids/reasons, and one stall observation per silent
+interval. #1439 connects this seam to the registry and agent.get/list; S7-min
+#1746 connects it to agent/<id> and fleet-lite. These immediate facts are not
+settled supervisor events. S4 emits no `agent.phase_changed`, `agent.needs_human`
+or `agent.session_stalled` EventHub envelopes: `AgentPhaseEvent` and mesh v5
+stay unchanged. #1804 owns the mesh-versioned pane-free event contract.
+No placement is empty or fabricated, and list/side-pane wiring remains #1439.
+
+S3a-3 registry amendment (#1439, owner-approved split). #1841 owns pure
+records, runtime-tagged persistence and the S4 `StateSink` consumer. Each
+registered agent owns a reducer and a generation token. Admission rejects
+conflicting agent ids, names and native session ids without replacing another
+record. Removal and state delivery require the current generation, so late
+worker output cannot alter a replacement. The registry stores the complete S4
+publication, including phase edges, needs-human facts and the next observation
+deadline; it emits no EventHub envelopes (#1804).
+
+Session persistence stores `runtime: structured` identity/name/harness/session,
+cwd and requested model alongside `runtime: pty` pane records. Older snapshots
+without structured records remain valid; older pane records default to PTY.
+Cold restore retains metadata only: lifecycle is offline, observations are
+unknown, and no clock ages, outstanding questions, deadlines, process ids or
+lease proofs survive. An agent whose process is gone stays `Lifecycle::Offline`:
+it remains resumable by explicit launch and is never resurrected automatically.
+Under ADR-0028 §3a, structured records deserialize individually. Unknown runtime
+or harness records, invalid entries and duplicates are skipped with a warning,
+without rejecting any PTY workspace. The first supported id/name/session wins.
+Skipped entries remain raw and in order across saves, including additional
+fields, so rollback cannot erase newer records. Explicit removal also discards
+retained entries sharing the removed id or session, preventing a shadowed
+duplicate from becoming active after restart. Known-runtime shadows also match
+by name; a future-runtime record sharing only a name has a separate identity
+and survives removal (#1858). Explicit admission refuses any retained name.
+Removal compacts retained slots.
+Known records also retain their original extra fields. An unknown collection shape remains raw
+and inactive; new admission refuses until its shape is understood. Warnings
+contain an index and reason, never raw payloads. The registry exposes a retained
+entry count for diagnostics; structured status/doctor routing remains #1843.
+Unknown pane runtime tags also survive restore/save and disable automatic agent
+resume for that pane only; its hibernation request and shell placement survive,
+and other panes retain normal resume behavior. A registry-only session remains
+persistable even when it contains only inactive raw entries and no terminal
+workspaces.
+
+**Retained-record lifetime (corrected owner decision, #1853).** DEAD classification
+is version-independent: an element is **DEAD** only when it is not a JSON object,
+or its canonical digest equals a record already kept, live or retained (an exact
+duplicate). Canonical JSON here sorts object keys and preserves JSON value types.
+Everything else this build cannot use is **FORWARD**, never automatically pruned:
+supported-tag parse failures (including future field shapes), unknown runtime or
+harness values, empty/odd identity strings, and non-identical conflicting records
+sharing an agent ID, name or session ID. Current-build parsing/validation failure
+is never evidence that another version cannot use an object (ADR-0028 §3a).
+On save, prune DEAD records strictly older than `RETAINED_DEAD_MAX_AGE` (30 days)
+and then enforce `RETAINED_DEAD_MAX` (256), oldest first. Equal timestamps use
+original array order. The injected clock determines age; a backward clock never
+ages a record early. Missing stamps receive the next capture/save time, not an
+invented historical age. Every capture runs stamp-only preparation on its snapshot copy
+with an injected clock; undo/test captures never prune or mutate live state.
+Only actual save/export boundaries prune the live registry. A failed wall clock
+or an unknown sidecar collection format logs a warning and refuses automatic
+retention maintenance, preserving data.
+
+`first_seen_ms` is Unix milliseconds in the additive `structured_retention`
+sidecar field, never a property inserted into preserved record JSON. Each entry
+binds a timestamp to the serialized slot and a SHA-256 digest of the record's
+JSON representation. Mismatched or invalid sidecar entries are logged and kept
+raw; matching entries preserve extra fields. Recognized stamps precede opaque
+entries so stale duplicates cannot replace the active timestamp. Cold restore,
+compaction, subsequent saves and live handoff carry these stamps. Older binaries
+may drop this new sidecar on save; missing stamps then restart conservatively on
+the next new-binary save. Retention timestamps never supply runtime observations,
+lease evidence or authority.
+
+A non-array `structured_agents` collection remains raw and inactive and refuses
+admission with typed `RegistryError::UnsupportedCollectionShape`, naming the
+session-state repair guide. Never discard the whole session because of a bad
+entry. `flk session retained list [--json]` lists kind, serialized slot and first-seen
+metadata, not opaque record payloads. `flk session retained purge (--dead | --all)
+[--older-than <dur>]` selects records explicitly; `--all` additionally requires
+`--yes`, validated by the server as well as the CLI. Durations use the existing
+`ms`, `s`, `m`, `h` units; age is strict and unstamped records do not match an age
+filter. Both API methods require the kernel/lease-classified operator principal;
+agent tokens alone grant no authority. `flk doctor [--json]` reports FORWARD/DEAD
+counts and a purge hint when FORWARD exists or DEAD exceeds half the cap.
+
+Purge commits an fsynced temporary snapshot, rename and directory sync before
+changing inactive records in the live registry; it never replaces active worker
+observations. A pre-replacement save failure returns a typed error and leaves
+live records unchanged. Its removed count includes normal save-time DEAD pruning.
+Age-filtered purges reclassify remaining copies, protecting the last unusable
+object as FORWARD before automatic maintenance.
+The server's explicit no-session mode remains memory-only. Unknown collection
+shapes refuse list/purge with typed `retained_collection_shape` and the offline
+repair guide; `--all --yes` cannot reinterpret an unknown collection layout.
+Both the temporary
+snapshot file before rename and its parent directory after rename are fsynced.
+A directory sync failure after successful replacement is logged as a durability
+warning and the save reports success because the new file is already installed.
+Handoff restores structured metadata offline; this slice owns no workers to
+transfer.
+
+#1842 owns runtime workers, actual lease ownership and observation scheduling.
+The app owns `structured::workers::Workers` outside pure `AppState`. Each launch
+reserves its native session before running the admission-supplied, bounded
+profile factory on an owning thread, then binds the registered cwd/model.
+Preparation is cancellable at its boundaries; an in-progress factory must finish
+within its own bound. One blocked factory cannot block another agent or the app.
+A new launch advances the observation generation, without modifying durable
+metadata. Live/unconfirmed workers refuse replacement. Cold restore remains
+offline and never starts a worker automatically.
+
+Ready/completion share a bounded two-message channel. Runtime stream queues are
+bounded separately; an app pass drains at most four records per worker and
+rearms its existing event wake when it reaches that budget. Every stream record
+enters S4 only via `Received::state_input`, so durable permission-book closes
+clear attention without waiting for a result (#1846/#1849). Lifecycle and due
+observations are explicit host facts. Both TUI and headless schedulers service
+owner wakes and include S4's exact next observation boundary. No periodic
+structured-agent timer, kill-on-silence policy or EventHub emission is added.
+
+Ordinary stop latches cancellation without waiting; polling joins only finished threads. A terminal report
+becomes visible only after queued stream facts drain. Confirmed cleanup closes
+open requests and sets Offline; unconfirmed ownership instead retains authority
+and Unknown lifecycle, refuses restart, and requires explicit recovery. Reports
+retain actual exit status/outcome or typed preparation/worker failure; results
+remain turn facts rather than process-success evidence. Finished threads are joined
+before replacement or pruning. Shutdown and the pre-handoff step attempt to stop
+all workers, drain durable permission closes, release confirmed leases, and join
+within the stated bound. Handoff deliberately stops structured sessions in this
+slice (full single-writer transfer is S7-rest). Records remain Offline and resume
+only through an explicit start using their stored session id, never automatically.
+A shared 10-second graceful deadline is followed by identity-checked child-tree
+KILL and a bounded 10-second cleanup/join interval. Deadline overruns report
+`structured_worker_timeout`; unconfirmed cleanup reports
+`structured_worker_cleanup_failed`. Worker diagnostics never veto handoff: kill,
+report the typed codes and proceed once the real handoff preconditions hold.
+An additive, optional handoff-manifest list carries uncertain agent identities,
+restored as Unknown without lease or process authority; confirmed cleanup stays
+Offline. Cold disk restore still defaults to Offline. Unknown identities never
+grant permission to signal. An unjoined worker remains owned and fenced, and
+later owner polls can finish joining it. Worker panics report the distinct
+`structured_worker_panicked` failure. These diagnostics require human inspection
+before retrying an uncertain session. Shutdown runs once per worker set and caches its typed result.
+Both TUI and headless quit always save the session before returning a shutdown
+error. Drop runs bounded teardown only if it has not already been attempted;
+after success or failure it joins only finished threads, without another wait.
+A newly admitted worker resets that cached result. The caller must mark session persistence
+dirty when durable metadata changes.
+#1843 owns the public `StructuredAgentInfo`, additive `structured_agents` list,
+get/status/stop routes and `runtime_unsupported` refusals. Existing PTY
+`AgentInfo` placement fields remain mandatory and unchanged; structured records
+have no fabricated placement. Mesh VERSION stays 5; remote directory rows
+remain #1380. Public structured start stays unreachable until #1843 and #1734
+have landed. The default remains the agent user (#1177); the owner-approved
+MVP exception permits explicit operator-mode opt-in only. #1843 supplies the
+public admission wiring and isolated manual dogfood runbook for that exception.
+
+#1843 part 1 amendment (owner-approved three-part split): read/control contracts
+land before public launch. `agent.list` adds a default-empty `structured_agents`
+array, preserving the existing PTY `agents` and `fleet` fields. A
+`StructuredAgentInfo` carries `runtime: structured`, `agent_id`, optional `name`,
+`harness`, `lifecycle`, presentation `status`, the canonical ADR-0028 `state`,
+`session_id`, `cwd`, optional `model`, and `lease_state`. The optional `view`
+contains workspace/tab/pane placement only when an attached view exists; it is
+omitted until S10. No PTY placement, process id or caller credential is fabricated.
+`lease_state` is nonblocking binding evidence (`absent`, `reserved`, `bound`,
+`uncertain`), never proof of liveness or authority. Contention is uncertain.
+
+`agent.get` and its `agent.status` alias resolve registered identity/name, refusing
+cross-runtime ambiguity. `agent.stop` accepts only a structured target and is
+restricted to the operator and the structured agent itself only (an
+app-session `operate` token counts as the operator under the accepted §1a
+amendment). PTY callers
+and lineage parents receive no stop authority. Stop latches cancellation and
+returns current facts; it does not promise immediate Offline. Offline stop is
+idempotent. A restored Unknown record refuses launch before epoch advancement or
+profile preparation, and refuses stop without process ownership, with
+`structured_recovery_required` (retry `after_human`, CLI exit 1). The operator must
+confirm cleanup and clear/re-register the record before explicit launch; no
+public recovery/force bypass is introduced. Pane-only operations, including
+attach and PTY readiness/settled waits, return `runtime_unsupported` (retry
+`never`, CLI exit 2). Required PTY `AgentInfo` fields remain unchanged.
+
+A committed successful handoff exits successfully even when its worker teardown
+cached a diagnostic. The diagnostic remains logged and carried through handoff as Unknown;
+ordinary quit still returns its typed shutdown error. Public structured start
+remains gated until part 3 and #1734 land. Part 2 owns atomic owner-thread pending
+admission; part 3 owns narrowed MCP start and the complete isolated dogfood runbook.
+
+Accepted-input silence (#1903): successful transport admission of a user
+stdin envelope supplies `Input::Accepted { at, at_ms }` through
+`Received::state_input`, using monotonic and Unix clocks captured at admission.
+It arms the same caller stall policy before any started/requesting/message_start
+observation, without inventing a working turn. Later stdout resets the silence
+anchor normally; started evidence establishes working, and top-level result or
+exit retires the pending interval. Control requests and open tools suppress
+stall reporting exactly as for started turns. The transport serializes its host
+`flk_input_accepted` stream record before later stdout observations, even for a
+fast response. This is an internal stream fact, not an EventHub event kind or
+mesh frame. Its monotonic stamp belongs only to the current launch and cannot
+be reconstructed on replay; a raw host record without that stamp is skipped.
+Admission is not proof of a successful pipe write or provider turn. An unavailable
+acceptance observer requests process shutdown as well as pipe cancellation.
+Ordinary I/O cancellation does not record stop intent or change the observed exit
+outcome. Transport failure remains an explicit worker failure, and output backpressure delays
+notification rather than dropping it. No queue/scheduler feed is needed.
+
+The caller supplies monotonic observation time and its configured `stall_ms`;
+the reducer never starts a timer, polls a process or kills/retries a turn.
+Every stdout line, including an unknown line, proves progress but an unknown
+event never changes the axes. A host-sent answer closes only its incoming
+`request_id`; stdout control responses acknowledge host-initiated controls
+and cannot close incoming permission requests. A CLI `control_cancel_request`
+closes only its named request; a top-level result or process exit closes all
+open permission/question requests, including an interrupted or errored turn.
+A tool remains open past its
+argument `content_block_stop`, until its matching `tool_result` or a top-level
+`result`. No stall is reported while any tool is open, however long it runs.
+Subagent results never end the parent turn. A late result ends a
+stalled turn normally; the observation itself leaves the phase unchanged.
+Unavailable background and registered-wait evidence stays `unknown`, so idle
+alone cannot manufacture `finished`. Provider reset timestamps are Unix seconds
+converted to an optional duration against receive-time Unix milliseconds;
+missing, null, incompatible or overflowing reset metadata gives no duration.
+Lifecycle comes explicitly from the registry and retains ADR-0028 precedence.
+While attention is set, public `turn` is `unknown` per ADR-0028 §1; the
+underlying turn boundary is retained for when attention clears. A known provider
+limit outranks crashed attention while lifecycle remains live; a registry-owned
+offline/hibernated/gone lifecycle outranks both.
+
+Phase derivation is ADR-0028 §1's unchanged; only the inputs differ. A
+question answered while its control request is still open becomes the
+`control_response` (`behavior: allow`, `updatedInput` with `answers`), so the
+one answer verb of §8a works for structured agents too. Registered waits
+(ADR-0028 §5) wake a structured agent by queueing a `wake` item (§3) instead
+of typing into a pane.
+
+### 2a. Questions do not block, except honest blockers (#1301)
+
+**Historical design:** S6e (#2242) below supersedes the hold check and direct
+fork answer. Its recorded owner decisions govern the next question slices.
+
+A question is a record, not a state the turn waits in, unless the agent has
+nothing else to do.
+
+- **Record and stable id.** Every ask becomes a question record in the
+  agent's stream: `question.asked { question_id, source: session | mcp |
+  recap | message, ask_point: message_uuid, prompt, options, multi_select,
+  allow_other }`. `ask_point` is the boundary the question was asked at: for
+  an `AskUserQuestion` or `flock_question_ask` call, the tool-result message
+  that closes it (§9's cut rules allow a fork there); for a question the E9
+  parsers (#1038, #1243) find in a turn's final text or `※ recap … Next: …`
+  line, the final `assistant` message of that turn. Later states are
+  appended as `question.answered { question_id, by, answer, via: in_place |
+  fork | record }`, `question.forked { question_id, fork_agent }` and
+  `reply.delivered { question_id, item_id }`. The ADR-0028 §8a kinds
+  `agent.question_opened` / `agent.question_closed` are emitted to the
+  global log as today, so `flk question list` and the TUI and web questions
+  views read one source.
+- **The id is a hash of the question, so it is stable across turns.**
+  `question_id` is `q-` plus the first 12 hex digits of SHA-256 over the
+  canonical JSON (sorted keys, no whitespace) of `{agent, prompt, options,
+  multi_select}`, with `prompt` and each option trimmed and their internal
+  whitespace collapsed. It contains no time, counter or ask point. The same
+  question asked again by the same agent, in a later turn or after a
+  reload, gets the same id and the same record (an `ask_count` is bumped,
+  nothing new is opened). A re-ask of an answered question is answered at
+  once from the record (`via: record`); an agent that wants a new answer
+  asks a different question.
+- **A fork is another agent, so its questions get their own ids.** `agent`
+  stays in the hash so that an id names one record on the whole server,
+  which the one answer verb (`question.answer { question_id }`, ADR-0028
+  §8a) relies on: the same words asked in a fork open a new record with a
+  new id. That costs the prompt cache nothing. A fork inherits its
+  parent's transcript prefix byte for byte, so the parent's question ids
+  and their rendered text are in the fork's prefix as they were, and the
+  fork's own asks come after the fork point, where the two transcripts no
+  longer share a prefix anyway. A question fork (`answers: question_id`,
+  below) names the parent's id explicitly and never needs to re-ask it.
+- **Byte-stable rendering.** Every text flk puts into the agent's context
+  about a question is rendered from a fixed template with the id and the
+  question's own text only: no timestamps, no counters, no ask count, no
+  key order that can vary. The same question therefore yields the same
+  bytes in every turn and resend of the agent, so a prefix that contains
+  it stays a prompt-cache hit (E10), and a fork of the parent at or after
+  the ask shares those bytes with it.
+- **Hold or continue: the System-One check (owner decision 3a).** When the
+  question policy (ADR-0034 §2) cannot answer an ask at once (a routed
+  architect answering within `[questions] hold_ms`, as ADR-0034 §3 does),
+  the server asks System One whether this is an honest blocker. It goes
+  through flk's existing `[systemone]` client (the advisory client of
+  `flk delegate`, `src/cli/delegate_s1.rs`, with its timeout and outage
+  breaker) as one `choice` question, `hold` ("nothing in the open work can
+  proceed without this answer") or `continue` ("some open work does not
+  depend on it"), over a bounded state of:
+  1. the last turn or turns of the agent (final `assistant` text and the
+     tool calls, newest first, cut to `[questions] s1_state_bytes`, default
+     4 KiB, the size flk's System One calls already send);
+  2. the question record (prompt, options);
+  3. the agent's open tasks and work packages and their dependency graph:
+     its `TodoWrite` list (P15), its goal and its open sub-goals (ADR-0031),
+     and the open delegates and forks it waits on, with their `depends on`
+     edges.
+
+  A `strong` `hold` holds the control request open (or, on the MCP path of
+  §2b, keeps the tool call open): the turn blocks, the agent is
+  `waiting_on_human`, and the answer, whenever it comes, is the tool
+  result. Anything else (`continue`, `lean`, `uncertain`, System One not
+  configured, timed out or broken) does not hold. Not holding is the
+  default because a wrongly held turn costs the agent its turn, and a
+  wrongly continued one costs only a later reply. `flock_question_ask
+  { blocking: true }` (§2b) always holds and skips the check;
+  `blocking: false` never holds and skips it too. Each check is recorded on
+  the question (`hold_check { verdict, p, band }`) so that its calls can be
+  rated against what the agent then did.
+- **The placeholder result.** When the ask is not held, the tool call ends
+  at once with the result text
+
+  ```text
+  <question-id> submitted for user feedback - the response will be relayed to you
+  ```
+
+  with `<question-id>` the stable id. On the MCP path (§2b) that is the
+  tool's result. On stdio the harness only offers `allow` (with
+  `updatedInput`) or `deny` (with a message) as the answer to an
+  `AskUserQuestion` control request, and the carrier is `deny` with the
+  text as its message (S0, A.12). The model then sees an `is_error` tool
+  result whose content is the text byte for byte, goes on with the rest of
+  its work in the same turn, and uses the reply when it comes (4 of 4
+  runs). `allow` with the text as every answer kept the model working too,
+  but the harness frames it as "The user answered: …", so it tells the
+  model that the user replied, which is what this rule excludes. The §2
+  carve-out applies: flk records the `tool_use_id` of every deferral, and
+  neither that `deny` nor its entry in `result.permission_denials` is a
+  permission denial. The turn continues, and the agent is `working` or
+  `finished`, never `waiting_on_human` for a question it did not hold on.
+  This is ADR-0034's `defer` verdict applied to a structured session.
+- **Permissions always block.** Allowing a tool call later is not possible,
+  so a `can_use_tool` for any tool other than `AskUserQuestion` stays open
+  until `hook.decide` answers or the operator does. Besides a held question,
+  that is the only `waiting_on_human` a structured agent has.
+- **Answer in place.** `question.answer { question_id, answer }` on a held
+  question answers its open control request or tool call. On a deferred
+  question it queues one `reply` item (`anchor: question_id`, `delivery:
+  at_idle`) whose body is the fixed template `Answer to <question-id>:
+  <answer>`, and records `question.answered{via: in_place}`.
+- **Answer in a fork.** `question.fork { question_id, at?: ask_point |
+  latest }` forks the agent at `ask_point` (default) or its current point
+  through §9, as a fork with `return_to_parent` and `answers:
+  question_id`. The fork is where the operator or a supervisor discusses
+  and explores; the main agent keeps working and its transcript never sees
+  the discussion. The fork ends with `question.resolve { question_id,
+  answer }` (an MCP tool in the fork, or the operator), which records
+  `question.answered{via: fork}` and queues the one `reply` item to the
+  main agent with `producer: fork:<id>` and the fork id cited in the body.
+- **Exactly one reply.** The question's states are `open → (forked →)
+  answered`, and `reply.delivered` is recorded when that item's
+  `command_lifecycle` reports `started`. A second answer, in place or from
+  another fork, is refused with `question_closed` (exit 13, ADR-0028 §8a);
+  more than one fork of a question may exist, and the first to resolve
+  wins.
+- **Unknown question shapes** go through §8 like every other unknown event.
+
+### 2b. Two question channels: stdio first, an MCP tool for richer asks (owner decision 3)
+
+**Historical channel order:** S6e (#2242) below replaces this with one MCP ask
+channel plus conversion of stray stdio calls; the A.13 concurrency limits stand.
+
+Both channels end in the same question record of §2a and the same answer
+verbs; they differ in what the agent can say and in what can block them.
+
+- **stdio (`--permission-prompt-tool stdio`) is the primary path.** It
+  carries every permission request and the harness's own
+  `AskUserQuestion` (E7: it is the only path that keeps that tool), needs no
+  extra process, and keeps the server the only owner of the session's I/O.
+- **The MCP tool is the richer path.** flk's MCP server, which every
+  structured agent has through flk's `--mcp-config`, serves
+  `flock_question_ask` (ADR-0034 §3) with the fields `AskUserQuestion`
+  lacks: `blocking: true | false` (absent means the §2a check decides),
+  `context` (markdown), `refs` (blob refs and file paths), `waits_on`
+  (task, work package or issue ids, which feed the §2a check),
+  `recipient` (`operator | architect | auto`, routed per ADR-0034 §2) and
+  `urgency`. It is listed in the launch profile's `--allowedTools`, so its
+  call never goes through a permission prompt. The compiled context
+  (ADR-0032) tells the agent to use it when an ask needs any of those
+  fields, and `AskUserQuestion` for a plain choice.
+- **When stdio can block, and what flk does about it.** The owner's concern
+  is right in three cases:
+  1. *An open permission request.* It blocks the turn by design (§2a), and
+     S0 observed that it also blocks everything after it in the same
+     message (A.13): while a `can_use_tool` was open, no later tool call of
+     that message ran, whether it prompted (a second `touch`), asked
+     (`AskUserQuestion`) or was pre-allowed (an MCP tool without a
+     read-only hint, so `flock_question_ask` too). Only one control request
+     was ever open, and a pre-allowed call ordered before the prompting one
+     ran first. A concurrency-safe `Read` after the prompting call did not
+     run either until the permission was answered (A.13). Separately, with
+     no permission open, a pre-allowed MCP call still waited for a slow
+     pre-allowed Bash call ordered before it (A.13): an unfinished
+     non-concurrency-safe call holds later ones too. So a question that
+     must not wait behind a permission has to be asked before the call
+     that may prompt, or in a separate message, and the compiled context
+     (ADR-0032) tells the agent so. The MCP tool still never prompts
+     itself, but it gives no way past a prompt that is already open in the
+     same message.
+  2. *flk not reading stdout.* A control request waits for flk. The stdout
+     pump (S3) is its own task that never awaits a client, a System One
+     call or a disk flush to read the next line; questions are answered or
+     deferred within `[questions] hold_ms` plus the System One timeout, and
+     a pump that falls behind is reported as `agent.session_stalled` (§1).
+  3. *The stdio prompt path disappears.* `--permission-prompt-tool stdio`
+     is hidden (A.4). The capability probe of §9 checks it too. If it is
+     gone, the launch profile switches to `--permission-prompt-tool
+     mcp__flock__permission_prompt` (E8: an MCP permission tool works),
+     `AskUserQuestion` is lost with it (E7), and `flock_question_ask` is the
+     only question path.
+
+### 3. One server-owned input queue per agent
+
+Every input to a structured agent is an item in that agent's queue, which is
+an event-log stream (§4) named `queue/<agent>`. Humans and agents feed the
+same queue (owner decision 5): there is no second input path.
+
+```text
+{ item_id (uuid; becomes the stream-json message uuid and command_uuid),
+  producer: human | agent:<id> | channel:<binding>/<user> | system:<source> | fork:<agent>,
+  kind: prompt | message | reply | delegate_result | wake | reload_notice | finding
+        | command (a harness slash command such as /compact)
+        | continuation (the prompt that follows a command, §3a),
+  anchor?: { item_id | correlation_id | question_id | fork_point },
+  priority: normal | urgent,          ordering only: which waiting item goes first
+  delivery: at_idle | steer | interrupt,   timing only: when the item is written
+  state: queued | held | stashed | delivered | done | cancelled | dropped | failed,
+  (queued → delivered → done | cancelled; queued → held | stashed | dropped;
+   held | stashed → queued; queued → failed with a typed refusal;
+   delivered → held when the process dies without a result)
+  stash?: name,                       which stash a stashed item is in
+  edit_lease?: { client, until_ms },  human producers only; skipped while it holds
+  batch_id?: uuid,                    the message the item was written in
+  relevant_now?: { p, band },         the last relevance check (below)
+  body, attachments: [blob refs] }
+```
+
+Queue-worker permission preflight and stdin admission wait for the permission
+book mutex (#2627). A transient contention refusal cannot be retried by an idle
+agent's event stream: releasing the book produces no event. The synchronous
+session-events worker already owns journal I/O and may block here; operator
+APIs retain nonblocking acquisition. Every book holder must finish its bounded
+in-memory state, JSON or hashing work before any await, I/O, logging or blocking
+channel operation. Audit persistence, pipe writes and notifications happen after
+release. Allocation and OS scheduling still have no hard wall-clock bound.
+
+- **One gate.** Each item passes `queue.gate` once: `send` (deliver per
+  `delivery`), `hold` (until a human releases it), `stash` (keep, never
+  deliver unless popped) or `drop`. The gate is the policy point;
+  ADR-0035's rows and ADR-0034's question policy plug in here.
+- **Delivery and priority are independent fields.** `delivery` alone says
+  *when* an item is written (E4, A.14). `at_idle`: only after the current
+  `result`. `steer`: at once, as a plain write; the harness reports it
+  `queued` and folds it into the running turn at the next model step, so it
+  waits out a running tool (7.25 s behind an 8 s `sleep` in A.14 "plain"),
+  and it can change what the running turn answers (in that run the turn's
+  one `result` answered the steered item, and the reply the first input
+  asked for was never written). `interrupt`: flk writes the item and sends
+  `control_request{interrupt, send_now: true, message_uuid}`, the
+  harness's own send-now; the running turn stops at once, a tool that is
+  mid-run included (it is rejected and its side effects so far stay), the
+  turn ends `error_during_execution` with `terminal_reason: aborted_tools`
+  (or `aborted_streaming` while text streams, A.5), its inputs are
+  `cancelled`, and the item starts as a new turn (A.14 "send_now").
+  `priority` alone says *in which order* items that are waiting
+  for the same delivery point are written: all `urgent` items before all
+  `normal` ones, each group in queue order. Priority never changes the
+  delivery mode, and no value of one implies a value of the other: an
+  `urgent` `at_idle` item is written first after the next `result`, never
+  into the running turn. Defaults (owner decisions 4 and 5): every item,
+  a human prompt included, is `at_idle` + `normal`; `steer` is what
+  "send now" sets; `interrupt` is explicit only. An idle agent with an
+  empty queue takes an `at_idle` item at once, so a prompt typed at an idle
+  agent is not delayed.
+- **One batch per turn, FIFO across producers (owner decisions 4 and 5).**
+  Queue order is arrival order until someone moves an item. At idle the
+  server writes one batch, waits for that batch's `result`, then writes the
+  next. The batch is built from the deliverable items (`queued`, `at_idle`,
+  gated `send`, no live `edit_lease`, and for a `continuation` its anchor's
+  `result` seen), `urgent` first, then in queue order:
+  1. The head goes.
+  2. If the head is a human item, every human item directly behind it goes
+     with it, up to the first item that is not human (the bulk submit at
+     idle). A human item open in an editor is skipped: it stays `queued`
+     and the run continues past it.
+  3. An agent, channel, system or fork item goes alone: agent messages and
+     human messages are never in one batch, and two agent messages are
+     never in one batch, unless the relatedness check below joins them.
+  4. A `command` item always goes alone, since a slash command cannot share
+     its turn.
+
+  A batch is written as one stream-json `user` message whose content holds
+  one text block per item, each rendered from a fixed template that names
+  its producer (and, for a reply, its question id), under a new `batch_id`
+  that every item in it records; a one-item batch uses the `item_id` as its
+  uuid, as before. `command_lifecycle` for that uuid moves all its items
+  together. Up to `[queue] max_batch` (default 8) items go in one batch.
+
+  **Command exception (architect decision for #1802, 2026-10-17).** A harness
+  slash-command item is sent **verbatim**, as the sole text block of its own
+  isolated turn, without a producer label and never batched with another item.
+  The label would break command parsing. Attribution remains in the queue item
+  and its audit/lifecycle records. Only an operator may create command items:
+  the operator composer or `flk agent send` authenticated as operator/token
+  principal. Text from agents, MCP or relayed peers that starts with `/` remains
+  ordinary input, wrapped in the normal producer-labelled template, and cannot
+  become a harness command. Neither a slash prefix nor a claimed producer in
+  request JSON grants operator authority.
+- **Relatedness joins (owner decision 5).** After rules 1 to 4, when
+  System One is configured (§2a's `[systemone]` client), the server asks
+  it, in one call, one `noul` per candidate among the next
+  `[queue] related_window` (default 4) deliverable items that the batch
+  does not already hold: "is this item about the same matter as the head, so that one turn
+  should answer both?". Candidates answered `strong` yes join the batch, in
+  queue order. Anything else, or no System One, leaves the batch as rule 1
+  to 4 built it. The check is recorded on the batch so it can be rated.
+- **Relevance to the running turn (owner decision 4).** While a turn runs,
+  at each model step that ends in a tool call and at most every
+  `[queue] relevance_every_ms` (default 20 s), the server asks System One,
+  in one call, one `noul` per queued human or agent item: "would this item
+  change or inform what the agent is doing right now?". The state is the
+  running turn's last `assistant` text and tool calls plus the items, cut to
+  `[questions] s1_state_bytes`. The answer is written to the item's
+  `relevant_now`. `[queue] relevance = off | suggest | force` (default
+  `suggest`): `suggest` lets clients mark the item and offer "send now";
+  `force` also sends `strong` items now, as `send_now` does. An item that
+  is being edited is never forced.
+- **Queue operations (owner decision 4).** All on the socket API and as
+  `cmd` verbs (§5), scope `send`, for items still `queued`, `held` or
+  `stashed`:
+  - `queue.update { item_id, body?, attachments?, priority?, delivery? }`
+    edits an item.
+  - `queue.edit { item_id, open }` takes or releases an edit lease for one
+    client (`[queue] edit_lease_ms`, default 10 min, renewed while the
+    editor is open; a lease that lapses releases itself), so a closed tab
+    never holds an item forever.
+  - `queue.move { item_id, before? | after? | to?: head | tail }` reorders.
+  - `queue.delete { item_ids }` drops items (state `dropped`, `by`
+    recorded).
+  - `queue.stash { item_ids, stash? }` moves items into a named stash
+    (default `default`); an agent has any number of stashes, each keeping
+    its items' order. `queue.pop { stash, item_ids?, to?: head | tail }`
+    moves a whole stash, or some of its items, back to `queued` at the
+    head or tail (default tail). `queue.clear { stash }` drops a stash's
+    items. `queue.stashes {}` lists stash names with counts and first
+    lines.
+  - `queue.send_now { item_ids, interrupt? }` is the forced send: the items
+    get `delivery: steer` (or `interrupt` when `interrupt: true`) and are
+    written at once, in the order given, as one batch. Without `interrupt`
+    the batch folds into the running turn at its next model step, with
+    the costs of `steer` above; with it, the running turn stops through the
+    harness's send-now.
+  - `queue.take_back { item_id }` withdraws a `steer` item that the
+    harness still reports `queued` (below).
+- **The harness's own queue (S0, A.14).** A written item stays `queued` in
+  flk until its `command_lifecycle{started}` (E3); in between it sits in
+  the harness's queue. The harness has a take-back there and no edit:
+  - *Take-back.* `control_request{cancel_async_message, message_uuid}`
+    withdraws an input that is still `queued` (`cancelled: true`, then
+    `command_lifecycle{cancelled}`) and answers `cancelled: false`, doing
+    nothing, once it has `started`. `queue.take_back` wraps it. On
+    `cancelled: true` the item stays `queued` in flk's queue with
+    `delivery: at_idle` and is editable again, and the harness's
+    `cancelled` for that uuid does not cancel the item; it is written again
+    later in a new message (a new `batch_id`), never under the uuid the
+    harness cancelled, since whether the harness accepts that uuid again
+    was not probed. On `cancelled: false` it is refused as too late and the
+    item runs. Items written in one batch share its uuid, so a take-back
+    of one of them withdraws the whole batch and every item in it returns
+    to `queued`.
+  - *Edit.* No control subtype edits a queued input, and an unknown subtype
+    is answered with an `error` naming it. flk's queue is the only edit
+    surface: an item is editable until it is written; once written, only a
+    successful take-back makes it editable again.
+  - *Send-now* is `interrupt{send_now: true, message_uuid}`. It is an
+    interrupt, so flk uses it for `interrupt` delivery (above); a `steer`
+    write needs no control request. Its response says
+    `stopped`, `delivering` (the input was already going) or
+    `nothing_waiting`. `interrupt{cancel_queued: true}` cancels every
+    input in the harness's queue and interrupts the running turn too, so
+    flk never uses it for a take-back.
+- **Acknowledgement (E3).** `command_lifecycle` drives the item state, so
+  "delivered" means the harness started it, not that bytes were written.
+- **Pending turns (architect revised decision, #1896 review).** Only a real
+  result consumed by the queue owner or runtime exit/error ends its reservation.
+  Harness cancellation keeps the items cancelled while waiting for the result;
+  operator take-back (§3 above) is a separate operation, not implemented by this
+  worker slice. Indeterminate loss retains the S3a writer guard. Status reports
+  the batch ID, original reservation time and an explicit cause: `awaiting_result`,
+  `turn_end_unknown` or `cancelled_awaiting_result`. A refused uncertain offer
+  writes no stdin and restores its original queued items instead of holding them
+  as `input_write_failed`. A real result or runtime exit/restart recovers the
+  pending state; restart holds unresolved items `session_unconfirmed`, never
+  automatically resending them. No queue timeout is inferred from pending age.
+  Stall observation belongs to the session state/supervision policy.
+- **Ported producers.** `msg.send` / `msg.reply` delivery to a structured
+  agent becomes a queue item instead of the inbox nudge and knock order
+  (ADR-0026, which superseded the delivery contracts of ADR-0008, ADR-0018
+  and ADR-0019; custody and the authenticated origin stay as ADR-0026
+  defines them). Relayed sends and replies use a typed
+  `node_asserted { sender, origin }` producer: "sender as asserted by node origin".
+  Display metadata `from_host` uses the authoritative node-id/name mapping,
+  preferring the configured alias to the authenticated inbound name, as legacy
+  custody does. It is absent for an unmapped origin; the existing node-asserted
+  header retains the claimed sender and signing node id as explicit attribution,
+  never a bare node id posing as a host. A recovery-time name lookup failure is
+  logged with its registered code and leaves the host absent; it cannot revoke
+  proven delivery. Name presentation grants no local sender authority.
+  The origin is the verified signing node, independent of the forwarding hop;
+  its sender assertion is attribution only, as strong as that node's sender
+  policy. It may have been a permitted caller claim on the originating node.
+  Signature, origin policy and reply capability checks precede admission and
+  are rechecked during recovery. Relays always enter as nonce-framed Messages,
+  never Commands or `Principal::Operator`; they gain no local authority or
+  locally attested sender quota. Remote blocking accounting retains the
+  existing unattested bucket.
+  Existing custody fields carry this proof, with no retroactive attestation
+  marker (architect decision on #1958). A delegate's structured result and receipt become a
+  `delegate_result` item for its parent. The Stop-hook recap and nudge
+  become server work on `result` (§3a).
+- **Queue custody completion (#2160, #2186, #2164).** The journal owner's
+  committed fold is authoritative: a committed `MessageKey` cannot later be
+  refused as never committed. The custody lookup shares that fold, without a
+  separate growing key index. Auxiliary tracking is bounded by in-flight
+  admissions. Each lookup is O(retained journal items), with no file I/O on the
+  server loop. The journal still retains its item history. The shared snapshot
+  refreshes on admission completion and publication; between an append and that
+  refresh, the owner and snapshot may briefly retain two item vectors. A definite
+  absence requires a complete, readable fold with no pending admission.
+  Production never emits queue removals; future garbage collection must preserve
+  commitment proof before removing items.
+  Missing owners/runtimes, read-only or future-format journals and uncertain
+  writes cannot prove absence. Admission persists `admission_pending` before
+  dispatching to the owner, so expiry before acknowledgement retains uncertainty.
+  Even a permanent recovery error then keeps the
+  same key recovering until its existing inbox TTL (24 hours), never a fresh
+  send or a terminal refusal. Jittered backoff is 4–5 seconds, then 48–60 seconds,
+  then capped at 240–300 seconds, clipped to the remaining TTL. Owner/capacity
+  wakes can shorten a long backoff, but consecutive attempts against the same
+  owner generation remain at least four seconds apart. A new owner generation
+  can resume immediately on its wake; a failure's own notification cannot
+  create a retry loop.
+  Status stays `queued` with typed detail `input_write_unknown:<cause>`:
+  `owner_unavailable`, `admission_pending`, `write_uncertain`,
+  `commit_proven_settle_pending`, `journal_opaque`,
+  `queue_journal_newer` or `queue_journal_corrupt`. These describe unresolved
+  proof or settlement, independently of the error that triggered recovery.
+  Positive proof whose delivery save fails records `commit_proven_settle_pending`
+  until settlement is durable. Expiry retains the correction path in this case
+  too, so a transient store failure cannot erase proven commitment. A reply is
+  not journal commitment proof: `queued` and the unknown detail may coexist
+  with a reply until the owner answers, custody settles, or its TTL expires.
+  At TTL expiry the existing expiry/tombstone path records
+  `input_write_unknown:commitment_unknown_at_expiry` for the existing outcome
+  window. Expiry ends admission recovery without proving that nothing committed;
+  positive proof can still retain settlement recovery as bounded below.
+  Positive proof before expiry is persisted settles `Delivered` directly, even
+  if the inbox deadline passed between commit and settlement. After persisted
+  expiry, only an expiry carrying unknown commitment can change to `Delivered`,
+  exactly once, with typed detail `delivered_after_expiry:<item_id>` (the proven
+  MessageKey's lifecycle identity). A commit proof never changes an existing
+  `Delivered` or `Refused` outcome.
+  If the delivery save fails again after expiry, a positive owner proof retains
+  the same key and retries settlement on the existing capped backoff, including
+  across wake notifications. Correction is bounded by the expired row's existing
+  `outcome_until` (seven days after expiry is persisted), never extended by a
+  retry or proof. At that deadline a retained row records typed detail
+  `input_write_unknown:correction_retention_elapsed`; after maintenance collects
+  the outcome, a retained status reference reports `outcome_retention_elapsed`.
+  Even before collection, proof cannot turn an out-of-window expiry into delivery.
+  The retention decision uses a read-only deadline check. If persisting its final
+  diagnostic fails, recovery still stops and logs the save error and typed
+  `outcome_retention_elapsed` reason; the status deadline remains observable.
+  **Restart limit:** active correction retains the already authenticated envelope
+  in memory. Startup's mailbox projection excludes payload-less `inbox_expired`
+  rows, so restart ends automatic post-expiry correction. It does not restore
+  deleted payload to revalidate a signature; the expired outcome remains until
+  ordinary retention deletion. Before expiry, startup recovery still loads inboxes.
+  Payload-less `Delivered`/`Read` rows are omitted from mailbox rehydration while
+  their terminal status is preserved; intentional collection is not corruption.
+  This corrects the expiry label only: deleted payload is not restored, released
+  quota is not re-acquired, and the original deadlines stay unchanged. Replies
+  use the existing payload-less path and the seven-day custody/reply deadline
+  from original admission; neither proof nor settlement extends that window.
+  Deleted payload cannot be signature-verified again or recover original pane
+  metadata, so local replies requiring that material remain unavailable. Remote
+  return bindings retain their existing deadline and validation requirements.
+  No new store
+  outcome or wire kind is introduced.
+  Attested sends reuse the process's validated node identity without reading its
+  key file per send. Pre-upgrade unsigned custody rows are not retroactively
+  attested: their replies retain the terminal route during the existing inbox
+  window (up to 24 hours), rather than acquiring structured sender authority.
+- **Storage.** The queue persists as `queue.jsonl` beside the agent's
+  session streams (§4).
+
+### 3a. Turn-end work keys on `result` and goes through the queue (#697)
+
+#697's diagnosis comment (2026-10-13) found flk's own self-compact path
+sound: an armed self-compact fires at turn end and its continuation is
+delivered with a background shell, a held wait or a background subagent
+live. The misses came from an external, client-side supervisor that polled
+`agent_status` every few minutes and missed short idle windows between
+back-to-back turns. For a structured agent there is no polling at all:
+
+- **Input framing (architect decision, #1885 review).** Every non-command
+  item uses a single header line `From <producer> (item <item_id>):` with
+  reply metadata and `Attachments (blob refs): <JSON refs>` on that line.
+  Producer/attachment values are JSON-encoded so embedded newlines remain
+  escaped, including U+2028, U+2029 and U+0085. Attachment strings must be
+  content-addressed `blob:<sha256>` refs: exactly 64 lowercase hex digits
+  after `blob:`. Reply `question_id` must be a canonical lowercase hyphenated
+  UUID. The next line is `<<<flk-item <nonce>`, followed
+  by the literal body and a final line `flk-item <nonce>>>>`. Here `<nonce>`
+  denotes 128 random bits encoded as 32 lowercase hex digits. Generate a
+  fresh nonce per rendered item and regenerate if its hex string occurs
+  anywhere in the body. Sender text, including fake labels, attachment lines
+  or delimiters, remains inside that item's block. Attachments and reply
+  metadata never enter the body block. The operator-only native command
+  exception in §3 remains verbatim and isolated. Admission and replacement
+  validate anchors and refs, refusing `invalid_request` before writing.
+  Rendering validates again: an invalid head becomes durably `failed`
+  with its typed refusal, allowing subsequent items through. A valid prefix
+  is delivered before a later malformed item is failed.
+- **Trigger.** The turn end is the `result` event (E1). An armed self-compact
+  (`flock_self_compact`, `flk pane arm-self-compact`) queues a `command`
+  item with body `/compact`, `delivery: at_idle`, `priority: urgent`. The §3
+  command exception applies to direct command items: operator authorization
+  is required, the body is sent verbatim alone, and attribution stays in
+  queue/audit records. The agent-initiated self-compact authorization path
+  belongs to S5c (#1879); this admission slice does not implement or grant it.
+  An agent's recap or supervisor text cannot manufacture that authority. By
+  §3, `at_idle` means it is never written into a running turn, and `urgent`
+  means it is the first item written after that `result`, ahead of any
+  `normal` `at_idle` item. Background shells, held waits and subagents do not matter, because
+  nothing reads a pane status.
+- **Continuation.** The post-compact continuation (the goal re-inject and
+  status of #998, or a supervisor's prompt) is a `continuation` item
+  (`delivery: at_idle`, `priority: urgent`) with `anchor: { item_id: <the
+  command item> }`; it
+  becomes deliverable when the compaction's own `result` arrives
+  (after `system/compact_boundary`) and is written then. A supervisor that
+  wants to know uses the stream (`queue/<agent>` or the `events` stream),
+  not `agent_status` polling.
+- **Recap and wakes.** On every `result` the server lifts the recap from the
+  final `assistant` text and wakes parked waits, which is what the Stop hook
+  did for a `pty` agent.
+
+### 4. Storage
+
+Owner amendment (#1820): each queue identity header declares a journal format
+version. Missing stamps mean version 1. Append/checkpoint require a journal
+version no greater than the writer's supported version, and checkpoint writes
+the writer's own version before any new-format append. Bump for every new kind,
+top-level field or enum name. Newer journals load read-only with persistence
+leniency (ADR-0028 §3a), preserving raw bytes without repair or rewriting.
+Every mutation returns typed `queue_journal_newer { found, supported }`;
+queue status exposes the refusal, which requires a compatible writer and must
+never be retried in a loop. Opaque checkpoint passthrough is forbidden because
+an older writer cannot preserve unknown records' interleaving semantics.
+Owner clarification (#1820): unknown kinds/fields/enum names follow lenient
+recovery, with raw bytes preserved and unknown semantics never delivered.
+Malformed known records in supported formats load read-only as
+`queue_journal_corrupt { seq, offset, reason }`: stop folding, refuse every
+mutation/checkpoint and preserve the whole file. Operator recovery is outside
+this slice. A crash-torn final line keeps the existing truncation/sync path;
+it is not corruption. Neither read-only mode permits tail repair.
+Owner clarification (#1922): an invalid header format version is known-record
+corruption and uses the same typed read-only refusal. Unknown data in v1 prevent
+its mandatory upgrade, so it opens read-only with `queue_journal_corrupt` and
+reason `unknown_data_prevents_checkpoint`. Same-version unknown data permit
+known writes only until a checkpoint is required; a refused checkpoint latches
+that typed read-only reason before any further writes, bounding journal growth.
+The fsync-temp, rename, fsync-directory rule below is unchanged.
+
+- **Per-agent session stream.** Every stdout line of a structured agent is
+  appended, with a per-stream `seq` and a receive timestamp, to
+  `<data dir>/sessions/<agent>/<session>.jsonl`. This is the lossless copy;
+  `event-log.jsonl` (ADR-0005) keeps only the cross-agent facts of §2 so its
+  readers and its rotation stay as they are.
+- **The queue.** `queue/<agent>` persists as
+  `<data dir>/sessions/<agent>/queue.jsonl`: one line per item change (added,
+  gated, edited, reordered, state change), appended before the change takes
+  effect, and folded into the in-memory queue at server start (as ADR-0031
+  folds goal state). The question records of §2a are lines in the same
+  file. When the file passes `[sessions] queue_rewrite_bytes`, serialize the
+  rewrite with appends. Let H be the last committed seq before the rewrite
+  and N the number of snapshot lines. Write a `queue_checkpoint` header
+  carrying `high_water: H + N`, followed by full-state snapshot lines with
+  seqs H+1 through H+N, to a temporary file; fsync it, atomically rename it
+  over `queue.jsonl`, and fsync the containing directory before publishing.
+  The header is storage metadata, not an `ev`, and consumes no seq. Recover
+  the next seq at startup from `max(header.high_water, appended event seqs)+1`.
+  Thus a zero-line rewrite persists H in the header and the next append is
+  H+1 even after restart. Readers must not treat a checkpoint header as a
+  queue item. No separate counter file can race the atomic replacement.
+  A retained checkpoint and subsequent changes are one consistent replay cut.
+  A subscriber needing the checkpoint gets
+  `gap { from: cursor + 1, to: H, snapshot_to: H + N }`, followed inline by
+  its snapshot lines and subsequent retained changes. For N>0, H is also
+  `first_snapshot_seq - 1`; for N=0 there is no first line and `to` is still
+  H, the last seq before rewrite. `snapshot_to` is the only completion
+  marker. On an empty snapshot (`snapshot_to == to`), clear that stream's
+  entities and advance its client cursor to `to` immediately; wait for no
+  `ev`. An initial empty stream uses `from:1, to:0, snapshot_to:0` (an empty
+  range, not a lost event). Checkpoint publication gives active subscribers
+  the same gap/snapshot batch, so removals cannot hide behind upserts.
+  Retain the latest checkpoint through the next atomic replacement; replay
+  must not interleave its lines with a newer checkpoint or concurrent appends.
+  Other materialized snapshot streams persist their seq high-water with their
+  checkpoint by the same atomic rule. Wire journal, queue and checkpoint
+  writes obey §5a's single-writer handoff rule, including seq allocation and
+  rename-rewrite; process overlap never grants simultaneous write authority.
+  `agent/<id>` and `events` have no
+  entity snapshot: a gap there reports lost history without `snapshot_to`.
+- **Two kinds of seq.** ADR-0005's `seq` stays the one total order of the
+  durable event log, and the `events` wire stream uses it. A per-agent
+  stream (`agent/<id>`, `queue/<id>`) has its own `seq`, starting at 1,
+  dense and strictly increasing within that stream only; it is a cursor for
+  that stream and orders nothing across streams. Facts that other agents or
+  supervisors act on (a question opened or closed, an item delivered, a
+  compaction, a phase change) are also appended to the global log, carrying
+  `{stream, stream_seq}` so a reader can jump from the global order into the
+  per-agent stream. The global log is the only place where two agents'
+  events are ordered against each other.
+- **Queue lifecycle facts (owner decision #1956).** Exactly one persisted
+  global kind, `queue_item_state`, follows a committed queue state transition.
+  Its fields are `agent`, `item_id`, optional `batch_id`, the existing typed
+  `producer`, typed `from` and `to`, `stream: "queue/<agent>"` and the original
+  committed `stream_seq`. The state vocabulary is §3's `queued`, `held`,
+  `stashed`, `delivered`, `done`, `cancelled`, `dropped`, plus `Unknown` for
+  lenient reading. Unknown kinds and facts with unknown states are skipped;
+  their global sequence remains spent. Adds, edits, reorders and checkpoints
+  do not emit this fact. Crash recovery's `delivered → held` does emit it.
+  Snapshot sequence allocation never changes a captured fact's transition
+  sequence. This kind stays local, under existing global retention/rotation;
+  it adds no mesh relay, per-transition kinds, checkpoint or question facts.
+- **Blobs by hash.** A tool result, attachment or thinking block over
+  `[sessions] blob_min_bytes` (default 2 KiB) is stored once under
+  `<data dir>/blobs/<sha256>` and the stored line keeps `{blob: sha256,
+  size, preview}` in its place. Partial deltas (`stream_event`) are relayed
+  live and not persisted; the complete `assistant` event that follows carries
+  the same content. A corrupt object is repaired by a verified put. Only repairs
+  attempt serialization across stores/processes using an advisory directory lock;
+  first writes never lock, since racing Missing writers publish identical verified
+  bytes without repair events. Contended nonblocking acquisition backs off on
+  the supplied monotonic clock: sleep 1 ms, doubling thereafter and clipping each
+  request to the remaining 20 ms budget. Every sleep leads to another acquisition
+  attempt, including the final clipped sleep. Elapsed time bounds normal contention;
+  eight attempts only guard against a clock/sleeper that fails to advance.
+  Clock expiry after an unsuccessful attempt reports `TimedOut`; attempt exhaustion
+  reports `WouldBlock`. A contended repair stalls the stream pump for about 20 ms
+  plus scheduling overshoot at worst. Filesystem latency is separately unbounded.
+  On a lock error or exhaustion, one `structured.blob.repair_lock_unavailable`
+  warning names only the error kind
+  and blob hash, then publication proceeds without the lock. The current object
+  is reverified before rename; coordinated writers emit `structured.blob.repaired`
+  only when replacing corrupt bytes, after directory fsync, with hash and size,
+  never content. Fallback may duplicate that diagnostic but must not lose a blob
+  or stop the pump because locking failed. Other filesystem I/O failures remain
+  explicit. Direct filesystem mutations outside the lock are not coordinated.
+- **Rehydrate.** The native transcript Claude writes under the profile is a
+  disposable working copy. A byte prefix of it (E11) is the only thing flk
+  ever writes back, under a new session uuid, and only for a fork behind a
+  compaction (§9). flk never edits a transcript line.
+- **Not in this cut** (owner decision 10): sealed zstd segments, SQLite for
+  hot state, a DuckDB query layer, and a thinking retention policy.
+
+### 5. The client wire contract
+
+**Architecture (owner decision 6).** A structured agent runs `claude -p`, so
+there is no terminal and nothing to render on the server: flk ships no
+terminal frames, cell grids or repaints for it, and none of the xterm
+bridge's machinery applies. What travels is the session's JSONL messages
+(§4) and flk's state about it (§2, §3), live as they happen, plus a pull for
+history from any cursor. A client is a renderer of those messages and that
+state; it holds no session logic and computes nothing the server has not
+sent. Between fleet nodes the mesh (ADR-0026) carries the same two things,
+state and messages, and nothing else: a client on node A that follows or
+commands an agent on node B talks to A's server only, A gets B's state and
+messages over the mesh, and a `cmd` for B's agent travels as a mesh message.
+No client hops into or out of another node's server.
+
+That mesh message does not exist yet. Mesh VERSION 5 envelopes have two
+kinds (ADR-0026; `Kind` in `src/mesh/store.rs`): `message`, mail for an
+agent's inbox that is delivered as text, and `receipt`, a delivery outcome
+sent back. Neither runs a verb: a `cmd` sent as `message` would reach B's
+agent as text, not as a `queue.update` or `question.answer` with its scope
+check and `ack`. A new `command` kind cannot be added within VERSION 5:
+`Kind` is a closed enum, so a VERSION 5 node fails to decode an envelope of
+a kind it does not know, and the mesh hello requires identical versions
+(ADR-0026, "Rollout"). It needs a VERSION bump with ADR-0026's
+coordinated upgrade, tracked with its design (how B authorises a principal
+that A authenticated, how the `ack` comes back) in #1380. Until then a
+`cmd` whose agent is on another node is refused with
+`unsupported_for_agent` before anything is sent. The one exception is
+opening a real terminal to a session, which is a `pty` agent's pane (the
+`terminal/<pane>` stream) served by the node that runs it, as today.
+
+For journal-admitted permission decisions, the command ACK must be written and flushed
+before its caused permission closed event or transport audit is published. The same
+ordering applies to caused fleet/lifecycle projections, including the fleet rows clients
+render. This holds on every connection, including observers and subscriptions opened
+while the command is pending. Durable Finish precedes the ACK. Joined waiters retain the
+publication hold until each ACK flushes or its originating socket is lost; socket loss
+releases that waiter without rolling back durable effects. Initial replay cuts and
+ordinary projections cannot bypass an active hold. Later records on the fenced stream
+preserve sequence order, while independent producers continue.
+
+This guarantee excludes history records that constitute the command outcome or
+downstream transport output: accepted input and queue admission cuts for `agent.send`,
+and lifecycle launch/terminal transport history. These records may precede the ACK.
+Correlate command outcomes using `cmd_id`; do not infer a universal history fence.
+Universal producer fencing is a separate owner decision tracked in
+[#3198](https://github.com/gerchowl/flock/issues/3198).
+
+The stream and its history stay the JSONL store of §4 and the endpoint
+below. The open item of whether they should run on the Grafana Labs stack
+(#1323) was resolved by the owner on 2026-10-16 (ADR-0038 §11 item 5):
+flk's log, metric and trace output goes through vig-os/vigil's OTLP/JSON
+Lines files and its optional signed audit trail, not through Grafana and not
+through a separate pipeline. The integration is #1614. #1323 no longer gates
+S7; #1546 (liveness and recovery on unstable connections) does.
+
+The network endpoints serving every frontend are `GET /v1/ws` (WebSocket) and
+`GET /v1/blob/<sha256>` (HTTP). They run inside the flk server process,
+because the streams, the queue and the blobs are server state. It reuses the
+axum stack of the `web` feature (`src/web/mod.rs`), not the `flk web`
+subcommand, which stays the terminal bridge it is (one pty client per
+socket). It is off by default, binds loopback by default, and follows
+ADR-0001's hosting rules (`--allow-non-loopback` explicit, refused under
+`tailscale funnel`, same-origin check on upgrade). The native local shell
+uses the same `/v1/ws` protocol over a sibling Unix socket, with kernel peer
+credentials as an additional admission gate (the local-transport amendment
+below). That listener does not enable TCP exposure.
+
+The optional TCP listener's Tailscale forwarding guard has three typed
+outcomes (#2476): positive absence (`NotInstalled`) permits startup with one
+INFO record naming the checked CLI/bundle/socket paths; discovered CLI status
+(`Status`) keeps the five-second/64-KiB serve/funnel refusal checks;
+installation evidence with an unreadable status (`Unavailable`) refuses
+startup and names the evidence/failure. Standard platform paths are defined
+in `platform::tailscale`; lookup errors never count as absence. Host/Origin
+and loopback checks do not change, and no failed probe is silently skipped.
+
+Messages are JSON text frames, one object each, tagged by `t`:
+
+```text
+client → server
+  hello   { protocol, client: { name, version }, token? }
+  sub     { sub_id, stream, after? }          fresh sub_id on this connection;
+                                            stream ∈ agent/<id>, agent/<id>/live,
+                                              queue/<id>, events, terminal/<pane>,
+                                              fleet, inbox, artifacts, work
+  ping    { nonce }                          resume probe, with resume_probe capability
+  pong    { nonce }                          echo the server ping nonce
+  unsub   { sub_id }                         closes id; drop late frames for it
+  cmd     { cmd_id, verb, args, resume_only } cmd_id is the idempotency key
+server → client
+  welcome { protocol, server_version, capabilities, principal,
+            server_epoch, idempotency_window_ms }
+  ping    { nonce }                          application heartbeat (§5a)
+  pong    { nonce }                          echo the client resume probe nonce
+  ev      { sub_id, stream, seq, ts_ms, ev }  ev is the typed event (§6)
+  synced  { sub_id, seq }                    replay barrier on every seq stream
+  subfail { sub_id, code, message }          closes id; drop late frames (§5a)
+  gap     { sub_id, from, to, snapshot_to? }  inline checkpoint (§4)
+  lagged  { sub_id, skipped_to }              closes id; fresh sub, no unsub (§5a)
+  ack     { cmd_id, ok, result? | error{ code, message, exit, retry } }
+```
+
+Agent replay preserves the receive-time `known`/`shape` provenance of §5a/§8.
+Legacy records without it produce `provenance_missing` history gaps while later
+records continue. Replay never reclassifies using the current harness version.
+
+**S7-min fleet and permission contracts (#1746).** The `fleet` snapshot stream
+lists structured agents as `FleetAgentRow { id, label, state: AgentState,
+activity?, waiting_on_human: string[] }`. `AgentState` is the shared S4 object,
+including axes, phase and sources, not a bare phase. Its per-field `or_unknown`
+reading follows ADR-0028 §3a: an unknown newer phase becomes `unknown` while the
+other axes survive; it must not discard the fleet delta. Snapshot rows use §5a's
+existing inline gap/checkpoint path. Fleet `ev` payloads are the closed tagged
+`FleetDelta` union: `{ type:"fleet.upsert", row: FleetAgentRow }` or
+`{ type:"fleet.remove", id }`, rather than session `WireEvent` payloads.
+
+S7-min slice 6a (#1832) supplies only the provider core: structured registry
+identity/label, S4 state, current activity and S6 waiting IDs project into these
+rows. Slice 6b omits optional `activity`: the structured registry and S4 have no
+activity producer yet. [#2243](https://github.com/gerchowl/flock/issues/2243)
+tracks that producer; no value is inferred from transcripts or PTY state.
+Amendment #1976 adds an independent durable cursor reservation record:
+under the same exclusive lock, fsync/rename/fsync-dir the cursor first, then
+atomically replace the rows/high-water snapshot by the same discipline, before
+returning changes or checkpoint cuts. The snapshot still mirrors its high-water
+as §4 requires; the independent floor can run ahead after a failed snapshot
+write, but never goes backwards or authorizes reuse of reserved positions.
+Snapshot reads allocate dense positions for their complete upserts; empty
+snapshots preserve the existing head, including across restart. Invalid row
+entries are skipped, warned with array index and unsupported/invalid/duplicate
+reason, and retained raw. Unchanged rows retain unknown top-level fields;
+changed rows serialize a fresh projection and drop them, since future fields may
+no longer agree with the changed facts. A missing or corrupt snapshot opens with
+no rows at the independent floor and a typed recovery diagnostic. Corrupt cursor
+metadata, or loss of both records from an initialized store, refuses loading rather
+than resetting it. A valid legacy snapshot with an unmarked lock seeds the new
+cursor durably; thereafter a durable marker on the locked inode makes cursor
+loss a refusal, not a migration from an older snapshot. When both records are
+valid, the maximum high-water wins. Any uncertain write requires reopening the
+store before another publication. Slice 6b (#2225) wires the provider into
+authenticated `fleet` subscriptions.
+Its single owner serializes refresh, durable checkpoint allocation, pending live
+publication, and new-cut registration. Each checkpoint belongs only to its
+requesting subscription, using that cut's acknowledged replay path. The shared
+ring carries only live deltas, so one reader's resnapshot cannot lag another
+reader. Checkpoint positions remain globally reserved: another cut's next live
+sequence can jump past those private positions without missing a mutation.
+Storage and frame preparation run off the executor; live publication
+yields between frames. Replay retains an immutable cut while later mutations
+enter its live continuation. Owner-turn
+observations coalesce to the latest materialization; the agent journal, not
+fleet-lite, retains every intermediate harness event. The live ring holds sixteen
+frames, each preflighted once with the maximum escaped subscription-ID overhead
+within the endpoint's existing 64 KiB message limit; overflow retires
+only the affected subscription ID. A fresh ID requests a complete snapshot, and
+absent rows disappear only at its advertised completion. Permission IDs come from
+the runtime book's open, non-automatic requests, never S4 phase inference. Before
+serving after cold boot, 6b refreshes the
+registry/S4/S6 provider cut; persisted observation state grants no process lease
+or resume authority. Local file locking does not implement S7-rest's
+single-writer handoff protocol.
+
+**Fleet-lite operator recovery (#1976).** For a store at `fleet.json`, preserve
+`fleet.cursor` (a small `{"high_water":N}` record) and `fleet.lock`. Do not
+delete them to repair snapshot corruption. Opening leaves damaged snapshot bytes
+intact for inspection; save a copy before a subsequent refresh/checkpoint
+replaces them. With a valid cursor, refresh the registry provider and publish a
+recovery snapshot at or above its floor. Unpublished reservations left by a
+failed write are covered by the next inline gap/checkpoint, not reused. If the
+cursor is missing after initialization or damaged, or both records are lost from an initialized store,
+repair offline with the owning store closed: restore a trusted cursor backup or
+atomically replace the cursor with a floor at least as high as both the
+surviving snapshot head and the highest cursor clients have observed. Use
+temp-file fsync, rename, then directory fsync. Never guess zero when that floor
+is unavailable; keep the store closed until trusted recovery evidence exists.
+
+An empty, unmarked lock with neither data record safely retries initialization
+at zero: cursor durability always precedes the initialization marker.
+`fleet.lock` carries that marker, so deleting it together with `fleet.cursor`
+while an older `fleet.json` survives reopens at that older head. The operator
+must never delete the lock.
+
+`cmd agent.decide` takes `AgentDecide { agent, request_id, decision, message? }`,
+where decision is `allow_once`, `allow_always` or `deny`. Only a token-authenticated
+client principal may call it. The existing ack envelope echoes `cmd_id`; success
+returns `AgentDecideResult { request_id, decision }`, echoing the applied answer.
+Decision-specific failure names are `permission_request_unknown`,
+`permission_request_closed` and `not_authorized`, with retry class `never` in the
+existing error envelope. Their API error-code registration and command behavior
+are deferred to S6 (#1429); this types slice names the contracts only.
+
+- **Cursors and bootstrap (architect decisions iii/iv).** Every stream except
+  `agent/<id>/live` has seqs, including `terminal/<pane>` and `events`.
+  `sub` with `after` replays from the last applied cursor, then goes live.
+  A first `sub` without `after` on a snapshot stream (`fleet`, `inbox`,
+  `queue/<id>`, `artifacts`, `work`, `terminal/<pane>`) gets an inline checkpoint
+  through the same path as recovery: `gap { from:1, to:first_snapshot_seq-1,
+  snapshot_to:last_snapshot_seq }`, or §4's empty-snapshot form. No separate
+  bootstrap fetch or client reducer exists. If no checkpoint exists yet,
+  create and persist one under §4's serialization rule before serving it.
+  Streams without entity snapshots replay retained history from the beginning
+  when `after` is absent, reporting any missing prefix as an ordinary gap.
+  Send `synced { sub_id, seq }` exactly once on **every seq stream** per
+  subscription, after replay through a captured head, including all announced
+  snapshot lines. The barrier's seq is that head (zero only for a genuinely
+  new empty stream); all later frames are live. `lagged` closes the old ID;
+  re-subscription with a fresh ID gets its own barrier without an `unsub`.
+  Empty-checkpoint completion advances to `to` before `synced`; a nonzero
+  high-water never becomes zero merely because no items remain. Delivery is
+  at-least-once; dedupe on `(stream, seq)` and persist a cursor only after
+  applying its event or empty checkpoint. Persist a pending
+  `snapshot_to` and unconfirmed-entity set with the cursor across disconnects.
+  Resume unfinished snapshots before declaring Current. A new gap supersedes
+  an old resync marker and marks all entities unconfirmed again.
+  `agent/<id>/live` has no cursor or `synced`; discard in-flight partial blocks
+  after a drop and render from the next complete persisted `assistant` event.
+- **Commands.** `cmd` verbs are the socket API's own (`queue.add`,
+  `queue.update`, `queue.gate`, `agent.interrupt`, `question.answer`,
+  `agent.fork`, `agent.reload`, …), with the same params types. The server
+  keeps `cmd_id`s for `[wire] idempotency_window_ms` (default 24 h); a
+  repeat returns the first `ack`, subject to the durable recovery rules in
+  §5a. Errors use ADR-0029 §4's envelope and
+  `ErrorCode`s from `src/api/error_code.rs`.
+- **Blobs.** `GET /v1/blob/<sha256>` is immutable: `Cache-Control: public,
+  max-age=31536000, immutable`, `ETag` = the hash, range requests honoured.
+  A client renders a large tool result from `preview` and fetches it only on
+  demand (E17).
+- **Protocol gating (#868).** The JSON wire has its own version,
+  `WIRE_JSON_VERSION`, independent of the framed protocol's
+  `PROTOCOL_VERSION`, bumped once per release that adds a verb or an event
+  type. `hello.protocol` is compared with it. A client newer than the server gets
+  `welcome` with the server's protocol and read-only capabilities; a `cmd`
+  whose verb the server does not know is refused with `server_version_gap`
+  (exit 78) before anything is allocated. A server never sends an `ev` whose
+  type the client's protocol predates without the §8 unknown wrapper.
+- **Auth.** Every client presents a bearer token in `hello`; the address it
+  connects from grants nothing (§1a). The operator's own browser gets an
+  `operate`-scoped token through `flk client open`, which runs over the
+  unix socket (so `caller_is_local_operator()` and the uid check of §1a
+  apply), mints a one-time code, and opens the client in a new browser tab or
+  window; the client
+  exchanges the code for its session token once. The code contains 256 bits of
+  randomness encoded as 64 lowercase hex characters, is bound to that token,
+  exists only in server memory, is single
+  use, and expires at age 60 seconds. `flk client open --print` prints the
+  loopback URL rather than launching the browser. The code is carried only in
+  the URL fragment (`#code=…`), never the query, so it is absent from HTTP
+  request targets and Referer. The browser consumes that fragment and sends
+  `POST /v1/client/exchange` with JSON `{ "code": "…" }`; the loopback-only,
+  same-origin endpoint returns `{ "token": "…" }` exactly once, with
+  `Cache-Control: no-store`. Used, expired and unknown codes get one uniform
+  401. There is no global failed-exchange gate: every caller reaches the
+  loopback listener locally, and local processes can forge Host/Origin.
+  Such a gate would let any local process, including an agent, lock out the
+  operator. Guessing a 256-bit, single-use code with a 60-second lifetime is
+  infeasible. Keep the store bounded at 128 live codes and request bodies at
+  1024 bytes. Cross-origin and non-loopback requests are refused, and neither
+  codes nor tokens enter diagnostic logs.
+  The opener's URL argument is an explicit credential-in-argv exception:
+  `open`/`xdg-open` have no stdin or environment URL channel. The exchange code
+  is visible through `ps` for the opener's lifetime. Single use, the 60-second
+  TTL and fragment-only transport bound this known exposure; process logging
+  masks the code. This exception does not permit long-lived tokens in argv.
+  Log-only argv scrubbing also masks userinfo in malformed URL tokens: raw
+  `/`, `#` or quotes before the final `@` must not expose a password prefix.
+  Without escaping, userinfo and path text containing `@` are ambiguous; the
+  conservative rule can hide preceding host/path text in logs. Quoted URL
+  wrappers are retained when the URL tail has no such ambiguity. Whitespace
+  and angle brackets (`<`, `>`) terminate URL tokens: malformed userinfo with
+  these characters can leave a password prefix visible. This backstop cannot
+  replace keeping credentials in stdin or the environment.
+  Query, fragment and semicolon parameter names containing a full credential
+  argument/header label, or `code`, `key`, `auth`, `pwd`,
+  `jwt` or `signature`, have their values masked
+  even when the label is mid-name, such as `api_key_v2` or `token_type`.
+  This intentionally also masks false positives such as `keyboard`, `monkey`,
+  `unicode` and `sessionid`; the short `sig` alias
+  matches only the complete name, preserving ordinary `design` parameters.
+  Credential header names include `Authentication`, standard credential headers,
+  API-key names and any hyphenated name with a credential-label segment
+  (for example `X-Access-Key`, `Ocp-Apim-Subscription-Key`, `X-Signature`
+  or `X-Hub-Signature-256`). These names
+  allow horizontal whitespace before `:` and mask values even without space
+  after it, including names glued to curl's `-H` option or a short-flag
+  cluster ending in uppercase `H`, such as `-sSLH`, `-4H`, `-0sH`, `-#H`
+  or `-:H`. Digit, progress-meter and next-transfer flags are valid cluster
+  members; lowercase `h` requests help and is not a header option. Header
+  recognition classifies the complete name, so `refs/heads/cookie` is a ref name rather
+  than a `Cookie` header. Generic credential labels such as `token`, `session`
+  and `secret`, including prefixed labels, require whitespace or end-of-string
+  after `:`. This preserves refspecs and terminal targets such as
+  `refs/heads/token:refs/heads/x`, `token:main` and
+  `mysession:0`.
+  Bare compact refspecs such as `cookie:cookie` and `authorization:main` are
+  masked in logs, along with hyphenated names such as `deploy-token:main`
+  and `custom-cookie:main`, because they are indistinguishable from compact
+  credential headers, an acceptable loss of diagnostic detail to avoid exposing secrets.
+  Everything after the first header-shaped label is value, never part of a
+  later label. If a later credential-header match would retain text following
+  an earlier colon, mask the whole argument instead. Curl's leading `-:` switch
+  is not a header delimiter. This deliberately over-masks ambiguous chains such
+  as `-:Hfoo:HAuthorization:z`, including `z`, and may hide option labels in that
+  argument; the program and other arguments remain logged. Skipped matches never
+  promote earlier values into a retained label.
+  JSON-quoted header names allow a closing quote before the colon. Labels
+  followed by `=` are scrubbed in every argument, including shell command text.
+  A backslash-escaped space belongs to the value and cannot expose its suffix.
+  Named flags match whole hyphen/underscore segments of the shared credential
+  vocabulary, including single-dash Go-style options. Key labels in compound
+  flags require a credential qualifier (`api`, `access`, `private` or `secret`),
+  so `--ssh-key-path`, `--hotkey`, `--keys`, `--keyring` and `--author` retain
+  their diagnostic values. Negated and known boolean prefixes (`no-`,
+  `disable-`, `enable-`, `show-`) never consume a following value.
+  Credential aliases (`-u`, `-b`, `-U`, `--user`, `--cookie`,
+  `--proxy-user`, `--oauth2-bearer`) use the value's shape independently of the
+  program: user/proxy values contain `:` or start with `@`; cookie values contain
+  `=` or start with `@`; OAuth bearer values are always secret. This also covers
+  wrappers, executable aliases, remote command strings and nested shell text.
+  Recognizing curl adds masking of its unshaped credential values, but never
+  gates the value-shape rule. Thus `git worktree add -b fix-1`,
+  `git push -u origin main`, `git add -u src` and `sort -u x` retain their
+  diagnostic values.
+  Labelled assignments and token-shaped secrets are scrubbed independently.
+  Short options are case-sensitive and clusters follow the
+  [curl option rules](https://curl.se/docs/manpage.html#options): the first
+  argument-taking letter owns the remainder, or the next argument. A public
+  option such as `-A` prevents a later `u` in its value from becoming a credential
+  switch. Both attached and `=` forms use the same value classifier. Quote and
+  escape handling retains value spans for masking; executed commands are unchanged.
+  The report/stderr scrubber splits labels on `_`, `-` and camelCase boundaries.
+  Compound labels ending in `key`, `auth`, `token`, `secret`, `password` or
+  `credential` mask with either delimiter, including `DEPLOY_KEY`, `ssh_key`,
+  `authKey` and the AWS `access_key_id` spelling. Strong credential words such as
+  `authorization`, `signature` and `password` also mask as bare labels. Bare
+  `key` and `auth` require `=` or a quoted JSON key. Consequently
+  `primary key: id`, `hotkey: ctrl-a`, `monkey=banana` and `auth: ok` stay visible.
+  Glued non-option prefixes such as `SECRET-HAuthorization` remain
+  conservatively masked as header labels.
+  These rules shape diagnostic logs only; executed argv is never rewritten.
+  The token then travels in the unchanged normal `hello` frame.
+  The served client derives its server and transport from its own location
+  (same-origin `ws://<host>/v1/ws`); the bundle router serves no config script.
+  `token add` prints the bearer only to terminal stdout unless `--json` or
+  `--show-token` explicitly permits redirected secret output. Without that
+  consent it refuses before issuance, so no undisclosed credential is created.
+  Tokens follow the channel-token model of ADR-0028 §8
+  (`src/channels.rs`): 32 random bytes as 64 hex digits, one file per client
+  under `<data dir>/client-tokens/<name>.token`, mode 0600 in a 0700 dir,
+  compared as SHA-256 digests in constant time, never logged, revoked by
+  deleting the file. (`authenticate` also checks a second, in-memory store
+  of app-session tokens; see the amendment "App-session tokens and shell
+  origins".) Each token carries scopes `read`, `send`, `answer`,
+  `operate` (`operate` is what the operator's own client holds). Only the
+  local operator (`caller_is_local_operator()` after §1a's uid check) can
+  issue or revoke one (`flk client token add|rm|list`; else
+  `operator_only`, exit 13), and verbs that are operator-only under ADR-0014's
+  authority boundary (and ADR-0035's owner rules) stay operator-only
+  whatever the token says unless it is `operate`-scoped. Stated plainly: an
+  `operate`-scoped bearer token *is* the operator's identity for ADR-0014's
+  operator-only verbs, from any address, and once `--allow-non-loopback`
+  is on that includes other machines (owner decision 9). That reach is why the
+  accepted §1a amendment extends structured stop/restart only to app-session
+  tokens, never to file tokens. Token files live in
+  the operator's data dir, which `flk-agent` cannot read (ADR-0035 §6.3), so
+  structured agents cannot pick up a client token. `pty` agents that still
+  run as the operator's uid until O19a can; that limit is #1177's.
+
+### 5a. Transport liveness and recovery (#1546, #1641)
+
+**Amendment accepted by the architect, 2026-10-16.** The snapshot/bootstrap,
+all-seq-stream `synced`, empty-checkpoint cursor, persisted high-water and
+S7 no-compression rules are decided. The values below are **proposed
+parameters for review**, not measured performance claims. Keep WebSocket as
+one transport for the `-p` surface and GUI; recovery is required in S7, including
+local use, and its types precede G3 in S7a. No deployment is authorized here.
+
+| Parameter | Proposed value | Rationale |
+| --- | --- | --- |
+| Connect deadline | 10 s per attempt, from attempt start through name resolution, TCP/TLS and HTTP upgrade | Bounds a black-holed route without waiting for operating-system timeouts; allows mobile connection setup. |
+| Handshake deadline | 5 s from WebSocket open to authenticated `welcome`; server closes 1001 if `hello` is absent within 5 s | Hello is local validation, not model work. Neither side can hold an unauthenticated socket indefinitely. |
+| Handoff deadline | 10 s from handoff request, across producer quiescence, claim settlement, flush and readiness for exclusive transfer | This is local coordination, not model work. Bound a stuck producer or flush without releasing ownership; fail and continue serving from the old owner rather than half-transfer. |
+| Heartbeat interval | 15 s from `welcome`, independent of other traffic | Detects suspended or half-open peers even during long quiet turns; four round trips/minute per connected client. |
+| Liveness window | 45 s | Three heartbeat intervals tolerate brief scheduling delays while bounding stale display and server resource retention. |
+| Subscription progress deadline | 30 s without a frame advancing that subscription while awaiting synced or snapshot completion | Large replays may take longer overall; unrelated traffic and heartbeats cannot hide a stalled stream. Only that stream re-subscribes. |
+| Command acknowledgement deadline | 30 s from each send | Marks that command uncertain while keeping the connection up; resend only after the next reconnect. Long work acknowledges admission and publishes completion separately. |
+| Reconnect backoff | base 500 ms, factor 2, cap 30 s, equal jitter in [base/2, base] after applying cap | Avoids fleet reconnect storms and zero-delay loops, while the first retry is quick. |
+| Stable connection before resetting backoff | 60 s continuously authenticated and live/read-only | An open socket followed by immediate failure must not reset storm protection. |
+| Resume retention | Entire session JSONL until explicit S16 retention; latest checkpoint plus later changes for materialized streams | No arbitrary time-based replay loss. Removed history uses gap, never a silent jump. |
+| Command idempotency window | 24 h from first admission (existing §5 default) | Covers sleep/offline recovery; does not promise indefinite replay safety. |
+
+These are failure ceilings for a single operation, not evidence of completion.
+Use monotonic clocks while running. Suspend/foreground invalidates the old
+connection instead of interpreting a frozen clock as continued liveness. This
+uses ADR-0037's principle that missing evidence fails rather than hangs; that
+ADR's test-binary ceilings do not set runtime timeouts. No condition is made
+true by expiry, a retry, a heartbeat or elapsed time.
+
+**Heartbeat direction and shape.** Use application JSON
+`{"t":"ping","nonce":"<opaque unique nonce>"}` server → client and
+`{"t":"pong","nonce":"<same nonce>"}` client → server. A bounded nonce
+identifies one outstanding ping; no shared wall clock is required. Retain the
+few outstanding nonces within the 45 s window, not an unbounded history. The
+client responds at once, without waiting for rendering, a model or a command.
+Application frames are chosen over WS control ping because browser JavaScript
+cannot observe control ping/pong to drive the same visible lifecycle
+([WebSockets Standard](https://websockets.spec.whatwg.org/#ping-and-pong-frames)). Native
+clients use the same JSON contract. Control ping/pong may be handled by the WS
+library but does not replace these checks. Invalid/replayed nonces do not renew
+server liveness. The server closes and releases per-client subscriptions when
+no valid pong has arrived for 45 s (initial baseline: `welcome`). The client
+enters Stale when no valid server frame, including ping, has arrived for 45 s,
+marks retained content stale, holds its outbox, closes and enters Reconnecting.
+Prioritize ping/pong ahead of queued replay/data messages in both directions.
+The writer sends bounded messages with bounded buffering, checks the priority
+queue between writes, and never enqueues an entire replay ahead of a heartbeat.
+A blocked socket write remains subject to the liveness failure ceiling; priority
+cannot cure a genuinely unusable link. This prevents a healthy slow replay from
+causing false Stale merely because the heartbeat waited behind its data backlog.
+Discard every frame from the abandoned socket, including late pings; send no
+pong for them and let no old callback advance a cursor or renew liveness.
+A stream's independent progress deadline still applies during traffic.
+
+**Resume probes (#2977).** `welcome.capabilities` advertises the additive
+`resume_probe` transport capability independently of the authenticated operation
+grants. Clients send JSON `ping { nonce }` only when that capability is present;
+the server echoes `pong { nonce }` through its priority writer. Nonces are opaque,
+nonempty strings of at most 128 UTF-8 bytes, accommodating the heartbeat's
+bounded epoch/connection/sequence identities. Like invalid heartbeat pongs,
+empty or oversized probe nonces are ignored and renew no liveness deadline.
+One probe response per connection may be queued or writing: the server ignores
+additional probes until that response has flushed. This bounds probe buffering
+without blocking heartbeat or subscription processing. Probe requests never
+renew the server's heartbeat deadline; clients must still answer server pings.
+
+On persisted `pageshow` or hidden-to-visible `visibilitychange`, the GUI sends
+one probe and gives it 3 s. Concurrent resume signals share that probe and its
+original deadline. Only its matching pong satisfies it; unrelated traffic and
+wrong, old or replayed pongs cannot do so. A healthy response leaves the visible
+connection state unchanged. On expiry, the client shows Reconnecting, closes the
+abandoned socket, and uses the existing reconnect backoff and applied cursors.
+For older servers without the capability it sends no unsupported frame: any
+valid server frame within the 15 s heartbeat interval plus 2 s scheduling grace
+proves liveness; otherwise it reconnects through the same path. Resume establishes
+this bounded window even when the pre-suspension liveness timer was overdue.
+Disconnect cancels the probe, and client disposal removes both browser listeners.
+
+**Reconnect and failure scope.** Connect/handshake expiry, protocol failure,
+socket loss or heartbeat failure ends the connection attempt and enters
+Reconnecting, preserving displayed state and applied cursors. Subscription
+progress and command-ack expiry never tear down a healthy connection.
+One attempt is active at a time. Backoff attempt n waits a uniformly sampled
+value in `[min(30s,500ms*2^n)/2, min(30s,500ms*2^n)]`, n starting at zero;
+use saturating arithmetic. A network-change or foreground event cancels the
+backoff and triggers one immediate attempt; coalesce repeated signals while an
+attempt is active. Foreground first closes a possibly suspended old socket.
+Retries of connection setup continue under the cap until user disconnects;
+each attempt ends at its deadline, with the latest failure visible and a
+user disconnect action always available. This deliberate background reconnect
+policy does not retry a condition assertion or declare a command successful.
+WS close **4401** means auth refused during hello; **4403** means token revoked
+mid-session. Both enter NeedsToken, holding the outbox without reconnecting until
+a new token arrives. These codes differ from protocol failures (visible error,
+capped reconnect) and network loss (reconnect). During initial hello and the
+post-registration recheck, a handshake deadline miss, unavailable token-store
+worker, store I/O failure or unsafe storage closes with **1001**, preserving the
+credential for reconnect. Unsafe storage is not evidence that a bearer is invalid.
+An unauthorized or revoked credential, an explicit authentication-scope
+refusal, or a malformed/tokenless hello justifies **4401** during hello.
+If no initial hello arrives within the handshake deadline, close **1001** and
+retain the token for reconnect; absence alone is not an auth refusal.
+A failed welcome encode or send drops the transport without attempting another
+close send; it cannot establish revocation. Only a credential that no longer authenticates, a changed verified principal,
+or a revocation signal justifies **4403** after registration.
+Frames for a closed subscription ID are silently dropped. A frame for an ID
+never opened on the current connection is a protocol error, not a closed-ID case.
+Protocol errors close with a visible diagnosis and capped reconnect (a server
+upgrade can cure them). A newer client follows §5's ReadOnly capabilities and
+holds commands; it can keep reading and detecting stale transport.
+
+**Session replay provenance (S7-min slice 3, #1829).** New session-store
+`StreamRecord`s add optional `known` (boolean) and `shape` (the original
+`ShapeKey` string). The receive-time adapter sets `known`; unknown events retain
+the original sender's harness/version-scoped `shape`. Known records keep their
+stored blob projection. Readers ignore additive envelope fields under ADR-0028
+§3a. Replay never invokes the current parser to reconstruct classification or
+shape. A legacy record without classification, or an unknown without its shape,
+yields a typed history gap with reason `provenance_missing`; later records still
+replay. It is neither a whole-replay refusal nor an entity snapshot. A missing
+retained prefix uses the same gap path with reason `retained_prefix`.
+
+The registry's runtime stream owner registers bounded continuation and captures
+its durable head under one publication lock. An owned file cut pages through that
+head before exactly one `synced`; subsequent publications cannot fall between
+registration and the barrier. Capture and registration are one operation over
+the locked book; constructing the owned cut afterwards cannot open a hole.
+Replay retains unread page bytes. Runtime-only, source-fenced byte checkpoints
+let a consumer resume its applied cursor after lag without rescanning the prefix;
+they are neither new wire fields nor durable cursor authority. Lag terminates
+unfinished replay on its next page. Terminal permission audits use this same source,
+even when runtime notification delivery is cancelled. Partial deltas consume no
+durable cursor and do not enter this source. The S4 reader remains singular.
+
+**Replay and resync.** Reconnect authenticates again, then sends each seq
+stream's `sub { after:last_applied_seq }`, preserving any unfinished resync
+marker. Retained events are replayed in order before `synced`, and mutations
+concurrent with replay follow the captured barrier without a hole. `lagged`
+closes its old ID, like `subfail`: the server sends nothing more on that ID and
+the client silently drops late frames for it. Re-subscribe with a fresh ID from
+the applied cursor, never `skipped_to`; no `unsub` is needed for the closed ID.
+A snapshot gap uses §4's inline checkpoint; no snapshot gap may omit `snapshot_to`.
+A history gap on `agent/<id>` or `events` leaves an explicit missing-range marker
+and continues from `to+1`, without implying complete history. A persisted known
+payload that no longer parses follows that same inline history-gap path over
+its original sequence; it does not close the socket or retry the same bad
+payload on reconnect.
+
+`terminal/<pane>` is a **snapshot stream**, not history-only. Its snapshot
+contains the complete terminal frame and rendering state for that pane; keep its
+seq high-water and checkpoint under §4's single-writer atomic checkpoint rule.
+Initial subscription and a gap both use
+`gap { from:cursor+1, to:H, snapshot_to:H+1 }` followed by one complete frame
+at H+1 (initial `from` is 1). Subsequent deltas follow it; a missing/removed pane
+gets `subfail { code:"unknown_stream", ... }`, not a fake empty terminal.
+Do not clear stale visual state until the complete frame has been applied;
+a delta cannot reconstruct a missing base. As for other snapshots, synced
+follows its completion and never substitutes for the frame. Cursors and
+identity survive reconnect; neither a new socket nor a new server epoch resets
+seqs. A cursor ahead of the restored stream head is refused as `cursor_ahead`,
+not clamped or treated as caught up. On ordinary reconnect, re-subscribe only
+the cursorless `agent/<id>/live` stream without `after`. Terminal recovery always uses its
+full-frame snapshot path; on cursor_ahead it clears that stream's state/cursor
+and bootstraps without `after` as specified below, never starts from a delta.
+
+**Subscription identity (architect decision, 2026-10-17).** Every `sub`
+uses a fresh `sub_id`, unique for the lifetime of that connection. IDs are
+never reused on that connection, including re-subscriptions of the same stream
+after `lagged` or the progress deadline. `unsub`, `subfail` and `lagged` each
+close the named ID; the server sends nothing more on a closed ID. Clients
+silently drop late frames for any closed ID, without advancing a cursor or
+renewing progress. After `lagged`, re-subscribe with a fresh ID without an
+`unsub`. After `subfail`, re-subscribe only where its code calls for it, using a
+fresh ID without `unsub`; otherwise stop until the code table's condition changes.
+A progress deadline first sends `unsub` to close the stalled ID. A frame for an
+ID never opened on the current connection is a protocol error. The server refuses
+a `sub` that reuses either a live or closed ID with typed
+`subfail { code:"sub_id_reused", ... }`. Preserve stream cursors and resync
+markers across replacement while allocating a new subscription identity.
+
+**Subscription refusal and progress.** `subfail { sub_id, code, message }`
+closes only the named subscription ID, which receives no further server frames;
+clients drop late frames for it. It supplies these typed codes (S7a defines
+the wire enum; implementation registers any new API error codes where needed):
+
+| Code | Meaning and client action |
+| --- | --- |
+| `cursor_ahead` | Stored cursor exceeds the stream head. Clear only that stream's entities, cursor and resync marker, then re-subscribe with a fresh ID without `after` through bootstrap; do not silently clamp. |
+| `operator_only` | Subscription requires the operator principal. Show refusal and stop that subscription until the principal changes; other streams stay up. |
+| `invalid_agent` | Unsafe or reserved stored agent namespace. Retry class `never`: select a valid subject rather than retrying unchanged. |
+| `unknown_stream` | Unknown stream kind or removed subject. Show unavailable and stop that subscription until the user selects a valid stream. |
+| `scope` | Token lacks read scope for the stream. Show refusal and stop that subscription until authorization changes. |
+| `session_busy` | Token mutation is pending, or the fleet permission book is temporarily unavailable during worker preparation or read contention. Retry class `later`: retry only this stream with fresh IDs after 250, 500 and 1000 ms (three automatic same-socket retries since the last `synced`), then remain visibly Refused until reopened or a later reconnect supplies a new welcome. Sibling subscriptions and the authenticated socket stay connected. |
+| `sub_id_reused` | ID was already used on this connection, live or closed. Refuse the registration; treat this as a client allocation error and use a fresh ID for any new subscription. |
+
+Start the 30 s progress deadline at sub registration, or when a new gap starts
+resync of a Current stream. Reset it only on a frame advancing that sub: a newly
+applied seq, an advancing gap/cursor or snapshot boundary, or its synced barrier.
+Duplicates, repeated identical gaps, unrelated streams and heartbeat frames do
+not reset it. Expiry sends unsub, then a new sub with a fresh ID from the applied
+cursor and stored resync marker; only that stream returns to Replaying/Resyncing.
+Keep the connection and other streams up and show the affected stream's
+recovery state.
+A replay that keeps advancing can exceed 30 s in total. No timeout marks Current.
+
+**Commands across a drop.** Persist the client's outbox before sending, keeping
+principal, unique `cmd_id`, exact verb/args and first-send time. A reconnect may
+resend an unresolved command only under the same principal, with the same id
+and identical payload, within the advertised window. Do not change ids on retry.
+Set `resume_only:false` on the first send and `true` on every resend after
+uncertain delivery; exclude this delivery flag from the payload digest. A
+resume-only request whose key is absent, expired or lost is refused as uncertain
+before dispatch, even if the server restarted with an empty journal. This trades
+a possibly unexecuted original for explicit inspection, never a duplicate effect.
+There is a dead-socket race: the original `resume_only:false` command may be
+buffered on the old connection while the new connection's resume-only lookup
+finds no claim and refuses it. The original may later arrive and execute once.
+Show **unknown outcome**, not cancelled or definitely unexecuted; inspection may
+later reveal its effect. Do not create another command ID to force execution.
+On an ack deadline, mark only the command uncertain and keep the connection up.
+A late ack on that still-current socket resolves it normally; resend with
+`resume_only:true` only after the next reconnect and within the window.
+The server persists an idempotency journal at `<data dir>/wire/commands.jsonl`,
+keyed by `(principal, cmd_id)` plus a canonical payload digest and first-admission
+expiry. Claim a key durably before dispatch; concurrent duplicates join that
+claim. Reuse with different payload is refused (`invalid_params`), never executed.
+Persist the outcome before sending ack; completed duplicates return the first
+ack. Integrate the claim/outcome with durable queue/question mutations so a
+restart cannot apply them twice. For nontransactional effects, a recovered pending
+claim is uncertain: do not dispatch again. Report `session_unconfirmed` with
+CLI `UNCONFIRMED`; expose the existing subject state for inspection. A duplicate
+never creates a second execution, including after restart or handoff; an
+unresolved original is not falsely presented as a completed first ack.
+`session_unconfirmed` keeps its registered `retry:later` class. Retrying is
+harmless only with the same principal/id/payload and `resume_only:true`: an
+absent/expired claim still refuses and cannot dispatch. The class is not license
+to resend as a first send or create a new ID; the outbox/expiry rules still apply.
+
+**Bound and overflow (J1, #1380).** Never evict an unexpired claim. Refuse
+new claims before dispatch with `session_busy` (`retry:later`) when either the
+per-principal or global entry cap is reached. The local constants budget four
+sockets per credential times four outstanding commands per socket times 2,880
+30-second acknowledgement windows per day: 46,080 claims per principal. The
+sixteen-socket global limit gives 184,320 claims globally. This supports a
+sustained budget of sixteen new commands per principal per 30 seconds for a
+full day; the transport has concurrency limits, not an enforced command-rate
+limit, so higher sustained traffic can reach the cap and must back off.
+Shared-principal credentials share the principal cap. Persist the payload digest,
+never the payload, and bound each claim/result record to 67,584 encoded bytes
+including its newline; acknowledgements also retain the 65,536-byte wire cap.
+An oversized outcome leaves its durable claim uncertain instead of truncating
+the result. The namespace is an explicit string (`local` today), so a later
+home-node namespace needs no format change.
+
+**J1 live admission (#1380).** Wire commands use the durable journal as the
+single source of completed outcomes. The app owner submits a claim without
+blocking, polls its durable completion, then rechecks current authorization
+under the token fence through dispatch. Revocation after claim prevents the
+effect. The outcome is synced before acknowledgement. Identical in-flight
+requests join the active claim, retaining each credential's metadata and
+reauthorizing each waiter before returning the stored outcome. Fresh dispatch,
+cached replay and joined replies share verb authorization; permission decisions
+require both current `answer` and `operate` scopes. Connection closure
+follows the requesting credential's current revocation status. Conflicting
+payloads refuse `invalid_params`. Journal capacity and writer queue pressure
+refuse through the bounded wire refusal audit before dispatch. Recovered pending
+claims and absent, expired or lost resume-only keys refuse `session_unconfirmed`.
+A completion from an earlier ownership phase cannot dispatch after freeze or
+rollback. Completed outcomes replay across restart and ownership transfer.
+
+Lease acquisition has a one-second budget (`JOURNAL_WAIT`), including any earlier
+writer drain. Startup, post-commit importer acquisition and rollback then await
+replay without a total-duration deadline. Replay work is bounded by the captured
+journal byte length, checked against `LOG_BYTES`, and the global index cap;
+machine speed cannot turn a progressing near-cap replay into a startup refusal.
+`REPLAY_STALL` is ten seconds without replay progress, measured by the async
+owner's monotonic clock. Completing lease setup starts a fresh window; every
+nonempty read chunk and every applied record resets it. This includes chunks
+skipped from oversized entries. Torn-tail archival and file/directory sync must
+also finish within a window without further progress. Ten seconds allows a
+single storage operation more room than lease acquisition while bounding a
+silent worker; it is independent of the number of retained claims.
+On stall, acquisition returns typed `session_busy` and logs `status=stalled`
+with the last byte counts. Admission stays closed. The owner retains its pending
+worker and lease until that worker actually stops, rejects its late completion,
+then retries after 250 ms; it never starts another local replay in parallel with
+the stalled worker or reports readiness from a partial index. Startup and
+importer completion fail closed; rollback's running transport continues issuing
+typed, audited refusals until a subsequent replay succeeds.
+Readiness requires both the lease and completed replay. Lease timeout and open
+failure return typed `session_busy`. Acquisition is a prerequisite like token
+store and listener setup. Rollback recovery remains fenced and retries failed
+acquisition every 250 ms (`ACQUIRE_RETRY`). Importer preparation never opens the
+journal. The import watchdog covers preparation and is disarmed before ownership
+commit; post-commit replay has the work cap and progress-stall window above.
+
+Server logs report `command journal replay` with `status=replaying`,
+`replayed_bytes=N` and `total_bytes=M` at the start and approximately each tenth
+of the captured file, then `status=ready` after successful replay. Startup and
+importer readiness wait throughout replay. During rollback the running transport
+continues refusing commands with typed, audited `session_busy` until replay
+finishes; it never dispatches using a partial index.
+
+At the existing mesh custody freeze point, the exporter closes wire admission
+and requests a drain. Freeze and shutdown stop waiting after one second, log
+the number of accepted queued/active journal writes, and proceed. Counts retire
+before their completion is published. Timed-out work is detached, not cancelled;
+the worker retains the exclusive lease until it actually stops. A replacement
+fails closed and retries while that lease is held, never becoming a second
+holder. Shutdown retains its existing separate five-second revocation and
+transport-drain budgets, plus at most one second for the journal caller.
+Neither five-second wait traverses the journal: revocation retires credential
+authorization fences and transport draining waits for socket/fleet leases.
+Journal I/O and compaction drain separately, so increasing journal size does not
+require increasing those budgets. A slow or stalled replay also remains fenced
+when the shutdown journal caller stops waiting.
+
+Rollback schedules reacquisition at the same recovery point as mesh custody.
+Generation fencing prevents stale recovery from reopening admission after a
+freeze or shutdown, and prevents an abandoned old drain from closing a newer
+recovered writer. Recovery finishes any earlier drain before replaying.
+
+The backend holds an exclusive writer lease, rebuilds its index and per-principal
+counts by replay once at open, and appends one bounded record per claim/outcome.
+Successful completion follows file sync and index publication; failed appends
+roll back to the previous length and sync it, then fence further writes until
+reopen. Directory sync occurs on file creation and compaction publication.
+Its mailbox holds at most 32 queued messages plus one active job. Submission
+uses a nonblocking try-send and owns no filesystem or authorization lock.
+Startup recovery and journal writes run on the dedicated writer thread.
+Asynchronous open returns a usable handle only after replay and exclusive lease
+acquisition succeed; a held lease returns typed `session_busy`. There is no
+usable handle retaining a failed open. Shutdown closes admission across all
+clones, drains accepted writes and compaction, and reports completion only after
+lease release. Cancelling a started shutdown waiter does not cancel the drain.
+Callers must await shutdown before opening a replacement; opening while the
+lease is held refuses, and a fresh open after release can succeed even when
+closed handles remain alive.
+
+After eight MiB of log growth or when the oldest retained claim expires, a
+claim attempt starts a separate compaction worker with that attempt's clock
+value and a fixed, complete append prefix. This also runs after a capacity
+refusal, so a full journal can recover without successful appends. An O(1)
+oldest-admission index is rebuilt during replay and compaction, and maintained
+when claims are inserted; admission never scans the journal to check expiry.
+The copier keeps records younger than 24 hours, conservatively retaining future
+timestamps. It catches up concurrent appends and builds the replacement index
+and per-principal counts off-thread, reserving capacity so publication cannot
+rehash the index. If more than two record byte caps remain, catch-up returns to
+the copier. Otherwise the writer copies the bounded final tail, syncs the
+private temporary file, renames it onto the active journal, syncs the directory
+and publishes matching index/count removals before serving another message.
+Old index destruction also runs on the copier. A crash leaves the complete old
+or new journal; abandoned `commands.compact` files are ignored during replay.
+Copy or publication failures fence further writes. The primary file's identity
+is checked before copying and publication, so a lost or replaced log is not
+resurrected. A failed concurrent append cancels publication rather than
+replacing an uncertain authoritative tail. A sweep that frees nothing waits
+for another eight MiB of growth or the next retained claim's expiry before
+trying again. Unexpired claims remain retained in either case.
+
+Expired entries occupy their counts until successful compaction: resume-only
+lookup refuses them as uncertain, and reuse as a new claim refuses busy. No
+unexpired entry is evicted. There are at most two records per retained key and
+a hard active-file byte bound of twice the global entry cap times the record byte cap.
+Unknown/invalid complete records stay raw in place, are skipped and logged,
+and fence further writes while readable indexed results remain available.
+Opaque journals are not compacted, preserving every raw row and the recovery
+fence rather than attempting expiry inference from unknown data.
+A torn final line is archived as raw bytes in private `commands.torn.jsonl`,
+file-synced before the active tail is truncated and synced. The archive is
+bounded to 32 record byte caps; recovery refuses without truncation when full.
+A recovered pending claim remains uncertain and a completed claim returns
+its first acknowledgement through the live wire after fresh authorization.
+
+Automatic resend is allowed for the listed §5 verbs only through this durable
+idempotency path, not based on an assumed harmless verb. Permission/question
+answers retain stable question/request IDs; apply answer validity, principal
+scope and first-answer-wins atomically with the claim. A lost ack cannot answer
+twice, and a late answer to an already closed prompt returns the stored result
+or the normal stale-request refusal, never targets a newer prompt. While offline
+hold answers/commands in the outbox; do not imply that they reached the agent.
+
+After the window, or if elapsed age cannot be established after a client restart,
+an unresolved command becomes **unknown outcome** and is not resent automatically,
+even with the old key. Do not generate a new key as a workaround. Inspect queue,
+question or agent state and require an explicit user decision about any new
+command. A changed principal drops the old outbox with a visible explanation.
+Persisted token files and journal survive normal restart/handoff; `welcome`
+reports the effective `idempotency_window_ms` and a fresh random `server_epoch`
+for diagnosis, not as a reason to bypass dedupe. Lost/replaced journal state must
+refuse `resume_only` commands rather than assume an empty cache permits execution.
+A revoked token stays revoked; no auth state is inherited from a dead socket.
+
+**Single-writer handoff.** As in ADR-0026's ownership-transfer rule, ownership
+of `wire/commands.jsonl`, every queue/session log and checkpoint, **ADR-0005's
+`event-log.jsonl` (including the `events` stream's seq allocator)**, and all
+other wire-stream seq allocators transfers before the new server loads these
+files or accepts a connection/command. Hold an exclusive data-directory writer
+lock/fence through all writes. Store the owner generation with that lock; every
+append, seq allocation and rename-rewrite checks it before committing, including
+late callbacks. A process overlap never permits two writer generations.
+
+Handoff has the proposed **10 s monotonic deadline** through the ownership
+commit; preparation and every precondition share that deadline, rather than
+receiving new windows at each stage.
+The old server retains ownership and continues serving reads while temporarily
+refusing new command admission/claims with `restart_pending`. It prepares a
+reversible quiescence barrier, drains or durably records uncertain in-flight
+claims, and flushes producers within that one deadline; none of these steps may
+wait indefinitely. Do not close existing wire sockets or release ownership until
+all readiness evidence has arrived. At the final fenced transfer, close the old
+`/v1/ws` sockets, stop all old writes, and transfer ownership before the new
+server loads/replays files and accepts. Check deadline/cancellation before closing
+old sockets too: a failed final commit must not needlessly drop those clients.
+No old callback may write afterward.
+Crash recovery acquires exclusive ownership before loading as the new owner.
+
+If a producer, flush or ownership-readiness step remains stuck at the deadline,
+**fail the handoff** with the existing `handoff_failed` outcome. Cancel the
+transfer request and discard its late readiness callbacks; keep the old lock,
+owner generation and serving endpoint, resume admission and reversible producers,
+and leave the new server unable to load as owner or accept. No counter, journal
+or checkpoint ownership has been half-transferred. The final ownership commit
+must atomically check deadline/cancellation before transferring; a timed-out
+request can never later release the old fence. A blocked producer remains the
+old owner's responsibility and may fail its own operation; it cannot force
+handoff or hold the handoff caller open. Once ownership has committed, report
+the committed outcome, never turn an acknowledgement delay into a rollback claim.
+This closes the overlap contract gap identified in ADR-0005; it does not claim
+that the existing implementation already enforces these rules.
+
+**Revocation on an open socket.** Re-check the current token file/digest and
+scopes on **every cmd**, before claiming an idempotency key, returning a cached
+ack or dispatching a verb; cached hello authorization is insufficient. Serialize
+this authorization/admission boundary with operator revocation, so a command
+cannot be newly admitted after revocation. Each admission or management operation
+explicitly unlocks its owned file description at scope exit, including completion
+or cancellation of lock-helper transfers. An inherited pre-exec descriptor in a
+child cannot extend that critical section. On detection of a removed/replaced
+token, return an error ack for the triggering cmd with `code:"auth_revoked"`
+before closing **all sockets for that token with 4403**; clients enter NeedsToken.
+Order that ack before the close on the triggering socket, without waiting for
+client acknowledgement or relaxing the write/liveness deadline. If the network
+loses the ack, the close still signals revocation. A still-valid token whose
+scopes have shrunk instead gets an error ack with `code:"scope"`; do not claim,
+return a cached result or dispatch an unauthorized verb, and keep the socket
+open for allowed operations. S7a defines these typed error codes and the
+implementation registers new API codes where needed. Check hello against the
+file too, with 4401 on refusal. This command-time check
+is chosen because it does not rely on portable filesystem-watch delivery. Its
+limit is explicit: deletion alone does not proactively close a read-only idle
+socket; the next cmd or reconnect detects it. Read scopes are checked at sub
+registration (`subfail scope`), not continuously on existing subscriptions;
+shrinking read scope alone does not terminate those subscriptions (continuous
+enforcement is tracked in #2042).
+Revocation prevents subsequent admission, not cancellation of an already admitted command; report its outcome
+through the journal and existing state rather than implying it was rolled back.
+
+**Compression and secrets (architect decision, round 2).**
+**`permessage-deflate` is NOT negotiated in S7.** Decline the extension at
+upgrade for every client; a browser or webview GUI gets no deflate at all, and
+all data messages, including hello, have RSV1 unset. Browsers/webviews may
+compress every client message after negotiation, including hello's token, with
+no per-message application switch. Disabling compression avoids an oracle on
+mixed secret and attacker-influenced content through observable lengths;
+no-context-takeover alone does not remove that risk (see
+[RFC 7692 security considerations](https://www.rfc-editor.org/rfc/rfc7692.html#section-8)).
+A later opt-in needs a separately reviewed **native-client-only** rule decided
+at upgrade time, with uncompressed hello and secret messages enforced; it is
+not an S7 setting or a post-hello capability toggle. Log neither bearer values
+nor raw secret payloads in transport diagnostics.
+
+**Boundaries.** Mobile background suspension closes or invalidates the connection;
+foreground resumes with cursors and the same bounded outbox rules. Push wakeups
+and a relay remain #1402, outside this amendment. Read recovery describes the
+client-to-serving-node hop; it does not assert that an unavailable remote node
+is current. Preserve origin/remote-health diagnostics and stale remote state;
+a successful local ping cannot certify a remote source. Cross-node command
+routing remains refused until #1380; mesh VERSION stays **5**. QUIC/WebTransport
+and SSE/long-poll are not selected: they add transport/auth/resume paths and do
+not remove the need for application cursors, snapshots or command dedupe. Revisit
+only with a filed proposal and evidence WebSocket recovery fails a requirement.
+S7 has not shipped: `ping`, `pong`, `synced`, `subfail`, `snapshot_to` and
+welcome recovery metadata are additions to the initial `WIRE_JSON_VERSION` contract, not a bump
+of an implemented/released wire. The framed protocol version is unchanged.
+
+**Implementation acceptance, not tests executed by this docs PR.** S7a defines
+the fake-server/fault-script types; S7 and G3 must preserve a failing baseline
+for each case below, then pass with the contract implemented. Use supplied clocks,
+controlled socket faults and bounded receives, not sleeps or live models.
+
+| Fault or scenario | Required evidence |
+| --- | --- |
+| Black-holed connect / missing hello / missing welcome | Each peer ends the appropriate 10 s or 5 s stage; no unbounded task or unauthenticated subscription remains. |
+| Half-open socket, silent live peer, missing pong | Stale and close within 45 s on the affected side; subscriptions released, outbox held, no success inferred. Active pings cannot hide a replay that never reaches synced. |
+| Backoff and foreground storm | Supplied randomness proves jitter bounds, cap, stable-reset rule and one active attempt; coalesced network changes do not create parallel sockets. User disconnect cancels attempt and timer. |
+| Mid-turn drop, duplicate delivery, delayed old-socket callback | Resume from applied cursor; rendered persisted transcript contains each event once in order. Discard old-socket frames; complete event repairs abandoned live deltas. |
+| Reordered replay/barrier | A fault script delivering synced before its announced snapshot end or out-of-order seq is rejected, never marked Current. Every seq stream, specifically terminal and events, receives exactly one valid barrier. |
+| First subscription and empty state | fleet, inbox and queue bootstrap all use the inline gap/snapshot path; empty from=1,to=0,snapshot_to=0 completes without waiting. No client fetch or guessed end marker. |
+| Zero-line queue rewrite and restart | Append through H, empty the folded queue, rewrite with header high_water=H, restart, subscribe and process empty gap: cursor becomes H; next item is H+1 and is applied rather than deduped away. Crash before/after rename preserves one complete checkpoint. |
+| Disconnect during snapshot / lagged / another rewrite | Stored marker and applied cursor resume remaining lines. Lagged closes the old ID; re-subscribe with a fresh ID without unsub and drop late old-ID frames. A newer checkpoint marks all entities unconfirmed again. Concurrent mutations are present after replay; removed entities disappear exactly at snapshot completion. |
+| Lost ack / duplicate cmd / restart at claim, effect or outcome | Same principal/key/payload yields one effect and first stored ack, or explicit uncertain pending outcome. All listed verbs, including fork/reload/interrupt, prove no automatic second dispatch. Different payload never executes. |
+| Permission prompt across drop | Prompt survives replay, stored answer retries once under the same request/key, closed prompt cannot receive a second answer or an answer intended for a newer prompt. |
+| Expired key / clock uncertainty / changed principal / revoked token | No automatic resend or new-id workaround; unknown outcome is visible, old-principal outbox drops, revoked token enters NeedsToken. |
+| Restart, handoff, missing journal or ahead cursor | File-token scopes and stream seqs persist; in-memory app-session tokens are revoked on restart and on handoff (their sessions close with `token_revoked`, and the shell mints again); no seq reset or duplicate side effect. Missing recovery state fails closed; ahead cursor is refused. |
+| Compression disabled | Offer permessage-deflate from browser, webview and native fixtures: every S7 upgrade declines it, all messages including hello have RSV1 unset, and no secret appears in diagnostics. |
+| Single-writer handoff overlap | Hold the old process alive with queued append/rewrite and command callbacks, including event-log.jsonl writes. New loading/acceptance requires exclusive ownership; every write checks the lock's owner generation. Race rewrite with append and duplicate cmd across transfer: no overwritten append, repeated seq or double effect. |
+| Stuck handoff producer | Keep a producer alive but unable to quiesce (repeat for a stalled flush/readiness step). At the supplied-clock 10 s deadline, handoff fails with handoff_failed: old ownership/generation/serving remain, admission resumes, new owner loads/accepts nothing. Release the delayed callback afterward: it cannot transfer the fence or mint a new-owner seq. No hang or half-transfer. |
+| Open-session revocation | Authenticate two sockets with one token, revoke it, then send a new cmd on one and a duplicate on the other. Neither claims, returns cached result or dispatches; the triggering cmd gets auth_revoked error ack before both sockets close 4403 and enter NeedsToken. Rejected hello closes 4401. An already admitted command is not claimed cancelled. |
+| Scope shrink | Reduce a still-valid token's scope after hello; a newly unauthorized cmd and cached-result lookup both get scope error ack without admission/result disclosure. Socket remains open and an allowed operation still succeeds. |
+| Slow replay heartbeat priority | Queue replay in both directions on a constrained healthy link; ping/pong bypass waiting data and prevent false Stale from backlog. An actually blocked writer or missing pong still fails within the liveness ceiling. |
+| Terminal snapshot recovery | Lose delta history, then receive gap with snapshot_to and a full frame followed by deltas and synced. The old display remains stale until the full frame applies; a delta or early synced cannot clear it. Removed pane refuses unknown_stream. |
+| subfail cursor_ahead | A restored head below the saved cursor refuses; client clears only that stream's entities/cursor/marker and bootstraps on a fresh ID without after. Other streams continue. |
+| Closed, unknown or reused subscription ID | Unsub/subfail/lagged close the ID. Client silently drops late frames for a closed ID, but treats a never-opened ID as a protocol error. Server refuses a sub reusing a live or closed ID with sub_id_reused. |
+| subfail operator_only | Non-operator subscription refuses and stops until principal changes; no reconnect loop or blocked sibling stream. |
+| subfail unknown_stream | Unknown kind/removed subject refuses and stops until a valid selection; no fake empty success. |
+| subfail scope | Insufficient token scope refuses only that sub until authorization changes; sibling streams remain live. |
+| Per-stream progress deadline | Replay exceeds 30 s overall but progresses within each window and succeeds. A stalled sub expires despite duplicate/unrelated/heartbeat traffic: unsub the stalled ID, then re-subscribe with a fresh ID from its applied cursor, retaining resync marker and the connection. |
+| Ack timeout and delayed original | Missing ack marks only that cmd uncertain; no same-socket resend or teardown. A late current-socket ack resolves it. After reconnect, deliver resume-only lookup before buffered original: show unknown outcome while the original may later execute once; never manufacture a new ID. Verify retry:later remains harmless with resume_only. |
+| Mobile suspend and remote outage | Browser resume probes the old socket and reconnects on a miss. Local heartbeat does not clear remote stale state; cross-node cmd still refuses under VERSION 5. |
+
+#### S7-min agent subscription resource bounds (§5a implementation)
+
+The agent subscription implementation uses at most eight active cuts and 1024
+lifetime-used IDs per connection. IDs are limited to 128 bytes and stream names
+to 256 bytes; exceeding these caps closes 1001. Each cut has one outstanding
+writer delivery, with per-ID cancellation fencing and flush acknowledgement.
+History page work has 32 global I/O slots; abandoned work retains its slot until
+it returns. Storage/resource failures close 1001, distinct from authorization
+refusals. Current read scope is rechecked before owner lookup.
+
+An encoded agent event above the 65,536-byte message cap closes that subscription
+with `lagged`, without truncation, silent cursor advancement or sibling failure.
+Resuming from the applied cursor encounters that event again while it remains
+retained. The retained History limits, inline gaps, persisted provenance and
+single replay barrier remain authoritative. Exact-cursor offset hints are bounded
+and source-fenced; stale hints are discarded and cursor paging is used instead.
+
+
+#### Amendment: token admission locks and subscription contention (#2450)
+
+The authorization/admission boundary above uses shared file-token locks through
+the recheck and bounded callback, with exclusive locks for token mutation.
+Revocation intent fences new admissions before waiting for existing callbacks;
+readers check it again after shared acquisition. Revoke cannot return while an
+admitted callback remains in flight. This preserves S6 decision fencing and is
+the same shared/exclusive split recorded in ADR-0038 §6. Hello lookup returns a snapshot and does not acquire the management lock.
+Registration still holds shared file ownership through insertion, but waits for
+management and any published revocation intent within the remaining original
+five-second handshake deadline. Its descriptor-only shared-lock helper is owned
+and reaped by a separate eight-slot hello-wait pool (four pending hellos per
+listener); abandoned async waiters retain that reservation until the bounded
+helper returns. No kernel-lock wait holds one of the four shared store-I/O
+permits. Only after acquiring the fence does registration acquire a store-I/O
+permit for credential recheck and insertion; the same fence stays owned across
+that transfer. Thus reconnects waiting on management cannot exhaust the store
+pool used by established subscriptions. The deadline also bounds welcome, and cancelled
+or expired waiters cannot insert a late registration. Command and subscription
+dispatch retain fail-fast admission with the existing retry class.
+
+A subscription's typed `session_busy` is retryable `later`, not a transport failure; unsafe storage and
+I/O failures retain their connection-close behavior.
+
+### 6. One schema, generated TypeScript
+
+The Rust types are the schema: the session event enum (§8), the wire
+messages of §5 and every `cmd` params and result type. They derive `ts_rs::TS`
+behind a `ts` cargo feature, and a test (`wire_ts_types_are_current`)
+renders them and compares with the checked-in `web/client/src/gen/*.ts`; a
+difference fails the test and therefore CI, and `just gen-ts` rewrites the
+files. No hand-written TS type may describe a wire shape.
+
+S8a (#1592) starts with the socket API's `AgentInfo`, `FleetAgentInfo`,
+`WorkspaceInfo` and `PaneInfo` records, their transitive dependencies, the
+question types and the Claude adapter's `SessionEvent`. The adapter's custom
+serializer emits an untagged union; its generated stored form is
+`SessionEvent = KnownSessionEvent | JsonValue`. Clients narrow `KnownSessionEvent`
+on literal `type` and catalogue discriminators, including nested stream and
+control tags. Switching on a nested tag narrows its payload, but TypeScript does
+not correlate that narrowing back to the containing envelope. Absent-only subtypes are `subtype?: never`. The event catalogue
+supplies these literals to ts-rs; no TypeScript wire declarations are maintained
+by hand. Extra JSON fields stay flattened as an index signature. Unknown events
+reach clients only through §8's `UnknownEvent` wrapper and use §8's rendering.
+
+S7a (#1604) defines separate `ClientFrame` and `ServerFrame` enums tagged by
+`t`, with unknown transport tags rejected as protocol errors and additive fields
+ignored. `WireEvent = UnknownEvent | KnownSessionEvent | JsonValue`: the known-only
+projection is the S8a catalogue type defined by the adapter’s `events!` macro. Agent `ev` payloads reuse known S8a events; an unknown, incompatible or
+client-version-ineligible event uses `{type:"unknown", raw, shape}`. `raw` is
+the exact original line as a string (including non-JSON diagnostics); `shape`
+is the sender's §8 canonical key, never recomputed with the client version.
+This wrapper reconciles the adapter's lossless raw serializer with §8's
+frontend rendering contract. Other stream payloads and cmd args/results stay
+explicitly opaque JSON until S8b #1677. No new payload interpretation lives in
+S7a. The server supplies the wrapper before sending, not the frontend reducer.
+
+The initial `WIRE_JSON_VERSION` is 1. Wire streams are strings using §5's paths;
+unknown paths decode so the server can return `subfail unknown_stream`. The
+`welcome` principal is the token name and capabilities include operation strings
+and the additive `resume_probe` transport feature;
+a newer client's read-only welcome advertises no command capability. `ev.seq`
+is omitted only for `agent/<id>/live`; its timestamp is still present. Ack
+success/error fields are exclusive; successful void commands may omit result.
+Ack error codes are open strings covering the full ADR-0029 registry and future
+codes; transport additions have documented constants rather than a closed enum.
+Fixture scripts require initial `given`, separate caller `client` actions,
+state `observe` assertions and final bounded `quiet`. `expect.absent` requires
+omission, `expect_connect` asserts reconnect timing, and `send.socket:previous`
+injects abandoned-generation callbacks without granting them authority.
+S7a's scripts and validators are test-only until S7 consumes the contracts, so
+there is no endpoint or default-binary behavior change.
+
+Absent metadata and explicit null remain distinct: `Option<Option<T>>` is
+exported as `?: T | null`. Typed 64-bit durations, timestamps and counters use
+JSON numbers, with exact JavaScript integer precision only below 2^53, documented
+on each field. Opaque identities and turn cursors already use strings. The default
+build excludes ts-rs; `just check` and CI compile and test the `ts` feature.
+`just gen-ts` is an explicit, ignored nextest generator, while the drift test
+only reads files, so a normal test run cannot repair stale generated output.
+The generator normalises trailing whitespace, and checks the complete TS file
+inventory as well as contents. ts-rs reports unsupported custom deserializers;
+these affect lenient input reading, while the emitted types describe serialization.
+The stored `SessionEvent` and wire `WireEvent` are distinct contracts.
+The adapter's `Unknown.raw` retains the exact line; its `shape` is Rust metadata
+until the server constructs §5/§8's explicit
+`UnknownEvent = {type:"unknown", raw:string, shape:string}` wrapper.
+A bare stored unknown is never an agent-stream wire payload. The wire alias
+remains `UnknownEvent | KnownSessionEvent | JsonValue`; `JsonValue` supports
+non-agent streams and does not remove the agent-stream wrapper requirement. The existing serde_json
+serializer preserves JSON token spelling and interior whitespace, trims surrounding whitespace, and
+encodes non-JSON diagnostics as a JSON string.
+
+### 7. The Bun/TypeScript reference client
+
+- **Layout.** `web/client/` is a Bun workspace: `src/gen/` (generated, §6),
+  `src/wire.ts` (connect, hello, subscribe from cursor, reconnect with the
+  last applied seq, heartbeat/stale detection, capped jittered reconnect and
+  the bounded durable outbox rules of §5a), `src/views/` (agent transcript,
+  queue, questions), `src/unknown.ts` (§8). The views use Solid (owner
+  decision 8): its fine-grained reactivity updates one text node or one
+  queue row per streamed event without re-rendering a transcript, which is
+  the load of P1 and P9. Solid's JSX transform runs through
+  `vite-plugin-solid` (`babel-preset-solid`), pinned in `bun.lock` like
+  every other dependency.
+- **Build.** Vite with `vite-plugin-solid` produces static assets that the
+  `web` feature embeds with `rust-embed`, as it embeds the terminal bridge's
+  assets today. Amended 2026-10-16 (owner decision, ADR-0038 §6, #1606): Vite
+  replaced `bun build` because it gives hot reload in development and is the
+  standard Tauri v2 front-end setup. Bun stays the package manager and test
+  runner. CI runs `bun install --frozen-lockfile`, `bun test` and the Vite
+  build; the nix package builds the assets in a fixed-output step pinned by
+  `bun.lock`.
+- **Release.** The assets ship inside the `flk` binary of a build with the
+  `web` feature; there is no separate artefact to version.
+
+### 8. Unknown events: pass through, show, log once, report
+
+- **Lossless parse.** `SessionEvent` is a Rust enum over the known
+  `type`/`subtype` pairs; every known variant keeps unknown fields in a
+  flattened `extra` map, and an unparseable or unknown line becomes
+  `SessionEvent::Unknown { raw, shape }`, with `raw` kept byte-for-byte. The
+  parser never errors past the JSON layer; a line that is not JSON is
+  `Unknown` too, with `raw` as a string.
+- **S7 wire wrapper.** On S7's `/v1/ws`, unknown, incompatible or
+  client-version-ineligible agent events are sent only as
+  `UnknownEvent = {type:"unknown", raw:string, shape:string}` inside `ev.ev`.
+  `raw` is the exact original line, including non-JSON diagnostics; `shape` is
+  the sender's canonical shape key, never recomputed by the client. The server
+  constructs this wrapper before sending. It is distinct from the internal
+  `SessionEvent::Unknown { raw, shape }` and its lossless raw serializer. The
+  legacy API keeps that existing raw JSON behavior; it does not emit this S7
+  wrapper. This is the explicit client envelope referenced by §6.
+- **Shape key.** `shape = harness + harness_version + type + subtype +
+  sorted top-level keys`. A known event whose `extra` is non-empty is also a
+  new shape.
+- **S1 note (shape identity).** The canonical key also includes `event.type`,
+  `request.subtype` and `response.subtype`, alongside harness, observed harness
+  version, top-level `type`/`subtype` and sorted top-level keys. These nested
+  discriminators distinguish SSE and control envelopes that otherwise share
+  the same top-level shape. Missing discriminators are null. This refines the
+  key's representation without changing the owner decision.
+- **Replay provenance.** The §5 session-store `known`/`shape` metadata fixes
+  the sender's original classification and version-scoped key across restarts
+  and parser upgrades. A now-known payload originally classified unknown still
+  uses its original unknown wrapper. Missing legacy provenance emits the
+  `provenance_missing` history gap and replay continues, without recomputation.
+- **Rendering.** Every frontend renders `Unknown` (and a known event's
+  `extra`) as a collapsible JSON dump with the shape key as its title. That
+  rendering is part of the reference client and of the TUI's structured view.
+- **Logged once.** The first sighting of a shape on this server appends
+  `session.unknown_shape { harness, version, shape, sample }` to the durable
+  log and logs one `tracing` warning; later sightings bump a counter only.
+  Owner decision (#1300): this logging goes through `tracing` only, with no
+  direct writer, so when flock adopts vigil (#1300) it moves to vigil's
+  OTLP/JSON Lines output with no call-site change. The durable-log kind is
+  state, not telemetry, and stays in the event log.
+  The sample is redacted: keys and JSON types are kept, every string becomes
+  its length, numbers are kept, arrays keep their first element only. Older
+  servers skip the new kind (ADR-0028 §3a).
+- **Reportable.** `flk report --unknown-events` composes a report (ADR-0010)
+  from the recorded shapes: the redacted samples, counts, harness versions,
+  flk version. It is previewed, the human submits it, and the binary never
+  does.
+
+### 9. Forks at any message boundary
+
+`agent.fork` gains `at` and `shape`; `agent.lineage` reports them. No new verb.
+
+```text
+AgentForkParams += { at?: { message_uuid } | "latest",
+                     shape?: prefix | segment | slice,
+                     slice_to?: message_uuid,
+                     tools?: [names] , return_to_parent?: bool,
+                     answers?: question_id }
+```
+
+- **Cut rules.** A fork point is the uuid of an `assistant` message that
+  ends a model step (its successor is a tool result or a user message) or of
+  a complete tool-result `user` message. Never inside an assistant step
+  (signed thinking stays intact), never between a `tool_use` and its
+  `tool_result`. Anything else is refused with `invalid_fork_point`.
+- **Mechanism per point (E9, E11).** `latest` is `--resume <id>
+  --fork-session`. A point inside the current compaction segment is
+  `--resume <id> --resume-session-at <uuid> --fork-session`. A point behind
+  the last compaction is a rehydrate: the byte prefix of the native
+  transcript up to the line before that `compact_boundary`, written under a
+  new uuid, resumed with `--fork-session` (and `--resume-session-at` when
+  the point is earlier than the prefix's end). `slice` renders messages
+  `at..slice_to` as text into a fresh session. `segment` is a prefix fork at
+  the first message after a `compact_boundary`.
+- **The hidden flag is gated.** On server start and on a harness version
+  change, a probe confirms `--resume-session-at` is accepted (a dry resume
+  of a two-line fixture with `--no-session-persistence`). If it is gone,
+  points inside the current segment use the rehydrate path too, and
+  `agent.fork` says which path it took.
+- **Read-only forks (E12).** A fork that only answers a question passes
+  `tools` (for example `Read,Grep,Glob`) plus a deny-all permission policy.
+  Resume keeps the cached tool schemas, so this costs no cache miss; the
+  removed tools are refused by the harness.
+- **Cost guard.** `dry_run` reports the path, the prefix size (from the
+  recorded usage at that point), whether it is warm (last request that
+  included it within its TTL: one hour for `ephemeral_1h` writes, five
+  minutes otherwise) and the expected cost as cache read or cache write.
+- **Fan-out (E15).** Several forks of one cold point run the first alone and
+  start the rest after its first `message_start`, so one process pays the
+  write.
+- **Return channel.** A fork with `return_to_parent` posts its finding as a
+  `finding` item into the parent's queue (`producer: fork:<id>`, `anchor:
+  fork_point`), through the parent's gate. A human can edit or drop it while
+  it is `queued`. A question fork (§2a) is the same mechanism with `answers:
+  question_id`: what it returns is a `reply` item anchored to the question,
+  at most one per question, and `question.resolve` is how it ends.
+- **Lineage.** `AgentForked` (`src/api/schema.rs`, emitted at
+  `src/app/api/worktrees.rs`) gains `fork_point`, `shape`, `mechanism`
+  (`fork_session | resume_at | rehydrate | slice`) and `source_session`.
+  `LineageEdge` carries them. A structured fork does not need a new worktree;
+  `agent.fork` keeps creating one only when `branch` or `path` is given.
+
+### 10. TUI parity: what structured mode must rebuild
+
+Claude Code's own TUI provides these; a structured agent's view has to
+render them from events. "Source" says where the data comes from.
+
+| # | Capability | Source in stream-json | Slice |
+|---|---|---|---|
+| P1 | Streaming text and markdown, code blocks | `stream_event` deltas, `assistant` | S9a |
+| P2 | Tool call cards, collapsible output, Edit diffs | `assistant/tool_use`, tool-result `user`, `tool_use_result` | S9a |
+| P3 | Thinking display | `thinking_delta`, `assistant/thinking` | S9a |
+| P4 | Spinner, elapsed time, token counter | `system/status`, `system/thinking_tokens`, `message_delta.usage` | S9a |
+| P5 | Permission dialog with allow once / always / deny and rule suggestions | `control_request{can_use_tool}.permission_suggestions` | S6 |
+| P6 | AskUserQuestion picker (multi-select, other) | `control_request{AskUserQuestion}` | S6 |
+| P7 | Plan mode approve / reject (`ExitPlanMode`) | `control_request{can_use_tool, ExitPlanMode}` | S6 |
+| P8 | Interrupt (Esc) | `control_request{interrupt}` from flk | S5 |
+| P9 | Queued messages shown, editable, cancellable | flk queue (§3), `command_lifecycle` | S5, S5c |
+| P10 | Prompt input with history, paste, image attach, `@file` mentions | flk-side composer; images as content blocks | S10 |
+| P11 | Slash commands (`/compact`, `/model`, `/clear`, `/context`, `/cost`) and completion | `system/init.slash_commands`; sent as a prompt | S10 |
+| P12 | Context usage meter, cost | `result.usage`, `modelUsage.contextWindow` | S9b |
+| P13 | Compaction notice | `system/compact_boundary` | S9b |
+| P14 | Subagent (Task) nesting | `parent_tool_use_id`, `--forward-subagent-text` | S9b |
+| P15 | Todo list | `TodoWrite` tool input | S9b |
+| P16 | Background shells and their output | `Bash` `run_in_background`; output needs the harness's own tool | gap (#1308) |
+| P17 | Rewind / checkpoints (Esc Esc) | `--rewind-files` exists, unprobed | gap (#1308) |
+| P18 | Rate-limit and usage banners | `rate_limit_event` | S4 |
+| P19 | MCP server status | `system/init.mcp_servers` | S9b |
+| P20 | Hook output | `system/hook_*` | S9b |
+| P21 | Model and effort switching | respawn with `--model` / `--effort` at idle (§1 reload) | S11 |
+| P22 | Resume picker | flk's agent list | existing |
+| P23 | Harness, model and effort picker, for a new agent and for a switch at idle | per adapter, §10a | S17 |
+| P24 | Message view whose whole turns collapse and expand, not only tool output | turn boundaries from `command_lifecycle` and `result` | S18 |
+| P25 | Permission preset, picked at start and switched at runtime, beside the P23 picker (#1321) | `system/init.permissionMode`; `set_permission_mode` in place, a reload for `bypassPermissions` (A.15, §10b) | S19 |
+
+P16 and P17 have no source in the stream today and are not promised;
+#1308 tracks finding one or deciding against them.
+
+### 10a. The picker (P23) and collapsible turns (P24)
+
+- **Picker.** One picker, in the TUI and the web client, chooses harness,
+  model and effort. For a new agent it fills `agent.start`'s `harness`,
+  `model` and `effort`. For a running structured agent it is a switch at
+  idle: `agent.reload { model?, effort? }` goes through §1's hot reload
+  (close stdin at idle, `--resume` with the new `--model` / `--effort`), and
+  the init diff records the change. Where an adapter can switch in place,
+  it may skip the respawn, but only after a probe confirms the prefix
+  behaviour (a model change always misses the cache: caches are per model).
+  The model and effort lists come from each adapter, merged with flk's
+  model registry (ADR-0021) for aliases and tiers:
+  - **Claude.** The CLI has no list verb. The binary carries the SDK control
+    messages `supportedModels`, `supportedEffortLevels` and `set_model`
+    (A.4 method: `strings`; not probed live). S17 probes them first; until
+    they are confirmed the list is flk's registry (ADR-0021) validated by
+    `system/init.model` after the switch, the effort levels are the
+    `--effort` choices that `claude --help` lists (`low`, `medium`, `high`,
+    `xhigh`, `max`; A.4, help text only, no run per level), and a switch is
+    always a reload.
+  - **Codex.** `codex app-server`'s `model/list` returns `Model{id, model,
+    displayName, isDefault, hidden, supportedReasoningEfforts,
+    defaultReasoningEffort, …}` (read from the generated schema, #1309);
+    `turn/start` takes `effort` per turn, so effort changes need no reload.
+  - **opencode.** `opencode serve` lists providers and models at
+    `GET /config/providers` and `GET /api/model` (from its OpenAPI document),
+    and `/api/session/{sessionID}/model` sets a session's model.
+- **Collapsible turns.** The message view groups the stream by turn: one
+  turn is the inputs a `result` closes (§3's items plus everything up to and
+  including that `result`; steered items fold into the turn they joined,
+  E4). Default rule: every turn except the last is collapsed to one line
+  (the first input's first line, the tool-call count, the outcome of §1
+  and the turn's tokens), the last turn and any turn with an open question
+  or a failed outcome are expanded, and a turn the user expanded stays
+  expanded for that client. Tool output inside an expanded turn keeps its
+  own collapse (P2). The rule is client state, not stream data: the stream
+  only carries the boundaries.
+
+### 10b. Permission presets (P25, #1321)
+
+- **A preset** is a named, ranked bundle in flk's config
+  (`[permissions.presets.<name>]`): the harness permission mode
+  (`--permission-mode`), the tool allow and deny rules, and the
+  `hook.decide` policy for `permission.request` (ADR-0034 §1). The rank
+  orders presets from least to most permissive, so "escalation" is
+  defined. The rules live in flk's `hook.decide` policy, not in
+  `--allowedTools`, so changing them needs nothing from the harness: every
+  prompting tool call already reaches flk over stdio (§2b).
+- **Pick at start.** `agent.start { permission_preset }`; the picker shows
+  it beside harness, model and effort (P23), in the TUI and the web client.
+- **Switch at runtime.** `agent.set_permissions { preset }`. The rule part
+  takes effect at the next `can_use_tool`. The mode part goes through the
+  control request `set_permission_mode { mode }` over stdio (S0, A.15): in
+  place, at once, with no respawn, and also during a turn, where it
+  applies from that turn's next tool call. S0 switched at idle to
+  `acceptEdits`, `default` and `plan`, and during a turn to `acceptEdits`
+  only; switches to `auto` and `dontAsk`, and any switch during a turn to
+  a mode other than `acceptEdits`, were not probed, so S19 probes them
+  before it relies on them. The valid modes are `default`,
+  `acceptEdits`, `plan`, `auto`, `dontAsk` and `bypassPermissions`; any
+  other is refused with `error_code: invalid_mode`, and a refused request
+  leaves the mode as it was. `bypassPermissions` is the exception: it is
+  refused (`bypass_not_launched`) unless the session was launched with
+  `--dangerously-skip-permissions`, so a switch to a preset whose mode is
+  `bypassPermissions` is a switch at idle through §1's reload with that
+  launch flag (no compaction, so the prefix stays warm, E14). Every other
+  switch is in place. A switch away from `bypassPermissions` is expected to
+  be in place too, but it was not probed (S0 never launched with the
+  flag), so S19 probes it as well. It is
+  recorded as `agent.permissions_changed { from, to, by, mechanism:
+  in_place | reload }`; `system/init.permissionMode` shows the new mode
+  from the next turn on (it is emitted at turn start, so a switch during a
+  turn shows only in the next one). A switch to `plan` makes the harness
+  write plan files into the session's config dir (`$CLAUDE_CONFIG_DIR/plans/`,
+  §1's private dir per profile, A.15), so they stay with the profile after
+  the session ends.
+- **Escalation is operator-only.** A switch to a higher-ranked preset needs
+  the local operator or an `operate`-scoped token (§1a, §5); anything else
+  is refused with `operator_only` (exit 13). A switch down needs `send`
+  scope. A `flk-agent` caller can switch its own agent down, never up.
+
+- **Per-request session grants (S6, #1429).** `agent.decide` accepts
+  `allow_once`, `allow_always` and `deny` only from an authenticated,
+  `operate`-scoped token principal. A local UID alone, pane input, an agent
+  message or a structured harness's MCP lease never authorizes a decision
+  (`not_authorized`, retry never). Identity comes from the authenticated
+  dispatcher context, never command arguments. Every decision is recorded
+  on `agent/<id>` in ordered open/closed permission audit records, including
+  automatic matches, with the originating token subject. Automatic closes also
+  reference the originating grant request ID. A raw request already reserved by
+  an exact grant carries that trusted reference into replay and counts as
+  stdout progress without ever opening S4 needs-human attention.
+  Decision messages normalize CRLF to LF, trim surrounding whitespace, and
+  contain at most 2048 UTF-8 bytes (`MAX_PERMISSION_DECISION_MESSAGE_BYTES`,
+  #2249). They use `prompt_control_bytes` rules: newlines and tabs are allowed;
+  other controls are refused. Oversized or unsafe messages return typed
+  `invalid_params` before any reservation, grant, audit or harness input.
+  Empty and absent messages are allowed; audits and deny responses carry the
+  normalized text.
+
+- **`allow_always` lasts for one live harness runtime.** Its grant is held
+  only in memory for that structured agent. Exit, restart and resume into a
+  new runtime discard it, even when resuming the same persisted session.
+  Grants are never shared between agents, persisted in flk policy, or
+  written to a settings file. Persistent presets remain the separately
+  operator-edited policy described above (#1799).
+- **Match exactly; never forward harness rules.** `allow_always` always
+  installs an in-memory grant for only the exact tool name plus canonical
+  JSON input (recursively sorted object keys; array order and scalar values
+  preserved). Matching performs no Unicode normalization and treats `1` and
+  `1.0` as different. A different tool or input prompts again.
+  Harness permission suggestions are never interpreted or forwarded, even
+  when they appear limited to the requested tool: determining their scope
+  would require interpreting the harness rule grammar. The response allows
+  the current call with its original input and no `updatedPermissions`.
+  When nonempty suggestions are present, the closed audit records
+  `ignored_suggestions` with reason `not_forwarded` and the request ID linking
+  to the open audit record containing the full original suggestions.
+  Absent, null and empty suggestions produce the same exact grant.
+  Broader rules belong to the separately operator-edited policy in #1799.
+  The `MAX_GRANTS` constant in `src/structured/permissions.rs` bounds distinct
+  installed and reserved exact grant keys per runtime; exceeding that bound
+  returns `permission_grant_limit` (retry never, policy refusal) without
+  closing the request or sending a response. The operator may still allow
+  once or deny that request. Token authorization still applies to manual
+  decisions after a grant exists.
+- **Permission request bounds and handles (S6, #1813).** There is no lifetime
+  request-ID cap. `MAX_OPEN_PERMISSION_REQUESTS = 16` keeps live requests in full,
+  including reserved/audited responses until stdin delivery completes. The
+  harness blocks per request, so more than a few concurrent prompts is
+  pathological; 16 leaves headroom for parallel tool calls. An excess valid new
+  request is denied individually with `permission_request_limit` (retry never),
+  a structured warning and a durable closed audit carrying that code, with no
+  matching open audit. It consumes no live slot and does not end the session or
+  close other requests. The deny uses existing bounded, cancel-aware writer
+  delivery: backpressure delays it, while disk failure, cancellation or a
+  disconnected writer remains an explicit I/O failure.
+  Every request receives a flk-issued `request_seq: u64`, strictly increasing
+  and never reused within the session. The book seeds allocation from the durable
+  stream cursor when a runtime resumes; each issued handle precedes at least one
+  durable stream record before being surfaced. Exhaustion fails closed without
+  wrapping. The open audit, authenticated stdout envelope and S4 snapshot carry
+  `(request_id, request_seq)`. `AgentDecide` requires both; only an exact live
+  pair can reserve an answer or a session grant. S7 slice 5 must carry the
+  sequence end to end in its request display, command and decision routing.
+  `CLOSED_PERMISSION_REQUEST_WINDOW = 1024` retains closed sequences with their
+  request IDs in FIFO order of durable closure, including capacity denials.
+  A decide for a retained closed pair gets `permission_request_closed`; an
+  evicted or never-seen pair gets `permission_request_unknown` (both retry never).
+  A mismatching sequence never approves the currently open request. Live/in-flight
+  handles remain independently correlated when older closed handles are evicted.
+  Invalid IDs and duplicates still live or in the window retain fail-closed
+  transport behavior. Reusing an evicted harness ID is harmless: the new request
+  has a new sequence and no delayed decision for the old handle can approve it.
+  Bookkeeping never expires or changes session-only exact-match `allow_always`
+  grants; their audits retain the originating request ID and sequence.
+- **Permission wire records (S6/S7, #2224).** `flk_permission_request` is a
+  known typed agent-stream event, generated from the producer's `PermissionRecord`.
+  Its `state` union is `open | closed`, never `decided`. Both states carry
+  `request_id` and `request_seq`; only `open` carries `request: ToolRequest`.
+  Closed records carry `decision`, nullable `message`, `principal` and `source`,
+  or a typed `reason`: `ended`, `cancelled`, `result`, `interrupted`,
+  `permission_request_limit`, `permission_request_too_large`, or `session_ended`.
+  Policy denies retain their existing reason/error-code fields alongside the
+  decision. Capacity refusals can close without a prior open. Existing closed
+  JSON stays unchanged apart from the handle. An `agent.decide` ack acknowledges
+  admission, while the durable close retires the card. Unknown fields or future
+  reasons retain the lossless unknown-event wrapper instead of being discarded.
+  `session_ended` marks the restart sweep in #2236.
+  Fixture time markers declare `after_ack` for pre-ACK persistence, otherwise
+  `record_delivery`. Both require exact persisted equality and a zero-slack
+  window to that observed bound; missing bounds fail (#2467 slice-3 ruling).
+- **Startup permission recovery (S6, #2236).** The stream owner projects host
+  audit headers while scanning the existing stream. Before admitting any new
+  control request, it appends a `closed` / `session_ended` record without a
+  decision for each unmatched `(request_id, request_seq)`. All recovery closes
+  use ordinary audit writes and fsyncs, and all are durable before the first
+  notification. A failed write/fsync stops the owner before control admission.
+  Repeated starts append nothing once every open has a matching close. Old
+  live slots and exact grants are never restored. An interrupted automatic or
+  oversized answer is handled exactly like any other unmatched open.
+  The projection ignores unknown kinds and preserves opaque metadata, including
+  newer close reasons. Invalid permission headers are warned and preserved raw,
+  not fatal to the whole scan (ADR-0028 §3a). For legacy audits without handles,
+  an open's durable stream position supplies its recovery handle; a legacy close
+  without a handle matches by ID. New closes match both ID and handle, so a
+  reused ID cannot close another generation. Recovery retains handles, not tool
+  inputs, until the scan completes.
+- **Delivery and audit ordering.** A permission closes for attention only
+  after its decision audit is durable, and user input remains gated until
+  the control response is fully written. Admission success reserves a
+  decision and does not promise eventual pipe delivery. Audit or writer
+  failure stops delivery; runtime shutdown writes a reasoned terminal close
+  for each outstanding request before clearing the book, without inventing
+  an operator decision.
+  Harness cancellation closes its named request; top-level result and host
+  interruption also produce reasoned closes. A cancelled reservation cannot
+  deliver a stale answer. Disk errors are surfaced; failed persistence cannot
+  promise a durable close. Unknown IDs, including evicted closed IDs, yield
+  `permission_request_unknown`. An already accepted decision or an ID still in
+  the closed window yields `permission_request_closed`; both are retry never.
+
+### 11. Harness neutrality
+
+One flk event model covers Claude, Codex and opencode at the level of §2:
+session, turn, step, text, reasoning, tool call, tool result, approval
+request and answer, user question, interrupt, usage with cache read and
+write, compaction, resume, fork. The adapters differ in transport and in
+four places that the schema must normalise rather than mirror:
+
+1. **Usage.** Claude reports per turn in `result.usage` (input excludes
+   cache); Codex `app-server` per thread in `thread/tokenUsage/updated`
+   (its `exec` `input_tokens` appears to include cached tokens); opencode per
+   step with `cache.read` / `cache.write` and a cost. flk stores
+   `{input_uncached, cache_read, cache_write, output, reasoning}` per turn.
+2. **Tool identity.** Claude: a generic `tool_use` then `tool_result`.
+   Codex: typed items (`commandExecution`, `fileChange`, `mcpToolCall`).
+   opencode: one `ToolPart` mutating through `pending` / `running` /
+   `completed` / `error`. flk stores a generic call with a typed `kind`.
+3. **Approvals.** Claude allow / deny with `updatedInput`; Codex accept /
+   acceptForSession / decline / cancel; opencode once / always / reject. flk
+   keeps `allow_once | allow_always | deny{reason}` and maps down.
+   `allow_always` obeys §10b's live-runtime lifetime, token-only authority
+   and audit contract. flk always uses exact in-memory grants and never
+   forwards harness permission suggestions or sends `updatedPermissions`.
+   Future adapters must preserve that scope rather than map an always
+   decision to a persistent harness rule.
+4. **Fork granularity.** Claude forks at a message uuid; opencode at a
+   message id; Codex at a turn (`thread/fork{lastTurnId}`). `agent.fork`
+   refuses a mid-turn point on Codex with `unsupported_for_agent`.
+
+Only the server modes qualify (E18): Codex through `codex app-server`
+(stdio JSON-RPC), opencode through `opencode serve` (HTTP + SSE). Their
+`exec --json` / `run --format json` modes are not used. Codex has `turn/steer`
+and opencode a `todo.updated` event that Claude lacks; they map to `steer`
+delivery and P15. Adapters for Codex and opencode are slices S14 and S15 and
+not part of the first delivery.
+
+### 12. Reserved extension points (#1310)
+
+The spike #1310 (structured agent output as validated HTML fragments, with
+anchored comments) follows this ADR. Three points are reserved here so it
+can land without reshaping §5, §6 or §8; their design belongs to #1310, not
+to this record:
+
+1. **A content-block kind beyond markdown.** The session event model keeps an
+   open `content.kind` on rendered text blocks (`markdown` today); a further
+   kind (markdown plus allow-listed components, or sanitised HTML) is added
+   as a new variant, and a client that does not know it falls back to the
+   unknown-event rendering of §8.
+2. **Stable per-block ids as comment anchors.** Every rendered block carries
+   a stable id (`message uuid` + block index), so a comment can anchor to
+   it; a comment is queued back to the agent as an input item through §3
+   (`kind` to be named by #1310) and passes the same gate.
+3. **The TUI's text fallback.** Every block kind has a plain-text rendering
+   that the TUI shows; a kind without one is not admitted.
+
+### Amendment: S6e — Non-blocking question threads and routing (#2242)
+
+**Status: Accepted (2026-10-29); design only, post-MVP.** This amendment
+specifies #1301/#1717, not an implemented endpoint. The owner typed "accept all
+rec with star" on #2731 on 2026-10-29, accepting all S6e recommended options.
+The earlier decisions on #1717 remain binding. Alternatives below are retained
+as rejected options and costs, not open questions. S6e supersedes §2a's
+System-One hold, §2b's two-channel preference, S6d, and the direct
+fork-to-answer path. Permissions in S6 remain blocking and separate.
+
+#### Recorded decisions and compatibility
+
+Owner decision 15 (typed “y” on #1717, 2026-10-19) retakes decision 3a: the
+asker chooses blocking. Omitted `blocking` means false. `blocking: true`
+requires `blocking_reason`, trimmed UTF-8, 1–512 bytes, one paragraph, checked
+with `prompt_control_bytes`. It is forbidden otherwise. One named schema
+constant owns the bound. Invalid input returns `invalid_params` before recording
+anything. S6d never holds a turn; no model judge may delay, downgrade or
+override this choice. A blocking question may hold its own tool call, never
+other sessions.
+
+`flock_question_ask` is the one taught question channel, including plain
+choices. The structured launch profile disallows `AskUserQuestion` and
+pre-allows the MCP question tool. A stray stdio question is converted to the
+same durable, non-blocking record and receives §2a/A.12's exact deferral text on
+the `deny` carrier. It is not a permission denial. Compiled context, recap
+extraction, CLI and harness adapters all target this service; a recap question
+is always non-blocking. Deduplicate the observed source/tool-call identity
+before opening anything. Unknown shapes retain their raw record under §8; no
+invented options. An MCP call cannot bypass a permission already open earlier in
+its message (A.13); agents must ask before starting work that may prompt.
+
+The server derives `asked_by` from the structured session lease, or from the PTY
+pane's attested agent attribution. No caller-supplied origin is accepted. An
+anonymous call is refused. The current `questions` policy still constrains
+routing; `deny` stays a refusal. A legacy harness without S6e capability keeps
+its existing adapter contract, visibly reported as legacy, rather than claiming
+non-blocking support. Enabling the S6e profile and service is one rollout gate.
+
+Owner decisions 12–14, reaffirmed on 2026-10-29, require recipient review/edit
+before applying a proposal, durable original and applied texts plus edit
+attribution, stopping the thread fork after a successful merge while retaining
+its transcript/lineage, and a read-only fork through the general S19
+permission-tier machinery (#1321). No thread-specific permission bypass is
+introduced.
+
+#### One typed record, with independent question and delivery lifecycles
+
+The following is a schema sketch for Rust types and generated TypeScript, not
+hand-maintained wire declarations. IDs use existing typed identifiers;
+question/proposal revisions and cursors use §6's integer representation.
+
+```text
+QuestionRecord {
+  question_id: QuestionId, content_digest: Sha256, revision: QuestionRevision,
+  asked_by: AgentIdentity, source: QuestionSource,
+  ask_point: Option<MessageBoundary>, source_ref: SourceRef,
+  prompt: BoundedText, context: Option<BoundedMarkdown>, refs: Vec<ContextRef>,
+  options: Vec<QuestionOption>, multi_select: bool, allow_other: bool,
+  blocking: bool, blocking_reason: Option<BlockingReason>,
+  recipient: Recipient, route: RouteReceipt, urgency: Urgency,
+  created_at: Timestamp, expires_at: Option<Timestamp>, state: QuestionState,
+  delivery: Option<DeliveryState>
+}
+QuestionOption { id: OptionId, label: BoundedText, description:
+  Option<BoundedText> }
+Recipient = Operator | Agent(AgentIdentity)
+QuestionSource = Mcp | Session | Recap | Message | Screen
+QuestionState = Pending | Answered(AnswerReceipt)
+              | Superseded(Supersession) | Expired(ExpiryReceipt)
+Answer = Choices { option_ids: Vec<OptionId>, other: Option<BoundedText> }
+       | Text(BoundedText)
+AnswerReceipt { answer_id: AnswerId, by: AuthenticatedPrincipal, answer: Answer,
+                proposal_id: Option<ProposalId>, edited: bool,
+                route_revision: RouteRevision, delivery_id: ItemId }
+DeliveryState = PendingAdmission | Queued(ItemId) | Started(ItemId)
+              | Held(ItemId, DeliveryHold) | Failed(ItemId, DeliveryFailure)
+```
+
+`AgentIdentity` includes the durable agent identity, never its reusable label. A
+process generation pins a held call or operation, not the durable question's
+lifetime. `SourceRef` is a closed source-specific enum, not arbitrary JSON.
+`ContextRef` holds validated blob/file references and no authority. Text,
+options, context and attachment counts have explicit schema bounds before the
+first producer ships. The limits below were accepted on 2026-10-29; no unlimited
+input is admitted. Option IDs are stable, unique within a record; answers use
+IDs, never label matching or key injection. Single-select requires one choice;
+multi-select rejects duplicates and unknown IDs; Other requires `allow_other`.
+Free-text questions accept Text; choice questions accept Choices. A reviewed
+prose proposal for a choice question must still include a valid typed selection.
+
+Keep §2a's canonical content hash and byte-stable rendering across re-asks,
+including its normalization and hash inputs. Persist the full digest and compare
+canonical content: a shortened-ID collision refuses rather than merging two
+questions. A repeated pending ask updates its observation/ask count without a
+new inbox card. Re-asking an answered question returns its recorded answer to
+that tool call (`via: record`), without a second queued reply. Terminal
+superseded or expired records do not reopen; a genuinely changed ask has new
+content.
+
+Pending may have zero or more threads and proposals: those are separate typed
+records, not extra terminal question states. GUI `open`, `threaded`, `proposed`
+are projections of Pending plus these records. Superseded carries a closed
+reason (`withdrawn`, `subject_replaced`, or an explicit replacement question
+ID); ADR-0028/G5's existing `withdrawn` projection remains compatible. Answered,
+Superseded and Expired are terminal. A compare-and-set on question identity and
+revision lets only the first valid answer/withdrawal/expiry win; stale answers
+return `question_closed` and the current projection, without mutating it.
+
+Recorded questions survive restart and handoff of the same asker. A held tool
+call lost with its process becomes deferred; the record stays Pending and a
+later answer goes through the queue. Identity replacement supersedes it with
+`subject_replaced`, stales every proposal and never retargets the successor.
+Screen-only PTY dialogs keep ADR-0028's withdrawal when the live dialog leaves.
+Durable JSONL is folded leniently under ADR-0028 §3a; unknown records are
+retained raw, logged and skipped. New record kinds require unknown-kind replay
+coverage. Checkpoint writes use temp-file fsync, rename, then directory fsync.
+
+#### Answer custody, idle delivery and crash limits
+
+Every accepted deferred answer owns one stable `AnswerId` and `ItemId`, anchored
+to its question. Persist the answer and a typed delivery obligation together in
+one authoritative append before acknowledging acceptance. The question stream
+cannot atomically append to a second queue file: recovery reconciles that
+obligation with the queue owner's durable idempotency key, rather than assuming
+two writes are a transaction. Admit one authenticated `reply` producer through
+§3's gate, `delivery: at_idle`, under that same key on recovery. Reply is
+already admitted by the queue (`validate_kind` in
+`src/structured/queue/admission.rs`;
+#2364 is closed). S6e-8 must bind every question Reply to an existing, committed
+AnswerReceipt, checking its asker, question identity and delivery ItemId at the
+mutation fence. Naming Reply or supplying an anchor is not that proof. Recipient
+answering authority authorizes this specific reply, not general sends to the
+asker.
+
+Repeated client commands replay their original receipt. A competing *new* answer
+gets `question_closed`. The delivery receipt appears separately from Answered:
+“answer recorded, delivery pending” is honest even while the queue is busy,
+held, or the agent is offline. Queue-full admission keeps the obligation durable
+and wakes recovery on capacity/readiness; it never silently drops the answer.
+The queue's persisted `command_lifecycle.started` drives one `reply.delivered`
+record, deduplicated by ItemId. A held blocking call, still live, consumes the
+answer once through that call instead; a serialized generation fence chooses
+held delivery OR queued delivery, including a racing runtime exit. If writing a
+held result may already have succeeded, recovery holds it unconfirmed instead of
+automatically falling through to queued delivery.
+
+**Exactly once** means one winning answer, one durable queue item, and one
+observed started receipt. It does not promise exactly-once model execution after
+an uncertain stdin write or exactly-once external side effects. Preserve §3's
+`session_unconfirmed` hold on restart: inspect receipts/transcript and require
+explicit recovery, never reissue a fresh reply identity to resolve uncertainty.
+A replaced asker fails the obligation visibly. A stopped asker keeps it pending
+for the same identity's restart; closing the question does not erase delivery.
+
+**Q1 — Decided 2026-10-29: a committed answer is a wake trigger, limited to its
+asker.** The owner accepted the recommended option. This extends ADR-0044 Q5 in
+[PR #2728](https://github.com/gerchowl/flock/pull/2728), inspected at
+`1ba1c7c9`: accepting the answer mints a server-internal wake obligation bound
+to `(AnswerId, asker identity, ItemId)`. It authorizes only resuming that same,
+confirmed Hibernated asker to consume that reply. It grants no general send,
+focus, start, operate or permission authority to the responder; an answer-only
+client or the admitted architect need not acquire those scopes. Validate the
+committed receipt and current asker identity, ownership and absence proofs at
+wake admission, not caller-provided wake fields. Subscription, progress reads,
+proposals and uncommitted answers grant no wake. Stopped, Crashed, replaced or
+uncertain askers retain their existing explicit-start/recovery requirements.
+Coalesce with other admitted wakes under ADR-0044's per-agent/per-node limits,
+retain the original ItemId, use its guarded resume bootstrap and record wake
+owed across restart. Never silently create a fresh conversation.
+
+**Rejected alternative:** record the reply but wait for a separate authorized
+send or operator resume. This needs no Q5 extension and saves a wake, but an
+unattended hibernated asker may never receive its answer. **Accepted cost:**
+extra resume compute/latency and one narrowly typed wake obligation. Acceptance
+alongside ADR-0044 Q5 does not make read or answer scope generic lifecycle
+authority.
+
+**Outstanding answer custody blocks hibernation.** Extend ADR-0044 Q2's “no
+unresolved batch or admission” eligibility rule and its quiesce protocol step 2
+to include the question owner's unfulfilled answer obligations, even before they
+reach the queue: PendingAdmission, queue-full and unresolved commit/admission
+proof all refuse the freeze. An eligible queued reply already blocks through
+Q2's “no eligible queued item” rule. A Pending non-blocking question alone is
+not a live prompt for Q2; a held blocking question remains a prompt and prevents
+hibernation. Check this under the shared lifecycle/input freeze fence, not an
+eventually consistent EventHub count. An answer committed before freeze
+invalidates eligibility; one committed after the hibernation intent records wake
+owed, finishes confirmed cleanup and then resumes, per ADR-0044's quiesce
+protocol step 4. Never launch alongside a still-exiting process. This is a
+prerequisite of S6e's wake integration, including the pristine focus-only exit.
+
+Render replies with §3's per-item random nonce frame. Put attested responder,
+question ID and optional fork ID in the header, outside untrusted answer text.
+Use the same saved frame on retries. Preserve §2a's stable interior text; nonce
+safety takes precedence over a byte-identical whole frame. Neither a proposal
+nor a recipient label in its body can forge the authenticated producer.
+
+#### Routing, escalation and configuration (ADR-0034; ADR-0042 #2724)
+
+The ask accepts `auto | operator | architect | agent(AgentId)` as a requested
+route, never as authority. Server policy resolves an admitted Recipient. `auto`
+follows ADR-0034 §2: live parent architect for route agents; operator for
+roots/ask_operator; deny for deny. For S6e questions `ask_human` still addresses
+the operator, through the shared inbox rather than an inline question dialog. An
+architect request with no live parent follows the documented orphan route.
+
+**Operator endpoint — decided 2026-10-29 (ADR-0045 D8).** An escalation that
+reaches the operator creates the durable attention/inbox record and targets the
+Tauri GUI's notifications on desktop and mobile (iOS/Android, #2733). Telegram
+is only an optional stand-in until mobile push ships, then is removed. It is not
+a second permanent escalation route. Notification transport does not grant
+answer authority; answers still pass the recipient-specific mutation fence.
+
+An explicit other-agent target must be a live, operator-authorized routing edge;
+an agent cannot address arbitrary peers or elevate its own route to the owner.
+Reassignment re-addresses Pending questions under the same QuestionId and logs
+old/new recipients. Old cards become stale. Only the *current* recipient may
+answer; knowing an old message correlation ID grants no authority.
+
+`RouteReceipt` records selected rule ID, config revision, recipient identity,
+route revision, visited recipients, escalation deadline and reason. Reassign,
+orphan and timeout serialize against answer acceptance. A bounded visited set
+prevents cycles; exhausting the hop limit leaves the question visible with a
+typed routing failure, never an implicit answer. Explicit `question.escalate`
+uses the same policy check and audit as timeout-driven escalation.
+
+The accepted config schema is a closed set, not arbitrary routing expressions:
+
+```text
+RouteRule {
+  rule_id: RouteRuleId, asker: Option<AgentId>, project: Option<ProjectId>,
+  to: RecipientSelector, escalate_to: Option<RecipientSelector>
+}
+RecipientSelector = Operator | ParentArchitect | Agent(AgentId)
+```
+
+Selectors in a rule are ANDed; the first matching rule wins within the resolved
+list. No match uses the existing policy default. A rule cannot override `deny`
+or an authority floor; invalid/stale target IDs fail visibly before delivery.
+
+ADR-0042 (#2724) was accepted by the owner on 2026-10-29; its implementation is
+still a prerequisite, not a feature claimed here. Its single Rust schema, scoped
+resolver, provenance and audited writer must own:
+
+- **`questions.routing.rules`**
+  Typed value and admission: Ordered RouteRule list: registered asker/project
+  selectors, admitted recipient selector, escalation target
+  Apply boundary: New asks; explicit reroute for pending records
+
+- **`questions.routing.escalate_after_ms`**
+  Typed value and admission: Optional duration, 1 second–30 days; null
+  disables automatic escalation
+  Apply boundary: Snapshot into RouteReceipt
+
+- **`questions.routing.max_hops`**
+  Typed value and admission: Positive integer, default 8 and maximum 32
+  Apply boundary: New asks; existing chains keep their recorded budget
+
+- **`questions.expire_after_ms`**
+  Typed value and admission: Optional duration, 1 second–30 days; null means
+  no automatic expiry
+  Apply boundary: Persist one absolute deadline at ask
+
+- **`questions.max_pending_per_asker`**
+  Typed value and admission: Positive integer, default 32 and maximum 256;
+  named schema constants
+  Apply boundary: Admission checks the durable Pending count per stable asker
+  identity
+
+No routing map in env strings, CLI or GUI bypasses schema validation. Use
+ADR-0042's defaults < file < env < explicit flags < runtime resolution, with
+admitted global/node/project/agent scopes and stable IDs. Routing policy is
+operator-owned: a repository or agent cannot widen human access or weaken deny.
+Agents may narrow through existing policy. No secret or executable command is a
+route value. Writes require operate/local-operator authority, revision checks
+and audit; read views redact per the config contract. Existing
+`questions.human_tools` remains independent. Reload never silently rewrites a
+Pending route/deadline; an explicit audited reroute uses the new revision.
+
+**Decisions Q2–Q6 — accepted 2026-10-29.** The owner selected every recommended
+option; the rejected alternatives and their costs remain below.
+
+- **Q2: escalation timing — decided 2026-10-29**
+  Accepted option and cost: Disabled by default; explicit policy may escalate
+  after 5 minutes, along admitted architect edges, default max_hops 8 (hard
+  cap 32). Orphans follow the existing operator route immediately.
+  Rejected alternative and cost: Automatic owner paging on every timeout
+  reduces unattended waits but increases interruptions and may disclose an
+  agent-only question to the owner without an admitted route.
+
+- **Q3: expiry — decided 2026-10-29**
+  Accepted option and cost: No implicit expiry; an explicit admitted deadline
+  expires without answering. Check persisted wall-clock deadlines on restart;
+  a runtime deadline also bounds each wait.
+  Rejected alternative and cost: Default 24-hour expiry bounds inbox growth
+  but can discard a slow, still relevant decision.
+
+- **Q4: other-agent routing — decided 2026-10-29**
+  Accepted option and cost: Explicit operator-managed edges only, local node
+  initially.
+  Rejected alternative and cost: Arbitrary peer or cross-node routing needs
+  mesh identity, delegated scopes and custody proof; defer that implementation
+  to ADR-0034's mesh follow-up.
+
+- **Q5: input bounds — decided 2026-10-29**
+  Accepted option and cost: Prompt/answer 16 KiB each, context 32 KiB, up to
+  16 options (label 256 bytes, description 2 KiB), 32 typed refs (path 1 KiB),
+  4 live threads and 8 live proposals per question, total serialized record
+  128 KiB. Named schema constants validate trimmed UTF-8 and prompt control
+  bytes; blocking reason keeps its already-decided 512-byte bound.
+  Rejected alternative and cost: Reusing an entire prompt/blob allowance
+  simplifies validation but makes question cards and replay substantially
+  larger.
+
+- **Q6: pending flood guard — decided 2026-10-29**
+  Accepted option and cost: At most 32 Pending questions per asker by default,
+  configurable 1–256. Re-asks reuse their slot; terminal commit releases it.
+  Refuse overflow with `session_busy` and typed pending-question-limit detail
+  before any write, without evicting existing questions.
+  Rejected alternative and cost: No count cap avoids admission refusals but
+  permits unbounded inbox/replay growth; a global-only cap lets one asker
+  exhaust everyone else.
+
+Timeout never applies a default choice. It reroutes or expires only as
+configured, including for blocking asks. Expiry ends a held call with a typed
+expired result, not a fabricated user answer. A timer is durable scheduling
+metadata, not a sleep loop. Manual answers, timeout, restart and reassign race
+through the same reducer.
+
+Expiry or supersession also commits a typed terminal-notice obligation to the
+original asker: question ID, terminal revision and reason, with no fabricated
+answer. Deliver it at idle through the queue's existing typed Message path,
+framed as server metadata plus untrusted question text. One stable notice ItemId
+per terminal transition prevents duplicates across restart; queue-full retains
+the obligation. Identity replacement never delivers into the successor: retain a
+visible failed notice for the old identity. A still-live blocking call receives
+its terminal result once instead of an additional notice. Notices alone do not
+grant the AnswerReceipt wake capability: a hibernated asker reads them on its
+next independently authorized wake. Unresolved notice admission is also covered
+by Q2's unresolved-admission freeze gate; a live eligible queued notice blocks
+hibernation like other input.
+
+#### Authorization and proposals
+
+The following explicitly narrows ADR-0028 §8a's blanket MCP answer path and
+preserves ADR-0034 §3's architect answers. It agrees with ADR-0038 §5b:
+
+- **Read/list/subscribe**
+  Required authenticated authority: `read` plus recipient/agent visibility; an
+  agent sees its own asks and questions addressed to it
+
+- **Answer an operator question**
+  Required authenticated authority: Client-token `answer` OR `operate`;
+  attested local operator CLI/TUI; or an operator-bound channel's existing
+  `reply` scope
+
+- **Answer an agent question**
+  Required authenticated authority: Its attested current recipient via CLI/MCP
+  or authenticated reply capability; never a self-asserted label
+
+- **Create/resolve a thread proposal**
+  Required authenticated authority: Attested fork bound to that question; it
+  may propose, never answer for the operator
+
+- **Start a thread fork**
+  Required authenticated authority: `operate`/local operator, or existing
+  admitted architect lifecycle authority for its delegate; cost preview still
+  checks visibility
+
+- **Receipt-bound wake of a Hibernated asker**
+  Required authenticated authority: S6e/ADR-0044 Q5 capability accepted
+  2026-10-29: from an accepted AnswerReceipt, for that asker and ItemId only
+
+- **Permission `agent.decide`, generic lifecycle or tier widening**
+  Required authenticated authority: `operate` or the existing specific
+  operator authority, unchanged
+
+`answer` is sufficient for a question reply and insufficient for a permission
+prompt. `send` alone answers neither, starts no fork, and cannot act as the
+operator (#2585). Its later attributed-principal implementation is a separate
+slice; today's stricter send behavior remains until then. Keep the question
+handler separate from `agent.decide`, including when rendered in one inbox. MCP
+is not an operator credential; it may answer only agent-addressed questions. All
+auth is checked again at the mutation fence, with revocation and identity
+checks. Neither tool arguments nor source labels can mint an answering
+principal.
+
+Proposals use a shared typed envelope with #1719: `Proposal<T> { proposal_id,
+source_agent, target, base_revision, value: T }`. `T` is a closed return-kind
+union: question Answer or §9 Finding, not arbitrary instructions for the server.
+A fork's `question.resolve` persists `question.proposed`, leaving the question
+Pending. The recipient reviews and may edit the typed answer, then applies
+`question.answer { question_id, revision, proposal_id, answer }` (GUI
+`inbox.answer` delegates here). The log retains proposal, applied answer,
+responder and edit flag/text for later analysis (#1717). It checks
+proposal/question/fork identity and route revision; stale proposals remain
+inspectable but cannot auto-send. Only successful answer commit triggers
+idempotent fork stop; restart recovery completes a missed stop. Keep transcript
+and lineage. A losing thread is marked stale; it is never silently merged or
+stopped as though its answer won.
+
+#### Fork points and progress (#2365, #2726)
+
+`question.fork { question_id, at: ask_point | latest, dry_run? }` delegates to
+§9 and #2365, without another fork engine. Persist the ask's complete
+message/tool result boundary. If it is not sealed yet, report pending
+availability; never cut between tool_use and tool_result. Recompute
+`fork_points` when compaction or retention changes: warm `resume_at`, cold
+`rehydrate`, or latest `fork_session`. A missing retained prefix is
+`fork_prefix_gone`, distinct from an invalid cut; PTY asks offer latest only.
+Dry-run reports mechanism, prefix size and estimated cache-read/write cost;
+admission revalidates it and refuses a changed point or cost needing new
+confirmation. Never fall back from ask_point to latest silently. The read-only
+tier is enforced by general permission machinery, not UI controls.
+
+For #2726, link ThreadRef to the fork's agent identity and normal subscriptions:
+phase/current step, recent actions/tool calls, token/time spend, blocked/waiting
+state and pending questions, with details opening its retained transcript.
+**Progress decision — accepted 2026-10-29:** derive objective facts from the
+event log and allow a separate labelled self-reported step; latest-wins
+coalescing under the existing stream budgets, never coalescing terminal/custody
+records. Rejected alternative: a progress tool alone costs model cooperation and
+can go silent; derivation alone cannot know intended next steps. The fork and
+parent viewers must independently pass read visibility; inheritance of lineage
+grants no transcript access. A parent AGENT reads through existing bounded `flk
+events read` + `flk events wait` / MCP `flock_events_read` cursor-and-wait
+surface, filtered to its admitted fork identities; #2726 adds a generated typed
+progress projection there, backed by the same owner stream the GUI subscribes
+to. An authenticated parent may read a bounded snapshot and wait from its
+cursor, with gap/replay handling, rather than scraping a tile or injecting every
+progress event into its own prompt. Registration survives an agent compaction
+through #2718's server-owned durable goal/task subscriptions: progress links the
+fork to its owning goal/task, and a terminal or blocked fact can wake that
+goal's admitted supervision loop. Neither task ownership nor a lineage edge
+bypasses read or wake authority; these loops do not acquire the AnswerReceipt
+capability. Progress cannot apply a proposal. Detailed progress schema/rate
+tuning belongs to #2726 and durable goal/task loop delivery to #2718; neither
+gates answer custody or non-blocking questions.
+
+#### GUI, TUI and CLI contracts
+
+G5 #1597, TUI and `flk question list/show/answer/fork` project one reducer and
+invoke the same typed service. MCP `flock_question_ask/answer` are adapters, not
+second stores. Rust owns schemas with generated TypeScript; frontend records
+carry question identity/revision, recipient, blocking reason, choices, context,
+refs, threads/proposals, fork availability/cost and delivery receipt. Server
+ordering is blocking, urgency, age; Pending non-blocking questions do not change
+a working agent to NeedsHuman. A held explicit blocker does, with its reason.
+
+The card shows server-attested asker/recipient and untrusted body separately.
+Select by option IDs, support multi-select/Other and editable proposal review,
+and render all control text as data, never escape sequences or active HTML.
+Terminal states remove the inbox card but keep history/thread tiles inspectable.
+A failed stale apply displays the current state. Read-only or unauthorized users
+see disabled actions with the required authority; they cannot bypass it via CLI.
+Use existing TUI controls and G5's transcript tile, not a new screen protocol.
+Expose `fork_points` absence with its typed reason rather than a dead action.
+
+#### Pre-mortem
+
+- **Agent idles behind its ask**
+  Prevention and observable result: Non-blocking tool completes immediately
+  after durable receipt; fake harness continues independent work before any
+  answer. No S6d hold.
+
+- **Hibernated asker never sees its answer, or reply races freeze**
+  Prevention and observable result: Owner-approved receipt-bound wake only for
+  that asker; PendingAdmission/queue-full obligations block Q2 eligibility;
+  post-freeze answer records wake owed until cleanup.
+
+- **One asker floods the shared inbox**
+  Prevention and observable result: Per-asker Pending cap, enforced before
+  append; re-ask dedupe, bounded proposals/threads and typed overflow without
+  eviction.
+
+- **Two answers, or crash between log and queue**
+  Prevention and observable result: Serialized question transition, durable
+  obligation, same queue key; exactly one item/started receipt, uncertainty
+  held visibly.
+
+- **An agent impersonates the owner**
+  Prevention and observable result: Lease/pane origin and recipient-specific
+  auth; answer scope cannot approve tools; proposals require separate
+  recipient apply.
+
+- **Escalation loops or leaks a question**
+  Prevention and observable result: Admitted edges, route revisions, bounded
+  visited set, read checks and no timeout auto-answer.
+
+- **Proposal survives replacement**
+  Prevention and observable result: Identity and revision checks; superseded
+  questions reject it and preserve the losing text.
+
+- **Cold fork surprises the user**
+  Prevention and observable result: Recomputed availability/cost,
+  confirmation, no silent latest fallback; read-only tier enforced by the
+  server.
+
+- **Poisoned answer changes producer labels**
+  Prevention and observable result: Per-item nonce framing, metadata outside
+  body, no permission inferred from model text.
+
+- **Restart loses blocking call or fork stop**
+  Prevention and observable result: Held-to-deferred recovery and durable
+  answer obligation; idempotent stop after apply.
+
+- **Progress claims completion or leaks context**
+  Prevention and observable result: Progress is advisory, separately scoped,
+  with source labels; answer custody reads durable records.
+
+#### Ordered implementation slices (each at most 400 production lines)
+
+These are accepted sub-slices of #2242 (2026-10-29), not implementation claims.
+File each sub-issue before work; further splits keep the same public acceptance
+boundary. Dependencies on S12/S13 (#2365), S19 (#1321), G5 and ADR-0042 are
+explicit. Every row adds a fail-first test through public CLI/socket/MCP
+adapters into an isolated server and the existing
+`tests/fixtures/structured-public/claude.py` fake harness; no real model,
+ambient profile, sleeps or timeout widening. Use injected clocks, notifications
+and bounded event receives. Show one behavioral red before each slice; a parent
+compilation error is build evidence, not a behavioral failure.
+
+- **S6e-1**
+  Scope / production budget: Typed records, bounds, generated DTOs and public
+  read/replay adapter, ≤300
+  Fail-first public-path acceptance: Launch isolated server with retained
+  fake-produced ask/terminal log; CLI/socket read replays the pair through the
+  real classifier as known typed records. An unknown-kind line is
+  preserved/skipped. Public adapter rejects invalid bounds; no seeded reducer
+  state.
+
+- **S6e-2**
+  Scope / production budget: Lease/pane origin and one ask adapter, ≤350
+  Fail-first public-path acceptance: Fake asks, emits independent work before
+  answer; absent blocking returns Pending; forged origin refuses; true
+  blocking without valid reason refuses.
+
+- **S6e-3**
+  Scope / production budget: Launch profile, MCP/stdio and recap convergence,
+  ≤300
+  Fail-first public-path acceptance: Stray AskUserQuestion gets the exact
+  deny-carried deferral and continues; duplicate source observation opens one
+  question; permissions still block.
+
+- **S6e-4**
+  Scope / production budget: Reducer persistence and lifecycle, ≤300
+  Fail-first public-path acceptance: Restart preserves Pending; replacement
+  supersedes; held exit becomes deferred; racing expiry/answer has one winner,
+  no half-written checkpoint.
+
+- **S6e-5**
+  Scope / production budget: Recipient routing and config schema, ≤350;
+  depends on accepted ADR-0042/config registry slices (#2724)
+  Fail-first public-path acceptance: Auto routes delegate to architect and
+  root to operator; authorized other-agent edge works; forbidden widening
+  refuses. Config round-trip/provenance through ADR-0042.
+
+- **S6e-6**
+  Scope / production budget: Reroute, escalation and deadlines, ≤300
+  Fail-first public-path acceptance: Inject clock, reassign/orphan/timeout;
+  old recipient refuses, cycle stops at bound, disabled timeout never answers
+  or expires; terminal notice reaches the original fake once at idle after
+  expiry/supersession.
+
+- **S6e-7**
+  Scope / production budget: Answer admission/auth and durable obligation,
+  ≤350
+  Fail-first public-path acceptance: Answer-only token answers question but
+  refuses agent.decide; send-only and wrong recipient refuse; concurrent
+  answers retain one immutable receipt; Pending cap refuses the next ask
+  without a write and releases one slot only on terminal commit.
+
+- **S6e-8**
+  Scope / production budget: AnswerReceipt-bound Reply admission and queue
+  recovery, ≤350
+  Fail-first public-path acceptance: Answer while busy delivers only at
+  result; crash after answer append/before queue ack recovers same ItemId;
+  unknown write holds, no duplicate started receipt. Fake sees one reply; a
+  forged Reply/receipt binding refuses before mutation.
+
+- **S6e-9**
+  Scope / production budget: Question fork adapter / availability, ≤300, after
+  #2365/S19
+  Fail-first public-path acceptance: Dry-run advertises warm/cold path;
+  compaction updates cost; missing prefix refuses; PTY latest only; read-only
+  fork cannot widen tools.
+
+- **S6e-10**
+  Scope / production budget: Generic proposals and reviewed apply, ≤300
+  Fail-first public-path acceptance: Bound fork resolves proposal, original
+  keeps working; recipient edit/apply logs both texts;
+  stale/replaced/wrong-question proposal refuses.
+
+- **S6e-11**
+  Scope / production budget: Thread stop recovery and progress link, ≤250
+  Fail-first public-path acceptance: Crash after apply/before stop then
+  restart stops once; lineage/transcript retained; unauthorized progress
+  subscriber gets no details (#2726).
+
+- **S6e-12**
+  Scope / production budget: G5 projection / review controls, ≤350, after
+  S6e-8/10
+  Fail-first public-path acceptance: GUI fixture and real-server adapter agree
+  on revisions and delivery; duplicate tap shows current state;
+  multiple-choice edits retain typed option IDs.
+
+- **S6e-13**
+  Scope / production budget: TUI/CLI projection and generated help, ≤350
+  Fail-first public-path acceptance: Same pending/answered data as GUI; fork
+  proposal cannot be applied by another agent; late idle reply reaches fake
+  with its question and fork attribution.
+
+- **S6e-14**
+  Scope / production budget: Answer wake and hibernation eligibility, ≤300;
+  after S6e-8 and the ADR-0044 Q2/Q5 lifecycle owner
+  Fail-first public-path acceptance: Fake asks, becomes confirmed Hibernated,
+  then an answer-only client answers: exactly one resume and original reply
+  ItemId, no general start permission. Gate queue admission
+  full/PendingAdmission and prove hibernate refuses; answer on either side of
+  freeze yields cancellation or one wake owed after cleanup. Stopped/replaced
+  targets and reads/proposals never wake. Restart retains the same obligation,
+  never a second input.
+
+- **S6e-15**
+  Scope / production budget: Coordinated rollout gate, ≤200; after core
+  custody/auth/routing, public projections and S6e-14 when hibernation is
+  enabled
+  Fail-first public-path acceptance: Start isolated server with gate off,
+  observe truthful legacy capabilities and launch profile; flip through the
+  admitted config API and launch a new fake: MCP shared-channel profile and
+  typed capability appear together, stray stdio converts. Gate-on with a
+  missing dependency refuses without changing profile; existing generations
+  retain their recorded contract.
+
+## Failure modes and known limits
+
+- **Hidden flags move.** `--resume-session-at`, `--permission-prompt-tool
+  stdio`, `command_lifecycle` and the control subtypes
+  `cancel_async_message` and `set_permission_mode` are undocumented in
+  `--help`. The
+  capability probe of §9 and the unknown-shape log of §8 are how flk notices;
+  the fallback is the rehydrate path, never a silent wrong fork.
+- **A removed tool stays visible (E12)** until compaction, and the model may
+  call it; the call is refused by the harness. The reload notice says so.
+- **Process crash mid-turn** leaves the input `held`; the operator or the
+  gate decides whether to resend. Tool side effects of the crashed turn are
+  not undone.
+- **The 1-hour cache write costs 2× input.** A fork's cost guard shows it.
+- **Structured agents need O19a (#1208).** Until `flk-agent` exists on a
+  host, no structured agent starts there (§1a).
+- **`pty` agents still share the operator's uid (#1177)** and can read client
+  tokens until O19a; see §5.
+- **`--restricted` and `CLAUDE_CODE_RESTRICTED=1` are the only switches
+  found that close the harness's messaging socket (E16, A.11).** The
+  launch profile uses the flag. Their effect on the socket is known from
+  one harness version (2.1.296) and the changelog line carried in it. If
+  a later version binds the socket despite the flag, `system/init` reports a
+  `messaging_socket_path` again, and S3 refuses to run that session
+  rather than give structured agents a door into each other past the
+  queue (§1).
+- **`interrupt` delivery stops the running turn (A.14).** A tool that is
+  mid-run is rejected, and what it did before that is not undone. A
+  `steer` write ("send now" without `interrupt`) does not stop it, but
+  waits for the next model step, so a long tool delays it, and it can
+  change what the running turn answers (§3).
+- **A question in the same message after a prompting call waits for the
+  prompt (A.13, §2b).** Not holding a question cannot help it there; the
+  compiled context tells agents to ask before, or apart from, a call that
+  may prompt.
+- **The login token is in the session's environment (owner decision 1).**
+  flk never logs it, but whether the harness passes
+  `CLAUDE_CODE_OAUTH_TOKEN` on to the agent's own tool processes is
+  untested; A.11 saw it pass its `CLAUDE_CODE_MESSAGING_TOKEN` on to them.
+- **System One is advisory.** When it is not configured, times out or its
+  breaker is open, questions are not held (§2a), batches are not joined and
+  no item is marked relevant (§3): the defaults, never a stall.
+- **The structured view needs a client.** A structured agent has no terminal
+  to attach to; `terminal/<pane>` is for `pty` agents only.
+
+## Owner decisions (2026-10-13)
+
+The owner answered the open questions of the proposed record on 2026-10-13.
+Each item names the question, the answer, and where the body follows it.
+"As recommended" means the recommendation of the proposed record, which the
+body already carried. An "S0 note" line (2026-10-14, #1324) records what
+the S0 probes found that bears on a decision. The notes record facts; they
+change no decision. An "Owner decision, 2026-10-14" line records a later
+decision by the owner.
+
+1. **Isolation and login under `flk-agent` (#1177, ADR-0035 §6.3).** As
+   recommended: `claude /login` once per profile as `flk-agent` into a
+   private config dir where a browser is available, `claude setup-token`
+   on headless hosts, never a copy of the operator's credentials (E6), with
+   the isolation flags of §1 on top (E5). Still unprobed: whether
+   `/login` and its keychain item work for a macOS user with no GUI login
+   session; probe slice S0 checks it, and if they do not, `setup-token` is
+   the macOS path too. (§1)
+   *S0 note:* as a macOS user with no GUI session and no keychain,
+   `claude auth login` failed to save its login and wrote no plaintext
+   file (2.1.287); a `setup-token` token in `CLAUDE_CODE_OAUTH_TOKEN`
+   worked for the same user (A.16).
+   *Owner decision, 2026-10-14 (#1404):* agent users log in with
+   `setup-token` only. The fleet configuration repo renders it from sops as a 0600 file owned by
+   `flk-agent`; flk passes it into the session env and never
+   logs it. `/login` is kept for GUI operators only. Rejected alternative:
+   unlocking a keychain at boot. (§1, S3)
+2. **Build on `--resume-session-at`.** As recommended: yes, behind the §9
+   capability probe, with the rehydrate path as the measured fallback
+   (E11). (§9)
+3. **Question and permission channel.** Superseded for questions by S6e
+   (#2242; owner direction on #1717). Original decision: both, not stdio
+   alone; stdio is primary, and an MCP tool (`flock_question_ask`) is the richer path, used
+   for asks that need more than a choice and whenever stdio would block. The
+   owner's concern that stdio can itself block is answered case by case in
+   §2b: an open permission request (S0 measures whether it holds a
+   question behind it; if so the MCP tool is the way to ask then), flk not
+   reading (the pump never waits on anything), and the hidden flag
+   disappearing (the launch profile falls back to an MCP permission tool).
+   (§2b)
+   *S0 note:* in A.13 an open permission held every later call of the
+   same message, a pre-allowed MCP call included, while a call ordered
+   before the prompting one ran first. A concurrency-safe `Read` behind
+   the open permission was held too, and with no permission open a slow
+   non-concurrency-safe call still held a later one. (§2b case 1, A.13)
+   - 3a. **Non-blocking questions (#1301).** Retaken by owner decision 15
+     on #1717 (2026-10-19), carried in S6e: the asker decides, absent blocking
+     is false, and true requires a reason. Original decision: as recommended
+     (questions are deferred, permission requests block), plus three additions now in
+     §2a: an honest-blocker question, where the agent has nothing else to
+     do, holds, and a System-One check decides hold or continue from the
+     last turn or turns, the question, and the open tasks and work packages
+     with their dependency graph; a question that is not held ends its tool
+     call with the result `<question-id> submitted for user feedback - the
+     response will be relayed to you`; and each question has a stable id,
+     a hash of the question, rendered in fixed bytes so the prompt cache
+     keeps hitting across turns and forks. (§2a)
+     *S0 note:* both carriers kept the model working, and `allow` is
+     framed as "The user answered", so the not-held result travels as a
+     `deny` (A.12). A question asked in the same message after a call that
+     prompts was not asked until that prompt was answered (A.13, §2b). The
+     id is stable per agent; a fork's prefix carries its parent's ids
+     unchanged (§2a, #1324).
+4. **Delivery and the queue.** Not as recommended (human `steer` by
+   default). The owner wants a full queue UX: queued messages wait for
+   idle and stay editable; they can be deleted and reordered; there are
+   any number of stashes with pop and clear; at idle the queued human
+   messages go as one bulk, except the one being edited; "send now" forces
+   one; a System-One check flags queued messages relevant to the running
+   work and suggests or forces them. First, probe slice S0 finds how Claude
+   Code handles queued messages in `-p` and whether it has a take-back or
+   edit surface; if it does, flk wraps it, otherwise flk's queue is the
+   surface. The default delivery is now `at_idle` for every producer,
+   humans included; `steer` is what "send now" sets. (§3)
+   *S0 note:* the harness has a take-back (`cancel_async_message`, for
+   inputs still `queued`), which `queue.take_back` wraps, and no edit, so
+   flk's queue is the only edit surface. The harness's own send-now
+   (`interrupt{send_now}`) is an interrupt: it rejects the tool in flight,
+   whose side effects so far persist, and starts the item as a new turn.
+   flk uses it for `send_now { interrupt: true }`. A `steer` write, which
+   "send now" sets, folds into the running turn at the next model step,
+   waits out a running tool, and can change what that turn answers.
+   (§3, A.14)
+5. **The messaging socket.** No separate concept. flk owns the session's
+   input, so agent messages are queued exactly like human ones. The agent
+   and human messages are not submitted together: FIFO across both, one
+   batch per turn at idle, the next after that turn's `result`, unless
+   System One judges them related, and then they go together. E16 is kept
+   as a fact about the harness; flk never uses that socket, and S0 records
+   what it accepts. The socket is no longer a blocker for shipping. (§1,
+   §3, E16, "Failure modes")
+   *S0 note:* the socket takes unauthenticated turns from any process of
+   the session's uid, and `--restricted` closes it; the launch profile
+   passes it, so the known limit is gone. (§1, E16, A.11)
+6. **Where the wire endpoint lives.** As recommended: `/v1/ws` in the
+   server process, with `web` on in release builds as part of S7. The
+   owner clarified the architecture, now stated in §5: with `-p` there is
+   no terminal-render shipping; JSONL messages and state go to clients
+   live, with a pull for history; the client is a renderer; the mesh
+   carries only state and messages between nodes, with no hopping between
+   servers except to open a real terminal. Open item: evaluate the Grafana
+   Labs stack (Loki, Tempo, Grafana Live) against our own for the stream
+   and history, filed as #1323, reporting before S7. (§5) Resolved
+   2026-10-16 by the owner (ADR-0038 §11 item 5): log, metric and trace
+   output goes through vig-os/vigil, the stream and history stay §4/§5's
+   own, and #1323 no longer gates S7 (integration: #1614).
+7. **TS generation.** As recommended: `ts-rs`. (§6)
+8. **Web client framework.** Not as recommended (none): Solid, for its
+   fine-grained reactivity under streaming updates. (§7)
+9. **Client tokens and scopes.** As recommended and as written in §5, with
+   no loopback trust (§1a). An `operate`-scoped token, minted over the unix
+   socket by the local operator, is operator identity from any address once
+   `--allow-non-loopback` is on. (§5)
+10. **Storage first cut.** As recommended: per-agent JSONL plus the blob
+    store; zstd sealing, SQLite and DuckDB later, when a measured view
+    needs them. (§4)
+11. **Thinking retention.** As recommended: thinking blocks are kept
+    lossless (signed, needed for a byte-exact resume); retention is decided
+    with storage sealing (S16). (§4)
+12. **The TUI's structured view.** As recommended: the server-side renderer
+    subscribes to the same typed stream in-process; a client-side TUI is
+    not part of this record. (S10)
+13. **Coexistence with `[slots]` and the switch paths.** As recommended: no
+    change. (§5)
+14. **Rehydrated transcripts.** As recommended: accepted as the
+    ingest/rehydrate operation the issue allows, copy only, never editing a
+    line, the copy deleted when the fork ends. (§4, §9)
+15. **Permission presets (#1321), added by the owner in the same session.**
+    A preset is picked at start and switched at runtime, with a picker
+    beside P23 and escalation for the operator only; probe slice S0 tries
+    `set_permission_mode` over stdio. (§10b, P25)
+    *S0 note:* it works in place at idle for `acceptEdits`, `default` and
+    `plan`, and mid-turn for `acceptEdits`; `auto` and `dontAsk` were not
+    switched to. `bypassPermissions` is refused unless the session was
+    launched with `--dangerously-skip-permissions`, so it needs a reload
+    with that flag. (§10b, A.15)
+
+## Slices
+
+Tracked in #1307. Ordered; each is at most about 400 production lines (tests and doc comments
+excluded; TypeScript counts the same as Rust) and lands behind `runtime: structured` or the `web` feature.
+
+The S7-min rows refine the original S7 endpoint slice. Execution follows
+1 → 7b → 2 → 3 → 4 → 5 → 6 → 8; the GUI bundle router (7a) is built
+independently. Artifact, inbox and mesh streams, full outbox/resume-only
+semantics, single-writer handoff and operator-only outcomes remain S7-rest;
+their fixture labels stay explicit under the ADR tracker #1307. #2369 proves
+isolated browser dogfood and
+metadata-selected welcomes, not full selected-script trace execution. That
+remaining slice-8 acceptance is tracked in #2467; #1833 and #1746 stay open.
+
+| # | Slice | Depends on | Est. lines |
+|---|---|---|---|
+| S0 | Complete (2026-10-14): the probes landed (#1356); the A.13 controls and token-path re-runs, the concurrency-safe call behind an open permission, and A.16 are recorded (#1404). Probes, recorded in the appendix: the messaging socket of E16 (what it accepts, its owner and mode, a switch to disable it); the placeholder carrier, `deny` versus `allow` with placeholder answers, and that the model keeps working after it (§2a); parallel control requests, an `AskUserQuestion` while a permission is open (§2b); the harness's own queue in `-p`: take-back, edit and send-now behind `interrupt_cancel_queued_v1` / `interrupt_send_now_v1` (§3); `set_permission_mode` over stdio (§10b); `claude /login` and its keychain item for a macOS user without a GUI login (owner decision 1) | — | 0 (probe) |
+| S1 | `SessionEvent` types for Claude stream-json: known variants with `extra`, `Unknown{raw, shape}`, shape key; redacted probe fixtures as tests | — | 350 |
+| S2 | `session.unknown_shape` persisted kind (skip test per ADR-0028 §3a), once-per-shape registry logging through `tracing` only (#1300), `flk report --unknown-events` | S1 | 250 |
+| S3 | Structured runtime: spawn as `flk-agent` with the §1 launch profile (the login from the 0600 `setup-token` file the fleet configuration repo renders, passed as `CLAUDE_CODE_OAUTH_TOKEN` in the session env and never logged, owner decision 1; `--restricted`; the restricted-versus-unrestricted `system/init` diff; refuse a session that reports `messaging_socket_path`), session lease (`session_busy`), lease-based caller identity and the uid check of §1a, stdout pump into the per-agent stream, blob store, truthful outcome | S0, S1, O19a #1208 | 400 |
+| S4 | Pure per-agent state reducer: `StateSource::Session`, turn / attention / limit from events, stall observation and in-process phase/needs-human facts; registry seam for #1439 and S7-min #1746. Pane-free EventHub events deferred to #1804 | S3 | 300 |
+| S5 | Input queue: `queue/<agent>` stream, producers, gate, `command_lifecycle` acks, independent `delivery` (`at_idle` / `steer` / `interrupt`) and `priority` ordering, one batch per turn with the FIFO rules 1 to 4 and batch messages, `flk agent send` and msg delivery routed to it | S3 | 400 |
+| S5c | Queue UX: `queue.update` / `edit` leases / `move` / `delete`, named stashes with `stash` / `pop` / `clear` / `stashes`, `send_now` (`steer`, or `interrupt` through the harness's `interrupt{send_now}`), `take_back` through `cancel_async_message` (§3, A.14, owner decision 4) | S0, S5 | 300 |
+| S5d | System One for the queue: relatedness joins at idle and the relevance check during a turn, `[queue] relevance` (whose `force` sends through S5c's `send_now`), recorded for rating (§3, owner decisions 4 and 5) | S5, S5c | 200 |
+| S5b | Turn-end work through the queue: armed self-compact and its continuation on `result`, recap lift, wake of parked waits (§3a, #697) | S5 | 200 |
+| S6 | Control requests: `can_use_tool` → `hook.decide` and §8a questions, `AskUserQuestion` answers, `ExitPlanMode` | S4, S5 | 350 |
+| S7a | Wire message Rust types with ts derives: hello/welcome recovery metadata, sub/unsub/cmd/ev/ack, subfail, ping/pong, synced on every seq stream, gap with snapshot_to, lagged (§5/§5a); scripted fake-server fixture format, types only with no endpoint. Before S3, as ADR-0038 §10 | #1546 settled | 200 |
+| S7 | Wire endpoint implementing S7a, §5a deadlines, heartbeat, durable command journal, resume/checkpoint and single-writer rules, `/v1/blob`, client tokens, `WIRE_JSON_VERSION` gate, `web` on in release builds; refuse remote-agent cmd until #1380 | S3 (S3a #1518/#1439, S3b #1426), S7a | 350 |
+| S7-min 1 (#1825) | Client-token authority and verification | S7a, #1798 | ≤400 |
+| S7-min 7b (#1827) | Operator token CLI/socket entry and dogfood URL | Slice 1 | ≤400 |
+| S7-min 2 (#1828) | Loopback WebSocket transport and liveness | Slices 1, 7b | ≤400 |
+| S7-min 3 (#1829) | Stored session replay and live publication | Slice 2, S3 | ≤400 |
+| S7-min 4 (#1830) | Agent subscriptions, identities and bounded delivery | Slice 3 | ≤400 |
+| S7-min 5 (#1831) | Send and permission-decision routing | Slice 4, S5, S6 | ≤400 |
+| S7-min 6a (#1832) | Durable fleet-lite projection and cursor core | S4, S6 | ≤400 |
+| S7-min 6b (#2225) | Fleet stream on the endpoint; activity omitted until #2243 | Slices 4, 6a | ≤400 |
+| S7-min 7a (#1826) | GUI bundle serving router | Loopback listener, GUI build | ≤400 |
+| S7-min 8 (#1833) | Real-server conformance and isolated browser dogfood proof | Preceding minimal slices; #1734 before public start | 0 (tests/docs) |
+| S8 | `ts` feature, `ts-rs` derives, generated `web/client/src/gen`, drift test, `just gen-ts` | S7 | 200 |
+| S9a | Bun reference client in Solid: connect, follow an agent from a cursor, render P1–P4, unknown JSON dump, lazy blobs | S8 | 400 (TS) |
+| S9b | Bun reference client: P12–P15, P19, P20, queue view with edit, reorder, stashes, send now and relevance marks | S9a, S5c | 400 (TS) |
+| S10 | TUI structured view: server-side renderer from the in-process stream; composer with queue display (P9–P11) | S3, S4, S5 | 400 |
+| S11 | Hot reload: idle → close → `--resume`, init diff event and notice, staged fleet reload | S5 | 300 |
+| S12 | Forks: `at` / `shape`, cut rules, `resume_at` / `rehydrate` / `slice` paths, capability probe, cost guard, warm-then-fan-out, lineage fields | S3 | 400 |
+| S13 | Return channel: `finding` items from forks into the parent's queue | S5, S12 | 150 |
+| S6b | Historical question plan, superseded by S6e sub-slices: question records with stable hashed ids and fixed-template rendering, the placeholder result on the `deny` carrier (A.12) with the §2 deny carve-out, `question.answer` / `question.fork` / `question.resolve`, re-ask from the record, exactly one reply (§2a, #1301) | S0, S6, S12 | 350 |
+| S6c | Historical MCP question plan, superseded by S6e sub-slices: `flock_question_ask`'s new fields (`blocking`, `context`, `refs`, `waits_on`, `recipient`, `urgency`), pre-allowed in the launch profile, the placeholder as its result, the fallback to an MCP permission tool when the capability probe finds `stdio` gone (§2b, owner decision 3) | S6b | 250 |
+| S6d | Superseded as a hold by S6e and owner decision 15 (#1717/#2242); no turn-holding judge is scheduled | — | 0 |
+| S6e | Non-blocking question service, recipient routing, reviewed fork proposals and idle reply custody; ordered sub-slices in the S6e amendment (#2242) | S6, S5; fork/UI/config dependencies per sub-slice | ≤400 each |
+| S14 | Codex `app-server` adapter onto `SessionEvent` | S4 | 400 |
+| S15 | opencode `serve` adapter | S4 | 400 |
+| S16 | Storage sealing (zstd segments) and thinking retention | S3 | 250 |
+| S17 | Picker (P23): probe Claude's `supportedModels` / `set_model`, per-adapter model and effort lists merged with ADR-0021's registry, `agent.start` fields, `agent.reload{model, effort}` | S11 (S14, S15 for Codex and opencode lists) | 300 |
+| S18 | Collapsible turns (P24): turn grouping from `command_lifecycle` and `result`, the default collapse rule, one-line summaries, in the web client and the TUI view | S9a, S10 | 250 |
+| S19 | Permission presets (P25, #1321): ranked presets in config, `agent.start{permission_preset}`, `agent.set_permissions` in place through `set_permission_mode`, by reload for `bypassPermissions` (A.15), operator-only escalation, picker beside P23 | S0, S6, S11, S17 | 300 |
+
+The spike's demonstration ("one throwaway session rendered by both the TUI
+and a thin Bun client") is S9a plus S10 against S3; this record does not ship
+it, because the brief for #1299 limits the spike to the decision and its
+evidence.
+
+## Appendix A — Evidence (2026-10-13)
+
+All runs used model alias `haiku` (resolved to `claude-haiku-5-5`), a
+scratch working directory holding three small files, and a throwaway Python
+driver that writes stream-json lines to stdin one turn at a time and records
+every stdout line with a monotonic timestamp. The driver and the raw
+captures are not committed (they contain account rate-limit state); the
+commands below are enough to repeat any row. "Profile iso" means
+`--setting-sources local --strict-mcp-config`; every run also passed
+`-p --input-format stream-json --output-format stream-json --verbose
+--include-partial-messages --include-hook-events --model haiku --tools
+Bash,Read --allowedTools "Bash(ls:*)" Read` unless the row says otherwise.
+Tokens are as reported by the turn's `result.usage`; "read %" is
+`cache_read / (input + cache_read + cache_write)`; TTFT is `result.ttft_ms`.
+
+### A.1 Hooks and isolation
+
+| Run | Flags | Hook events seen | Notes |
+|---|---|---|---|
+| default | no isolation flags | `hook_started`/`hook_response` ×2 each for SessionStart, UserPromptSubmit, Stop | the fleet's user-level hooks; the flock stub no-ops without `FLOCK_*` |
+| safe | `--safe-mode` | none | `--mcp-config` is ignored too (the added server never appeared in `system/init`) |
+| iso + benign | profile iso, `--settings` with one Stop hook writing a file | only the benign Stop hook | claude.ai connectors still listed as `pending` without `--strict-mcp-config` |
+| isolated dir | `CLAUDE_CONFIG_DIR=<empty dir>` | — | `Not logged in · Please run /login`, exit 1 |
+
+### A.2 Event catalogue (all runs)
+
+Count, `type[/subtype]`, top-level fields besides `type`, `session_id`, `uuid`:
+
+```text
+  121 assistant                       message, parent_tool_use_id, request_id, timestamp, error, is_api_error_message,
+                                      aborted, thinking_display, thinking_duration_ms, tool_use_meta, wire_tool_inputs,
+                                      user_message_uuid(s)
+   38 user                            message, parent_tool_use_id, timestamp, isReplay, isSynthetic, tool_result_meta,
+                                      tool_use_result
+   15 command_lifecycle               command_uuid, state ∈ {queued, started, completed, cancelled}
+   68 system/init                     agents, apiKeySource, capabilities, claude_code_version, cwd, mcp_servers,
+                                      memory_paths, messaging_socket_path, model, output_style, permissionMode, plugins,
+                                      skills, slash_commands, tools, …
+   94 system/status                   status ∈ {requesting, compacting, null}, compact_result, user_message_uuids
+   36 system/thinking_tokens          estimated_tokens, estimated_tokens_delta, user_message_uuid
+    2 system/compact_boundary         compact_metadata{trigger, pre_tokens, post_tokens, preserved_segment, …},
+                                      logical_parent_uuid
+    2 system/permission_denied        tool_name, tool_use_id, decision_reason_type, message
+    7 system/hook_started             hook_event, hook_id, hook_name
+    7 system/hook_response            hook_event, hook_id, hook_name, exit_code, outcome, output, stdout, stderr
+   58 rate_limit_event                rate_limit_info{status, resetsAt, rateLimitType, …}
+    2 control_request/can_use_tool    request_id, request{tool_name, display_name, input, tool_use_id, description,
+                                      permission_suggestions, requires_user_interaction}
+    1 control_response                response{subtype, request_id, response}   (reply to flk's interrupt)
+   89 stream_event/message_start      event, api_message_id, ttft_ms, user_message_uuid(s), parent_tool_use_id
+  842 stream_event/content_block_delta  delta ∈ {text_delta, thinking_delta, signature_delta, input_json_delta}
+  120 stream_event/content_block_start  content_block ∈ {text, thinking, tool_use}
+  120 stream_event/content_block_stop
+   89 stream_event/message_delta, message_stop
+   67 result/success                  result, is_error, stop_reason, terminal_reason, api_error_status, usage, modelUsage,
+                                      total_cost_usd, ttft_ms, num_turns, permission_denials, queued_turn_count, …
+    1 result/error_during_execution   errors, terminal_reason = aborted_streaming
+```
+
+`system/init.capabilities` was `interrupt_receipt_v1, interrupt_cancel_queued_v1,
+interrupt_send_now_v1, msg_lifecycle_v1, request_marker_lists_v1,
+sdk_mcp_tools_list_changed, sdk_mcp_manifests, mcp_read_resource_v1,
+mcp_tool_ui_meta_v1, ui_surface_v1` in every run. `result.total_cost_usd`
+is cumulative over the resumed chain (a fork starts from its parent's
+recorded cost), so it is not a per-test cost.
+
+### A.3 Base session and hot reload
+
+| Run | in | read | write | out | read % | TTFT ms |
+|---|---|---|---|---|---|---|
+| base turn 1 (`ls`) | 4 | 5,102 | 5,214 | 87 | 49.4 | 1,114 |
+| base turn 2 (two Reads) | 4 | 10,502 | 430 | 271 | 96.0 | 1,620 |
+| base turn 3 | 2 | 5,644 | 47 | 3 | 99.1 | 1,222 |
+| reload, no compact: turn 1 (Read of a 70 KB file) | 6 | 39,908 | 35,726 | 579 | 52.8 | 1,679 |
+| reload, no compact: first turn after `--resume` + `--mcp-config` | 2 | 40,921 | 470 | 4 | 98.9 | 1,681 |
+| reload, compact: turn 1 | 6 | 63,360 | 12,198 | 499 | 83.8 | 2,397 |
+| reload, compact: `/compact` (result.usage) | 0 | 0 | 0 | 0 | — | — |
+| reload, compact: `/compact` (modelUsage delta) | 13,945 | 28,647 | 250 | 1,383 | — | — |
+| reload, compact: first turn after `--resume` + `--mcp-config` | 2 | 0 | 7,815 | 4 | 0.0 | 1,140 |
+
+`compact_metadata`: `trigger: manual, pre_tokens: 40032, post_tokens: 1237,
+duration_ms: 7140`. The init diff after the reload was exactly
+`mcp_servers += flkstub (connected, dynamic)` and `tools +=
+mcp__flkstub__approve, mcp__flkstub__ask_user` (plus a new
+`messaging_socket_path`).
+
+### A.4 Flags present in the binaries
+
+`strings` over both the 2.1.296 and the 2.1.287 binary find
+`--resume-session-at <message id>`, `--resume-drops-turn`,
+`--rewind-files`, `--fork-point` and `--permission-prompt-tool` (including
+`=stdio`); none is in `--help`. Errors read: `--resume-session-at requires
+--resume`; `No message found with message.uuid of: <id>`. The loader looks
+the uuid up among the loaded messages and keeps everything up to it.
+
+`claude --help` (2.1.296) lists `--effort <level>  Effort level for the
+current session (low, medium, high, xhigh, max)`. That is the only evidence
+for the effort levels in §10a: no run per level was made.
+
+### A.5 Turn control: mid-turn input, interrupt, error
+
+Driven with `--replay-user-messages` and flk-chosen input uuids `1111…`
+and `2222…`.
+
+- **Mid-turn.** Input 1 at t=0.002 s; `command_lifecycle{1, queued}` 0.49,
+  `{1, started}` 0.49; input 2 written at 1.20 after the third delta;
+  `{2, queued}` 1.20; `{2, started}` 1.51 (input 1 still running); one
+  `result` at 3.98 (`success`, `queued_turn_count: 0`) whose text answers
+  input 2; then `{2, completed}`, `{1, completed}`.
+- **Interrupt.** `control_request{request_id: int-1, subtype: interrupt}`
+  after five deltas; `control_response{success, still_queued: []}` within
+  1 ms; a synthetic `user` "[Request interrupted by user]"; `result{subtype:
+  error_during_execution, is_error: true, terminal_reason:
+  aborted_streaming}`; `{1, cancelled}`; process exit 1 after stdin close.
+- **Error.** `--model no-such-model-1299`: `assistant{error:
+  model_not_found}`; `result{subtype: success, is_error: true,
+  terminal_reason: api_error, api_error_status: 404}`; exit 1; stderr
+  `[claude-code:unrecognized_model]`.
+
+### A.6 Permissions and questions
+
+Prompt: run `ls`, then `touch flk-probe.txt`, no `--allowedTools`.
+
+| Run | Path | `touch` outcome | `permission_denials` |
+|---|---|---|---|
+| P2 | `--permission-prompt-tool mcp__flkstub__approve` (an MCP tool returning `{"behavior":"deny","message":…}`) | denied with flk's message | 1 |
+| P3 | `--permission-prompt-tool stdio`, driver answers `control_response{behavior: deny}` | denied with flk's message | 1 |
+| P6 | no prompt tool | denied by the harness ("… need[s] permission") | 1 |
+| P4 | MCP `ask_user` tool | answered "blue" | — |
+| P5 | `--tools default --permission-prompt-tool stdio` | `AskUserQuestion` listed; answered via `updatedInput.answers` | — |
+| P7 | `--tools default`, no prompt tool | `AskUserQuestion` absent; `ToolSearch select:AskUserQuestion` finds nothing | — |
+
+`ls` and `cat` were never put to the prompt tool (read-only commands are
+allowed without asking).
+
+### A.7 The cache matrix
+
+Base F: three turns (Read a 300-line file; `ls` then Read, sequentially; a
+one-word reply), 19.4k tokens of context. Fork prompt "Reply with exactly:
+ok" unless noted. Input-equivalent cost = `in + 0.1 × read + 2 × write`
+(1-hour writes), in tokens.
+
+| Test | What | in | read | write | out | read % | TTFT ms | input-eq |
+|---|---|---|---|---|---|---|---|---|
+| 1 | latest (`--resume F --fork-session`) | 2 | 19,376 | 64 | 4 | 99.7 | 2,384 | 2,068 |
+| 2 | end of turn 1 (`--resume-session-at`) | 2 | 18,913 | 108 | 4 | 99.4 | 1,853 | 2,109 |
+| 3 | between the two tool calls of turn 2 | 2 | 19,053 | 135 | 117 | 99.3 | 2,949 | 2,177 |
+| 4 | base G, end of turn 1, immediately | 2 | 18,913 | 112 | 4 | 99.4 | 1,741 | 2,117 |
+| 4 | same point after 6 min | 2 | 19,025 | 0 | 4 | 100.0 | 1,421 | 1,905 |
+| 4 | same point 65 min after the 6-min read | 2 | 0 | 19,025 | 4 | 0.0 | 1,723 | 38,052 |
+| 5a | point of test 2 + an MCP server added | 2 | 18,996 | 336 | 4 | 98.3 | 1,606 | 2,574 |
+| 5b | point of test 2 + `--tools Bash` (was `Bash,Read`) | 2 | 19,021 | 0 | 4 | 100.0 | 1,172 | 1,904 |
+| 5c | 41k session forked with its MCP server removed | 2 | 41,391 | 165 | 4 | 99.6 | 1,619 | 4,471 |
+| 5d | control for 5c, server kept | 2 | 41,391 | 41 | 4 | 99.9 | 1,877 | 4,223 |
+| 5e | 5b, asked to use Read | 4 | 37,966 | 353 | 230 | 99.1 | 1,752 | 4,507 |
+| 5g | point of test 2 + MCP added, asked to call it | 4 | 38,283 | 559 | 80 | 98.6 | 1,163 | 4,950 |
+| 6 | base H, end of turn 1, 6 min later across local midnight (A.7.2) | 2 | 6,203 | 118 | 4 | 98.1 | 1,159 | 858 |
+| 7a | segment: fork at the first message after `/compact` | 2 | 5,195 | 2,266 | 4 | 69.6 | 683 | 5,054 |
+| 7b | slice of F's turn 1 (28 kB of text) as the first prompt of a fresh session | 2 | 5,195 | 13,808 | 6 | 27.3 | 1,588 | 28,138 |
+| 7c | `--resume-session-at` a preserved pre-compaction uuid | 2 | 5,195 | 2,153 | 3 | 70.7 | 1,139 | 4,828 |
+| 7d | byte-prefix copy ending before `compact_boundary`, `--resume <copy> --fork-session` | 2 | 40,845 | 170 | 3 | 99.6 | 1,149 | 4,426 |
+| 8a | 10 concurrent forks at test 3's point (each) | 2 | 19,188 | 0 | 87–129 | 100.0 | 1,428–2,984 | 1,921 |
+| 8b | 10 concurrent fresh sessions, identical new 28 kB prompt (each) | 2 | 5,195 | 13,808 | 6 | 27.3 | 1,143–2,163 | 28,138 |
+| 8c | the same prompt once more after 8b | 2 | 19,003 | 0 | 6 | 100.0 | 1,251 | 1,902 |
+
+Notes:
+
+- The 5,195-token read in 7a, 7b, 7c and 8b is the system prompt and tool
+  block shared by every session with the same flags; a fresh session G whose
+  first turn matched F's byte for byte read 24,979 and wrote 0 (cross-session
+  prefix reuse).
+- 7c's transcript holds `compact_boundary`, the summary, the preserved
+  assistant message and the new turn only: the pre-compaction messages are
+  not reachable through `--resume-session-at`.
+- 5e: the model called `Read`; the harness answered `<tool_use_error>Error:
+  No such tool available: Read. Read is disabled for this session, in
+  subagents as well as here.</tool_use_error>`.
+
+#### A.7.1 Test 4, 65 minutes
+
+Base G (a fresh session whose first turn matched F's byte for byte) was
+created at 18:31:31 and forked at the end of its turn 1 three times with
+`--resume G --resume-session-at <uuid> --fork-session`: at 18:31:39, at
+18:37:40 and at 19:42:43, 65 minutes after the second fork, the last
+request that read that prefix. The rows are in the A.7 table. The third
+fork read nothing and wrote the whole prefix again (19,025 tokens, all as
+`ephemeral_1h_input_tokens`): the 1-hour TTL holds, a read inside the hour
+renews it (the second fork read 100% six minutes after the first wrote),
+and an hour without a read is a full miss and a full 1-hour write, 38,052
+input-equivalent tokens against 1,905 for the warm read. This is the rule
+§9's cost guard applies. Recorded on #1305 on 2026-10-13.
+
+#### A.7.2 Test 6, day boundary
+
+An earlier attempt with `CLAUDE_CODE_OVERRIDE_DATE=2026-10-14` on a fork at
+test 2's point read 99.4% (18,913 / 116) but did not change the date: no
+date-change attachment appeared and the model answered 2026-10-13. The
+override did not take effect on that path, so that row proves nothing about
+a day boundary.
+
+The real run straddled local midnight (CEST), Claude Code 2.1.296, Haiku,
+profile iso, same driver and flags as A.7.1. Base H (`86b52283`) ran three
+turns at 23:56:00–23:56:13 on 2026-10-13: read `big.txt` and give its last
+line; `ls` then Read `a.txt`, sequentially; a one-word reply. Its transcript
+holds `attachment{type: date, date: 2026-10-13}` in turn 1. H was forked at
+the end of its turn 1 (`c4697d6a`) twice with `--resume H
+--resume-session-at c4697d6a --fork-session`:
+
+| When | Prompt | in | read | write | out | read % | TTFT ms | input-eq |
+|---|---|---|---|---|---|---|---|---|
+| 00:02:03, 2026-10-14 | "Reply with exactly: ok" | 2 | 6,203 | 118 | 4 | 98.1 | 1,159 | 858 |
+| 00:03:08, 2026-10-14 | "What is today's date? Reply with only YYYY-MM-DD." | 2 | 6,203 | 130 | 481 | 97.9 | 3,170 | 882 |
+
+All writes were `ephemeral_1h_input_tokens`. In both forks Claude Code
+appended `attachment{type: date, date: 2026-10-14, changed: true}`, rendered
+as a system reminder ("The date has changed. Today's date is now
+2026-10-14. …"), after the new user prompt. The original date attachment
+in turn 1 was left as it was. The prefix up to the fork point therefore
+stays byte-identical across the day boundary and is read from cache. The
+writes are only the new prompt plus the date-change reminder. This matches
+E13's expectation: a fork across a day boundary keeps its cache. It does
+not contradict §9 or A.7.
+
+Caveats:
+
+- H is smaller than F and G (about 6.3k tokens at the fork point, not
+  19k): in turn 1 the model read `big.txt` with `tail -n 1` through Bash,
+  not with Read. The 6,203 tokens read is the shared system and tool block
+  (5,195, see the A.7 notes) plus H's whole turn 1. The prefix past the
+  shared block was a hit as well, not just the system prompt.
+- The gap from base to fork was 6 minutes, inside the 1-hour TTL (A.7.1).
+  This test isolates the date change. It is not a TTL test.
+- Model behaviour, not cache: in the second fork Haiku answered
+  `2026-10-13` even though the date-change reminder was in its input, and
+  added that "nothing in this conversation supports" the change. The
+  reminder reaches the model, but Haiku did not act on it here. flk should
+  not rely on the model noticing a date change on its own.
+
+Recorded on #1305 on 2026-10-14.
+
+### A.8 Bytes
+
+Over every probe run (1,864,109 bytes of stdout JSON):
+`user` tool results 41.7%, partial deltas 28.8%, other events 11.1%,
+`system/init` 10.6% (repeated at every turn), `assistant` 7.8%.
+
+### A.9 Budget
+
+Sum over all `result.usage` objects at the time of writing: input 176,
+cache read 1,204,445, cache write 365,494, output 6,860; total 1,576,975
+tokens (76% cache reads), under the 2M ceiling the brief set.
+
+### A.10 Codex and opencode
+
+Captured with `codex exec --json --skip-git-repo-check -s read-only` (exit 0),
+`codex app-server generate-json-schema` and `generate-ts` (exit 0; 651
+definitions), `opencode run --format json` (exit 0) and `opencode serve` on a
+loopback port (`GET /doc`: OpenAPI 3.1, 162 paths; `GET /event` SSE; one
+`POST /session` and one `POST /session/{id}/message`).
+
+| Concept | Codex | opencode |
+|---|---|---|
+| session init | `thread/started{thread}` (exec: `thread.started{thread_id}`) | `session.created`, `POST /session` → `Session` |
+| text, streaming | `item/agentMessage/delta`; `item/completed{agentMessage}` | `message.part.delta`; `message.part.updated{text}` |
+| reasoning | `item/reasoning/textDelta`, `summaryTextDelta` | `ReasoningPart` |
+| tool call / result | `item/started` / `item/completed` with `commandExecution`, `fileChange`, `mcpToolCall`; `…/outputDelta` | `ToolPart{callID, tool, state: pending → running → completed / error}` |
+| turn end, usage | `turn/completed{status: completed / interrupted / failed}`; `thread/tokenUsage/updated{inputTokens, cachedInputTokens, cacheWriteInputTokens, outputTokens, reasoningOutputTokens}` | `step-finish{tokens{input, output, reasoning, cache{read, write}}, cost}`; `session.idle` |
+| errors | `error{willRetry}`, `Turn.error{codexErrorInfo}` | `session.error`, `AssistantMessage.error` (`APIError`, `ContextOverflowError`, …) |
+| approval | server request `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`; reply `{decision: accept / acceptForSession / decline / cancel}` | `permission.asked`; `POST /permission/{id}/reply{once / always / reject}` |
+| user question | `item/tool/requestUserInput{questions}`, `mcpServer/elicitation/request` | `question.asked{questions[{options, multiple, custom}]}`; `POST /question/{id}/reply` |
+| interrupt | `turn/interrupt`; `turn/steer` injects mid-turn | `POST /session/{id}/abort` |
+| resume | `thread/resume` | `run -s <id>`; persistent sessions |
+| fork | `thread/fork{lastTurnId}` (turn granularity) | `POST /session/{id}/fork{messageID}` |
+| compaction | `thread/compact/start`, `thread/compacted` | `POST /session/{id}/summarize`, `session.compacted` |
+
+Not verified live: reasoning events, approvals, questions, errors and
+interrupts on both (read from the schemas only), and any live Codex
+`app-server` session; #1309 tracks those runs.
+
+## Appendix A, continued — S0 probes (2026-10-14, #1307)
+
+Measured on 2026-10-14 against Claude Code 2.1.296 on a fleet host (macOS,
+Apple Silicon), model alias `haiku`. Drivers are committed under
+`docs/adr/0036-probes/` (`s0lib.py` is the shared stream-json driver; every
+probe below names its script; `README.md` there says how to re-run it).
+The raw captures are not committed, as in A (they hold account rate-limit
+state), so a figure below can be checked only by re-running its script.
+
+Every run removed every `FLOCK_*` and `CLAUDE_CODE_*` variable plus
+`CLAUDECODE`, `CLAUDE_PID` and `CLAUDE_EFFORT` from the child environment,
+ran in a fresh temporary working directory holding `a.txt` and `b.txt`
+(deleted afterwards), and passed `-p --input-format stream-json
+--output-format stream-json --verbose --replay-user-messages
+--include-hook-events --setting-sources local --strict-mcp-config
+--no-session-persistence --model haiku` plus the flags each section names.
+No flk server, pane or sccache server was started or reached. None of the
+original runs passed `--permission-mode`. A.13's token-path re-runs include
+controls in `auto` (no flag), followed by controls and permission shapes
+with `--permission-mode default`. The drivers now pass
+`--permission-mode default` (#1404): under the token path, with an empty
+config dir, every session started in `auto` (A.13, A.17).
+
+**Isolation caveat.** The runs recorded here set `CLAUDE_CONFIG_DIR` to the
+operator's live work profile, for its keychain login (E6). That was not
+isolated enough: each session registered `sessions/<pid>.json`, an inbox
+key and a socket under it while it ran, left empty `projects/<cwd>/memory/`
+and `session-env/<session id>/` directories, and one A.15 run wrote a plan
+file into `plans/`. All of it was removed afterwards by the session ids and
+working directories in the captures (PR #1356 lists the paths). The
+drivers have since been changed to give every session a fresh temporary
+`CLAUDE_CONFIG_DIR`, deleted on close, with the login passed in as
+`CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token`. Of the figures
+below, only A.13's re-runs were measured that way (2026-10-14); A.11,
+A.12, A.14 and A.15 have not been re-run. Nothing measured here depends on the profile: user
+settings were already dropped by `--setting-sources local`.
+
+Totals over the
+63 `result`s of 38 sessions: input 228, cache read 603,138, cache write
+149,881, output 13,667 (766,914 tokens, 79% cache reads).
+
+Code reading used `strings -n 6` over the 2.1.296 binary
+(`.claude-wrapped`, a Bun bundle); a statement marked "(code)" was read
+there and not run.
+
+### A.11 The messaging socket (E16)
+
+Script `s0_socket.py`, flags `--tools Bash,Read --allowedTools
+"Bash(printenv:*)" --permission-prompt-tool stdio`. Each variant ran one
+turn, read `system/init.messaging_socket_path`, then connected to that path
+as a plain same-uid Python process with no token and wrote three lines, one
+connection each: `{"type":"user","message":{"content":"Reply with exactly:
+SOCKET-NEXT"},"from":"s0-probe"}`, the same with `"priority":"now"`, and
+`{"type":"control","action":"rename","name":"s0-renamed"}`. Last, the agent
+ran `printenv CLAUDE_CODE_MESSAGING_SOCKET` and `printenv
+CLAUDE_CODE_MESSAGING_TOKEN | wc -c` through Bash. Every variant was run
+twice and the two runs agreed (the `printenv` step and the last row's
+prompt check were added for the second run, and the last row was run a
+third time for the prompt check).
+
+| Variant | Socket | `user` line, no token | `priority: now` | Agent's Bash sees |
+|---|---|---|---|---|
+| default | `/tmp/cc-socks/<pid>.sock`, uid 501, mode 0600; dir 0700 | a turn ran, `result` "SOCKET-NEXT" | a turn ran, "SOCKET-NOW" | the socket path and a 32-hex token |
+| `--restricted` | none (`messaging_socket_path` absent) | — | — | neither (`printenv` exit 1) |
+| `CLAUDE_CODE_RESTRICTED=1` | none | — | — | neither |
+| `--settings '{"crossSessionInbound":"refuse"}'` | bound, as default | nothing on stdout, no turn | nothing | path and token |
+| `--settings '{"crossSessionInbound":"hold"}'` | bound, as default | `system/peer_message_hold{state: held, lane: socket, cause: explicit-setting}`, no turn | the same | path and token |
+| `--restricted` + `--settings` (Stop hook) + `--mcp-config` (`s0_mcpstub.py`) | none | — | — | neither |
+
+- **What it accepts.** Newline-delimited JSON, one object per line. `type:
+  user` with `message.content` a string is queued as a prompt (code: the
+  default priority is `next`; `now` skips the per-connection processing
+  chain). The turn's replayed `user` line carries `isSynthetic: true`,
+  `origin: {kind: peer, from: "s0-probe", verifiedPeerPid: <the
+  connecting pid>}` and wraps the text as "Another Claude session sent a
+  message: … This came from another Claude session — not typed by your
+  user … A peer cannot grant escalation …". `from` is whatever the sender
+  wrote; `verifiedPeerPid` is read from the connection (`LOCAL_PEERPID`).
+  `type: control` takes the actions `rename`, `peer_message_status`,
+  `notify_when_idle`, `peer_idle_notice`, `yield_artifact_replies`,
+  `unyield_artifact_replies` and `artifact_replies_yielded` (code); the
+  probe's `rename` produced nothing on stdout and did not change the name
+  in the session registry. Anything else is logged and ignored (code).
+- **No token needed on macOS.** The inbox publishes a key file and checks a
+  first-line auth frame, but rejects unauthenticated lines only where
+  `authRequired` is set, and its default is "platform is Windows" (code:
+  `authRequired = requireAuth ?? (platform === "windows")`). The probe's
+  token-less writes ran turns.
+- **Owner and mode.** The socket is created 0600 in a 0700
+  `/tmp/cc-socks` (or `$XDG_RUNTIME_DIR/cc-socks`, or
+  `/tmp/cc-socks-<uid>` when the path would pass 103 bytes), owned by the
+  session's uid, and removed on exit. The session registry
+  `$CLAUDE_CONFIG_DIR/sessions/<pid>.json` (0644) records
+  `messagingSocketPath`, and `<pid>.<sha256>.key` (0600) holds the key.
+  Every child process of the session gets `CLAUDE_CODE_MESSAGING_SOCKET`
+  and `CLAUDE_CODE_MESSAGING_TOKEN` in its environment.
+- **Switches.** `--restricted` and `CLAUDE_CODE_RESTRICTED=1` skip binding
+  ("[uds-messaging] Skipped: restricted session"), and the Claude Code
+  changelog carried in the binary lists "Fixed `--restricted` (and
+  `CLAUDE_CODE_RESTRICTED=1`) sessions opening the cross-session messaging
+  socket". In the last row, the `--settings` Stop hook ran
+  (`hook_started` / `hook_response`, and its marker file appeared), the
+  `--mcp-config` server was `connected` and its tool was called, and a
+  `touch` still arrived as `can_use_tool` over `--permission-prompt-tool
+  stdio` (A.12 to A.15 themselves ran without `--restricted`). Other effects of
+  restricted mode that the code shows: no user settings are read, auto
+  memory is off, cloud sessions and teleport are refused, Claude in Chrome
+  does not connect. `tools`, `slash_commands` (55) and `capabilities` in
+  `system/init` were the same as the default run.
+  `crossSessionInbound` (`accept | hold | refuse`, read from policy, flag
+  and user settings, so `--settings` sets it) leaves the socket bound:
+  `refuse` drops silently, `hold` reports `peer_message_hold` and, at exit,
+  `state: dropped, outcome: discarded`.
+
+### A.12 The deferral carrier: `deny` versus `allow` (§2a)
+
+Script `s0_carrier.py`, flags `--tools Bash,Read,AskUserQuestion
+--permission-prompt-tool stdio`. Prompt: two independent tasks, "use the
+AskUserQuestion tool to ask me which colour I prefer for the report, red
+or blue", then "run `ls` … and count the files", finishing with one line
+per task. The driver answered the AskUserQuestion `can_use_tool` with the
+§2a text `q-6854666e9377 submitted for user feedback - the response will be
+relayed to you` (the id computed as §2a specifies over agent `s0-probe`,
+the prompt, the option labels and `multi_select`), carried as
+`{behavior: deny, message: <text>}` or as `{behavior: allow,
+updatedInput: {…input, answers: {<question>: <text>}}}`. A second turn then
+sent the §2a reply `Answer to q-6854666e9377: blue`. Four runs per carrier.
+
+| | `deny` (4 runs) | `allow` (4 runs) |
+|---|---|---|
+| tool result the model saw | `is_error: true`, content exactly the text | `is_error: false`, `The user answered: "Which colour do you prefer for the report: red or blue?"="q-6854666e9377 submitted for user feedback - the response will be relayed to you". Read the answers carefully — they may request clarification, changes, or that you not proceed — and follow what they actually say.` |
+| went on to run `ls` in the same turn | 4/4 | 4/4 |
+| re-asked, or any later control request | 0/4 | 0/4 |
+| turn end | one `result`, `success`, `end_turn`, `num_turns` 3 (one run 4) | one `result`, `success`, `end_turn`, `num_turns` 3 |
+| `result.permission_denials` | 1 entry: `AskUserQuestion` with its `tool_use_id` and input | empty |
+| `system/permission_denied` event | none | none |
+| final text on task A | "no answer has come back yet … submitted for your feedback" (4/4) | "returned a submission receipt / ID, not red or blue" (4/4) |
+| reply turn used "blue" | 4/4 | 4/4 |
+
+Both carriers keep the model working, so by §2a's rule S6b uses `deny`. Its
+tool result is the deferral text byte for byte; `allow`'s is the harness's
+"The user answered" frame around it.
+
+### A.13 Parallel control requests and an ask while a permission is open (§2b)
+
+Script `s0_parallel.py`, flags `--tools Bash,Read,AskUserQuestion
+--permission-prompt-tool stdio` (no `--allowedTools`, so `touch` prompts).
+The prompt asked for two tool calls in one response, in a given order. The
+driver left the first `can_use_tool` open for 10 s, then answered it
+(`deny` for Bash, `allow` with answers for AskUserQuestion). Every run
+produced both `tool_use` blocks in one API message (same `message.id`),
+complete within 0.37 s of each other. Two runs per shape.
+
+| Shape (order in the message) | First `can_use_tool` | Second, while the first was open | Second after the first was answered |
+|---|---|---|---|
+| `touch`, then AskUserQuestion | Bash | never in 10 s | AskUserQuestion, 5–6 ms after the answer |
+| AskUserQuestion, then `touch` | AskUserQuestion | never in 10 s | Bash, 12–16 ms after |
+| `touch`, `touch` | Bash | never in 10 s | Bash, 7–8 ms after |
+| `touch`, then a pre-allowed MCP tool (`s0_mcpstub.py` `echo`, in `--allowedTools`) | Bash | — (no prompt); its result arrived 5 ms after the Bash answer, not before | — |
+| the MCP tool, then `touch` | Bash, after the MCP result (0.34–0.36 s) | — | — |
+
+What this shows: in a message of non-concurrency-safe calls (Bash
+`touch`, AskUserQuestion, and an MCP tool without a read-only hint), only
+one `can_use_tool` was ever open, and no call later in the message ran,
+prompting or not, until the open one was answered. A pre-allowed MCP call
+ordered before the prompting one ran first.
+
+**Re-run on the token path, 2026-10-14.** Every shape below ran on the
+token path of the S0 preamble (a fresh `CLAUDE_CONFIG_DIR` per session,
+the login passed as `CLAUDE_CODE_OAUTH_TOKEN` from `S0_OAUTH_TOKEN_FILE`),
+Claude Code 2.1.296 (from each capture's `system/init`), model `haiku`,
+two runs each. All runs exited 0 and no token appeared in the output.
+Times are seconds from session start.
+
+*Controls, no permission open.* `s0_parallel.py 2 10 sleep_then_mcp
+slowtouch_then_mcp`. Both shapes put the same pre-allowed MCP call behind a
+pre-allowed Bash call: `sleep 5` (in `--allowedTools` as `Bash(sleep:*)`),
+and `sleep 5 && touch` (also `Bash(touch:*)`), which writes and so is not
+concurrency-safe even if `sleep` alone were classed read-only. No
+`can_use_tool` was sent. They ran twice: first with no `--permission-mode`,
+when `system/init.permissionMode` was `auto` (A.17, #1406; #1307, comment
+6165573342), then with `--permission-mode default`. Both calls were in one
+API message in every run. `tool_use` → `tool_result`:
+
+| Control | Mode | Run | Bash | MCP `echo` |
+|---|---|---|---|---|
+| `sleep 5`, then MCP | `auto` | 1 | 2.62 → 8.42 | 2.70 → 8.43 |
+| `sleep 5`, then MCP | `auto` | 2 | 1.91 → 7.21 | 1.99 → 7.21 |
+| `sleep 5 && touch`, then MCP | `auto` | 1 | 2.25 → 7.55 | 2.35 → 7.56 |
+| `sleep 5 && touch`, then MCP | `auto` | 2 | 2.11 → 7.41 | 2.21 → 7.42 |
+| `sleep 5`, then MCP | `default` | 1 | 1.980 → 7.256 | 2.077 → 7.260 |
+| `sleep 5`, then MCP | `default` | 2 | 2.187 → 7.461 | 2.284 → 7.465 |
+| `sleep 5 && touch`, then MCP | `default` | 1 | 2.469 → 7.739 | 2.481 → 7.743 |
+| `sleep 5 && touch`, then MCP | `default` | 2 | 2.794 → 8.057 | 2.806 → 8.061 |
+
+In all eight runs the MCP result came only after the slow Bash result, 4 to
+5 ms behind it: with no permission open, a later call waits for an unfinished
+non-concurrency-safe call before it.
+
+*The shapes of the first table, in `default`.* `s0_parallel.py 2 10
+touch_then_ask ask_then_touch touch_then_mcp mcp_then_touch touch_touch`.
+The first `can_use_tool` was held open for 10 s, except in `mcp_then_touch`,
+where it was answered at once.
+
+| Shape | Run | First `can_use_tool` | While it was open | Answered | Next, after the answer |
+|---|---|---|---|---|---|
+| `touch`, then AskUserQuestion | 1 | Bash, 1.919 | nothing | 11.929 | AskUserQuestion prompt, 4 ms |
+| `touch`, then AskUserQuestion | 2 | Bash, 2.104 | nothing | 12.113 | AskUserQuestion prompt, 4 ms |
+| AskUserQuestion, then `touch` | 1 | AskUserQuestion, 2.302 | nothing | 12.310 | Bash prompt, 16 ms |
+| AskUserQuestion, then `touch` | 2 | AskUserQuestion, 2.348 | nothing | 12.358 | Bash prompt, 12 ms |
+| `touch`, then MCP | 1 | Bash, 3.017 | no MCP result | 13.018 | MCP result, 9 ms |
+| `touch`, then MCP | 2 | Bash, 3.449 | no MCP result | 13.520 | MCP result, 11 ms |
+| `touch`, `touch` | 1 | Bash, 2.680 | nothing | 12.687 | Bash prompt, 7 ms |
+| `touch`, `touch` | 2 | Bash, 2.047 | nothing | 12.057 | Bash prompt, 8 ms |
+| MCP, then `touch` | 1 | Bash, 2.381, after the MCP result at 2.082 | — | 2.381 | — |
+| MCP, then `touch` | 2 | Bash, 2.679, after the MCP result at 2.517 | — | 2.679 | — |
+
+This repeats the first table under the token path: one `can_use_tool` at a
+time, nothing later in the message before the answer, and a pre-allowed call
+ordered first ran first.
+
+*A concurrency-safe call behind an open permission.* `s0_parallel.py 2 10
+read_behind_permission` asks for a Bash `touch` (which prompts) and then a
+`Read` of `a.txt` (which does not prompt in `default`) in one message, and
+holds the `touch` permission open for 10 s.
+
+| Run | One message | Bash `can_use_tool` | `Read` `tool_use` | Other prompts while open | Answered (`deny`) | Bash result | `Read` result |
+|---|---|---|---|---|---|---|---|
+| 1 | yes | 2.230 | 2.470 | none | 12.480 | 12.484 | 12.492 |
+| 2 | yes | 2.438 | 2.792 | none | 12.793 | 12.797 | 12.804 |
+
+The `Read` result did not arrive while the permission was open in either run
+(`read_result_before_permission_answered: false`). It came 7 to 8 ms after
+the Bash result. A first attempt, with no `--permission-mode`, started in
+`auto`. Its `touch` raised no `can_use_tool`, so it did not test this case
+(A.17).
+
+**Reading.** Nothing in a message ran past an open permission. That held
+for a prompting call, an AskUserQuestion, a pre-allowed MCP call without a
+read-only hint and a concurrency-safe `Read`. Only one `can_use_tool` was
+ever open, and a call ordered before the prompting one ran first. Finding
+3's caveat that one open request "may hold only for non-concurrent calls"
+is resolved in the strong direction: an open permission held a
+concurrency-safe call behind it too. Separately, the controls show that an
+unfinished non-concurrency-safe call holds later calls with no permission
+open. Not separated: whether the `Read` waited on the permission itself or
+on the earlier Bash call in message order. A `Read` behind a slow,
+pre-allowed Bash with no permission open was not probed. Also not probed:
+an MCP tool with `readOnlyHint` in that position, and a concurrency-safe
+call ordered before the prompting one.
+
+### A.14 The harness's own queue in `-p` (§3)
+
+Script `s0_queue.py`, flags `--tools Bash --allowedTools "Bash(sleep:*)"
+--permission-prompt-tool stdio`. Input M1 "Run `sleep 8` with Bash, then
+reply with exactly: DONE-1" (flk-chosen uuid); one second after the
+`sleep` tool call, input M2 "Reply with exactly: M2-ANSWERED" (flk-chosen
+uuid), then the control request of each row. Times are seconds from start.
+The verbs come from the `-p` control loop in the binary (`print.ts`
+handles `interrupt`, `cancel_async_message`, `set_permission_mode`, …).
+
+| Scenario | Control request | Response | Lifecycle and outcome |
+|---|---|---|---|
+| plain | none | — | M2 `queued` 3.82; the sleep ends 11.07; M2 `started` 11.07; one `result` 12.92, text "M2-ANSWERED" (M1's "DONE-1" is never written); M2 then M1 `completed` |
+| takeback | `cancel_async_message{message_uuid: M2}` while M2 is `queued` | `{cancelled: true}` within 1 ms | M2 `cancelled` at once; the sleep runs to its end; one `result` "DONE-1" |
+| takeback_late | the same, after M2 reported `started` | `{cancelled: false}` | M2 runs; `result` "M2-ANSWERED" |
+| cancel_queued | `interrupt{cancel_queued: true}` | `{still_queued: [], cancelled: [M2]}` in 2 ms | M2 `cancelled`; the running sleep is rejected ("The user doesn't want to proceed with this tool use …"); `result{error_during_execution, terminal_reason: aborted_tools}`; M1 `cancelled` |
+| send_now | `interrupt{send_now: true, message_uuid: M2}` | `{still_queued: [M2], send_now: "stopped"}` in 1 ms | the sleep is rejected 1 s into its 8; `result{error_during_execution, aborted_tools}`; M1 `cancelled`; M2 `started` at once; a second `result` "M2-ANSWERED" 0.8 s later |
+| edit | `edit_queued_message{message_uuid, message}` (no such verb) | `{subtype: error, error: "Unsupported control request subtype: edit_queued_message"}` | M2 runs unchanged |
+
+- **Take-back** exists: `cancel_async_message` withdraws a `queued` input
+  and reports `command_lifecycle{cancelled}`; once the input has
+  `started` it answers `cancelled: false` and does nothing.
+- **Edit** does not exist. No control subtype in the binary edits a queued
+  input (the subtype list read by `strings` has none), and an unknown
+  subtype is answered with an `error` response naming it.
+- **Send-now is an interrupt.** `send_now` stops the running turn,
+  including a tool that is mid-run, cancels the turn's input, and starts
+  the named queued input as a new turn. Its `send_now` field is `stopped`,
+  `delivering` (the input is already going) or `nothing_waiting` (code).
+  It does not fold the input into the running turn: a plain write does
+  that (E4), but only at the next model step, so during a long tool the
+  write waits for the tool (row "plain": 7.25 s).
+- An interrupt during a tool ends `terminal_reason: aborted_tools`
+  (A.5's, during streaming, was `aborted_streaming`).
+
+### A.15 `set_permission_mode` over stdio (§10b, P25)
+
+Script `s0_permmode.py`, flags `--tools Bash,Write --allowedTools
+"Bash(sleep:*)" --permission-prompt-tool stdio`, started in `default`. Each
+step asked for one `Write` of a new file; every `can_use_tool` was denied.
+Run twice; the runs agreed.
+
+| Step | Request | Response | That turn's `system/init.permissionMode` | Write prompted | File written |
+|---|---|---|---|---|---|
+| 1 | — | — | `default` | yes | no |
+| 2 | `set_permission_mode{mode: acceptEdits}` at idle | `{mode: acceptEdits}` | `acceptEdits` | no | yes |
+| 3 | `{mode: default}` at idle | `{mode: default}` | `default` | yes | no |
+| 4 | `{mode: acceptEdits}` during the turn's `sleep 4`, before its Write | `{mode: acceptEdits}` | `default` (emitted at turn start) | no | yes |
+| 5a | `{mode: bypassPermissions}` at idle | `error: "Cannot set permission mode to bypassPermissions because the session was not launched with --dangerously-skip-permissions"`, `error_code: bypass_not_launched` | — | — | — |
+| 5b | `{mode: plan}` at idle | `{mode: plan}` | — | — | — |
+| 5c | `{mode: bogus}` at idle | `error: "Cannot set permission mode: must be one of acceptEdits, auto, bypassPermissions, default, dontAsk, plan"`, `error_code: invalid_mode` | — | — | — |
+| 6 | none; the turn is "Reply with exactly: ok" (second run) | — | `plan` | — | — |
+
+The switch is in place and immediate: no respawn, and a switch during a
+turn applies to that turn's next tool call. Step 6 shows `plan` stuck and
+the refused requests left it unchanged. In the first run step 6 was a
+Write, and in `plan` mode that wrote a plan file into
+`$CLAUDE_CONFIG_DIR/plans/` (the probe created that directory; it was
+removed). The second run's step 6 only reads the mode.
+
+### A.16 `claude /login` for a macOS user with no GUI session (owner decision 1)
+
+Run by the operator on 2026-10-14 (#1307, comments 6165592953 and
+6165606960), as a throwaway non-admin macOS user, `s0probe` (uid 502),
+entered with `sudo -iu`: a shell with no GUI login session. Claude Code
+2.1.287. The runbook is `s0_login_flk_agent.sh`: it records the user's
+keychain state, runs `claude auth login` with
+`CLAUDE_CONFIG_DIR=$HOME/.flk/claude/s0-login`, checks where the token
+landed without printing it, and runs one `-p` turn.
+
+| Check | Result |
+|---|---|
+| `gui/<uid>` launchd domain | absent |
+| default keychain | none (`SecKeychainCopyDomainDefault user: A default keychain could not be found`) |
+| `claude auth login` | the browser step completed, then `Login failed: Couldn't save your login. If your Mac's keychain is locked, unlock it and log in again.`, exit 1 |
+| keychain item `Claude Code-credentials-<8 hex>` | not found (`security` exit 44) |
+| `.credentials.json` in the config dir | not written |
+| `claude auth status` | `loggedIn: false` |
+| the `-p` turn | exit 1 |
+
+The plaintext fallback read from the 2.1.296 code (below) did not happen on
+2.1.287 when the user has no keychain at all. So `/login` cannot persist a
+login for a user with no GUI session on that version.
+
+**The token path, same user and shell.** A `claude setup-token` token was
+installed as a 0600 file in the user's home. `CLAUDE_CODE_OAUTH_TOKEN=<the
+file's content> CLAUDE_CONFIG_DIR=<a fresh temp dir> claude -p --model haiku
+--no-session-persistence 'Reply with exactly: ok'` printed `ok` and exited
+0. The setup-token path works for a user with no GUI session and no
+keychain. Not reported: the repeat from a new shell and after a reboot
+that the runbook asks for.
+
+What the code shows (code, not run): the OAuth blob is written with
+`security add-generic-password -U -a "$USER" -s "Claude
+Code-credentials-<first 8 hex of sha256(CLAUDE_CONFIG_DIR)>"` (the formula
+was checked against the work profile's existing item) into the user's
+default keychain. If that write fails and the failure is not "locked"
+(`security` exit 36) for an item the keychain already holds, the token is
+written to `.credentials.json` in the config dir instead (telemetry
+`plaintext_fallback_used`). That reading is of 2.1.296; the run above, on
+2.1.287 with no default keychain, did not reach it. 2.1.296 was not run as
+that user.
+
+### Open S0 items
+
+None. S0 completed on 2026-10-14 (#1404). The A.13 controls, the A.13 shapes
+on the token path and the concurrency-safe call behind an open permission
+are recorded in A.13. A.16 (`/login` cannot persist a login for a user with
+no GUI session, and the token path works) is recorded in A.16, and owner
+decision 1 is narrowed. The launch profile's permission mode is a design
+question for S3, #1406.
+
+### A.17 Gotchas met while probing
+
+- `--no-session-persistence` keeps the transcript out of the profile but
+  still creates `projects/<cwd>/memory/` and `session-env/<session id>/`
+  (both empty here). In these runs that was 33 and 23 directories in the
+  operator's profile, removed by matching the captured session ids and
+  working directories (see the isolation caveat above). Each running
+  session also writes `sessions/<pid>.json` and a key file there (A.11).
+  These are observations from the profile directory, not from a capture.
+- A permission prompt answered `deny` with a message is not a
+  `system/permission_denied` event: in A.12 to A.15 none was emitted for
+  any stdio deny; only `result.permission_denials` records it. This rests
+  on the uncommitted captures of `s0_carrier.py`, `s0_parallel.py` and
+  `s0_permmode.py`; re-running them reproduces it.
+
+- **Without `--permission-mode`, the startup mode is not set by the
+  flags.** With the same flags, the A.15 runs in the operator's profile
+  started in `default`, while every token-path session with an empty
+  config dir (the four A.13 controls and the two first
+  `read_behind_permission` runs, 2.1.296) started in `auto`. There, a Bash
+  `touch` with no allow rule ran with no `can_use_tool` and no
+  `permission_denials`. In the code, the startup mode with no CLI mode is
+  resolved from settings `defaultMode`, a proactivity level and the
+  auto-mode gate `tengu_auto_mode_config` (code). Which of them picked
+  `auto` here was not determined. The drivers now pass `--permission-mode
+  default`. §1's launch command passes no `--permission-mode` either, and
+  presets (§10b), which carry one, come only with S19, so an S3 session's
+  startup mode would depend on this default. That is a design question,
+  filed as #1406, and not decided here.
+
+### S0 findings for the architect
+
+Each item names the body section whose assumption it changes. This list
+records S0's findings and the completed follow-ups; the body was amended
+from them on 2026-10-14 (#1324, #1404), and each item ends with where.
+
+1. **§1 "No second input door", E16, "Failure modes" (the socket).** The
+   socket accepts unauthenticated `user` lines from any process of the
+   session's uid on macOS and runs them as turns (A.11), and the agent's own
+   Bash children are handed its path and token. Under §1a every structured
+   agent runs as `flk-agent`, so without a switch any structured agent
+   could start turns in any other one, past the queue. A supported switch
+   exists: `--restricted` (or `CLAUDE_CODE_RESTRICTED=1`) binds no socket
+   and sets neither variable, while `--settings` hooks, `--mcp-config`
+   servers and the stdio prompt keep working. The launch profile can pass
+   `--restricted`, and the "known limit" in "Failure modes" falls away.
+   Restricted mode also turns off auto memory, reads no user settings and
+   refuses cloud sessions (A.11), which fits §1's isolation, but S3 should
+   diff its `system/init` against the unrestricted profile once more.
+   *Applied in §1 (launch profile, isolation, "No second input door"),
+   E16, "Failure modes" and the S3 row; noted under owner decision 5.*
+2. **§2a placeholder result, §2 table.** Both carriers keep the model
+   working (8/8), so S6b uses `deny`. The §2 carve-out applies to
+   `result.permission_denials` only: no `system/permission_denied` event
+   is emitted for a deny flk sends over stdio (A.12, A.17), so the §2 row
+   "`system/permission_denied`, `result.permission_denials` →
+   `agent.permission_denied`" gets every stdio deny from flk's own answer,
+   not from that event. `allow` is framed by the harness as "The user
+   answered: …", which §2a's "the model cannot mistake it for the user's
+   answer" argued against.
+   *Applied in the §2 table, §2a "The placeholder result" and the S6b
+   row; noted under owner decision 3a.*
+3. **§2b case 1, owner decision 3 (asking while a permission is open).**
+   An `AskUserQuestion` later in the same message as a prompting call did
+   not arrive while the permission was open, as §2b allowed for. Neither
+   did the result of a pre-allowed MCP tool (no read-only hint) ordered
+   after it (A.13), so the stated way out, `flock_question_ask`, did not
+   escape the block within that message. Only a call ordered before the
+   prompting one ran. The completed A.13 controls show that a slow
+   non-concurrency-safe call held a later call with no permission open;
+   an open permission also held a concurrency-safe `Read` behind it.
+   The latter run did not separate waiting on the permission from waiting
+   on the earlier Bash call in message order. §2b's advice is therefore
+   "ask before, or in a message apart from, a call that may prompt". Only
+   one open control request per session was observed in the probed shapes.
+   *Applied in §1 "Stall and waiting" (open requests tracked by id), §2b
+   case 1 and "Failure modes"; noted under owner decisions 3 and 3a.
+   The completed controls and `Read` run (2026-10-14, #1404) are reflected
+   in §1, §2b and decision 3's note.*
+4. **§3 "The harness's own queue", S5c, owner decision 4.** Take-back
+   exists (`cancel_async_message{message_uuid}`, `queued` only), so
+   `queue.take_back` can wrap it. Edit does not exist, so flk's queue is the
+   only edit surface. The harness's send-now (`interrupt{send_now: true,
+   message_uuid}`) is an interrupt that kills the running tool and starts
+   the item as a new turn: it matches §3's `delivery: interrupt`, not
+   `steer`, and cannot "save a model step" without costing the running
+   turn. `steer` stays a plain write, which folds only at the next model
+   step (it waits out a running tool, A.14 "plain"). In that row the
+   folded item also displaced M1's requested final reply, so a steered item
+   can change what the running turn answers. `interrupt{cancel_queued:
+   true}` cancels the harness's queued inputs and also interrupts the
+   running turn.
+   *Applied in §3 (the `steer` and `interrupt` delivery mechanics,
+   `queue.take_back`, "The harness's own queue"), "Failure modes" and the
+   S5c row; noted under owner decision 4, which is unchanged: "send now"
+   still sets `steer`, and the harness's send-now serves
+   `send_now { interrupt: true }`.*
+5. **§10b, S19 (permission presets).** `set_permission_mode` works over
+   stdio in `-p`, in place, at once, and mid-turn (A.15), so the mode
+   part of a preset switch is `mechanism: in_place` for every mode except
+   `bypassPermissions`, which is refused unless the session was launched
+   with `--dangerously-skip-permissions`; a preset that ranks it needs a
+   reload with that flag. Valid modes are `acceptEdits`, `auto`,
+   `bypassPermissions`, `default`, `dontAsk`, `plan`. A switch to `plan`
+   writes plan files into the agent's config dir.
+   *Applied in §10b (with the modes and directions S0 did not probe), P25
+   and the S19 row; noted under owner decision 15.*
+6. **Owner decision 1, §1 (login as `flk-agent`).** The completed A.16 run
+   on 2.1.287, as a user without a GUI session or keychain, found that
+   `/login` failed and wrote no plaintext `.credentials.json`. The
+   `setup-token` path worked with a 0600 token file and a fresh config dir.
+   This supersedes the earlier plaintext-fallback hypothesis from reading
+   the 2.1.296 code; that version was not run as the user (A.16).
+   *The owner narrowed decision 1 to `setup-token` for agent users
+   (2026-10-14, #1404); applied in §1 and the S3 row.*
+7. **§9 capability probe.** An unsupported control subtype is answered at
+   once with `error: "Unsupported control request subtype: <name>"`
+   (A.14), so a capability probe can test a control verb such as
+   `cancel_async_message` with a harmless request instead of a dry
+   resume.
+   *Not applied: §9's probe is unchanged; this is an option for S12 to
+   weigh when it builds that probe.*
+
+
+### Amendment: Uncertain spawn records
+
+Owner decision, 2026-10-15 (#1461 review round 2): persist `uncertain=true`
+before spawn, then capture and persist the child's birth identity immediately
+when the owning supervisor receives the child, before enumerating descendants.
+A failed identity capture is explicit; an authoritative wait on our own child
+records its reaped status, including an immediate exit. Unknown descendants
+still prevent automatic cleanup.
+
+If a dead supervisor left no persisted child birth identity, quarantine the
+record with its first timestamp and reason. A sweep reports that directory as
+a distinct outcome, never signals a process or deletes the directory, and never
+retries its recovery. Later sweeps report the stored quarantine unchanged.
+Malformed or unsafe entries are retained and reported individually; they cannot
+prevent recovery of other eligible sessions. A namespace-level containment
+failure still refuses the whole scan.
+
+Operator cleanup is explicit: inspect the retained directory and associated
+processes, establish that none still uses it, then remove the directory by hand.
+No automatic PID-only reaping and no cleanup CLI is introduced in this slice;
+operator tooling is a follow-up owned by the architect.
+
+### Amendment: Atomic structured admission (#1843 part 2a)
+
+The Workers owner is the single admission authority for structured launches. It
+checks limits and reserves a pending slot keyed by agent id in one owner
+operation before starting a producer. Counts combine live leases with pending
+slots, deduplicated by agent id. Agent-started launches count toward capacity
+and parent fanout; the attested operator exemption is unchanged. Admission reads
+the published lease copy nonblockingly, falling back to the live copy. If both
+copies are busy, `session_busy` is a typed retryable refusal. Neither path waits
+on the App thread or changes caller identity.
+
+A pending slot ends on lease acquisition or launch failure, never on elapsed
+time alone. Pending metadata grants neither caller identity nor signaling
+rights. Preparation remains off-thread and bounded by its owner. Part 2b adds
+the production CLI/socket caller and its loaded session policy; public client
+and server start remain gated until part 3 completes narrowed MCP admission.
+
+### Amendment: Shared structured CLI/socket launch (#1843 part 2b)
+
+The local `agent.start` contract adds the closed selector `runtime` (`pty` by
+absence, `structured` by explicit request) and the optional structured `model`.
+The CLI and socket share App admission and the Workers owner's atomic pending
+reservation. The listener supplies the immutable MCP endpoint. Relative listener
+paths are resolved to absolute paths once at listener bind time. Endpoint
+resolution is optional at server startup: failure emits a typed
+`structured_endpoint_restart_required` warning with fixed reason `exe` or
+`socket`, without private resolution details, and a structured start refuses
+with that code before registering metadata or reserving capacity. Endpoint
+recovery takes effect on the next listener initialization. Ordinary server
+startup and PTY routes remain available. The caller cannot supply a binary, MCP
+endpoint, credential or harness flags: the only accepted structured argv is
+`claude`. `cwd` must resolve to an existing absolute directory. A resumed
+identity keeps its native session, cwd and model; launch overrides on resume are
+refused. Structured launches create no pane placement. Pane-only placement,
+focus, dry-run and readiness options are refused rather than ignored. Unknown
+restored ownership remains fenced before any start.
+
+Default `run_as = "flk-agent"` refuses until the dedicated-user launcher exists.
+Operator execution requires the explicit `run_as = "operator"` opt-in and
+retains #1177's cooperative same-UID limitation. Preparation and bounded version
+verification run off the owner thread; startup/cleanup facts remain asynchronous
+worker observations. The first production Workers caller forwards the loaded
+`sessions` storage policy and `stall_ms` together, without substituting
+defaults.
+
+Both production start gates stay closed until part 3 supplies narrowed MCP
+admission and capability negotiation: a client must not send this selector to an
+older server that might silently ignore it and launch a PTY. Existing PTY
+`AgentInfo` fields and the `agents` list are unchanged. Structured read/control
+continues to use the additive `structured_agents` and `StructuredAgentInfo`
+contracts. Refusals use registered error codes and their retry/exit mappings.
+
+Endpoint provisioning failures require operator recovery: correct executable or
+socket resolution, then restart or hand off the listener. The registered
+`structured_endpoint_restart_required` refusal has retry `after_human`, exit 1.
+Ordinary routes remain available. Repeating start alone cannot repair it.
+
+### Amendment: Public structured routing (#1843 part 3)
+
+The public CLI/socket gate opens with narrowed MCP admission. Servers advertise
+`structured_agents`; CLI and MCP refuse absent or malformed capability evidence
+before transmitting a structured selector, avoiding a legacy PTY launch.
+`agent.spawn` adds default-PTY `runtime` and optional structured `model`. MCP's
+`flock_agent_start` continues to build only that narrowed verb, never raw
+`agent.start`. Structured Claude resolves a tracked checkout, validates and
+nonce-frames the opening prompt (ADR-0014 §4). There is no prompt in launch argv.
+
+The MCP opening turn follows the single queue owner (ADR-0036 §3/S5, #1955).
+Before Ready, the launch worker commits one lifecycle-UUID item with
+`Producer::Agent` bound to the server-attested starter and `Kind::Message`.
+Its validated `SpawnPrompt` nonce frame is preserved byte for byte inside the
+queue's message frame. It never uses direct stdin or command admission.
+CLI starts enqueue no opening turn. Refused admission reports the queue's typed
+refusal code, or `agent_start_failed` for other launch failures, and publishes
+no Ready runtime or partial harness process.
+Until stdin accepts that item, the owner retains a settlement guard. Startup
+failure terminally fails it with `agent_start_failed` through the existing queue
+Fail record. Its internal `opening_turn` metadata also fences an unresolved
+queued opening on reopen: settlement must commit before that generation may
+serve input. Failed settlement is logged with its typed code; reopening attempts
+the terminal write before delivery rather than replaying an old opening prompt.
+After accepted input, ordinary result and unresolved-turn recovery apply.
+A failed stdin offer requests supervisor stop even if transport cancellation has
+not yet happened (ADR-0036 §3/§4); busy and uncertain-turn pending remain waits.
+
+Both routes share App admission and the Workers owner reservation from parts
+2a/2b. MCP uses Spawn policy, including explicit node opt-in and attested caller
+identity. Lineage, depth, fanout, capacity and pending accounting remain intact.
+An unattested MCP caller never receives the operator exemption. #1734's scoped
+credential remains only in generated private MCP configuration and immutable MCP
+client context, never the model environment. Verification and revocation at
+effect admission apply equally to these newly public verbs.
+
+MCP mirrors the additive `structured_agents` list and typed get result, with no
+invented placement. `flock_agent_stop` wraps typed stop; authority remains the
+operator and the structured agent itself, never its lineage parent. Public start
+never accepts caller-selected binaries, harness flags or MCP endpoints. Unknown
+restored ownership remains fenced, and default agent-user execution still
+refuses until #1208. The operator-mode #1177 cooperative limitation and #1629
+detachment limitation remain explicit. Permission decisions and question routing
+remain S6 (#1307); explicit structured question policies are refused. Pane-only
+read/control operations retain registered `runtime_unsupported` (retry `never`,
+exit 2). PTY fields/contracts and mesh VERSION 5 are unchanged.
+
+The executable dogfood is `tests/probes/structured_public.py`, documented in
+`tests/probes/structured-public.md` and run by nextest's `structured_public`
+integration binary. It owns a separate server and HOME, fake Claude and real
+scoped MCP child, readiness pipes and finite failure ceilings. No live server,
+profile, model, sleeps or retry loops participate.
+
+The current live-reload whitelist does not apply `[structured]` or `[fleet]`
+changes (#2043); use a fresh server after changing launch/admission policy.
+`[sessions]` live-reload semantics remain tracked by #1975. The dogfood isolates
+its policy cases in fresh servers rather than assuming a successful reload
+report changed these startup values.
+
+### Amendment: S5 reserved queue kinds (#2364)
+
+`finding`, `delegate_result` and `reload_notice` are reserved known queue kinds,
+not currently enabled producers. Keep their typed serialized names and lossless
+round trips so retained data and future clients can be inspected today:
+
+| Kind | Future producer | Tracker |
+| --- | --- | --- |
+| `finding` | S13 fork-return channel into the parent's queue | #2365 |
+| `delegate_result` | Server-owned structured delegate completion and receipt | #2419 |
+| `reload_notice` | S11 structured reload lifecycle and init-difference notice | #2420 |
+
+Until those producers exist, shared admission refuses every reserved kind from
+every principal/producer and gate with registered `queue_kind_reserved` (retry
+`never`, CLI exit 2). No journal append, cursor advance or queue mutation occurs.
+There is no operator override. Enabling one requires its producer slice and
+explicit authenticated admission policy; merely sending the enum name is not
+permission to create it.
+
+Retained reserved records remain readable and round-trip with their known kind;
+loading never deletes or reinterprets them. Edits cannot release them for delivery.
+Formation durably fails a queued reserved head with the same typed reason while
+preserving its payload, rather than sending it or wedging later supported work.
+Unknown future kinds retain the existing ADR-0028 §3a behavior. The session
+transcript's raw JSON fallback preserves exported queue records and items, but
+there is no queue GUI renderer or transport yet. Its fallback test is not
+queue-kind-specific GUI coverage. This reservation adds no producer, queue
+command or live GUI transport.
+
+
+### Amendment: S5 unresolved reserved records on restart (#2364)
+
+Before holding unresolved records for a fresh generation, the scheduler durably
+fails reserved kinds with `queue_kind_reserved`, preserving identity, body and
+FIFO position. The terminal failure clears `awaiting_result`, so reconstructing
+the scheduler again adds no duplicate failure. Supported unresolved records keep
+the existing hold behavior. Admission and edits still refuse reserved kinds;
+recovery uses the existing durable `fail` transition, not renewed admission.
+Later supported queued inputs remain deliverable after construction. Read-only
+and opaque future records retain their existing inspection-only behavior.
+
+### Amendment: S6 operator grant management (#2362, part 1)
+
+The architect ruling on #2362 adds local-operator-only socket and CLI management
+of the exact, live-runtime `allow_always` grants in §10b. S7 WebSocket management
+is part 2 after #2251, under `operate`; this amendment adds no WS or MCP verb.
+
+A grant's handle is its originating `(request_id, request_seq)`, fenced by the
+exact `agent_id` and runtime `generation`. List returns installed handles, tool,
+canonical JSON `[tool_name, input]` key and installation audit time. Revoke must
+supply the generation and handle, including an originating decision handle when
+revoking an in-flight install. Stale generations and unknown handles have typed
+refusals. The existing operator admission and cooperative-mode limitations apply.
+
+Each key has a revocation epoch under the Book lock. `prepare` captures it when
+reserving `allow_always`; revoke bumps it and removes any installed grant.
+`audited` installs only if that captured epoch is unchanged. Retained epoch
+entries are bounded by in-flight reservations and pruned once no pending install
+can reference them. Epoch overflow refuses without removing the installed grant.
+An already admitted response still completes as `allow` for that one call, but a
+revoked in-flight decision cannot install a grant. The next matching request
+prompts. This is not cancellation or rollback of an admitted tool call.
+
+Successful revoke emits `structured_grant_revoked` in the existing persisted
+global event stream, with authenticated revoker principal, agent/generation and
+originating handle. Runtime grants remain memory-only and are cleared on end.
+The socket contract documents the result fields, registered refusals and the
+absence of automatic revoke retries. These raw socket schemas are not generated
+S7 TypeScript roots; the typed S7 management contract belongs to part 2.
+
+### Amendment: S6 grant-list input redaction (#2416)
+
+Following ADR-0041 §4's fail-closed redaction stance, grant projections omit the
+full canonical tool/input key by default, including for the local operator.
+They expose its UTF-8 byte length and first 16 lowercase hexadecimal SHA-256
+digits. These are display/comparison metadata; grant authority still uses the
+originating request handle plus agent/generation, never the fingerprint.
+
+The owner decision on #2416 permits explicit local-operator disclosure through
+socket `show_input: true` or CLI `--show-input` on list. The full key can contain
+credentials, and CLI output can persist in terminal scrollback and logs. Hashes
+and lengths also reveal comparison metadata. Revoke responses always redact
+remaining grants; operator identity alone does not opt into full input export.
+This narrow grant-list opt-in does not authorize raw config-secret export.
+
+### Amendment: App-session tokens and shell origins (#1601)
+
+ADR-0038 owner decision 16 (decided 2026-10-25, recorded on #1601) gives a
+Tauri shell on the server's own machine a zero-touch token. ADR-0038 §6 has the
+shell's side. This section is the server contract. §5's other auth rules are
+unchanged.
+
+**Mint verb.** A new socket method mints an **app-session token**.
+- **Who may call it.** It is admitted only from the LocalOperator (the same
+  `client_token_authority()` guard as `ClientOpen`): the kernel-checked peer
+  UID and PID, a non-empty PID, no flk pane in the caller's ancestry, and no
+  mesh edge.
+- **Scopes.** It takes no scope parameter. It grants exactly `{read, send,
+  answer, operate}`, the set `ClientOpen` hands out. A request naming scopes is
+  refused with `invalid_params`.
+- **Parameters.** Empty. The captured shell origin needs no `origin_port`;
+  extra fields are refused with `invalid_params` (#2442).
+
+**What the token is.** A bearer secret. With `operate` it **is** the
+operator's identity for ADR-0014's operator-only verbs, as §5 says of an
+`operate`-scoped file token.
+- On the local Unix transport, only the minting process may use it at
+  `/v1/ws`, after a fresh LocalOperator check and bearer authentication. The
+  local-transport amendment below supersedes admission by possession alone.
+  App-session bearers are not admitted over TCP, where their PID binding
+  cannot be proved.
+- **Residual risk (#1177).** Processes started from a flk pane, agents
+  included, are refused the mint and local admission. PID binding prevents
+  another process from using a stolen bearer directly, but does not prevent
+  control of the shell process, for example by modifying its memory. The
+  bounded lifetime and shell hardening in ADR-0038 §6 narrow that risk but do
+  not close it. #1177 tracks same-UID agent isolation.
+
+**Stable app-session identity (#2442).** The principal is exactly
+`app:operator:<uid>`, where `<uid>` is the decimal kernel-attested operator
+UID sealed by LocalOperator. It is scoped to this server's operator identity,
+not a cross-server authorization claim. It survives re-mint, restart, handoff
+and relaunch; no caller field chooses it. File-token principals remain separate.
+The credential is distinct: every mint retains its fresh random `app:<nonce>`
+name, bearer/digest, process watch, deadline and revocation signal. Revoking or
+expiring one bearer closes only sockets using that credential, not sibling
+mints of the same operator. All mints have the same fixed operator grants;
+sharing the principal adds no authority beyond those grants.
+
+Command resend/dedupe stays keyed by `(principal, cmd_id)`. Re-mint no longer
+changes that key or requires dropping the operator's outbox. This does not
+extend retention or preserve an in-memory command cache across restart:
+existing epoch/resume-only/unknown-outcome rules still apply, with no automatic
+second dispatch.
+
+Resource budgets are per credential, keyed by the authenticated bearer digest,
+not by the shared operator principal. Each mint has four registered sockets,
+including pending welcome. A live old mint can fill all four while a fresh
+mint connects and uses its own four; sharing identity does not require the old
+app to drain. The global bound remains sixteen upgraded sockets, so one full
+credential cannot consume it. No additional per-principal aggregate cap is
+introduced. The four unauthenticated hello slots remain global: no credential
+is trusted before authentication. The store's 128-entry cap remains per
+credential, so a renewal still needs a free entry or expired/exited reclamation.
+
+**Audit limit.** Permission-decision records currently retain only the verified
+principal and source (`token`). The decision capability exposes neither the
+token name nor a bearer digest, so an answer can be attributed to the operator
+but not to a particular app mint. Shared-principal mints are indistinguishable
+in that audit trail. This does not expose credentials or change answer policy.
+
+**Binding to the minting process.**
+- **Where the PID comes from.** The **minting connection's peer credentials**:
+  `LOCAL_PEERPID` on macOS; on Linux `SO_PEERPIDFD` where available, else
+  `SO_PEERCRED`. Never from a parameter.
+- **Start time.** It is captured when the connection is accepted
+  (`src/platform/peer.rs`: Linux `/proc/<pid>/stat` field 22, macOS
+  `flock_process_facts`).
+- **Order.**
+  1. Arm the exit watch: kqueue `EVFILT_PROC`/`NOTE_EXIT` on macOS; on Linux
+     the peer pidfd, or else `pidfd_open`.
+  2. Read the start time again and compare it with the one taken at accept.
+- **Refusal.** If the watch cannot be armed, or the start times differ, the
+  mint is refused with `peer_process_changed`.
+- **No polling.** The server never polls with `kill(pid, 0)`.
+
+**Lifetime and revocation.**
+- **Storage.** App-session tokens live in a second, in-memory store that
+  `authenticate` checks beside the file tokens. They are never written under
+  `client-tokens/` and never listed as file tokens.
+- **TTL (#2489 owner decision).** A fixed 12 suspend-inclusive elapsed hours
+  from the mint, with no sliding renewal. Linux uses `CLOCK_BOOTTIME`; macOS
+  uses `mach_continuous_time`. Sleep counts, and wall-clock changes cannot
+  extend validity. The shell renews by minting again. `expires_in_ms` is
+  derived from the same clock and deadline.
+- **Idle expiry.** The credential clock also owns its absolute kernel timer
+  (Linux timerfd; macOS continuous-time kqueue timer). An elapsed deadline is
+  ready on resume without polling or occupying a blocking worker. This does
+  not request a hardware wakeup or change the transport heartbeat clock.
+  Clock read failures withhold authorization and mint returns `internal_error`;
+  timer failures close with 1001, without falsely claiming revocation. There
+  is no fallback to an awake-time or settable wall clock.
+- **Restart and handoff.** Both revoke every app-session token. A handoff does
+  not carry them or their watches to the successor. This amends the §5a
+  matrix row "Restart, handoff…".
+- **Revocation.** On process exit, TTL expiry, restart or handoff,
+  `authenticate` stops accepting the token. Every live `/v1/ws` session
+  authenticated by it uses the existing close 4403. A command that detects
+  revocation receives its `auth_revoked` error acknowledgement before the close;
+  idle expiry and exit also close without waiting for a command. No new auth
+  error names are introduced (#2442).
+
+**Shell origins, on `/v1/ws` only.**
+- **The allow-list.** The listener guard (`shell_origin_allowed`,
+  `src/web/gui.rs`; `src/web/client_listener.rs`) admits an exact allow-list
+  of shell origins on the `/v1/ws` upgrade.
+- **Its values.** The allow-list holds only values captured from real Tauri v2
+  shells and recorded in ADR-0038 §6. For those origins only, the guard
+  accepts the `Sec-Fetch-Site` value captured with them.
+- **Unchanged.** Every other origin and path keeps today's checks.
+  `/v1/client/exchange` keeps its strict same-origin rule.
+- **`null` is never admitted.**
+- **Captured local origin (#2442).** Exactly `tauri://localhost` with
+  `Sec-Fetch-Site: cross-site`, only on the exact `/v1/ws` path. The captured
+  platforms need no registered-loopback origin, `origin_port`, port-ownership
+  check or `origin_port_not_owned` code. Windows remains remote-only.
+- **Replacement for the held policy (#2500).** Owner decision (a),
+  2026-10-26, replaces per-UID TCP attribution with the local Unix transport
+  specified below. TCP retains one shared browser pre-auth budget, without
+  attribution or unknown-UID buckets. The registry's `preauth_capacity`
+  (HTTP 503/retry `later`) and `auth_rate_limited` (HTTP 429/retry `later`)
+  remain registered; registration is not a new rate-limiting policy.
+- **Linux native refusal.** G9a refuses local mint at `ptrace_scope=0`, explains
+  that another process could read the operator credential from app memory,
+  and offers explicit remote pairing or administrator-enabled
+  `ptrace_scope ≥ 1`. No silent fallback is permitted (ADR-0038 §6).
+- **Remote/browser path only.** The captured shell-Origin exception from
+  #2505 remains on TCP for an explicitly selected remote/browser connection.
+  It does not authenticate a local native bridge, bypass a bearer, or permit
+  an app-session token on TCP. The UDS route uses kernel peer evidence, not
+  an Origin or fetch-metadata claim, to establish local authority.
+
+**Tests that must fail first.**
+- A captured shell origin is admitted on `/v1/ws` and refused on the exchange.
+- `null` is refused on both.
+- A shell origin with a missing or wrong token is refused at `hello`.
+- A scoped mint is refused, and so is a mint from a non-LocalOperator peer.
+- A start-time mismatch is refused with `peer_process_changed`.
+- Process exit revokes the token and closes its live sessions (a real child
+  process, no polling).
+- TTL expiry does the same (an injected clock).
+- Restart and handoff each revoke every app-session token.
+- `same-site`, duplicate headers, lookalike shell origins and non-WS paths
+  keep their existing refusal treatment.
+
+### Amendment: Local `/v1/ws` over a Unix socket (#2500)
+
+**Accepted owner decision (a), 2026-10-26.** This is the server half of
+[#2500](https://github.com/gerchowl/flock/pull/2500#issuecomment-6411345834).
+The native shell owns the Unix connection and bridges WebSocket traffic for
+its webview. The companion shell amendment is
+[#2529, reviewed head `37455b06`](https://github.com/gerchowl/flock/pull/2529):
+[ADR-0038 §6](0038-gui-workbench.md#6-shells-one-bundle-two-hosts-one-transport),
+"One protocol, two sockets", and ADR-0038 §11 owner decision **18**. The GUI
+architect owns that amendment; ADR-0038 is not edited here. This server
+contract does not claim implementation. It supersedes the earlier TCP UID
+attribution/window proposal, not §5's scopes, idempotency or §5a's recovery.
+
+**Shell cross-reference, not additional server requirements.** ADR-0038 §6
+keeps the bearer in native memory: the webview sends a token-free first
+`hello`; the bridge injects the bearer and passes later frames through byte
+for byte. A first frame other than a token-free hello is closed by the bridge
+with 1008, before forwarding. The server always receives the bearer-bearing
+hello specified below. The same shell contract re-mints on any 4401 or 4403
+for its current bearer, whether welcomed or not, at renewal at three quarters
+of `expires_in_ms`, and on `openBridge({renew:true})`. Closures 1006 and 1001
+reuse that bearer; replacing it does not revoke it early, so its existing TTL
+or exit watch still ends it. These bridge/re-mint rules are owned by ADR-0038,
+not introduced as another server admission path here.
+
+**Transport and location.** Use a **sibling `flock-ws.sock`**, derived beside
+that session's active `flock.sock`, including a selected or overridden runtime
+path. Its socket mode is **0600**, matching `SOCKET_PERMISSION_MODE` in
+`src/api/server.rs`. It lives in the **same directory as `flock.sock`**, with
+that directory's existing owner and permissions; do not broaden those
+permissions or create a less protected directory for the sibling. Retain
+listener ownership and the bounded shutdown/handoff lifecycle.
+
+Before binding, inspect an existing path and check whether its listener is
+live. A successful connect means busy, never permission to unlink. Remove
+only a proved-stale socket owned by this operator, after verifying its file
+type, owner and unchanged device/inode identity. A timeout, uncertain
+ownership, foreign owner, non-socket or symlink is not proof of staleness:
+refuse startup without removing it. Cleanup must likewise compare the bound
+socket's device/inode identity before unlinking, so a replaced path and
+another live listener's socket survive. `src/ipc.rs` owns the existing socket
+lifecycle helpers; implementation must preserve these checks rather than
+assuming every pre-existing sibling is disposable. Do not bind a
+machine-wide hard-coded path.
+The endpoint on that socket is exactly `GET /v1/ws`: HTTP/1.1 upgrade, then
+exactly the existing JSON text frames. No JSON-line tunnel, custom length
+prefix, new handshake field, wire-version bump or mesh change is introduced.
+The close-code set is reused **verbatim**, including 4401 for refused hello,
+4403 for post-registration revocation, 1001 for capacity/liveness failure,
+and the remaining §5/§5a codes. Recovery and command logic remain identical.
+The sibling serves only the WS route, not token exchange, minting or static
+web content; minting remains a request over `flock.sock`.
+
+This location deliberately avoids protocol sniffing on the existing API:
+`api::server::handle_connection` captures credentials and calls
+`read_initial_request_line`, then `api::scoped::decode` on a bounded,
+newline-delimited JSON request (`src/api/server.rs`, `src/api/scoped.rs`).
+It has no HTTP path router; routing an HTTP upgrade there would require a new
+protocol discriminator and complicate existing CLI/subscription reads.
+The sibling can reuse the HTTP/1.1 upgrade and WS core in
+`src/web/client_listener.rs` and `src/web/wire.rs`, while the platform adapter
+provides Unix peer evidence through `src/platform/peer.rs`. This is a
+recommendation for the implementation's listener placement, not permission
+to reinterpret existing socket bytes or weaken its permissions.
+
+**Admission requires both proofs.** Capture UID, PID and process-birth evidence
+from the accepted Unix connection, never from HTTP headers or `hello` fields.
+The UDS LocalOperator rule is explicit: a **known UID equal to the operator
+UID**, a live peer PID **with verified start-time evidence**, no pane/agent
+ancestry and no mesh-edge caller. A missing UID is a refusal, not an operator
+fallback. A missing PID, missing start time, exited peer or changed process
+identity is also a refusal. Matching UIDs or a non-empty PID alone are
+insufficient.
+
+Do **not** reuse `App::client_token_authority` or
+`App::caller_is_local_operator` as the complete UDS proof without strengthening
+it: `src/app/api/mesh.rs` currently uses `is_none_or` for the UID and only
+`pid.is_some()`, without requiring start-time evidence. Those existing
+semantics are not the normative rule for this new listener. Do not allocate
+a registered session before the stronger checks pass. Bounded admission
+resources may be reserved before this check, but never unbounded work or
+authenticated capacity.
+
+**Pre-upgrade refusal contract.** Send no HTTP 101 or WebSocket frame on these
+paths. Return `Content-Type: application/json`, `Cache-Control: no-store`,
+and exactly the following JSON object for the matching HTTP status, then close
+the HTTP connection within its admission deadline. JSON whitespace and key
+order are immaterial; code and message strings are fixed.
+
+| Condition | HTTP status | JSON body |
+| --- | --- | --- |
+| UID missing, UID not the operator UID, pane/agent ancestry or mesh-edge caller | 403 | `{"error":{"code":"operator_only","message":"Local operator required"}}` |
+| PID/start-time evidence missing, exited peer or changed process identity | 403 | `{"error":{"code":"peer_process_changed","message":"Peer process identity unavailable or changed"}}` |
+| No pre-auth admission capacity | 503 | `{"error":{"code":"preauth_capacity","message":"Pre-authentication capacity exhausted"}}` |
+
+Capacity can refuse before identity checks; otherwise check the UID/ancestry
+rule before process evidence, so a caller violating both receives
+`operator_only`. Reuse the typed-body shape of `web::gui::refusal`
+(`src/web/gui.rs`); do not emit a bare status or HTML fallback. ADR-0038 §6's
+native bridge **must map these status/code pairs** into its visible bridge
+admission failure/reconnect behavior; that mapping belongs in the companion
+shell amendment, not in a new server frame. It must not treat a refused HTTP
+upgrade as 4401/4403 or forward the HTTP body as a WS message.
+
+Kernel evidence is **additional to**, never a replacement for, bearer auth.
+Mint over `flock.sock`, then send the existing `hello` with that bearer; this
+is the **only** session admission path. A kernel-authorized but tokenless,
+invalid-token, expired-token or revoked-token hello receives the existing
+4401 without welcome. File credentials, if used locally, still require both
+LocalOperator and their own current scopes; local transport adds no scopes.
+Recheck authority at registration and preserve §5's command-time checks.
+No Origin, webview claim, command parameter or UID can mint a session implicitly.
+
+**App-session PID binding and reuse.** Bind each mint to its kernel-attested
+process instance, not merely its UID, deterministic operator principal or
+per-mint name. A UDS hello must have the minting peer PID **and birth**.
+A mismatched process is refused with the registered `peer_process_changed`
+(close 4401 with that code as the close reason, no new JSON frame or welcome).
+The native process that mints must therefore also own the bridge connection;
+a webview or helper with another PID cannot use its token. TCP cannot prove
+this binding, so its app-session hello refusal is exactly **close 4401 with
+reason `peer_process_changed`**, without welcome or a new JSON frame. This
+reuses the registered identity-proof refusal because TCP lacks the required
+peer-process proof, rather than inventing another transport error code or
+claiming the bearer itself expired. ADR-0038 §6 must mirror that exact reason
+string; it is not `operator_only`, `auth_revoked` or an implementation-chosen
+message. The browser/file-token path remains available.
+
+The ordering guarantee is stronger than waiting for an asynchronous callback:
+arm the per-mint exit watch before validating the accepted process identity,
+recheck birth after arming, and only then publish the bearer. On every hello,
+under the admission/revocation fence, verify the token's live exit watch and
+peer instance **before registering or sending welcome**. An already-ready
+exit must invalidate admission even if the owner has not yet serviced its
+notification. Exit retirement and session registration share that fence:
+a registration that linearizes first is included in revocation fanout; an
+exit that linearizes first prevents registration. A reused numeric PID can
+never revive the old watch, bearer or token-store entry. Exit, expiry,
+restart and handoff retain the existing 4403 fanout and the triggering
+`auth_revoked` command acknowledgement-before-close ordering. Missing watch
+proof fails closed; watch/store I/O failure remains 1001 under §5a, not
+fabricated evidence of revocation. See
+`src/structured/permissions/auth/tokens/app_sessions.rs` and
+`src/platform/process_exit.rs` for the existing per-mint watch/admission owner.
+
+**Budgets and isolation.** No TCP tuple-to-UID lookup, per-UID table or
+unknown-UID bucket is used. TCP browser admissions share one pre-auth budget.
+UDS admissions have their own bounded HTTP/hello reservations and consume
+**none** of that TCP pre-auth budget. Preserve these explicit backstops:
+
+| Resource | Bound and ownership |
+| --- | --- |
+| Incomplete HTTP connections | 32 per transport listener; TCP and UDS reservations are separate, at most 64 combined. Each has the existing absolute 5 s HTTP admission deadline. |
+| Pending unauthenticated WS hellos | Four per transport listener, at most eight combined; separate TCP/UDS permits. One hello per connection; the existing 5 s hello deadline applies. |
+| Upgraded WS sockets, including pending hello/welcome | 16 server-wide across both transports. This resource backstop is shared; it is not a TCP pre-auth attribution budget. |
+| Registered sockets per credential, including pending welcome | Four, counted across both transports by sealed bearer digest, as decided in #2518. Never key this cap by operator principal or PID. |
+| In-memory app-session credentials | 128 server-wide, retaining the existing store cap, TTL and exit retirement. |
+| Frame, writer and command resources | Existing WS core limits, including 65,536-byte messages and four concurrent first-send commands per socket; no unbounded bridge buffer. |
+
+An old mint's four sockets must not exclude a new mint's four merely because
+the operator principal is stable. There is no extra principal-wide cap;
+the global 16-socket backstop still applies. Refusing a new reservation must
+not evict authenticated sockets or leak a permit. Before upgrade, exhaustion
+is typed `preauth_capacity`/HTTP 503; after upgrade use existing 1001 capacity
+semantics. This amendment does not reinstate #2500's proposed ten-failures
+window or claim per-UID browser isolation. Same-UID processes outside the
+pane ancestry can still compete for local unauthenticated slots; #1177's
+residual process-isolation boundary remains explicit.
+
+**Implementation tests: each must fail first.** These are acceptance tests
+for the implementation PR, not claims that this docs-only PR adds a listener.
+Use real Unix sockets and child processes for credential/exit checks, an
+injected monotonic clock for deadlines, and bounded observable barriers rather
+than sleeps or ambient process scans.
+
+1. On the real sibling listener, perform HTTP/1.1 upgrade and drive the existing
+   client hello/subscription/command fixtures unchanged through JSON text
+   frames. Verify all §5a close-code mappings, including 4401/4403/1001, and
+   reject extra paths. Existing JSON-line requests and subscriptions on
+   `flock.sock` must still work without a discriminator or framing change.
+   Assert mode 0600 and the same parent directory/permissions as `flock.sock`.
+   A proved-stale operator-owned socket is replaced; a live listener, foreign
+   socket, non-socket, symlink or uncertain stale probe is refused without
+   unlinking it. Replace the bound socket's inode before cleanup and prove
+   the replacement survives.
+2. A LocalOperator with a valid bearer gets welcome. Tokenless and wrong-token
+   hellos do not. A real pane-descended caller with a valid stolen bearer,
+   another UID, **UID missing**, PID missing, start time missing, an exited
+   peer, and a mesh caller each fail before registration. Assert the exact
+   pre-upgrade HTTP status, content type, cache policy and JSON body above,
+   including refusal precedence. None yields a 101 or WS frame. Spoofed
+   headers do not help; the UID-missing case must fail with the current
+   helper's permissive `is_none_or` rule substituted.
+3. Child A mints and bridges successfully; child B using A's bearer is refused
+   with `peer_process_changed`/4401. Reusing A's PID in injected peer facts
+   after its real exit never admits the old token. Gate the exit notification
+   consumer to prove that a ready exit still prevents welcome; race exit with
+   registration to prove that every admitted socket is in revocation fanout.
+4. Exit and expiry revoke every socket of that credential, without revoking a
+   sibling mint. Restart/handoff reject old bearers. A command discovering
+   revocation gets its `auth_revoked` acknowledgement before 4403. PID/birth
+   mismatch and watch I/O failure exercise their distinct refusal/1001 paths.
+5. Fill TCP's pre-auth budget and still admit an authorized UDS hello, and
+   vice versa, with authenticated sessions alive. Exercise each HTTP, hello,
+   global upgraded and store limit independently; verify permit release on
+   every refused or interrupted admission. A slow header/absent hello must
+   terminate at its deadline without keeping a slot forever. The exhausted
+   pre-auth path must return the exact 503/`preauth_capacity` body above.
+6. Keep four ping-answering sockets on one credential and four on a renewed
+   mint with the same principal. Refuse each fifth with existing capacity
+   behavior, while other sockets keep working. Across both transports a file
+   credential still has only four slots; the 17th total upgraded socket fails.
+7. TCP refuses an app-session bearer with exactly close 4401 and reason
+   `peer_process_changed`, without welcome or another frame. The explicit remote
+   browser/file-token route still admits #2505's exact captured shell Origin
+   pair only on `/v1/ws`; exchange, duplicate-header, lookalike-Origin and
+   `null` refusals remain unchanged. A shell-Origin claim on UDS never replaces
+   LocalOperator or bearer proof. No unsupported-platform failure silently
+   redirects the local bridge onto TCP.
+
+### Amendment: Recipient tool-inbox projection (#2363)
+
+The internal projection uses the same admitted MessageKey, body and native
+agent/session binding. It never admits another input, writes stdin, changes a
+custody outcome or renews a reply deadline. Its first harness-delivery observation
+starts a persisted read window. The caller supplies its retention policy;
+#2452 introduces `msg.inbox_retention_ms` (default 24 hours) with its actual
+harness-delivery consumer.
+Idle sweeps and non-consuming reads project logical time without writing the
+clock or opening a write transaction; only acknowledgements persist changes.
+Delivery replay, custody settlement and restart cannot renew that window. Queue
+journal checkpoint/pruning cannot delete this independently retained projection.
+Unread projected bodies pin custody storage until read or expiry acknowledgement;
+normal byte quotas still charge the retained body. Sweep/read acknowledges expired
+entries once and emits the existing `dropped_undeliverable` event; mixed bulk reads
+return live entries once. There is no selector or partial-error envelope. Invalid
+persisted envelopes are skipped, logged and preserved, without consuming them.
+This foundation adds no public read surface: #2452 owns lease/caller resolution,
+queue-delivery binding and CLI/socket/MCP wiring. It must supply actual harness
+delivery, not custody admission, and decode payloads before consumption. Existing
+queue snapshots and custody labels are not backfilled as fresh delivery. Existing
+custody expiry cannot restore an already deleted body or extend reply recovery.
+
+The internal queue binding (#2452 Part A) freezes `msg.inbox_retention_ms` at
+admission and stamps `native_inbox_until` only on the harness `started` event,
+in the same durable queue replacement as `delivered`. The deadline uses custody's
+pause-aware logical clock. The worker projects this explicit marker after the
+append and on reopening, before re-holding unresolved turns. Reopening preserves
+the original deadline; older items without the marker are not backfilled. Deleted
+custody payloads are not restored. A projection failure reports
+`mail_store_unavailable` and fences that owner until storage repair and restart;
+the committed marker remains available for recovery. All this I/O stays on the
+owning worker. Tool reads decode the payload before acknowledging it and preserve
+malformed raw data. Conditional acknowledgement winners alone receive live or
+expired entries, including when independent database connections read concurrently.
+Socket, CLI and MCP caller binding remains #2452 Part B.
+
+Part B of #2452 binds socket `msg.list`/`msg.read`, CLI and MCP to the current
+attested agent/session. Omitting a target selects structured self, preserving the
+operator global list. Native names use the directory's ambiguity refusal; targets
+cannot grant inbox ownership (`inbox_not_owner`, retry `never`). Invalid or revoked
+leases uniformly refuse as `not_authorized` before target resolution. The CLI
+reference's messaging and MCP tool sections document the shared caller contract.
+
+### Amendment: Welcome capability grants (#2461)
+
+Clarification of §5's protocol gating and §6's operation advertisement:
+`welcome.capabilities` is the authenticated token's exact granted scopes, using
+`api::client_tokens::Scope` wire spellings in enum order: `read`, `send`,
+`answer`, `operate`. Missing scopes are omitted; `operate` implies no other
+scope. A client whose `hello.protocol` exceeds `WIRE_JSON_VERSION` receives
+only `read` when explicitly granted, or an empty array otherwise. It receives
+no command capability.
+
+The welcome is an advisory snapshot, not an authorization lease. Every command
+and subscription still checks current authority at admission, including scope
+changes and revocation after the welcome. Browser command holding according to
+this advertisement is tracked separately in [#2464](https://github.com/gerchowl/flock/issues/2464).
+
+### Pathname listener ownership (#2531)
+
+`SocketOwner::acquire` takes a nonblocking exclusive `flock` on a permanent
+sibling `<socket>.lock` before bind or stale-path reclamation. This applies to
+`flock.sock`, the terminal client socket, and the UDS WebSocket listener when
+introduced. The lock file is operator-owned, regular, single-link, mode `0600`,
+opened with `O_CLOEXEC | O_NOFOLLOW`; it is never unlinked. Newly created
+files receive descriptor-based mode `0600` repair after open, independently of
+the inherited umask. Existing lock files are never permission-repaired; they
+must pass the original ownership, link-count, mode and pathname validation.
+The containing directory must exclude entry replacement by other users.
+Contention reports busy and never removes a socket, even with a full accept
+backlog. After acquiring the lock, `SocketOwner::prepare` also makes a nonblocking
+connection probe: a **successful** connect means busy, preserving an older listener
+that has no lock.
+A failed probe never proves staleness; the held lock excludes live owners only
+when those owners participate in this protocol. An old-build listener with a
+full backlog can fail this probe and its pathname can still be reclaimed. This
+residual rollout limitation is stated in the legacy-listener busy diagnostic;
+ownership locks cannot retroactively protect older builds. Once ownership is acquired,
+`SocketOwner::prepare` checks socket type, owner, and device/inode before removing
+an abandoned pathname. Symlinks, foreign ownership, and replacement entries
+are refused rather than followed or removed.
+
+The lock follows the **open file description**, including across SCM_RIGHTS.
+`perform_live_handoff` sends the API and terminal ownership descriptors after
+PTYs and the optional TCP listener. Internal handoff manifest version 4 also
+appends the native WebSocket ownership descriptor; builds without that extension
+retain version 3. Older importers refuse unsupported versions before transfer.
+`run_handoff_import_server` adopts these ownership descriptors before
+acknowledging restoration or rebinding the public paths; the exporter retains its descriptors for rollback. Public Unix
+listeners are rebound under those same locks; TCP retains its listening fd.
+`restore_public_sockets_after_failed_handoff` also reuses the retained locks.
+There is no unlocked interval during either transition. This changes only the
+internal handoff manifest, not the mesh protocol.
+
+Cleanup removes only the recorded socket inode while still holding ownership.
+The final descriptor close releases the lock on shutdown or process death.
+There is deliberately no explicit `LOCK_UN`: that would release the shared lock
+while an importing process still owns it. Ownership guarantees apply to
+listeners implementing this protocol; older releases do not hold these locks.
+
+
+#### Unix HTTP listener foundation (#2500 PR3a)
+
+`local_listener::Listener` reuses `client_listener::serve` with a Unix stream
+and kernel-captured peer credentials. `prepare` does not accept HTTP requests;
+`activate` is explicit, and `stop` cancels the owned acceptor and HTTP tasks.
+The containing directory must be real, operator-owned and not writable by
+other users; its ancestor chain is trusted as for the API namespace. The
+socket shares the API's mode `0600` constant and the ownership protocol above.
+`owner`, `SocketOwner::duplicate` and `SocketOwner::take` retain the same locked
+open description through descriptor transfer, rebind and rollback. `unlink`
+and destruction compare the recorded inode, so an old exporter cannot unlink
+an importer's replacement socket. `HeadlessServer::prepare_client_wire` activates the foundation together with
+`Core::local_router` owner admission and TCP app-session refusal. The bounded
+`local_admission::Owner::service` obtains a sealed proof from the application
+owner. `Store::admit_peer` and the final registration check hold the existing
+revocation fence through insertion; `Lease::drop` prevents a cancelled waiter
+from leaving a registration behind. HTTP and hello permits are separate per
+transport; upgraded and per-credential caps belong to the single shared core.
+`client_listener::Listener::shutdown` cancels HTTP acceptance and drains the
+upgraded sessions through `Core::shutdown`; the HTTP task set alone does not
+own upgraded futures. Internal handoff manifest version 4 appends the native
+ownership descriptor after the API and terminal owners; import adopts it before
+preparation and rollback retains the same guard. No mesh or JSON wire version
+changes.
+
+
+PR3b refusal delivery uses four independent writer/drain tasks per listener.
+They do not consume normal HTTP reservations or block acceptance. Each retains
+the same absolute five-second deadline; when that separate budget is exhausted,
+additional over-cap connections are closed without a 503 response or another task.
+This trades a typed overload response for bounded memory and continued acceptance.
+A refused hello closes 4401 before registration; an exit after registration
+closes 4403 and includes every socket already admitted under the fence.
+
+### Amendment: S10a1 native placement
+
+A native view has explicit membership beside terminal panes. The checked content
+accessor requires disjoint, exhaustive layout membership; absent terminal state
+is never evidence of a native view. One placement per local structured agent is
+reused on focus, and every UI target is fenced by the registry generation.
+Closing detaches placement without stopping the runtime. Native cross-tab or
+workspace relocation is unsupported and refuses before any layout mutation,
+including removal of a single-pane tab. Public start/render wiring is S10d.
+
+### Amendment: S10a2 frozen view and persistence contracts
+
+`structured::view::contracts` freezes the S10b/S10c snapshot and fenced intent boundary.
+`Snapshot.agent.model` is requested; reported values and absent usage stay distinct.
+`TabSnapshot.native_views`: layout ID → `{kind:"structured",schema:1,agent_id}`.
+Restore uses cold registry generations, never credentials, PIDs or auto-restart.
+Unsupported records remain visible unavailable tiles without attach authority.
+Raw record bytes survive migration/save; native-only tabs survive until explicit close.
+Snapshot format version 3 is deliberately unchanged. Older builds ignore this
+additive field and spawn shells in native tile slots; their next save permanently
+drops `native_views`. This placement loss is preferable to a version bump, which
+would make older builds ignore the entire session, including its terminal tabs.
+
+### Amendment: native card identity and observed tool use
+
+`CardId { seq, ordinal }` separates fold/inspection identity from a shared source
+cursor. Ordinals are deterministic for a given record and projection parser
+version; sibling cards never share a fold key. `ObservedToolUse` retains the
+original id, name, typed input and raw source event, independently of the stdio
+permission `ToolRequest`. Neither observed cards nor their ids grant authority.
+
+The native projection retains at most `history::LIVE_RECORDS` (16) source
+cursors. `Snapshot.earlier_history` explicitly marks the eviction watermark so
+older history can be requested. Window eviction never rewinds the applied cursor
+or claims a storage gap. Live partials are keyed by message identity and block index (source
+cursor when no message id exists), with at most 16 active blocks and at most
+`transport::MAX_LINE_BYTES` (2 MiB) of text per block. Capacity or text overflow
+clears transient cards and marks replay lagged at the observed durable floor;
+further deltas at that floor are suppressed until durable progress. No synthetic
+cursor is allocated. Known live deltas retain only current partial state, rather
+than an additional raw card for every delta. Malformed or unsupported content
+remains inspectable as raw JSON with its original classifier provenance.
+Durable ordinals are raw event at zero, then content-block position plus one.
+Live cards use a disjoint provisional ordinal range, assigned in observation
+order within a source cursor; durable assistant records replace matching completed
+blocks and older cursor-only partials, while preserving unmatched named blocks.
+A block's public envelope is not a whole-message completion signal. Fold state is per-card:
+thinking, unprojected JSON and raw source beside typed cards start folded,
+independently of sibling text/tool cards. Raw inspection remains an explicit
+choice, so raw source cannot bypass a thinking fold by default.
+
+This amendment also specifies `ObservedToolUse.raw: Arc<str>` to share exact
+source events between tool cards, and a disjoint provisional live ordinal range
+beginning at `1 << 31`, as described above. `content_block_start` and
+`content_block_stop` are lifecycle signals ignored by the text projection;
+neither replaces accumulated text. Durable assistant records finalize correlated blocks.
+Fold choices for the 16 most recently retired live blocks survive gap recovery
+and transfer to the final card for the same message/block. Preferences outside
+that bounded live window may return to their defaults on later reconstruction.
+Claude Code 2.1.296 emits one assistant envelope per completed content block
+(E1, A.13). Its public envelope omits the internal API block index. Named
+text/thinking hints therefore transfer only when message identity, content kind
+and exact completed content select a unique retained hint (a bounded SHA-256 fingerprint
+retains no text). Single-block envelopes do not imply block zero. Bundled
+multi-block records additionally match their content positions. Unmatched named
+siblings remain within the same 16-hint cache; unrelated or ambiguous content
+uses default folding. Finalizing one block preserves unmatched named live blocks.
+Content equality correlates a provisional block and its fold preference with a
+completed block; it is not a message-lifetime condition. `Model::partial` retires
+all remaining blocks for a reported `message_stop` identity even if final text
+differs from the deltas. A delayed stop still retires its older partials after
+history catch-up, without recreating stale data or retiring newer partials.
+An anonymous stop retires cursor-only blocks through
+its live cursor; it cannot identify an unrelated named message. `Model::record`
+retires remaining partials at a known top-level turn result, including error
+results, without a content match. Nested tool results do not end the parent
+turn. Only partials preceding that durable result are retired, so already
+received output from a later turn survives history catch-up. Named blocks whose
+stop omits their identity remain until the top-level turn result rather than
+being assigned to a guessed message.
+
+Evicting a partial saves its fold before removing its card. Anonymous hints retire
+with their final message. Anonymous hints whose possible
+final record lies inside an actual missing history range are discarded rather
+than assigned to another message. Anonymous partials at the final record's own
+cursor belong to later output and are preserved.
+
+Permission snapshots retain the latest lifecycle observation per
+`(request_id, request_seq)`, in publication order. Pending opens have no local
+projection count limit or clock-based expiry: only a matching real close retires
+them, including host cancellation or session-end closes. The production producer
+bounds live opens with `permissions::MAX_OPEN_PERMISSION_REQUESTS` (16), and
+`permissions::Orphaned::into_closes` emits `SessionEnded` closes on recovery.
+These upstream bounds do not authorize the projection to drop an unmatched open;
+unmatched opens in older data remain visible until a matching close is observed. Only closed
+observations are bounded to the latest 16; older closed records remain in
+History. Displayed requests never substitute for S6 decision revalidation.
+
+### Amendment: native queue subscription recovery (S10b2)
+
+A lagged native queue reader is spent. Its owner retains the applied queue cursor
+and any incomplete replacement, discards the reader, and waits on the source's
+readiness notification when replacement capture is temporarily busy. Busy capture
+is not an end or a mutation retry. A successful capture resumes after the applied
+cursor; only a producer end or generation retirement ends the subscription. A
+terminal queue refusal remains a typed failure on subsequent polls rather than
+becoming a successful end. Retirement clears old presentation state and leaves
+composer admission refused as `agent_not_found`; it does not grant a new target.
+
+Queue subscribers wake waiters after releasing the book on every result,
+including unwinding from a snapshot callback or registration. One guard owns
+both the mutex guard and its notify-on-drop field; declaration-order field
+destruction releases the book first. Publishers use the same guard for capture,
+finish, publication and teardown, waking both readiness and capture capacity.
+Failed try-locks never self-notify. Ended sources need this wake because their
+publisher has stopped. Capture capacity has a separate notification, armed
+before capture, so a full channel cannot self-wake a retry loop.
+A terminal queue refusal also stops history and live retirement. Canonical
+generation refresh still precedes presentation and can retire the failed view.
+
+### Amendment: S10d1 public native placement
+
+Public structured start and focus use the S10a1 placement lifecycle. Start
+attaches to the active tab, or creates a native-only workspace; focus reuses
+one placement and may rebind it to the current registry generation. Reported
+view IDs come from actual layout membership and public numbering. Detaching
+does not stop the worker. Placement preflight precedes worker admission.
+The App-owned subscription controller is described below; renderer/input routing
+follows in separate S10d slices under #1430. Placement creates no terminal runtime.
+
+### Amendment: S10d1b cancel-safe native continuation
+
+`Stream::next` is cancel-safe. Stream owns its in-flight history task, cut and
+unapplied page, as well as queue cursor/replacement and resubscribe state.
+Cancelling a caller's future preserves that continuation. Resuming an older
+Pending history page yields one step to recheck readiness; a publication that
+predates the new wait cannot leave the continuation asleep. Retirement alone
+discards a dead generation's page. Its blocking work retains the I/O permit
+until completion, even if the Stream is dropped. No timeout, sleep or mutation
+retry substitutes for source readiness.
+
+### Amendment: S10d1b copy-on-write publication
+
+Model owns its projection through an `Arc<Snapshot>` mutation gate. All mutable
+access uses `Arc::make_mut`. The additive Snapshot/card Clone implementations
+exist solely for this copy-on-write boundary. Published frames stay immutable;
+App and render share Arcs and never borrow Model. Unshared mutation reuses the
+allocation. A watch channel's retained last frame is itself a shared owner, so
+it can require a copy even when App has not separately retained that frame.
+No snapshot fields or intent shapes change.
+
+Initial queue admission also belongs to the continuation: opening a view does
+not acquire the publication book or capture channel. Its first poll arms the
+source readiness notification before trying admission, preserving the same
+pending state through contention and cancellation as a lagged resubscribe.
+
+### Amendment: S10d1b App-owned frame driver
+
+This slice supplies the frame/controller lifecycle; renderer dispatch follows in S10d2.
+One typed task per native placement owns its Stream and Model. It publishes the
+same immutable Arc through a latest-wins watch channel, coalescing unread frames.
+App stores only published frames or typed source failures in pure presentation
+state. Render never borrows Model or performs subscription I/O. Canonical target
+facts fence every publish and App validates them again before presentation.
+Closing a placement aborts only its reader task; the worker continues. Reopening
+replays from canonical warm sources. Cold sources retain their typed refusal;
+source refusals remain visible instead of appearing as successful frozen frames.
+An ended stream still accepts canonical metadata updates until placement closes.
+
+### Amendment: S10d1b warm-history opening
+
+A canonical warm history handle can precede producer file initialization.
+`Stream::next` waits on that source's readiness for this opening state, retaining
+it across cancellation. This is not cold recovery: no second writer or loader is
+created. Producer failure and actual page I/O errors stay explicit errors. As with
+a cancelled Pending page, resuming an older opening yields one recheck step so
+an initialization preceding the new wait cannot be missed.
+
+### Amendment: admitted launch with failed placement (#2655)
+
+If placement fails after launch admission, return the typed
+`structured_agent_started_unplaced` result with the admitted ID, generation
+and registered placement cause. Keep the registry/worker under normal ownership
+so it remains inspectable and stoppable. CLI/MCP expose the result with exit 1;
+this is not a clean start refusal and must not trigger a fresh start blindly.
+Duplicate placement and invalid membership remain typed preflight refusals.
+
+### Amendment: S10d2 prepared native rendering
+
+Desktop and client-sized mobile geometry prepare S10c's pane from the App-owned
+immutable frame. The prepared pane and its owned hit-to-Intent payloads live in
+that ViewState, so paint and later input share one cut and geometry. Paint checks
+canonical generation and current placement again; stale cuts and source refusals
+produce a typed error tile. Ready and unavailable native members never fall
+through to PTY rendering. This slice wires rendering; input dispatch remains the
+next S10d2 slice and Unicode composer/admission semantics remain S10d3.
+
+### Amendment: S10d2 local control routing
+
+Native keyboard and mouse routing consumes only complete painted S10c controls,
+revalidating the original target generation before dispatch. Tab/Shift-Tab selects
+a painted control and Enter activates it; Ctrl-W detaches without stopping the
+worker. PageUp/PageDown move the source-card anchor and End follows the tail.
+Float input, global bindings, prefix commands and overlays retain precedence.
+Presentation edits reach the Model through a bounded driver channel, never an
+App borrow of the Model. Permission decision intents keep their exact handles;
+UID-only interactive context remains `not_authorized` under S6 until S10e supplies
+the approved capability and Always confirmation. Text/paste editing remains S10d3.
+Submission and inspection completion follow in the next S10d2 child under #1430.
+
+Native input consumes only unmodified left-button presses on painted controls and
+wheel events; other pointer events reach the workspace handler. An active layout
+or sidebar drag always keeps ownership through release, including over native
+content. Keyboard selection highlights the full painted control label. PageDown
+at the following tail is a no-op; End explicitly resumes following from an anchor.
+Collapse and scroll state are per-driver and shared between panes showing the same
+agent, rather than per frontend viewport. Permission decisions remain refused for
+UID-only Operator context without reserving or closing the exact live request.
+
+### Amendment: S10d2 current-draft submission
+
+Enter without a selected control submits the current composer; Tab/Shift-Tab and
+Enter continue to activate painted controls. S10d2 adds no native Escape binding;
+navigation continues through the existing App routing. Empty or whitespace-only
+drafts refuse with `invalid_params` before admission. A stale draft or generation refuses
+before admission. Send uses the existing durable queue owner as interactive Operator,
+never raw stdin. One in-flight ticket per view prevents duplicate clicks. Only the
+exact committed draft is cleared; refusal or uncertainty retains it, and unknown
+admission stays latched with its lifecycle ID rather than being blindly resent.
+A receipt acknowledges admission, never delivery or turn completion. Details expands
+the exact card and anchors its source cursor; sibling cards share that cursor. S10e still owns full permission inspection,
+capability-backed decisions and Always confirmation; UID-only decisions refuse.
+
+Text and paste are not submission intents. S10d3 explicitly extends the frozen S10
+contracts with typed composer editing: insert, delete, cursor movement, history and
+bounded paste as one insert. It adds editor/history and admission-receipt UX plus
+idle delivery, rather than interpreting printable or pasted text as Send.
+
+### Proposed amendment: S10d3 composer editing contract (#2696)
+
+This is the proposed extension for architect acceptance, not a claim that editing
+has shipped. D3a alone supplies MVP #1424 step 2 on top of S10d2c (#2685);
+D3b–D3e below are issue-tracked post-MVP work. The typed `Composer` gains a
+`text_revision: u64`; its cursor remains a UTF-8 byte offset, now
+restricted to an extended-grapheme boundary. `Action` gains `EditComposer(Edit)`
+with typed focus, insertion, deletion and movement variants; existing `ComposerHistory`
+and `Send(Composer)` remain. Directions and units are enums, never JSON commands.
+A paste is one insertion, not a sequence of key events or a submission.
+
+#### Ownership, focus and keys
+
+The existing App mode and binding dispatcher runs first: overlays, visible floats,
+direct configured actions/commands and the prefix own their existing inputs. Only
+otherwise-unclaimed input in `Mode::Terminal`, focused on a valid native target,
+can edit its composer. A PTY pane keeps its terminal routing. Non-terminal modes
+never edit or submit a hidden composer. Key release does nothing. The runtime
+currently forwards Repeat events to `handle_key` (`src/app/runtime.rs`): D3a must
+consume repeated Enter before either Submit or painted-control activation, even
+when a nonempty draft has no pending ticket. A repeated Enter never submits.
+Repeat may repeat movement/deletion/printable insertion. Legacy input cannot
+distinguish repeated Press events from independent presses; pending admission
+and text-revision-fenced clear still protect those paths without timing guesses.
+
+An accepted composer operation selects the composer, leaving painted-control
+selection; subsequent Enter submits the draft rather than activating an old
+control. A left click inside the painted composer emits typed `Edit::Focus`,
+selecting it without moving the cursor; mouse caret placement is post-MVP #2699.
+A rejected operation preserves both draft and selection. Tab/Shift-Tab
+continue selecting painted controls, and Enter on a selected control activates
+its original generation-fenced intent. Esc acquires no new native binding.
+The full target keymap below applies only after the existing App bindings. D3a
+implements its minimal typing keys; remaining movement/newline bindings are
+post-MVP D3b (#2702), and history is post-MVP D3e (#2704):
+
+| Input | Composer operation |
+| --- | --- |
+| Printable `Char`, unmodified or Shift | Insert the exact Unicode scalar at the cursor |
+| Left / Right | Previous / next extended-grapheme boundary |
+| Backspace / Delete | Delete one preceding / following extended grapheme |
+| Ctrl-Left / Ctrl-Right, Alt-B / Alt-F | Previous word start / next word end |
+| Ctrl-Backspace / Ctrl-Delete | Delete to the preceding word start / following word end |
+| Home or Ctrl-A / Ctrl-E | Start / end of the logical LF-delimited line |
+| Ctrl-Home / Ctrl-End | Start / end of the entire draft |
+| Up / Down | Previous / next logical line, preserving a preferred display-cell column |
+| Ctrl-P / Ctrl-N | Older / newer local committed composer history |
+| Ctrl-J, or distinguishable Shift-Enter | Insert LF; never submit |
+| Plain Enter | Submit the current accepted text revision, unless a painted control is selected |
+| PageUp / PageDown / End | Existing transcript scroll / follow-tail actions |
+| Ctrl-W | Existing detach action, not word deletion |
+
+The raw parser already distinguishes CR (Enter) from LF (Ctrl-J). A terminal that
+encodes Shift-Enter as ordinary CR cannot communicate the distinction: Ctrl-J is
+the newline binding when unclaimed, and the UI never guesses from timing. Other modified keys
+have no implicit insertion fallback. A configured App binding may shadow an editor
+binding; the App binding wins. In particular, `keys.prefix = "ctrl+a"` makes Ctrl-A
+unavailable to the editor (Home remains an alternative). A direct Ctrl-J binding
+without the kitty protocol can leave no distinguishable newline key: Shift-Enter
+may arrive as ordinary CR. The UI must expose that binding gap, not steal Ctrl-J
+from the App or pretend Shift-Enter is distinct. Unbracketed CR retains Enter
+semantics, so a stream of ordinary key events is not promised paste safety.
+
+#### Graphemes, words and bounds
+
+Use `unicode-segmentation`, already locked transitively at 1.13.3, promoted to a
+direct dependency by the implementation. Extended graphemes and Unicode word
+boundaries come from that dependency, not scalar counts, ASCII-only words or a
+second hand-written segmenter. Word-left skips intervening separators to the
+preceding word start; word-right skips separators and traverses the next word to
+its end. Combining marks, regional-indicator flags and ZWJ emoji remain indivisible.
+Insertion can join adjacent graphemes: resegment around the edit and move the
+caret to the first grapheme boundary at or after the inserted bytes. Never leave
+it inside the newly joined cluster. No Unicode normalization rewrites user text.
+
+Rendering maps grapheme boundaries to cells with the existing Unicode-width
+support, not byte offsets. LF changes logical line; pasted TAB displays as spaces
+to the next eight-cell tab stop. Vertical movement clamps to a grapheme boundary
+on the target logical line, retaining the preferred column across short lines.
+Visual wrapping does not create extra logical lines. Text/horizontal movement
+resets that preferred column. Rendering is pure and never repairs the cursor.
+
+The named draft bound is `COMPOSER_MAX_BYTES = 64 * 1024` UTF-8 bytes. Every insert,
+including a recalled draft, validates the whole result before mutation. Limit
+failure is atomic `invalid_params`, not truncation. Every insertion origin shares
+the control/UTF-8 validator below; only paste normalizes CR. Existing queue/transport
+bounds still apply independently when sending; the editor bound grants no admission.
+
+#### Bracketed paste and the byte boundary
+
+Until post-MVP native paste insertion lands (D3d, #2703), D3a handles a delivered
+paste event targeting a native pane with an `invalid_params` refusal toast and no
+draft or queue mutation. It never silently drops the event. Float/PTY owners keep
+their existing routing. The shared `raw_input` decoder currently buffers paste
+without a bound and stalls on invalid UTF-8; that existing PTY-affecting bug is
+#2701, not a native-only feature deferral. It can prevent a paste event reaching
+the App. D3c (#2705) builds on the #2701 fix, or fixes #2701 in its first child,
+before claiming the bounded end-to-end behavior below.
+
+`COMPOSER_MAX_PASTE_BYTES = 64 * 1024` bounds the original paste payload as bytes;
+the resulting draft must also satisfy `COMPOSER_MAX_BYTES`. Valid UTF-8 is required.
+Normalize CRLF and lone CR to LF for paste only; preserve other Unicode and LF/TAB.
+NUL, ESC, DEL, other C0 controls except LF/TAB, and C1 controls refuse the entire
+paste as `invalid_params`. A genuine U+FFFD is valid text; never use lossy decoding
+to turn invalid bytes into it. Validation precedes any edit, focus change or submit.
+
+The bound must hold before allocation of a complete `String`, at the earliest
+paste accumulator, including the client byte framer and server input decoder.
+The client streams bounded chunks instead of retaining the entire paste; it does
+not guess native destination policy. The first native-aware server accumulator
+enforces the total native paste cap against App-captured context. Existing
+input-byte transport frames carry the same bytes in bounded chunks; their boundaries
+are not key or paste boundaries. Keep per-input-connection framing state through
+those chunks. Internal typed paste-begin/completion/refusal events preserve order;
+this adds no persisted event kind or new public input-message format.
+
+At paste-begin the App captures the native target, generation and input focus.
+Completion is one atomic edit only if that target/focus is still current. It never
+retargets a paste into another pane. Generation retirement gives `agent_not_found`;
+a focus/mode change refuses with `invalid_params`. The receiver derives this
+context; it is not a producer-supplied claim of authority.
+
+On overflow or invalid data, report one typed refusal and drain through the paste
+terminator using bounded delimiter state. Do not interpret the rejected tail as
+keys, terminal escapes or Submit. An unterminated paste remains in bounded drain
+state until its terminator or connection close; a timer must not release its tail
+as commands. Disconnect refuses an incomplete paste as `invalid_params` unless
+already refused, discards it and resets the framer. A valid terminated paste
+followed by another key must leave that key independently
+processable. Chunk splitting inside UTF-8 or the delimiters cannot change results.
+PTY paste forwarding retains its semantics; bounded streaming must not impose the
+native editor's insertion policy on a PTY destination.
+
+#### Authoritative revision and coherent publication
+
+Keep one pure `EditorState` per App-owned driver lifetime, keyed by the exact
+`Target` (agent and generation). It lives in App state, separately from the
+runtime task. The App serializes accepted input into this authority; it never
+reads back its own painted payload as proof of freshness and never borrows Model.
+The driver task still owns Stream and Model. It receives an immutable typed
+`EditorCut` containing composer/text revision, admission state and receipt identity,
+and projects that coherent cut through its existing copy-on-write snapshot.
+Latest-wins publication may skip frames, not accepted edits. Queue/history/live
+projection cannot overwrite the editor with an older composer cut.
+
+A single App-wide monotonically increasing `u64` counter supplies every editor's
+initial `text_revision` and each subsequent actual text change. Creating another
+driver takes a fresh value, so detach/reattach cannot reuse an old driver's
+revision. Intervening edits to another editor can consume values; an editor must
+not assume consecutive values.
+
+Within an editor, only a change to the exact UTF-8 text allocates a new text
+revision: insertion, deletion, paste, history recall that changes text, or clear.
+Cursor/word/line movement, history-index movement or recall of identical text,
+focus, refusal and admission-status updates leave it unchanged. Cursor-only changes
+still publish a new coherent `EditorCut`; text revision is not a frame version.
+The cursor remains in bounds at a grapheme boundary in the same cut.
+
+Keyboard Submit captures the authoritative editor text revision and body, even
+when paint has not caught up. Painted Send retains its captured text revision;
+the dispatcher compares that value to `EditorState` before admission. Cursor
+movement alone does not stale Send: the body is text-only. A matching revision
+admits the authoritative editor text, not a body inferred from a copied frame;
+a stale text revision refuses atomically with `invalid_params`. This replaces the
+circular stale-draft comparison noted in #2655. Existing target and principal
+checks remain mandatory. Each accepted edit commits locally before projection,
+so rapid typing followed by Enter cannot omit the unpainted suffix or spuriously
+reject it as a stale frame.
+
+One outstanding admission ticket per driver still fences Submit (`session_busy`).
+Editing may continue while that ticket is pending. Its completion carries the
+original target, lifecycle ID and captured text revision. Clear applies only if
+the current generation and text revision still match; it empties the text, resets
+the cursor to zero, assigns a new text revision and publishes one cut. Enter
+"hello", Left, then acknowledgement must clear "hello": retaining it would make
+the next Enter resend an already admitted message. This intentionally supersedes
+S10d2c's cursor-mismatch retention. Editing text away and back to identical bytes
+(ABA) changes its text revision and prevents the old clear. A different text
+revision keeps its draft while the receipt still reports the older item's outcome.
+Completion must match the outstanding lifecycle ID; stale or already-settled
+completions cannot clear or append history twice. Deduplication
+does not require an unbounded set of historical IDs.
+
+Refusal preserves the editor. `input_write_unknown` preserves both draft and
+lifecycle identity and stays latched across edits; another Enter still refuses.
+No edit, cursor movement or fresh text revision authorizes automatic resubmission.
+This latch lasts only while its driver/ticket lives: existing detach/reattach drops
+the ticket and therefore clears the unknown-admission latch, even if the item may
+have committed. That is current behavior, not proof that retry is safe. Explicit
+reconciliation and the fix for silent latch loss belong to #2700; D3a does not
+claim that UX or invent a new queue owner.
+
+The composer receipt displays its lifecycle ID and owner-confirmed admission or
+typed refused/unknown outcome, independently of the newer text revision. A
+committed receipt means admission, never start, delivery or completion. Delivery
+continues through the existing queue's canonical idle boundary.
+
+A stale/retired target refuses with `agent_not_found` before editing or sending.
+An unavailable driver/source reports its existing typed failure and preserves the
+editor; it must not accept invisible input into an error tile. App still settles an
+outstanding ticket against editor authority even if its frame cannot be published.
+Publication coalescing is not a mutation failure; stale source cuts cannot roll the
+draft back. A valid App-owned edit requires no asynchronous command-queue retry.
+
+#### History and lifetime
+
+History contains only this driver's acknowledged composer submissions, once per
+lifecycle ID, in commit order. It is not reconstructed from assistant output or
+other principals' queue items. Retain at most `COMPOSER_HISTORY_ENTRIES = 16` and
+`COMPOSER_HISTORY_BYTES = 256 * 1024`, evicting whole oldest entries. Refused and
+uncertain submissions do not become acknowledged history. Different committed IDs
+may retain equal text. Recalling preserves exact text and places the cursor at
+its end; the first older-history action saves the current scratch draft/cursor,
+and moving newer past the newest entry restores it. The 256-KiB history budget
+includes that saved scratch draft; evict oldest entries as needed before saving it.
+The authoritative current draft has its separate 64-KiB bound. An empty history or
+a boundary move is a no-op.
+
+Draft, text revision, history and pending/uncertain presentation survive repaint,
+focus changes, workspace/tab switches and source replay while that driver lives. They
+are local to that App/controller: attached clients showing the same driver share
+them, while another App/server has an independent editor. Explicit detach drops
+that driver and its unsent draft/history; reattach creates a fresh empty editor
+with a fresh text revision from the App-wide counter and no inherited outstanding
+ticket. This also clears the unknown-admission latch under current behavior
+(#2700). The single App-wide counter continues for the App lifetime. Generation
+changes get fresh values from that counter. An App restart has a new counter/empty
+editor state and no outstanding editor receipts from the old App. This slice adds
+no placement/session persistence for editor state. An already committed queue item
+survives detach/restart under the existing journal; dropping its view or ticket
+never cancels or resends it. A new driver must not auto-send or reconstruct an
+uncertain draft from a queued item. Inspect the canonical queue before manually
+repeating a possibly admitted message after reopening.
+
+#### Pre-mortem
+
+| Production failure | Required prevention and evidence |
+| --- | --- |
+| Fast typing outruns the published frame; Enter sends a prefix | App editor authority precedes paint; public test types and submits without yielding to a frame |
+| An old receipt clears a newly edited draft that happens to look identical | Text-revision-fenced clear; hold acknowledgement, type/delete back to the same bytes/cursor, then release it |
+| Cursor movement keeps already admitted text and the next Enter duplicates it | Cursor movement leaves text revision unchanged; Enter, Left, release acknowledgement must clear the draft |
+| Delete corrupts an emoji or caret lands inside a combining cluster | Grapheme segmentation and boundary assertions; real key path covers combining/ZWJ/flag cases and cell rendering |
+| A large, binary or split paste leaks a newline as Submit, or exhausts memory | Bounded byte framing, one typed refusal and drain-to-terminator; test chunks, exact limits and disconnect |
+| A modal/float or another pane receives the wrong draft/paste | Existing routing precedence and captured paste focus/generation; public mode/focus change tests assert zero edit/admission |
+| Detach or worker failure appears to cancel an already admitted item | Per-driver lifetime is explicit; canonical queue/idle tests prove one admission and no automatic retry |
+
+#### Implementation slices and fail-first public acceptance
+
+Each child below is at most 350 production lines (tests excluded), leaving margin
+below the 400-line ceiling. Split further before exceeding the ceiling. Stack in
+order after architect acceptance of this amendment. Every slice uses the existing
+isolated socket-start fake fixture; no real model or operator session is involved.
+Pure reducer/segmentation tests supplement, never replace, the public path.
+
+Implementation staging: D3a1 supplies the typed App editor authority, shared text
+revision allocator, coherent driver cuts, driver-lifetime cleanup and revision-fenced
+admission/clear. It does not yet bind raw text input. D3a2 adds the raw keyboard,
+composer-focus and paste-refusal routing and the public fake-fixture acceptance
+coverage below. Each child carries its own fail-first tests.
+
+1. **D3a — MVP: editor authority, minimal typing and text-revision-fenced
+   submission (#2696; MVP #1424 step 2).** Add typed editor/cut contracts, the
+   App-wide revision allocator, insert/backspace and left/right grapheme edits,
+   coherent publication, and text-revision-based Send/clear. Guard repeated Enter
+   here, not in D3b; handle native paste with a typed unsupported-paste refusal toast
+   until D3d lands. Public acceptance uses the actual raw-event/key path on the
+   socket-started fake fixture:
+   - Type Unicode and Enter without waiting for paint; assert one exact queue body.
+   - Type "hello", press Enter, hold its acknowledgement, move Left, then release it:
+     assert an empty draft and cursor zero; another Enter cannot resend "hello".
+   - Hold a real ticket's completion, edit/delete back to the original text/cursor,
+     then release it; the newer text revision survives. A cursor move leaves a
+     painted Send valid, but a captured stale text revision refuses without mutation.
+   - Deliver Repeat Enter to `handle_raw_input_event` with nonempty text and no
+     pending ticket: zero submissions. Press Enter submits once; repeated Enter
+     still never submits, including after a fresh draft replaces the cleared one.
+   - Deliver a native paste event: a typed refusal toast, unchanged editor and zero
+     queue items. Preserve float/PTY ownership as regression coverage. #2701 covers
+     malformed raw pastes that currently fail before event delivery.
+   - Detach/reattach while the old acknowledgement is held, then release it: it must
+     not clear or settle a new editor with the same text and canonical generation.
+2. **D3b — post-MVP: remaining editor keys and caret rendering (#2702).** Add
+   forward/word deletion, word/line/draft/vertical movement and newline routing.
+   Public acceptance edits combining/flag/ZWJ text through actual key events,
+   inspecting the painted caret and admitted body. Ctrl-J/distinct Shift-Enter adds
+   LF without admission; plain Enter submits once. Prefix Ctrl-A and direct Ctrl-J
+   bindings demonstrate the documented gaps without stealing App ownership. Test
+   App bindings, prefix, modal, float and control focus. Clicking the composer leaves
+   control selection; mouse caret placement is separate #2699. End still follows
+   tail as regression coverage. Key release performs no editor operation; test release-only
+   events here. Repeat-Enter acceptance belongs to D3a.
+3. **D3c — post-MVP: bounded byte-paste framing integration (#2705).** Shared
+   parser hardening #2701 is a prerequisite, or is fixed in the first child here.
+   Capture App destination policy/context at paste-begin, then stream existing
+   input-byte frames with per-connection incremental framing and typed internal
+   completion/refusal. Native insertion remains disabled with D3a's refusal toast.
+   Public acceptance feeds the real client/server raw-input entry with chunk splits
+   inside UTF-8 and delimiters: exact-limit paste arrives once, overflow/invalid
+   UTF-8 refuses once with bounded retained bytes, and tail/newline is never
+   dispatched. Termination/disconnect leaves the next independent input processable;
+   producer death or silence must fail a bounded test, never hang it.
+4. **D3d — post-MVP: atomic native paste routing (#2703).** Revalidate captured
+   App target/focus, normalize/validate and apply one insertion/text revision.
+   Public acceptance uses the same raw-input path on a fake-started native pane:
+   64-KiB boundaries, combined draft overflow, NUL/ESC/C1, CRLF/TAB, and focus/mode/
+   generation changes. Assert exact text/cursor/text revision, unchanged state on
+   refusal and zero queue items until explicit Enter. PTY/float forwarding retains
+   regression coverage through its real paths.
+5. **D3e — post-MVP: bounded history and lifecycle/receipt integration (#2704).**
+   Add history recall/scratch restoration, lifecycle-ID-bearing admission receipt
+   rendering and editor cleanup. Public acceptance commits real fake-worker turns,
+   recalls/edits/submits, covers both history caps, then detaches/reattaches and
+   retires a generation. Recalling equal text does not change text revision;
+   recalling different text does. Assert a fresh editor/text revision and the same
+   durable queue item. A held-busy/then-idle fake worker proves one admission receipt
+   before delivery and one delivery only at idle, as regression coverage. Refusal/
+   unknown retains drafts without automatic retry while the ticket lives; existing
+   detach latch loss is documented, with reconciliation/fix owned by #2700. No new
+   delivery policy or persisted history format is introduced.
+
+For every slice, run its new public acceptance tests against its parent once and
+record the command, behavioral failures and exit code, then record the passing
+focused selection on the child. Preserved App/PTY routing, idle policy and existing
+scroll behavior are explicitly regression coverage; tests for them may pass on the
+parent and must not be claimed as fail-first evidence for the new feature.
+Framing/routing may be split into smaller children rather than merging a partially
+unbounded paste path as a completed native feature.
+
+
+### Amendment: S10e native TUI permission decisions (#1430, #1424)
+
+A full TUI attach over `flock.sock` captures kernel peer credentials before Hello.
+The existing LocalOperator admission seals that process instance and arms its exit
+watch before issuing an existing ADR-0038 §6 app-session token. Its fixed scopes
+are Read, Send, Answer and Operate, with the same suspend-inclusive 12-hour TTL.
+The bearer stays inside the server; neither Hello nor an input frame can supply
+or select one. Direct terminal attaches receive no permission capability.
+
+Each native decision uses only the input connection's session and sealed peer.
+Process identity, liveness, expiry and Operate scope are checked at the existing
+shared admission fence, through `Principal::Token`. Exact request id, request
+sequence and target generation remain mandatory. Allow once resumes the paused
+turn; Deny sends the harness its denial. UID-only or internal interactive calls
+continue to refuse with `not_authorized`; this does not widen send-only principals.
+Per #2585, Answer alone cannot authorize `agent.decide`: missing Operate refuses
+with `not_authorized`. A direct attach without a capability entry also refuses
+with `not_authorized`.
+
+Detach removes the input capability before retiring the credential under the
+existing revocation fence. Retirement errors are logged and the detached
+connection remains disabled. Owner exit and TTL expiry refuse queued decisions
+with `auth_revoked`, even before EOF or a cleanup notification is serviced.
+Reattach mints a new credential and reruns admission. TUI LocalOperator proof
+refusals (unverified UID/origin, agent/relay ancestry, or unavailable process
+evidence) map explicitly to `not_authorized`. A stored credential that has been
+revoked or expired remains `auth_revoked`; the per-decision process-binding check
+continues to report `peer_process_changed` for mismatched evidence. Registration
+uses the production `wait_peer`/`register_peer` fence and the existing GUI handshake
+budget. Detach uses the production begin/wait/finish mutation phases in every
+build. Scheduling these TUI phases off the App thread remains tracked in #2712.
+No credential is persisted or transferred at handoff.
+This slice covers Allow once and Deny. Always (session) remains refused with
+`permission_decision_unsupported` pending the confirmation flow tracked in #1430.

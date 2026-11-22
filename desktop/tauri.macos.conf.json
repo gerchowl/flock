@@ -1,0 +1,7 @@
+{
+  "bundle": {
+    "active": true,
+    "targets": ["app"],
+    "macOS": { "signingIdentity": "-", "hardenedRuntime": true, "entitlements": "entitlements.plist" }
+  }
+}

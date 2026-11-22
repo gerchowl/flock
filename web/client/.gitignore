@@ -1,0 +1,4 @@
+node_modules/
+dist/
+# Screenshot artefacts written by the client check (tests/screenshots.test.ts).
+artifacts/

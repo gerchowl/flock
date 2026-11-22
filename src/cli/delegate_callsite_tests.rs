@@ -1,0 +1,1142 @@
+//! Call-site tests for the inventory-driven decisions (P578 r4-3, W7).
+//!
+//! The frozen pure-function tests prove the DECISIONS; these prove the WIRING
+//! around them: that the right inventory requests are made, that failures
+//! stop before anything destructive, and that `require_delegate` maps every
+//! `AgentFetch` to the right exit path. The decision/callsite split keeps
+//! each function's tests independent of the socket.
+
+use super::*;
+use serde_json::json;
+use std::cell::RefCell;
+use std::io;
+use std::rc::Rc;
+
+fn with_json_output<T>(run: impl FnOnce() -> T) -> T {
+    struct ResetOnDrop;
+    impl Drop for ResetOnDrop {
+        fn drop(&mut self) {
+            crate::cli::output::set(crate::cli::output::Format::Default);
+        }
+    }
+    crate::cli::output::set(crate::cli::output::Format::Json);
+    let _reset = ResetOnDrop;
+    run()
+}
+
+#[test]
+fn retained_block_json_output_resets_during_unwind() {
+    let failed = std::panic::catch_unwind(|| {
+        with_json_output(|| {
+            let response = json!({"error": {"code": "write_failed", "message": "fixture failure"}});
+            crate::cli::output::error(
+                &response,
+                crate::api::error_code::ErrorCode::WriteFailed.exit(),
+            );
+            assert!(crate::cli::output::json());
+            assert!(crate::cli::output::envelope_pending());
+            panic!("fixture panic before normal output reset");
+        })
+    });
+    assert!(failed.is_err());
+    assert!(!crate::cli::output::json());
+    assert!(!crate::cli::output::envelope_pending());
+}
+
+// ---------- fixtures ---------------------------------------------------------
+
+fn start_flags_worktree(branch: &str) -> StartFlags {
+    StartFlags {
+        branch: Some(branch.to_string()),
+        worktree: true,
+        ..StartFlags::default()
+    }
+}
+
+fn start_flags_cwd(cwd: &str) -> StartFlags {
+    StartFlags {
+        cwd: Some(cwd.to_string()),
+        ..StartFlags::default()
+    }
+}
+
+fn worktree_row(path: &str, branch: &str) -> serde_json::Value {
+    json!({"path": path, "branch": branch})
+}
+
+fn ok_response() -> serde_json::Value {
+    json!({"result": {}})
+}
+
+fn cleanup_cwd() -> Cleanup {
+    Cleanup {
+        name: "d1".to_string(),
+        workspace_id: "w_delegate".to_string(),
+        pane_id: "p".to_string(),
+        root_pane: "rp".to_string(),
+        root_pane_terminal_id: "rt".to_string(),
+        terminal_id: "t".to_string(),
+        mode: Mode::Cwd,
+        worktree: None,
+        parent_workspace_id: Some("w_parent".to_string()),
+        repo_root: Some("/repo".to_string()),
+        repo_key: Some("k".to_string()),
+    }
+}
+
+/// Capture of what a fake `kill_path` closure saw.
+#[derive(Default)]
+struct KillLog {
+    calls: Vec<String>,
+}
+
+type Log = Rc<RefCell<KillLog>>;
+
+fn record_kill(log: &Log, path: &str) -> Result<serde_json::Value, ServerError> {
+    log.borrow_mut().calls.push(path.to_string());
+    Ok(ok_response())
+}
+
+// ---------- teardown_after_place_failure_with --------------------------------
+
+#[test]
+fn w7_place_failure_a_failed_post_list_kills_nothing() {
+    let log: Log = Rc::new(RefCell::new(KillLog::default()));
+    let log_clone = log.clone();
+    let before = vec![worktree_row("/repo/x", "feat/x")];
+    let exit = teardown_after_place_failure_with(
+        "d1",
+        Some(&before),
+        Mode::Worktree,
+        &start_flags_worktree("feat/x"),
+        CreateFailure::TimedOut,
+        |_deadline| None, // The post-create list FAILED.
+        |path| record_kill(&log_clone, path),
+    );
+    assert_eq!(exit, 1);
+    assert!(
+        log.borrow().calls.is_empty(),
+        "a failed post-create list is not permission to kill anything: {:?}",
+        log.borrow().calls
+    );
+}
+
+#[test]
+fn w7_place_failure_look_with_a_new_checkout_kills_exactly_that_path() {
+    let log: Log = Rc::new(RefCell::new(KillLog::default()));
+    let log_clone = log.clone();
+    let before = vec![worktree_row("/repo/existing", "feat/other")];
+    let after = vec![
+        worktree_row("/repo/existing", "feat/other"),
+        worktree_row("/repo/stray", "feat/x"),
+    ];
+    let exit = teardown_after_place_failure_with(
+        "d1",
+        Some(&before),
+        Mode::Worktree,
+        &start_flags_worktree("feat/x"),
+        CreateFailure::TimedOut,
+        |_deadline| Some(after.clone()),
+        |path| record_kill(&log_clone, path),
+    );
+    assert_eq!(exit, 1);
+    assert_eq!(log.borrow().calls, vec!["/repo/stray".to_string()]);
+}
+
+#[test]
+fn w7_place_failure_look_with_no_new_checkout_kills_nothing() {
+    let log: Log = Rc::new(RefCell::new(KillLog::default()));
+    let log_clone = log.clone();
+    let before = vec![worktree_row("/repo/a", "feat/a")];
+    let after = before.clone();
+    let exit = teardown_after_place_failure_with(
+        "d1",
+        Some(&before),
+        Mode::Worktree,
+        &start_flags_worktree("feat/x"),
+        CreateFailure::TimedOut,
+        |_deadline| Some(after.clone()),
+        |path| record_kill(&log_clone, path),
+    );
+    assert_eq!(exit, 1);
+    assert!(log.borrow().calls.is_empty());
+}
+
+#[test]
+fn w7_place_failure_a_refusal_never_lists() {
+    let listed: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
+    let listed_clone = listed.clone();
+    let log: Log = Rc::new(RefCell::new(KillLog::default()));
+    let log_clone = log.clone();
+    let before = vec![worktree_row("/repo/a", "feat/a")];
+    let refused = CreateFailure::Refused(ServerError {
+        code: "worktree_create_failed".to_string(),
+        message: "branch already exists".to_string(),
+    });
+    let exit = teardown_after_place_failure_with(
+        "d1",
+        Some(&before),
+        Mode::Worktree,
+        &start_flags_worktree("feat/x"),
+        refused,
+        |_deadline| {
+            *listed_clone.borrow_mut() = true;
+            Some(Vec::new())
+        },
+        |path| record_kill(&log_clone, path),
+    );
+    assert_eq!(exit, 1);
+    assert!(
+        !*listed.borrow(),
+        "a Refused failure must not even LIST — leftover_check says Nothing"
+    );
+    assert!(log.borrow().calls.is_empty());
+}
+
+#[test]
+fn w7_place_failure_cwd_transport_prints_and_never_lists() {
+    let listed: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
+    let listed_clone = listed.clone();
+    let log: Log = Rc::new(RefCell::new(KillLog::default()));
+    let log_clone = log.clone();
+    let exit = teardown_after_place_failure_with(
+        "d1",
+        None,
+        Mode::Cwd,
+        &start_flags_cwd("/some/cwd"),
+        CreateFailure::Transport(io::ErrorKind::ConnectionReset),
+        |_deadline| {
+            *listed_clone.borrow_mut() = true;
+            Some(Vec::new())
+        },
+        |path| record_kill(&log_clone, path),
+    );
+    assert_eq!(exit, 1);
+    assert!(
+        !*listed.borrow(),
+        "cwd mode has nothing to list for; a transport failure never asks"
+    );
+    assert!(log.borrow().calls.is_empty());
+}
+
+// ---------- parent_to_close_with ---------------------------------------------
+
+fn target_with_parent() -> Cleanup {
+    cleanup_cwd()
+}
+
+fn parent_record() -> serde_json::Value {
+    json!({
+        "workspace_id": "w_parent",
+        "pane_count": 1,
+        "worktree": {"checkout_path": "/repo", "is_linked_worktree": false, "repo_key": "k"}
+    })
+}
+
+fn list_rows() -> Vec<serde_json::Value> {
+    vec![
+        json!({"workspace_id": "w_parent", "worktree": {"is_linked_worktree": false, "repo_key": "k"}}),
+        json!({"workspace_id": "w_delegate", "worktree": {"is_linked_worktree": true, "repo_key": "k"}}),
+    ]
+}
+
+#[test]
+fn w7_parent_a_failed_list_returns_none() {
+    let target = target_with_parent();
+    let out = parent_to_close_with(&target, |_id| Some(parent_record()), || None).expect("no err");
+    assert!(out.is_none());
+}
+
+#[test]
+fn w7_parent_a_failed_record_returns_none() {
+    let target = target_with_parent();
+    let out = parent_to_close_with(&target, |_id| None, || Some(list_rows())).expect("no err");
+    assert!(out.is_none());
+}
+
+#[test]
+fn w7_parent_all_evidence_present_returns_some() {
+    let target = target_with_parent();
+    let out = parent_to_close_with(&target, |_id| Some(parent_record()), || Some(list_rows()))
+        .expect("no err");
+    assert_eq!(out.as_deref(), Some("w_parent"));
+}
+
+// ---------- parent_closable: malformed-row rules (W6) ------------------------
+
+#[test]
+fn w6_parent_closable_a_row_with_no_workspace_id_keeps_parent_open() {
+    let others = [
+        json!({"worktree": {"is_linked_worktree": false, "repo_key": "k"}}), // no id
+    ];
+    assert!(!parent_closable(
+        Some(&parent_record()),
+        Some("/repo"),
+        Some(&others),
+        "w_delegate",
+        Some("k"),
+    ));
+}
+
+#[test]
+fn w6_parent_closable_a_row_without_boolean_is_linked_keeps_parent_open() {
+    // A `worktree` block IS present but `is_linked_worktree` isn't a boolean:
+    // the row CLAIMS a worktree but its linkage is malformed. Refuse to
+    // close the parent on the strength of that row.
+    let others = [
+        json!({"workspace_id": "w_other", "worktree": {"is_linked_worktree": "yes", "repo_key": "k"}}),
+    ];
+    assert!(!parent_closable(
+        Some(&parent_record()),
+        Some("/repo"),
+        Some(&others),
+        "w_delegate",
+        Some("k"),
+    ));
+    let missing = [json!({"workspace_id": "w_other", "worktree": {"repo_key": "k"}})];
+    assert!(!parent_closable(
+        Some(&parent_record()),
+        Some("/repo"),
+        Some(&missing),
+        "w_delegate",
+        Some("k"),
+    ));
+}
+
+#[test]
+fn w6_parent_closable_an_operator_workspace_with_no_worktree_block_does_not_block() {
+    // A legitimate non-worktree workspace has `worktree: None` and is simply
+    // not linked — the parent close may still proceed. This is what a19 and
+    // the operator workspaces in the integration suite look like.
+    let others = [
+        json!({"workspace_id": "w_parent", "worktree": {"is_linked_worktree": false, "repo_key": "k"}}),
+        json!({"workspace_id": "w_operator"}),
+    ];
+    assert!(parent_closable(
+        Some(&parent_record()),
+        Some("/repo"),
+        Some(&others),
+        "w_delegate",
+        Some("k"),
+    ));
+    let null_worktree = [
+        json!({"workspace_id": "w_parent", "worktree": {"is_linked_worktree": false, "repo_key": "k"}}),
+        json!({"workspace_id": "w_operator", "worktree": null}),
+    ];
+    assert!(parent_closable(
+        Some(&parent_record()),
+        Some("/repo"),
+        Some(&null_worktree),
+        "w_delegate",
+        Some("k"),
+    ));
+}
+
+// ---------- require_decide: pure mapping of AgentFetch -> RequireFailure -----
+
+fn entry_for(name: &str) -> Entry {
+    Entry {
+        name: name.to_string(),
+        terminal_id: "t".to_string(),
+        pane_id: "p".to_string(),
+        root_pane: "rp".to_string(),
+        workspace_id: "w".to_string(),
+        mode: "cwd".to_string(),
+        worktree: None,
+        branch: None,
+        parent_workspace_id: None,
+        repo_root: None,
+        repo_key: None,
+        harness: "opencode".to_string(),
+        model: None,
+        sandbox: None,
+        round: 1,
+        brief: "x".to_string(),
+        submitted_at_ms: 0,
+        cursor: String::new(),
+        created_at_ms: 0,
+        root_pane_terminal_id: "rt".to_string(),
+        base: None,
+        base_sha: None,
+        agent_id: None,
+        lock_resolution: None,
+        session: None,
+        extra: Default::default(),
+    }
+}
+
+#[test]
+fn w7_require_decide_a_found_record_with_matching_identity_is_ours() {
+    let mut entry = entry_for("d1");
+    entry.agent_id = Some("agent_a".into());
+    let record = json!({"terminal_id": "t", "agent_id":"agent_a"});
+    assert!(require_decide(entry, AgentFetch::Found(record)).is_ok());
+}
+
+#[test]
+fn w7_require_decide_a_mismatched_identity_is_not_a_delegate() {
+    let mut entry = entry_for("d1");
+    entry.agent_id = Some("agent_a".into());
+    let record = json!({"terminal_id": "someone_else"});
+    assert!(matches!(
+        require_decide(entry, AgentFetch::Found(record)),
+        Err(RequireFailure::NotDelegate)
+    ));
+}
+
+#[test]
+fn require_decide_a_restarted_delegate_is_found_by_its_agent_id() {
+    // #975: a server restart re-mints the terminal id. The agent id survives,
+    // and the entry is re-pointed at the new terminal and pane.
+    let mut entry = entry_for("d1");
+    entry.agent_id = Some("agent_a".to_string());
+    let record = json!({"terminal_id": "t2", "pane_id": "p2", "agent_id": "agent_a"});
+    let live = require_decide(entry, AgentFetch::Found(record)).expect("same agent");
+    assert_eq!(live.terminal_id, "t2");
+    assert_eq!(live.pane_id, "p2");
+}
+
+#[test]
+fn require_decide_another_agent_on_a_new_terminal_is_not_a_delegate() {
+    let mut entry = entry_for("d1");
+    entry.agent_id = Some("agent_a".to_string());
+    let record = json!({"terminal_id": "t2", "agent_id": "agent_b"});
+    assert!(matches!(
+        require_decide(entry, AgentFetch::Found(record)),
+        Err(RequireFailure::NotDelegate)
+    ));
+}
+
+#[test]
+fn require_decide_no_recorded_identity_cannot_backfill_from_a_terminal() {
+    let entry = entry_for("d1");
+    let record = json!({"terminal_id": "t", "agent_id": "agent_a"});
+    assert!(matches!(
+        require_decide(entry, AgentFetch::Found(record)),
+        Err(RequireFailure::SessionUnbound(_, _))
+    ));
+}
+
+#[test]
+fn require_decide_a_legacy_worktree_cannot_authorize_recovery() {
+    let mut entry = entry_for("d1");
+    entry.worktree = Some("/wt/d1".to_string());
+    for cwd in ["/wt/d1", "/elsewhere"] {
+        let record = json!({"terminal_id":"t2", "pane_id":"p2", "agent_id":"agent_a", "cwd":cwd,
+            "agent_session":{"source":"flock:codex","agent":"codex","kind":"id","value":"other-session"}});
+        let Err(RequireFailure::SessionUnbound(saved, _)) =
+            require_decide(entry.clone(), AgentFetch::Found(record))
+        else {
+            panic!("a directory is not identity evidence");
+        };
+        assert!(saved.agent_id.is_none());
+        assert!(saved.session.is_none());
+    }
+}
+
+#[test]
+fn require_decide_a_terminal_match_cannot_override_a_conflicting_agent_id() {
+    let mut entry = entry_for("d1");
+    entry.agent_id = Some("agent_a".into());
+    assert!(matches!(
+        require_decide(
+            entry,
+            AgentFetch::Found(json!({"terminal_id":"t","agent_id":"agent_b"}))
+        ),
+        Err(RequireFailure::NotDelegate)
+    ));
+}
+
+#[test]
+fn w7_require_decide_a_missing_agent_is_not_a_delegate() {
+    let entry = entry_for("d1");
+    assert!(matches!(
+        require_decide(entry, AgentFetch::Missing),
+        Err(RequireFailure::NotDelegate)
+    ));
+}
+
+#[test]
+fn w7_require_decide_a_failed_lookup_is_a_transport_failure_not_a_delegate_denial() {
+    let entry = entry_for("d1");
+    let out = require_decide(entry, AgentFetch::Failed("socket closed".to_string()));
+    assert!(
+        matches!(out, Err(RequireFailure::Failed(ref r)) if r == "socket closed"),
+        "Failed must stay Failed — collapsing it into NotDelegate was the F4 blocker"
+    );
+}
+
+#[test]
+fn w7_require_decide_a_timeout_hands_the_entry_back() {
+    let entry = entry_for("d1");
+    let out = require_decide(entry.clone(), AgentFetch::TimedOut);
+    match out {
+        Err(RequireFailure::TimedOut(boxed)) => assert_eq!(boxed.name, entry.name),
+        other => panic!("expected TimedOut(entry), got {other:?}"),
+    }
+}
+
+// ---------- recorded_decide: status/result answer for a gone delegate (#817) --
+
+#[test]
+fn recorded_decide_a_record_with_no_agent_left_is_gone() {
+    let out = recorded_decide(entry_for("d1"), AgentFetch::Missing, || AgentFetch::Missing);
+    assert!(
+        matches!(out, Ok(Recorded::Gone(ref e)) if e.name == "d1"),
+        "{out:?}"
+    );
+}
+
+#[test]
+fn recorded_decide_a_renamed_agent_is_still_not_a_delegate() {
+    let out = recorded_decide(entry_for("d1"), AgentFetch::Missing, || {
+        AgentFetch::Found(json!({"terminal_id": "t", "name": "renamed"}))
+    });
+    assert!(matches!(out, Err(RequireFailure::NotDelegate)), "{out:?}");
+}
+
+#[test]
+fn recorded_decide_a_live_agent_skips_the_terminal_lookup() {
+    let mut entry = entry_for("d1");
+    entry.agent_id = Some("agent_a".into());
+    let out = recorded_decide(
+        entry,
+        AgentFetch::Found(json!({"terminal_id": "t", "agent_id":"agent_a"})),
+        || panic!("a name that resolves needs no second lookup"),
+    );
+    assert!(matches!(out, Ok(Recorded::Live(_))), "{out:?}");
+}
+
+#[test]
+fn recorded_decide_an_unreachable_terminal_lookup_is_a_failure_not_gone() {
+    let out = recorded_decide(entry_for("d1"), AgentFetch::Missing, || {
+        AgentFetch::Failed("socket closed".to_string())
+    });
+    assert!(matches!(out, Err(RequireFailure::Failed(_))), "{out:?}");
+}
+
+// ---------- submit_outcome: one answer for a pane that died (#817) ----------
+
+#[test]
+fn submit_outcome_a_pane_gone_before_typing_is_gone() {
+    let refused = json!({"error": {"code": "pane_gone", "message": "pane_gone"}});
+    assert!(matches!(submit_outcome(&refused), Err(SubmitFailure::Gone)));
+}
+
+#[test]
+fn submit_outcome_a_pane_gone_during_confirmation_is_gone() {
+    let abandoned = json!({"result": {"outcome": "abandoned", "reason": "pane_gone"}});
+    assert!(matches!(
+        submit_outcome(&abandoned),
+        Err(SubmitFailure::Gone)
+    ));
+}
+
+#[test]
+fn submit_outcome_other_failures_keep_their_kind() {
+    let refused = json!({"error": {"code": "input_not_empty", "message": "x"}});
+    assert!(matches!(
+        submit_outcome(&refused),
+        Err(SubmitFailure::Refused(_))
+    ));
+    let abandoned = json!({"result": {"outcome": "abandoned", "reason": "operator_active"}});
+    assert!(matches!(
+        submit_outcome(&abandoned),
+        Err(SubmitFailure::Unconfirmed(_))
+    ));
+    let accepted = json!({"result": {"outcome": "accepted"}});
+    assert!(submit_outcome(&accepted).is_ok());
+}
+
+// ---------- W10: "already gone" is reachable ---------------------------------
+
+#[test]
+fn w10_a_close_that_answers_workspace_not_found_is_done() {
+    // The scenario the P578 r4-4 brief names: a race between two reaps.
+    // One wins; the loser's `close_workspace` returns `workspace_not_found`.
+    // `is_already_gone` must treat that as the state we wanted, not an error.
+    let not_found = ServerError {
+        code: "workspace_not_found".to_string(),
+        message: "workspace w42 not found".to_string(),
+    };
+    assert!(is_already_gone(&not_found, None));
+}
+
+#[test]
+fn w10_a_kill_that_answers_not_git_worktree_is_done() {
+    let not_git = ServerError {
+        code: "not_git_worktree".to_string(),
+        message: "path is not a git worktree".to_string(),
+    };
+    assert!(is_already_gone(&not_git, Some("/some/path")));
+}
+
+#[test]
+fn w10_an_unknown_code_without_a_vanished_path_is_still_an_error() {
+    let other = ServerError {
+        code: "dirty_worktree_requires_force".to_string(),
+        message: "the worktree is dirty".to_string(),
+    };
+    // Root (/) always exists, so the path-not-exists fallback does not fire
+    // here, and `dirty_worktree_requires_force` is not in ALREADY_GONE_CODES.
+    assert!(!is_already_gone(&other, Some("/")));
+    assert!(!is_already_gone(&other, None));
+}
+
+#[test]
+fn w10_an_unknown_code_with_a_vanished_path_is_already_gone() {
+    let other = ServerError {
+        code: "some_other_refusal".to_string(),
+        message: "whatever".to_string(),
+    };
+    // A path that does not exist IS evidence the checkout is gone; the
+    // server's wording does not have to match our code list.
+    assert!(is_already_gone(
+        &other,
+        Some("/this/path/surely/does/not/exist/under/claude/flock")
+    ));
+}
+
+// ---------- W12: cap_for caps PaneSendInput / PaneSendKeys at 10 s -----------
+
+#[test]
+fn w12_cap_for_submit_methods_is_at_most_10_seconds() {
+    use crate::api::schema::{PaneSendInputParams, PaneSendKeysParams};
+    use std::time::Duration;
+    let input = Method::PaneSendInput(PaneSendInputParams {
+        write_timeout_ms: None,
+        raw: false,
+        pane_id: "p".to_string(),
+        text: "x".to_string(),
+        keys: Vec::new(),
+    });
+    let keys = Method::PaneSendKeys(PaneSendKeysParams {
+        write_timeout_ms: None,
+        pane_id: "p".to_string(),
+        keys: vec!["Enter".to_string()],
+    });
+    assert!(
+        cap_for(&input) <= Duration::from_secs(10),
+        "{:?}",
+        cap_for(&input)
+    );
+    assert!(
+        cap_for(&keys) <= Duration::from_secs(10),
+        "{:?}",
+        cap_for(&keys)
+    );
+}
+
+// ---------- G12: find_new_checkout uses same_path, not raw strings -----------
+
+#[test]
+fn w13_find_new_checkout_treats_two_spellings_of_one_path_as_the_same() {
+    // Pre-existing checkout spelled with a trailing slash in `before`, same
+    // path without one in `after`: a raw-string comparison would call the
+    // second entry "new" and force-kill it. `same_path` canonicalises.
+    let before = vec![json!({"path": "/repo/wt/x/", "branch": "feat/x"})];
+    let after = vec![
+        json!({"path": "/repo/wt/x", "branch": "feat/x"}),
+        json!({"path": "/repo/wt/y", "branch": "feat/y"}),
+    ];
+    let new = find_new_checkout(&before, &after, Some("feat/x"));
+    assert_eq!(
+        new, None,
+        "a respelled pre-existing checkout must not be force-killed: {new:?}"
+    );
+    // And when there IS a new one, filtering by branch still finds it.
+    let new = find_new_checkout(&before, &after, Some("feat/y"));
+    assert_eq!(new.as_deref(), Some("/repo/wt/y"));
+}
+
+#[tokio::test]
+async fn delegate_startup_dialog_ignores_scrollback() {
+    let dialog = HARNESSES
+        .iter()
+        .find(|harness| harness.name == "codex")
+        .and_then(|harness| harness.startup_dialogs.first())
+        .expect("Codex dialog");
+    let screen = "Hooks need review\r\n1 hook is new or changed.\r\nHooks can run outside the sandbox after you trust them.\r\n› 1. Review hooks\r\n2. Trust all and continue\r\n3. Continue without trusting (hooks won't run)\r\nenter confirm · esc skip";
+    let mut bytes = screen.as_bytes().to_vec();
+    bytes.extend_from_slice("\r\n".repeat(24).as_bytes());
+    bytes.extend_from_slice(b"\x1b[2J\x1b[H");
+    let pane = crate::terminal::TerminalRuntime::test_with_scrollback_bytes(80, 24, 65_536, &bytes);
+    assert!(
+        (dialog.shows)(&pane.recent_text(STARTUP_DIALOG_LINES as usize)),
+        "the old dialog remains in scrollback"
+    );
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let shown = pane_shows_startup_dialog_with("fixture:p1", dialog, deadline, |method, bound| {
+        assert_eq!(bound, Some(deadline));
+        let Method::PaneRead(params) = method else {
+            panic!("expected pane read")
+        };
+        assert_eq!(params.source, ReadSource::Detection);
+        let text = match params.source {
+            ReadSource::Detection => pane.detection_text(),
+            ReadSource::Recent => pane.recent_text(params.lines.unwrap_or(40) as usize),
+            _ => panic!("unexpected read source"),
+        };
+        Ok(json!({"result": {"read": {"text": text}}}))
+    });
+    assert!(
+        !shown,
+        "a dialog outside the live screen cannot block startup"
+    );
+}
+
+// ---------- recover_lost_brief_with: the #828 resubmit decision ---------------
+
+const LOST_SENTENCE: &str = "Read /fixture/briefs/task.md and execute it exactly.";
+const EMPTY_CODEX: &str = "OpenAI Codex\n› Ask Codex to do anything\n  ? for shortcuts\n";
+
+struct LostBriefRun {
+    outcome: Result<bool, SubmitFailure>,
+    resubmits: u32,
+    elapsed: Duration,
+}
+
+/// Drive the decision with one probe per fake second until it answers.
+fn run_lost_brief(mut probe: impl FnMut(u64) -> Probe) -> LostBriefRun {
+    let mut entry = entry_for("lost");
+    entry.harness = "codex".to_string();
+    entry.cursor = "term_fixture:0:3:8:i".to_string();
+    let start = Instant::now();
+    let settle = Duration::from_millis(300);
+    let deadline = start + start_watch::StartWatch::window(settle) + LOST_BRIEF_MARGIN;
+    let clock = std::cell::Cell::new(start);
+    let mut second = 0;
+    let resubmits = std::cell::Cell::new(0);
+    let outcome = recover_lost_brief_with(
+        &entry,
+        LOST_SENTENCE,
+        settle,
+        start,
+        deadline,
+        SubmitFailure::Unconfirmed("owned_composer_not_visible".to_string().into()),
+        || {
+            second += 1;
+            probe(second)
+        },
+        || {
+            resubmits.set(resubmits.get() + 1);
+            Ok(())
+        },
+        || clock.get(),
+        || clock.set(clock.get() + Duration::from_secs(1)),
+    );
+    LostBriefRun {
+        outcome,
+        resubmits: resubmits.get(),
+        elapsed: clock.get() - start,
+    }
+}
+
+fn idle_probe(cursor: &str, screen: &str) -> Probe {
+    Probe::Record {
+        status: crate::api::schema::AgentStatus::Idle,
+        cursor: Cursor::parse(cursor).unwrap(),
+        screen: screen.to_string(),
+        unfaint: screen.to_string(),
+    }
+}
+
+#[test]
+fn a_brief_swallowed_at_startup_is_resubmitted_once_after_the_window() {
+    let run = run_lost_brief(|_| idle_probe("term_fixture:0:3:8:i", EMPTY_CODEX));
+    assert!(matches!(run.outcome, Ok(true)), "{:?}", run.outcome);
+    assert_eq!(run.resubmits, 1);
+    assert!(
+        run.elapsed >= start_watch::StartWatch::window(Duration::from_millis(300)),
+        "never before the not_started window: {:?}",
+        run.elapsed
+    );
+}
+
+#[test]
+fn a_brief_that_shows_on_screen_is_never_resubmitted() {
+    // vigil-5: the brief was queued, then the composer emptied again.
+    let shown =
+        format!("› Read /fixture/briefs/task.md and\n  execute it exactly.\n\n{EMPTY_CODEX}");
+    let run = run_lost_brief(|second| {
+        idle_probe(
+            "term_fixture:0:3:8:i",
+            if second == 3 { &shown } else { EMPTY_CODEX },
+        )
+    });
+    assert!(
+        matches!(run.outcome, Err(SubmitFailure::Unconfirmed(_))),
+        "{:?}",
+        run.outcome
+    );
+    assert_eq!(run.resubmits, 0);
+    assert_eq!(
+        run.elapsed,
+        Duration::from_secs(2),
+        "it stops at the sighting"
+    );
+}
+
+#[test]
+fn a_turn_that_starts_late_confirms_the_brief_without_a_resubmit() {
+    let run = run_lost_brief(|second| {
+        if second < 20 {
+            idle_probe("term_fixture:0:3:8:i", EMPTY_CODEX)
+        } else {
+            idle_probe("term_fixture:0:4:9:i", EMPTY_CODEX)
+        }
+    });
+    assert!(matches!(run.outcome, Ok(false)), "{:?}", run.outcome);
+    assert_eq!(run.resubmits, 0);
+}
+
+#[test]
+fn a_brief_running_past_the_weekly_notice_is_taken_and_never_resubmitted() {
+    // #870: the record has not caught up, but the screen shows the brief
+    // echoed with its turn running under it.
+    let screen = include_str!("../../tests/fixtures/codex/working-after-weekly-notice.txt")
+        .replace("/fixture/codex-870/briefs/63.md", "/fixture/briefs/task.md");
+    let run = run_lost_brief(|_| idle_probe("term_fixture:0:3:8:i", &screen));
+    assert!(matches!(run.outcome, Ok(false)), "{:?}", run.outcome);
+    assert_eq!(run.resubmits, 0);
+    assert_eq!(run.elapsed, Duration::ZERO, "decided on the first look");
+}
+
+#[test]
+fn queued_startup_evidence_or_a_restart_never_resubmits() {
+    let queued =
+        "Waiting for startup · esc cancel\n› Ask Codex to do anything\n  ? for shortcuts\n";
+    let run = run_lost_brief(|_| idle_probe("term_fixture:0:3:8:i", queued));
+    assert!(matches!(run.outcome, Err(SubmitFailure::Unconfirmed(_))));
+    assert_eq!(run.resubmits, 0);
+
+    let run = run_lost_brief(|_| idle_probe("term_fixture:1:3:8:i", EMPTY_CODEX));
+    assert!(matches!(run.outcome, Err(SubmitFailure::Unconfirmed(_))));
+    assert_eq!(run.resubmits, 0);
+
+    let run = run_lost_brief(|_| Probe::Gone);
+    assert!(matches!(run.outcome, Err(SubmitFailure::Gone)));
+    assert_eq!(run.resubmits, 0);
+}
+
+#[test]
+fn only_codex_retypes_a_lost_brief() {
+    for harness in &HARNESSES {
+        assert_eq!(
+            harness.resubmit_lost_brief,
+            harness.name == "codex",
+            "{} (opencode keeps #636's never-retype rule)",
+            harness.name
+        );
+    }
+}
+
+// ---------- the failed-start tail (#925) ------------------------------------
+
+/// A start that fails reads the pane's recent buffer, bounded by the caller's
+/// deadline, and asks for more rows than it prints so a screen's blank bottom
+/// cannot crowd the content out.
+#[test]
+fn pane_tail_reads_the_recent_buffer_within_the_deadline() {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let tail = pane_tail("w2:p1", deadline, |method, bound| {
+        assert_eq!(bound, Some(deadline));
+        let Method::PaneRead(params) = method else {
+            panic!("expected pane read")
+        };
+        assert_eq!(params.pane_id, "w2:p1");
+        assert_eq!(params.source, ReadSource::Recent);
+        assert!(params.lines.unwrap() > FAILURE_TAIL_LINES);
+        assert!(params.strip_ansi);
+        Ok(json!({"result": {"read": {"text": "a\nb\n"}}}))
+    });
+    assert_eq!(tail.as_deref(), Some("a\nb\n"));
+
+    let failed = pane_tail("w2:p1", deadline, |_, _| Err(BoundedError::TimedOut));
+    assert_eq!(failed, None, "a read that fails prints nothing");
+    let no_pane = pane_tail("", deadline, |_, _| panic!("no pane, no read"));
+    assert_eq!(no_pane, None);
+}
+
+/// The printed block: the last twenty non-trailing-blank lines, each behind a
+/// bar, under a header naming the delegate. An all-blank pane prints nothing.
+#[test]
+fn tail_block_keeps_the_last_twenty_lines_and_drops_the_blank_bottom() {
+    let mut screen: Vec<String> = (1..=30).map(|n| format!("line {n}")).collect();
+    screen.push("\u{276f} ghost suggestion   ".to_string());
+    screen.extend(std::iter::repeat_n(String::new(), 10));
+    let block = tail_block("d1", &screen.join("\n")).expect("a block");
+    let lines: Vec<&str> = block.lines().collect();
+    assert_eq!(lines[0], "delegate d1: last 20 pane line(s):");
+    assert_eq!(lines.len(), 21, "{block}");
+    assert_eq!(lines[1], "  | line 12");
+    assert_eq!(
+        lines[20], "  | \u{276f} ghost suggestion",
+        "the composer line, trailing spaces trimmed"
+    );
+
+    let short = tail_block("d1", "only\n\n").unwrap();
+    assert_eq!(short, "delegate d1: last 1 pane line(s):\n  | only\n");
+    assert_eq!(tail_block("d1", "\n   \n\n"), None);
+}
+
+/// #938: `data.pane_tail` holds exactly the lines the block prints, bare.
+#[test]
+fn tail_lines_are_the_printed_lines_without_the_bar() {
+    let mut screen: Vec<String> = (1..=25).map(|n| format!("line {n}  ")).collect();
+    screen.extend(std::iter::repeat_n(String::new(), 3));
+    let text = screen.join("\n");
+    let lines = tail_lines(&text);
+    assert_eq!(lines.len(), 20);
+    assert_eq!((lines[0], lines[19]), ("line 6", "line 25"));
+    assert!(tail_lines("\n  \n").is_empty());
+}
+
+/// `--keep-on-failure` is a start flag, and only that.
+#[test]
+fn keep_on_failure_is_a_start_flag() {
+    let args = |words: &[&str]| words.iter().map(|w| w.to_string()).collect::<Vec<_>>();
+    let start = parse_flags(Verb::Start, &args(&["d1", "--keep-on-failure"])).unwrap();
+    assert!(as_start(&start).keep_on_failure);
+    assert!(!as_start(&parse_flags(Verb::Start, &args(&["d1"])).unwrap()).keep_on_failure);
+    for verb in [Verb::Send, Verb::Wait, Verb::Reap] {
+        assert!(parse_flags(verb, &args(&["d1", "--keep-on-failure"])).is_err());
+    }
+}
+
+#[test]
+fn retained_block_directory_sync_failure_is_typed_and_keeps_a_complete_entry() {
+    let dir = crate::test_support::TempDir::socket();
+    let path = dir.path().join("retained.json");
+    let mut entry = entry_for("retained");
+    entry.round = 0;
+    entry.harness = "claude".into();
+    let saved = save_startup_block_at(&entry, &path, |parent| {
+        assert_eq!(parent, dir.path());
+        let published: Entry = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            published, entry,
+            "the rename publishes the complete entry before directory sync"
+        );
+        Err(io::ErrorKind::PermissionDenied.into())
+    });
+    assert_eq!(
+        saved.as_ref().unwrap_err().kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    let dialog = validate_harness(Some("claude"))
+        .unwrap()
+        .startup_dialogs
+        .iter()
+        .find(|dialog| dialog.keep_on_start)
+        .unwrap();
+    with_json_output(|| {
+        let code = emit_startup_block(&entry, dialog, true, saved);
+        assert_eq!(code, crate::api::error_code::ErrorCode::WriteFailed.exit());
+        assert!(
+            crate::cli::output::envelope_pending(),
+            "durability failure has a typed envelope"
+        );
+    });
+    assert_eq!(
+        serde_json::from_slice::<Entry>(&std::fs::read(&path).unwrap()).unwrap(),
+        entry
+    );
+    assert!(!dir.path().join(".retained.json.tmp").exists());
+}
+
+#[test]
+fn retained_block_write_failure_keeps_prior_regular_file_untouched() {
+    let dir = crate::test_support::TempDir::socket();
+    let path = dir.path().join("retained.json");
+    let mut prior = entry_for("retained");
+    prior.round = 7;
+    let prior_bytes = serde_json::to_vec_pretty(&prior).unwrap();
+    std::fs::write(&path, &prior_bytes).unwrap();
+    assert!(path.is_file());
+    // A directory at the temporary path refuses the write deterministically,
+    // including when the test process can bypass filesystem permissions.
+    let temp = dir.path().join(".retained.json.tmp");
+    std::fs::create_dir(&temp).unwrap();
+    let mut entry = prior.clone();
+    entry.round = 0;
+    let saved = save_startup_block_at(&entry, &path, |_| {
+        panic!("failed temporary write must not reach directory sync")
+    });
+    assert!(saved.is_err());
+    let dialog = validate_harness(Some("claude"))
+        .unwrap()
+        .startup_dialogs
+        .iter()
+        .find(|dialog| dialog.keep_on_start)
+        .unwrap();
+    with_json_output(|| {
+        assert_eq!(
+            emit_startup_block(&entry, dialog, true, saved),
+            crate::api::error_code::ErrorCode::WriteFailed.exit()
+        );
+        assert!(crate::cli::output::envelope_pending());
+    });
+    assert!(path.is_file());
+    assert_eq!(std::fs::read(&path).unwrap(), prior_bytes);
+    assert_eq!(
+        serde_json::from_slice::<Entry>(&std::fs::read(&path).unwrap()).unwrap(),
+        prior
+    );
+    assert!(temp.is_dir());
+    assert_eq!(std::fs::read_dir(&temp).unwrap().count(), 0);
+}
+
+#[test]
+fn s4_delegate_write_budget_fits_the_actual_cap_and_preserves_unknown_effect() {
+    let peer = crate::test_support::ScriptedApi::new(vec![
+        (
+            "ping",
+            Some(
+                json!({"result":{"version":"fixture","protocol":crate::protocol::PROTOCOL_VERSION,"capabilities":{"pane_input_write_ack":true}}}),
+            ),
+        ),
+        ("pane.write_input", None),
+    ]);
+    std::env::set_var(crate::api::SOCKET_PATH_ENV_VAR, peer.path());
+    let method = Method::PaneSendInput(crate::api::schema::PaneSendInputParams {
+        write_timeout_ms: None,
+        pane_id: "p_fixture".into(),
+        text: "hello".into(),
+        keys: vec![],
+        raw: false,
+    });
+    assert_eq!(cap_for(&method), Duration::from_secs(10));
+    let result = bounded(method, Some(Instant::now() + Duration::from_millis(2500))).unwrap();
+    std::env::remove_var(crate::api::SOCKET_PATH_ENV_VAR);
+    assert_eq!(result["error"]["code"], "input_write_unknown");
+    let calls = peer.finish();
+    assert!(calls[1]["params"]["write_timeout_ms"].as_u64().unwrap() < 1500);
+}
+
+/// Restore both caller settings on success or unwinding, including absent values.
+struct SubmitTestEnv([(&'static str, Option<std::ffi::OsString>); 2]);
+impl SubmitTestEnv {
+    fn capture() -> Self {
+        Self(["XDG_STATE_HOME", "FLOCK_SOCKET_PATH"].map(|key| (key, std::env::var_os(key))))
+    }
+}
+impl Drop for SubmitTestEnv {
+    fn drop(&mut self) {
+        for (key, previous) in &self.0 {
+            if let Some(value) = previous {
+                std::env::set_var(key, value);
+            } else {
+                std::env::remove_var(key);
+            }
+        }
+    }
+}
+
+/// Run the real submit client and start/send completion handlers against an isolated peer.
+fn r2_unknown_submit_keeps_round(start: bool, failure: Option<&str>, codex: bool) {
+    for &keep_on_failure in if start {
+        &[true, false][..]
+    } else {
+        &[false][..]
+    } {
+        let root = crate::test_support::TempDir::socket();
+        let _environment = SubmitTestEnv::capture();
+        std::env::set_var("XDG_STATE_HOME", root.path());
+        let mut script = vec![
+        ("ping", Some(json!({"result":{"capabilities":{"pane_input_write_ack":true}}}))),
+        ("pane.submit", failure.map(|code| json!({"error":{"code":code,"message":"inspect the pane",
+            "data":{"input_write":{"bytes_written":1,"bytes_total":2,"reason":"write_failed","remainder_discarded":true}}}}))),
+    ];
+        if start {
+            script.push(("pane.read", Some(json!({"result":{"read":{"text":""}}}))));
+        }
+        let peer = crate::test_support::ScriptedApi::new(script);
+        std::env::set_var("FLOCK_SOCKET_PATH", peer.path());
+        let original = entry_for("r2-fixture");
+        let mut entry = original.clone();
+        entry.round = if start { 1 } else { 2 };
+        entry.submitted_at_ms = 42;
+        entry.cursor = "retained-round-cursor".into();
+        write_entry(&entry).unwrap();
+        let code = if start {
+            // Even --keep-on-failure used to overwrite this round with round zero.
+            let flags = StartFlags {
+                keep_on_failure,
+                ..StartFlags::default()
+            };
+            submit_start_brief(
+                &mut entry,
+                "brief",
+                &cleanup_cwd(),
+                &flags,
+                validate_harness(Some(if codex { "codex" } else { "opencode" })).unwrap(),
+            )
+        } else {
+            submit_send_brief(&entry, &original, "brief", false)
+        };
+        assert_eq!(code, Some(crate::cli::exit::FAILURE));
+        let saved = read_entry(&entry.name).expect("workspace record must remain");
+        assert_eq!(
+            saved.round,
+            if start { 1 } else { 2 },
+            "unknown effect keeps the round"
+        );
+        assert_eq!(saved.submitted_at_ms, 42);
+        assert_eq!(saved.cursor, "retained-round-cursor");
+        let calls = peer.finish();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call["method"] == "pane.submit")
+                .count(),
+            1
+        );
+        assert!(!calls.iter().any(|call| matches!(
+            call["method"].as_str(),
+            Some("workspace.close" | "worktree.kill")
+        )));
+    }
+}
+
+#[test]
+fn r2_start_unknown_effect_keeps_workspace_and_round() {
+    r2_unknown_submit_keeps_round(true, None, false);
+}
+#[test]
+fn r2_send_unknown_effect_keeps_workspace_and_round() {
+    r2_unknown_submit_keeps_round(false, None, false);
+}
+#[test]
+fn r2_partial_submit_keeps_start_and_send_rounds() {
+    r2_unknown_submit_keeps_round(true, Some("input_write_failed"), false);
+    r2_unknown_submit_keeps_round(false, Some("input_write_failed"), false);
+}
+#[test]
+fn r2_codex_unknown_effect_is_not_resubmitted() {
+    r2_unknown_submit_keeps_round(true, None, true);
+}
+#[test]
+fn r2_submit_cap_exceeds_the_server_waits_and_reply_margin() {
+    let method = Method::PaneSubmit(crate::api::schema::PaneSubmitParams {
+        pane_id: "p".into(),
+        text: "brief".into(),
+        if_session: None,
+        min_age_secs: 0,
+        self_submit_confirmed: None,
+    });
+    // Three 1s draft steps, three 2s windows, a 120ms gap and seven 50ms polls.
+    let server_waits = crate::app::guarded_submit::SUBMIT_WAIT_BOUND;
+    assert!(cap_for(&method) > server_waits + Duration::from_secs(1));
+}
+
+#[test]
+fn restack_codex_lock_resolution_keeps_its_own_write_cap() {
+    let method = Method::PaneResolveCodexLock(crate::api::schema::PaneResolveCodexLockParams {
+        pane_id: "p".into(),
+        choice: crate::api::schema::CodexLockChoice::Retry,
+        write_timeout_ms: None,
+    });
+    assert_eq!(cap_for(&method), Duration::from_secs(10));
+    assert_ne!(cap_for(&method), crate::api::client::SUBMIT_CAP);
+}

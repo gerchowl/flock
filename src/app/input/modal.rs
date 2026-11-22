@@ -466,7 +466,7 @@ pub(super) const SETTINGS_ACTIONS: &[ModalActionSpec<ModalAction>] = &[
 pub(super) fn apply_rename_action(state: &mut AppState, action: ModalAction) {
     match action {
         ModalAction::Save => {
-            let new_name = if state.name_input.trim().is_empty() {
+            let new_name = if state.mode == Mode::RenamePane || state.name_input.trim().is_empty() {
                 state.name_input.clone()
             } else {
                 state.name_input.trim().to_string()
@@ -545,7 +545,16 @@ pub(super) fn apply_rename_action(state: &mut AppState, action: ModalAction) {
                             if let Some(pane) = ws.pane_state(pane_id) {
                                 let terminal_id = pane.attached_terminal_id.clone();
                                 if let Some(terminal) = state.terminals.get_mut(&terminal_id) {
-                                    terminal.set_manual_label(new_name);
+                                    if terminal.set_manual_label(new_name).is_err() {
+                                        state.toast = Some(crate::app::state::ToastNotification {
+                                            kind: crate::app::state::ToastKind::NeedsAttention,
+                                            title: "Invalid pane label".into(),
+                                            context: crate::terminal::agent_name::POLICY.into(),
+                                            position: None,
+                                            target: None,
+                                        });
+                                        return;
+                                    }
                                     state.mark_session_dirty();
                                 }
                             }
@@ -1299,6 +1308,26 @@ mod tests {
 
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn security_label_rename_modal_refuses_and_shows_policy() {
+        for (case, name) in crate::test_support::hostile_agent_names() {
+            let mut state = state_with_workspaces(&["label-fixture"]);
+            state.ensure_test_terminals();
+            state.active = Some(0);
+            state.mode = Mode::RenamePane;
+            state.rename_pane_target = Some(state.workspaces[0].tabs[0].root_pane);
+            state.name_input = name;
+            apply_rename_action(&mut state, ModalAction::Save);
+            assert_eq!(
+                state.mode,
+                Mode::RenamePane,
+                "unsafe modal accepted: {case}"
+            );
+            let toast = state.toast.as_ref().expect("visible refusal");
+            assert!(toast.title.contains("Invalid pane label"));
+        }
     }
 
     #[test]

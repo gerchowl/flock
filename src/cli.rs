@@ -13,23 +13,41 @@ use crate::api::schema::{
     SplitDirection, Subscription,
 };
 
+mod adapter;
 mod agent;
+pub(crate) mod argv;
 mod checks;
+mod client;
+mod compatibility;
+mod delegate;
+pub(crate) mod delegate_list;
+mod delegate_s1;
+mod delegate_verdict;
 mod digest;
+mod events;
+pub(crate) mod exit;
 mod fleet;
+mod goal;
+mod grants;
 mod help;
 mod hook;
+mod hook_question;
 mod integration;
 mod issue;
 mod lineage;
 mod mcp;
 mod msg;
 mod notification;
+pub(crate) mod output;
+mod owner;
 pub(crate) mod pane;
 mod peers;
 mod preflight;
+mod profile;
+pub(crate) mod questions;
 mod ready;
 mod report;
+mod retained;
 mod revert;
 mod server;
 mod settled;
@@ -78,9 +96,41 @@ pub enum CommandOutcome {
 }
 
 pub fn maybe_run(args: &[String]) -> std::io::Result<CommandOutcome> {
+    // ADR-0029 §3: the output flags are global, so they come off before any
+    // help lookup or verb parser reads argv.
+    let (args, format) = match output::take_global(args) {
+        Ok(taken) => taken,
+        Err(reason) => {
+            eprintln!("{reason}");
+            return Ok(CommandOutcome::Handled(exit::USAGE));
+        }
+    };
+    output::set(format);
+    let outcome = run(&args);
+    // The envelope prints last, so its `exit` is the status the process
+    // returns, a skew failure's 78 included.
+    match &outcome {
+        Ok(CommandOutcome::Handled(code)) => output::finish(*code),
+        Err(_) => output::finish(exit::FAILURE),
+        Ok(CommandOutcome::NotCli) => {}
+    }
+    outcome
+}
+
+fn run(args: &[String]) -> std::io::Result<CommandOutcome> {
     let Some(command) = args.get(1).map(|arg| arg.as_str()) else {
         return Ok(CommandOutcome::NotCli);
     };
+
+    // Bare client remains the internal terminal attachment command.
+    if command == "client"
+        && !matches!(
+            args.get(2).map(String::as_str),
+            Some("token" | "grant" | "open" | "help" | "--help" | "-h")
+        )
+    {
+        return Ok(CommandOutcome::NotCli);
+    }
 
     // #455: `--help` / `-h` is answered here, above every verb parser, so it
     // cannot be read as one of a verb's arguments (`flk agent fork --help`
@@ -99,6 +149,71 @@ pub fn maybe_run(args: &[String]) -> std::io::Result<CommandOutcome> {
         return Ok(CommandOutcome::Handled(0));
     }
 
+    // MCP stays alive across server upgrades and diagnoses each failed call.
+    let cli_probe = command != "mcp";
+    if cli_probe {
+        // `flk server` and `flk status` are how an older server is found and
+        // handed off, and hooks report into whichever server is running.
+        let gate = !matches!(command, "server" | "status" | "hook");
+        crate::api::compatibility::begin_cli(&ApiClient::local(), gate, |server| {
+            eprintln!(
+                "warning: server is flk {} (protocol {}); client protocol {} is incompatible",
+                server.version,
+                server.protocol,
+                crate::protocol::PROTOCOL_VERSION,
+            );
+        });
+    }
+    let outcome = dispatch(args, command);
+    if cli_probe {
+        if let Some(message) = crate::api::compatibility::end_cli() {
+            // Optional lookups may consume a capability error and still succeed.
+            // Preserve that command's outcome instead of turning it into a refusal.
+            if matches!(
+                outcome,
+                Ok(CommandOutcome::Handled(0) | CommandOutcome::NotCli)
+            ) {
+                return outcome;
+            }
+            if let Err(error) = &outcome {
+                eprintln!("{error}");
+            }
+            if output::json() && !output::envelope_pending() {
+                // §4: the skew error keeps exit 78 and gains the envelope.
+                let gap = crate::api::error_code::ErrorCode::ServerVersionGap;
+                let exit_code = output::failure(gap, &message, gap.exit());
+                return Ok(CommandOutcome::Handled(exit_code));
+            }
+            eprintln!("{message}");
+            return Ok(CommandOutcome::Handled(
+                crate::api::compatibility::EXIT_CODE,
+            ));
+        }
+    }
+    match outcome {
+        Err(error) if outcome_unknown(&error).is_some() => {
+            Ok(CommandOutcome::Handled(exit::REQUEST_OUTCOME_UNKNOWN))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+            let code = output::failure(
+                crate::api::error_code::ErrorCode::Timeout,
+                &error.to_string(),
+                exit::TIMEOUT,
+            );
+            Ok(CommandOutcome::Handled(code))
+        }
+        // An io error ends the verb before it reported anything: under
+        // machine output it is still an envelope on stdout, exit 1.
+        Err(error) if output::json() && !output::envelope_pending() => {
+            let code = output::io_error_code(&error);
+            let exit_code = output::failure(code, &error.to_string(), exit::FAILURE);
+            Ok(CommandOutcome::Handled(exit_code))
+        }
+        outcome => outcome,
+    }
+}
+
+fn dispatch(args: &[String], command: &str) -> std::io::Result<CommandOutcome> {
     let exit_code = match command {
         "server" => {
             let Some(exit_code) = server::run_server_command(&args[2..])? else {
@@ -111,6 +226,7 @@ pub fn maybe_run(args: &[String]) -> std::io::Result<CommandOutcome> {
         "config" => run_config_command(&args[2..])?,
         "channel" => run_channel_command(&args[2..])?,
         "workspace" => workspace::run_workspace_command(&args[2..])?,
+        "delegate" => delegate::run_delegate_command(&args[2..])?,
         "worktree" => worktree::run_worktree_command(&args[2..])?,
         "tab" => tab::run_tab_command(&args[2..])?,
         "notification" => notification::run_notification_command(&args[2..])?,
@@ -126,11 +242,25 @@ pub fn maybe_run(args: &[String]) -> std::io::Result<CommandOutcome> {
         "wait" => run_wait_command(&args[2..])?,
         "integration" => integration::run_integration_command(&args[2..])?,
         "preflight" => preflight::run_preflight_command(&args[2..])?,
+        "profile" => profile::run(&args[2..])?,
         "checks" => checks::run_checks_command(&args[2..])?,
         "digest" => digest::run_digest_command(&args[2..])?,
+        "events" => events::run_events_command(&args[2..])?,
+        "adapter" => adapter::run_adapter_command(&args[2..])?,
+        "owner" => owner::run_owner_command(&args[2..])?,
         "fleet" => fleet::run_fleet_command(&args[2..])?,
+        "goal" => goal::run_goal_command(&args[2..])?,
+        "structured" => match args.get(2).map(String::as_str) {
+            Some("grants") => grants::run(&args[2..])?,
+            _ => {
+                eprintln!("usage: {}", grants::USAGE);
+                exit::USAGE
+            }
+        },
         "revert-run" => revert::run_revert_run_command(&args[2..])?,
+        "doctor" => retained::run(&args[2..], true)?,
         "session" => run_session_command(&args[2..])?,
+        "client" => client::run(&args[2..])?,
         "web" => run_web_command(&args[2..])?,
         _ => return Ok(CommandOutcome::NotCli),
     };
@@ -174,6 +304,23 @@ fn run_channel_command(args: &[String]) -> std::io::Result<i32> {
     }
 }
 
+/// Closed edit stages distinguish input rejection from a failed output guard.
+#[derive(Clone, Copy)]
+enum ConfigEdit {
+    ChannelInput,
+    ChannelOutput,
+    KeysInput,
+    KeysOutput,
+}
+
+fn config_edit_parse_error(error: &toml::de::Error, source: &str, stage: ConfigEdit) -> String {
+    crate::config::edit_parse_error(
+        error,
+        source,
+        matches!(stage, ConfigEdit::ChannelOutput | ConfigEdit::KeysOutput),
+    )
+}
+
 fn channel_set(args: &[String]) -> std::io::Result<i32> {
     let Some(channel) = parse_channel_set_arg(args) else {
         eprintln!("usage: flk channel set <stable|preview>");
@@ -196,8 +343,8 @@ fn channel_set(args: &[String]) -> std::io::Result<i32> {
     };
     if let Err(err) = toml::from_str::<toml::Value>(&content) {
         eprintln!(
-            "config file at {} is invalid TOML: {err}. Fix it before changing the update channel.",
-            path.display()
+            "{}",
+            config_edit_parse_error(&err, &content, ConfigEdit::ChannelInput)
         );
         return Ok(1);
     }
@@ -210,8 +357,8 @@ fn channel_set(args: &[String]) -> std::io::Result<i32> {
     );
     if let Err(err) = toml::from_str::<toml::Value>(&updated) {
         eprintln!(
-            "changing the update channel would make {} invalid TOML: {err}; leaving config unchanged",
-            path.display()
+            "{}",
+            config_edit_parse_error(&err, &updated, ConfigEdit::ChannelOutput)
         );
         return Ok(1);
     }
@@ -236,8 +383,10 @@ fn channel_set(args: &[String]) -> std::io::Result<i32> {
 
     if let Err(err) = crate::update::self_update(crate::update::SelfUpdateOptions::default()) {
         eprintln!("update failed: {err}");
-        eprintln!("Run `flk update` to retry.");
-        return Ok(1);
+        if err.code().is_none() {
+            eprintln!("Run `flk update` to retry.");
+        }
+        return Ok(err.exit());
     }
 
     Ok(0)
@@ -303,23 +452,24 @@ fn run_config_command(args: &[String]) -> std::io::Result<i32> {
     }
 }
 
-/// Exit codes for `flk config check`. The split between "loaded with warnings"
-/// and "did not load" is what makes the command usable as a deploy gate: a
-/// deprecation rename should not block a rollout, a config that leaves the
-/// session running on defaults should (#240).
-const CONFIG_CHECK_ADVISORY: i32 = 1;
-const CONFIG_CHECK_PARSE_FAILURE: i32 = 2;
+// Exit codes for `flk config check`. The split between "loaded with warnings"
+// and "did not load" is what makes the command usable as a deploy gate: a
+// deprecation rename should not block a rollout, a config that leaves the
+// session running on defaults should (#240).
+use exit::{CONFIG_CHECK_ADVISORY, CONFIG_CHECK_PARSE_FAILURE};
 
 fn config_check(args: &[String]) -> std::io::Result<i32> {
+    let mut json = output::json();
     let mut explicit_path: Option<String> = None;
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
         match arg.as_str() {
+            "--json" => json = true,
             "--path" => match rest.next() {
                 Some(path) => explicit_path = Some(path.clone()),
                 None => {
                     eprintln!("flk config check: --path needs a file path");
-                    eprintln!("usage: flk config check [--path PATH]");
+                    eprintln!("usage: flk config check [--path PATH] [--json]");
                     return Ok(CONFIG_CHECK_PARSE_FAILURE);
                 }
             },
@@ -328,7 +478,7 @@ fn config_check(args: &[String]) -> std::io::Result<i32> {
                     explicit_path = Some(path.to_string());
                 } else {
                     eprintln!("flk config check: unknown argument {other}");
-                    eprintln!("usage: flk config check [--path PATH]");
+                    eprintln!("usage: flk config check [--path PATH] [--json]");
                     return Ok(CONFIG_CHECK_PARSE_FAILURE);
                 }
             }
@@ -344,12 +494,39 @@ fn config_check(args: &[String]) -> std::io::Result<i32> {
     }
 
     let checked = crate::config::config_path();
-    match config_check_outcome() {
+    let outcome = config_check_outcome();
+    if json {
+        let (code, diagnostics) = match &outcome {
+            ConfigCheckOutcome::Clean => (0, &[][..]),
+            ConfigCheckOutcome::Warnings {
+                diagnostics,
+                removed,
+            } => {
+                for diagnostic in removed {
+                    eprintln!("warning: {diagnostic}");
+                }
+                (CONFIG_CHECK_ADVISORY, diagnostics.as_slice())
+            }
+            ConfigCheckOutcome::DidNotLoad(diagnostics) => {
+                (CONFIG_CHECK_PARSE_FAILURE, diagnostics.as_slice())
+            }
+        };
+        println!(
+            "{}",
+            serde_json::json!({
+                "path": checked,
+                "exit_code": code,
+                "diagnostics": diagnostics,
+            })
+        );
+        return Ok(code);
+    }
+    match outcome {
         ConfigCheckOutcome::Clean => {
             println!("{}: ok", checked.display());
             Ok(0)
         }
-        ConfigCheckOutcome::Warnings(diagnostics) => {
+        ConfigCheckOutcome::Warnings { diagnostics, .. } => {
             let count = diagnostics.len();
             let noun = if count == 1 { "warning" } else { "warnings" };
             eprintln!("{}: {count} {noun}", checked.display());
@@ -372,8 +549,12 @@ fn config_check(args: &[String]) -> std::io::Result<i32> {
 enum ConfigCheckOutcome {
     Clean,
     /// The config loaded; these are advisory. Every diagnostic is carried, not
-    /// the four-line summary the TUI banner shows.
-    Warnings(Vec<String>),
+    /// the four-line summary the TUI banner shows. `removed` repeats the
+    /// removed-key ones, which `--json` also echoes to stderr.
+    Warnings {
+        diagnostics: Vec<String>,
+        removed: Vec<String>,
+    },
     /// The config did not load at all — the session would run on defaults.
     DidNotLoad(Vec<String>),
 }
@@ -381,18 +562,40 @@ enum ConfigCheckOutcome {
 fn config_check_outcome() -> ConfigCheckOutcome {
     match crate::config::load_live_config() {
         Err(diagnostics) => ConfigCheckOutcome::DidNotLoad(diagnostics),
-        Ok(loaded) => {
+        Ok(mut loaded) => {
+            // The source scan supplies a safe category and line, replacing the loader's
+            // warning for every key it found. A key it missed keeps the
+            // loader's, which is how no warning gets lost.
+            let file_keys = crate::config::file_key_diagnostics();
+            loaded.remove_key_diagnostics(|loader| {
+                file_keys
+                    .iter()
+                    .any(|source| source.kind == loader.kind && source.key == loader.key)
+            });
+            let removed = file_keys
+                .iter()
+                .chain(&loaded.key_diagnostics)
+                .filter(|diagnostic| diagnostic.kind == crate::config::KeyDiagnosticKind::Removed)
+                .map(|diagnostic| diagnostic.message.clone())
+                .collect();
+            let mut diagnostics: Vec<String> = file_keys
+                .into_iter()
+                .map(|diagnostic| diagnostic.message)
+                .collect();
+            diagnostics.extend(loaded.diagnostics);
             // `load_live_config` reports parse- and section-level problems, but
             // keybind conflicts and deprecation renames only surface once the
             // bindings are actually resolved — and those are the warnings this
             // command mostly exists to catch.
-            let mut diagnostics = loaded.diagnostics;
             diagnostics.extend(loaded.config.collect_diagnostics());
 
             if diagnostics.is_empty() {
                 ConfigCheckOutcome::Clean
             } else {
-                ConfigCheckOutcome::Warnings(diagnostics)
+                ConfigCheckOutcome::Warnings {
+                    diagnostics,
+                    removed,
+                }
             }
         }
     }
@@ -452,8 +655,8 @@ fn config_reset_keys(args: &[String]) -> std::io::Result<i32> {
         Ok(value) => value,
         Err(err) => {
             eprintln!(
-                "config file at {} is invalid TOML: {err}. Fix it manually or move it aside to use defaults.",
-                path.display()
+                "{}",
+                config_edit_parse_error(&err, &content, ConfigEdit::KeysInput)
             );
             return Ok(1);
         }
@@ -484,8 +687,8 @@ fn config_reset_keys(args: &[String]) -> std::io::Result<i32> {
     }
     if let Err(err) = toml::from_str::<toml::Value>(&updated) {
         eprintln!(
-            "removing keybinding config would make {} invalid TOML: {err}; leaving config unchanged",
-            path.display()
+            "{}",
+            config_edit_parse_error(&err, &updated, ConfigEdit::KeysOutput)
         );
         return Ok(1);
     }
@@ -550,6 +753,7 @@ fn run_wait_command(args: &[String]) -> std::io::Result<i32> {
         "output" => wait_output(&args[1..]),
         "agent-status" => wait_agent_status(&args[1..]),
         "reply" => msg::wait_reply(&args[1..]),
+        "park" => events::park(&args[1..]),
         "help" | "--help" | "-h" => {
             print_wait_help();
             Ok(0)
@@ -572,6 +776,7 @@ fn run_session_command(args: &[String]) -> std::io::Result<i32> {
         "attach" => session_attach_help(&args[1..]),
         "stop" => session_stop(&args[1..]),
         "delete" => session_delete(&args[1..]),
+        "retained" => retained::run(&args[1..], false),
         "help" | "--help" | "-h" => {
             print_session_help();
             Ok(0)
@@ -707,7 +912,7 @@ pub(super) fn parse_attach_target(args: &[String], usage: &str) -> Result<(Strin
 
 fn wait_output(args: &[String]) -> std::io::Result<i32> {
     let Some(raw_pane_id) = args.first() else {
-        eprintln!("usage: flk wait output <pane_id> --match <text> [--source visible|recent|recent-unwrapped] [--lines N] [--timeout MS] [--regex]");
+        eprintln!("usage: flk wait output <pane_id> --match <text> [--source visible|recent|recent-unwrapped|detection] [--lines N] [--timeout MS] [--regex]");
         return Ok(2);
     };
 
@@ -793,8 +998,7 @@ fn wait_output(args: &[String]) -> std::io::Result<i32> {
     })?;
 
     if response.get("error").is_some() {
-        eprintln!("{}", serde_json::to_string(&response).unwrap());
-        return Ok(1);
+        return Ok(output::error(&response, exit::FAILURE));
     }
 
     println!("{}", serde_json::to_string(&response).unwrap());
@@ -907,6 +1111,8 @@ fn wait_agent_status(args: &[String]) -> std::io::Result<i32> {
             Request {
                 id: "cli:wait:agent-status".into(),
                 method: Method::EventsSubscribe(crate::api::schema::EventsSubscribeParams {
+                    after: None,
+                    after_sequence: None,
                     // `idle` is "ready for input", so it watches `done` too.
                     // Without the pair this verb hung on every unattended
                     // agent — an agent nobody is looking at goes quiet as
@@ -938,8 +1144,8 @@ pub(super) fn wait_for_agent_change(
         .map_err(api_client_error_to_io)?;
     if let Err(err) = crate::api::client::parse_response_value(ack) {
         if let ApiClientError::ErrorResponse(response) = err {
-            eprintln!("{}", serde_json::to_string(&response).unwrap());
-            return Ok(1);
+            let response = serde_json::to_value(&response).unwrap_or_default();
+            return Ok(output::error(&response, exit::FAILURE));
         }
         return Err(api_client_error_to_io(err));
     }
@@ -961,25 +1167,97 @@ pub(super) fn wait_for_agent_change(
     }
 }
 
-pub(super) fn print_response(response: &serde_json::Value) -> std::io::Result<i32> {
+pub(crate) fn print_response(response: &serde_json::Value) -> std::io::Result<i32> {
+    print_response_for(response, false)
+}
+
+/// [`print_response`] for a send-like or guarded verb, where a refusal that
+/// changed nothing exits `REFUSED` (ADR-0029 §2, #1025).
+pub(crate) fn print_send_response(response: &serde_json::Value) -> std::io::Result<i32> {
+    print_response_for(response, true)
+}
+
+fn print_response_for(response: &serde_json::Value, send_like: bool) -> std::io::Result<i32> {
+    if let Some(code) = response
+        .get("result")
+        .and_then(crate::api::effect_exit_code)
+    {
+        return Ok(output::effect(response, code));
+    }
     if response.get("error").is_some() {
-        eprintln!("{}", serde_json::to_string(response).unwrap());
-        return Ok(1);
+        return Ok(output::error(response, error_exit(response, send_like)));
     }
 
     println!("{}", serde_json::to_string(response).unwrap());
     Ok(0)
 }
 
+/// Preserve registered refusal exits across the launcher I/O error boundary.
+pub(crate) fn io_error_exit(error: &std::io::Error) -> i32 {
+    error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<crate::api::error_code::ErrorCode>())
+        .map_or(exit::FAILURE, |code| code.exit())
+}
+
+/// The exit status for an error response. Only a send-like or guarded verb
+/// maps a refusal to `REFUSED`; every other verb takes what the error-code
+/// registry assigns, which is `FAILURE` unless the code names another.
+pub(crate) fn error_exit(response: &serde_json::Value, send_like: bool) -> i32 {
+    match response["error"]["code"].as_str() {
+        Some(code) if send_like => refusal_exit(code),
+        Some(code) => error_code_exit(code, false),
+        None => exit::FAILURE,
+    }
+}
+
+/// The exit status a call ending in error `code` returns, with no stderr
+/// notice: `REFUSED` for a send-like or guarded call's `later` refusal, else
+/// what the error-code registry assigns. MCP reports it as `data.exit`.
+pub(crate) fn error_code_exit(code: &str, send_like: bool) -> i32 {
+    match crate::api::error_code::ErrorCode::from_code(code) {
+        Some(code) if send_like && code.retry() == exit::Retry::Later => exit::REFUSED,
+        Some(code) => code.exit(),
+        None => exit::FAILURE,
+    }
+}
+
+/// A send-like or guarded verb's exit for a server refusal: `REFUSED` for an
+/// error whose retry class is `later` (refused before acting, nothing
+/// changed), which names its old code on stderr (#1025), else what the
+/// error-code registry assigns (`FAILURE` for most codes, `POLICY_REFUSED`
+/// for `operator_only`).
+pub(crate) fn refusal_exit(code: &str) -> i32 {
+    match crate::api::error_code::ErrorCode::from_code(code) {
+        Some(code) if code.retry() == exit::Retry::Later => exit::moved(exit::REFUSED),
+        Some(code) => code.exit(),
+        None => exit::FAILURE,
+    }
+}
+
 pub(super) fn send_ok_request(method: Method) -> std::io::Result<i32> {
+    send_ok_request_for(method, false)
+}
+
+/// [`send_ok_request`] for a guarded verb.
+pub(super) fn send_guarded_request(method: Method) -> std::io::Result<i32> {
+    send_ok_request_for(method, true)
+}
+
+fn send_ok_request_for(method: Method, send_like: bool) -> std::io::Result<i32> {
     let response = send_request(&Request {
         id: "cli:request".into(),
         method,
     })?;
 
+    if let Some(code) = response
+        .get("result")
+        .and_then(crate::api::effect_exit_code)
+    {
+        return Ok(output::effect(&response, code));
+    }
     if response.get("error").is_some() {
-        eprintln!("{}", serde_json::to_string(&response).unwrap());
-        return Ok(1);
+        return Ok(output::error(&response, error_exit(&response, send_like)));
     }
 
     Ok(0)
@@ -987,8 +1265,23 @@ pub(super) fn send_ok_request(method: Method) -> std::io::Result<i32> {
 
 pub(super) fn send_request(request: &Request) -> std::io::Result<serde_json::Value> {
     ApiClient::local()
+        .with_class(crate::api::client::RequestClass::for_method(
+            &request.method,
+        ))
         .request_value(request)
         .map_err(api_client_error_to_io)
+}
+
+/// Preserve the typed post-dispatch refusal even in verbs with custom outcomes.
+fn outcome_unknown(error: &std::io::Error) -> Option<i32> {
+    error
+        .get_ref()?
+        .downcast_ref::<crate::api::deadline::RequestOutcomeUnknown>()?;
+    Some(output::failure(
+        crate::api::error_code::ErrorCode::RequestOutcomeUnknown,
+        &error.to_string(),
+        exit::REQUEST_OUTCOME_UNKNOWN,
+    ))
 }
 
 fn api_timeout_error(err: &std::io::Error) -> bool {
@@ -1017,6 +1310,55 @@ pub(super) fn normalize_pane_id(value: &str) -> String {
     value.to_string()
 }
 
+/// A pane verb's target as a pane id (ADR-0029 §5). `self` is the calling
+/// pane, and a public pane id passes through. Anything else (an agent name,
+/// a terminal id, a fleet agent id) is pre-resolved through `agent.get`,
+/// which servers answered long before their pane verbs took names, so a new
+/// client names agents against an old server too. When that fails the target
+/// goes on as typed and the verb's own refusal names the expected shapes.
+///
+/// An agent whose name is shaped like a pane id (`w1:p2`, `p_3`, `1-2`) is
+/// not pre-resolved: the id goes as typed, so against an old server it means
+/// the pane, and only a new server falls back to the name.
+pub(super) fn resolve_pane_arg(value: &str) -> String {
+    // The server resolves `self` by ancestry; the env saves it a lookup.
+    if value == "self" {
+        return std::env::var("FLOCK_PANE_ID").unwrap_or_else(|_| value.to_string());
+    }
+    if is_public_pane_id(value) {
+        return value.to_string();
+    }
+    send_request(&Request {
+        id: "cli:target:resolve".into(),
+        method: Method::AgentGet(crate::api::schema::AgentTarget {
+            target: value.to_string(),
+        }),
+    })
+    .ok()
+    .and_then(|response| {
+        response["result"]["agent"]["pane_id"]
+            .as_str()
+            .map(str::to_string)
+    })
+    .unwrap_or_else(|| value.to_string())
+}
+
+/// `<workspace>:p<number>`, `p_<…>` or the legacy `<ws>-<n>`: needs no round
+/// trip to resolve.
+fn is_public_pane_id(value: &str) -> bool {
+    let digits = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit());
+    value.starts_with("p_")
+        || value.rsplit_once(":p").is_some_and(|(ws, number)| {
+            !ws.is_empty()
+                && !number.is_empty()
+                && number.chars().all(|c| c.is_ascii_alphanumeric())
+        })
+        || value.rsplit_once('-').is_some_and(|(ws, number)| {
+            let ws = ws.strip_prefix("w_").or(ws.strip_prefix('w')).unwrap_or(ws);
+            digits(ws) && digits(number)
+        })
+}
+
 pub(super) fn parse_split_direction(value: &str) -> std::io::Result<SplitDirection> {
     match value {
         "right" => Ok(SplitDirection::Right),
@@ -1032,6 +1374,7 @@ pub(super) fn parse_read_source(value: &str) -> std::io::Result<ReadSource> {
         "visible" => Ok(ReadSource::Visible),
         "recent" => Ok(ReadSource::Recent),
         "recent-unwrapped" | "recent_unwrapped" => Ok(ReadSource::RecentUnwrapped),
+        "detection" => Ok(ReadSource::Detection),
         _ => Err(std::io::Error::other(format!(
             "invalid read source: {value}"
         ))),
@@ -1074,7 +1417,7 @@ pub(super) fn parse_u64_flag(flag: &str, value: &str) -> std::io::Result<u64> {
 
 fn parse_session_json_only(args: &[String], usage: &str) -> Result<bool, i32> {
     match args {
-        [] => Ok(false),
+        [] => Ok(output::json()),
         [flag] if flag == "--json" => Ok(true),
         _ => {
             eprintln!("{usage}");
@@ -1085,7 +1428,7 @@ fn parse_session_json_only(args: &[String], usage: &str) -> Result<bool, i32> {
 
 fn parse_session_name_and_json(args: &[String], usage: &str) -> Result<(String, bool), i32> {
     let mut name = None;
-    let mut json = false;
+    let mut json = output::json();
     for arg in args {
         if arg == "--json" {
             json = true;
@@ -1121,24 +1464,22 @@ fn print_session_table(sessions: &[crate::session::SessionInfo]) {
     }
 }
 
+/// Every caller exits `FAILURE` after it.
 fn print_session_error(code: &str, message: &str) {
-    eprintln!(
-        "{}",
-        serde_json::to_string(&serde_json::json!({
-            "error": {
-                "code": code,
-                "message": message,
-            }
-        }))
-        .unwrap()
-    );
+    let response = serde_json::json!({
+        "error": {
+            "code": code,
+            "message": message,
+        }
+    });
+    output::error(&response, exit::FAILURE);
 }
 
 fn print_config_help() {
     eprintln!("flk config commands:");
     eprintln!("  flk config edit        open the live config (or overlay) in $EDITOR");
     eprintln!("  flk config reset-keys  back up config.toml and remove custom keybindings");
-    eprintln!("  flk config check [--path PATH]");
+    eprintln!("  flk config check [--path PATH] [--json]");
     eprintln!("                         validate a config without starting or touching a server");
     eprintln!("                         exit 0 clean · 1 warnings · 2 did not load");
     eprintln!("                         (unrelated to `flk checks`, which runs health checks)");
@@ -1152,18 +1493,26 @@ fn print_terminal_help() {
 
 fn print_wait_help() {
     eprintln!("flk wait commands:");
-    eprintln!("  flk wait output <pane_id> --match <text> [--source visible|recent|recent-unwrapped] [--lines N] [--timeout MS] [--regex] [--raw]");
+    eprintln!("  flk wait output <pane_id> --match <text> [--source visible|recent|recent-unwrapped|detection] [--lines N] [--timeout MS] [--regex] [--raw]");
     eprintln!("  {WAIT_AGENT_STATUS_USAGE}");
     eprintln!("  flk wait reply <correlation_id> [--timeout MS] [--json]");
     eprintln!(
         "    waits for the answer to a message you sent (msg send --intent needs-reply): \
          prints its body; exit 0 replied, 3 deferred or expired, 124 timed out"
     );
+    eprintln!("  {}", events::PARK_USAGE);
+    eprintln!(
+        "    parks this agent on a registered wait and returns at once, so it can end \
+         its turn; the wait shows as `waiting_on_event` until the deadline (at most 24h). \
+         PREDICATE: 'delegate:<id> phase in [finished, needs_human, gone]' or \
+         'reply:<correlation_id>'; exit 2 for a bad or unsupported predicate"
+    );
 }
 
 fn print_session_help() {
     eprintln!("flk session commands:");
     eprintln!("  flk session list [--json]");
+    eprintln!("  {}", retained::USAGE);
     eprintln!("  flk session attach <name>");
     eprintln!("  flk session stop <name> [--json]");
     eprintln!("  flk session delete <name> [--json]");
@@ -1229,7 +1578,7 @@ mod config_check_tests {
 
         let (outcome, code) = check(&base);
         assert_eq!(code, CONFIG_CHECK_ADVISORY);
-        let ConfigCheckOutcome::Warnings(diagnostics) = outcome else {
+        let ConfigCheckOutcome::Warnings { diagnostics, .. } = outcome else {
             panic!("expected advisory warnings, got {outcome:?}");
         };
         assert!(
@@ -1254,13 +1603,19 @@ mod config_check_tests {
 
         let (outcome, code) = check(&base);
         assert_eq!(code, CONFIG_CHECK_ADVISORY);
-        let ConfigCheckOutcome::Warnings(diagnostics) = outcome else {
+        let ConfigCheckOutcome::Warnings { diagnostics, .. } = outcome else {
             panic!("expected a conflict warning, got {outcome:?}");
         };
         assert!(
-            diagnostics.iter().any(|d| d.contains("ctrl+shift+j")),
+            diagnostics
+                .iter()
+                .any(|d| d.contains("conflicting keybinding")
+                    && d.contains("key=keys.new_tab")
+                    && d.contains("kept keys.new_workspace")
+                    && d.contains("disabling binding")),
             "{diagnostics:?}"
         );
+        assert!(diagnostics.iter().all(|d| !d.contains("ctrl+shift+j")));
     }
 
     #[test]
@@ -1296,12 +1651,61 @@ mod config_check_tests {
         .unwrap();
 
         let (outcome, _) = check(&base);
-        let ConfigCheckOutcome::Warnings(diagnostics) = outcome else {
+        let ConfigCheckOutcome::Warnings { diagnostics, .. } = outcome else {
             panic!("expected warnings, got {outcome:?}");
         };
         assert!(
             diagnostics.len() > 4,
             "the CLI must not truncate like the banner: {diagnostics:?}"
+        );
+    }
+
+    /// A misplaced `[toast]` is reported once, with the `[ui.toast]` hint and
+    /// its line, not again as an unknown setting (#860).
+    #[test]
+    fn misplaced_toast_section_warns_once() {
+        let dir = unique_dir("flk-config-check-toast");
+        let base = dir.join("config.toml");
+        std::fs::write(&base, "onboarding = false\n[toast]\ndelivery = \"flock\"\n").unwrap();
+
+        let (outcome, code) = check(&base);
+        assert_eq!(code, CONFIG_CHECK_ADVISORY);
+        let ConfigCheckOutcome::Warnings { diagnostics, .. } = outcome else {
+            panic!("expected one warning, got {outcome:?}");
+        };
+        assert_eq!(
+            diagnostics,
+            vec!["unknown_config_key; key=document root; source=base file; at 2:2; expected [ui.toast] section; did you mean [ui.toast]?; setting ignored"]
+        );
+    }
+
+    /// A bad-typed `[msg]` value stopped serde before the unknown key after it,
+    /// and the check dropped the loader's copy of that warning (#860).
+    #[test]
+    fn unknown_msg_key_survives_a_type_error_in_the_same_section() {
+        let dir = unique_dir("flk-config-check-msg-type");
+        let base = dir.join("config.toml");
+        std::fs::write(
+            &base,
+            "onboarding = false\n[msg]\nenabled = \"yes\"\nfuture_setting = true\n",
+        )
+        .unwrap();
+
+        let (outcome, code) = check(&base);
+        assert_eq!(code, CONFIG_CHECK_ADVISORY);
+        let ConfigCheckOutcome::Warnings { diagnostics, .. } = outcome else {
+            panic!("expected warnings, got {outcome:?}");
+        };
+        let unknown: Vec<_> = diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.contains("unknown_config_key") && diagnostic.contains("key=msg;")
+            })
+            .collect();
+        assert_eq!(
+            unknown,
+            vec!["unknown_config_key; key=msg; source=base file; at 4:1; setting ignored"],
+            "{diagnostics:?}"
         );
     }
 
@@ -1352,6 +1756,50 @@ mod config_check_tests {
 
 #[cfg(test)]
 mod tests {
+    /// A send-like or guarded verb's refusal exits what the registry assigns
+    /// (#1231, #1241): `later` is `REFUSED`, a version gap 78, a widening or
+    /// operator refusal 13 (`POLICY_REFUSED`). Only an unregistered code or a plain `never` /
+    /// `maybe` one stays `FAILURE`. Before #1195 every non-`later` code here
+    /// exited 1, unlike the same call through MCP's `data.exit`.
+    #[test]
+    fn a_send_like_refusal_exits_its_registered_code() {
+        use super::exit;
+        for (code, want) in [
+            ("not_settled", exit::REFUSED),
+            ("server_version_gap", exit::PROTOCOL_GAP),
+            ("questions_widening_refused", exit::POLICY_REFUSED),
+            ("operator_only", exit::POLICY_REFUSED),
+            ("pane_not_found", exit::FAILURE),
+            ("pane_send_failed", exit::FAILURE),
+            ("an_unregistered_code", exit::FAILURE),
+        ] {
+            assert_eq!(super::refusal_exit(code), want, "{code}");
+            assert_eq!(
+                super::error_code_exit(code, true),
+                want,
+                "{code}: MCP data.exit"
+            );
+        }
+        assert_eq!((exit::PROTOCOL_GAP, exit::POLICY_REFUSED), (78, 13));
+    }
+
+    #[test]
+    fn only_public_pane_ids_skip_the_target_round_trip() {
+        for id in ["w3:p2", "w_1:p1a", "p_7", "p_1_2", "1-1", "w_2-3", "w2-3"] {
+            assert!(super::is_public_pane_id(id), "{id}");
+        }
+        for target in [
+            "reviewer",
+            "worker-2",
+            "agent_atlas_6f21c4",
+            "w3:p",
+            ":p2",
+            "a:pb-c",
+        ] {
+            assert!(!super::is_public_pane_id(target), "{target}");
+        }
+    }
+
     #[test]
     fn parses_channel_set_argument() {
         assert_eq!(
@@ -1392,5 +1840,59 @@ mod tests {
             super::channel_set_install_action(None),
             super::ChannelSetInstallAction::RunSelfUpdate
         );
+    }
+}
+
+#[cfg(test)]
+pub(crate) use agent::test_structured_start;
+
+#[cfg(test)]
+mod config_sink_tests {
+    use super::*;
+    fn check(stage: ConfigEdit) {
+        let source = "[ui]\nconfirm_close = 'SECRET_CLI_2384' trailing";
+        let error = toml::from_str::<toml::Table>(source).unwrap_err();
+        let text = config_edit_parse_error(&error, source, stage);
+        assert!(!text.contains("SECRET_"), "CLI guard leaked: {text}");
+    }
+    #[test]
+    fn security2384_s3b1_cli_channel_input() {
+        check(ConfigEdit::ChannelInput);
+    }
+    #[test]
+    fn security2384_s3b1_cli_channel_output() {
+        check(ConfigEdit::ChannelOutput);
+    }
+    #[test]
+    fn security2384_s3b1_cli_keys_input() {
+        check(ConfigEdit::KeysInput);
+    }
+    #[test]
+    fn security2384_s3b1_cli_keys_output() {
+        check(ConfigEdit::KeysOutput);
+    }
+}
+
+#[cfg(test)]
+mod fix1_tests {
+    use super::*;
+    fn diagnostic(stage: ConfigEdit) -> String {
+        let text = "[ui]\nconfirm_close='SECRET_CLI_2384' trailing";
+        let error = toml::from_str::<toml::Table>(text).unwrap_err();
+        let d = config_edit_parse_error(&error, text, stage);
+        assert!(!d.contains("SECRET_"));
+        d
+    }
+    #[test]
+    fn usability2384_fix1_cli_input_hint() {
+        for stage in [ConfigEdit::KeysInput, ConfigEdit::ChannelInput] {
+            assert!(diagnostic(stage).contains("Fix it manually or move it aside"));
+        }
+    }
+    #[test]
+    fn usability2384_fix1_cli_output_guard_hint() {
+        for stage in [ConfigEdit::KeysOutput, ConfigEdit::ChannelOutput] {
+            assert!(diagnostic(stage).contains("flock's own edit"));
+        }
     }
 }

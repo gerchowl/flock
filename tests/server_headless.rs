@@ -3,7 +3,7 @@
 mod support;
 
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -131,11 +131,13 @@ fn spawn_server(
     api_socket_path: &Path,
     _client_socket_path: &Path,
 ) -> SpawnedFlock {
-    fs::create_dir_all(config_home.join("flock")).unwrap();
+    fs::create_dir_all(config_home.join(support::paths::app_dir_name())).unwrap();
     fs::create_dir_all(runtime_dir).unwrap();
     register_runtime_dir(runtime_dir);
     fs::write(
-        config_home.join("flock/config.toml"),
+        config_home
+            .join(support::paths::app_dir_name())
+            .join("config.toml"),
         "onboarding = false\n",
     )
     .unwrap();
@@ -151,14 +153,16 @@ fn spawn_server(
 
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flk"));
     cmd.arg("server");
-    cmd.env("XDG_CONFIG_HOME", config_home);
-    cmd.env("XDG_RUNTIME_DIR", runtime_dir);
+    for (key, value) in support::environment::isolated_env(config_home, runtime_dir) {
+        cmd.env(key, value);
+    }
     cmd.env("FLOCK_SOCKET_PATH", api_socket_path);
     cmd.env_remove("FLOCK_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", "/bin/sh");
     cmd.env_remove("FLOCK_ENV");
 
-    let child = pair.slave.spawn_command(cmd).unwrap();
+    support::environment::assert_pty_isolated(&cmd);
+    let child = support::environment::spawn_pty(pair.slave.as_ref(), cmd).unwrap();
     register_spawned_flock_pid(child.process_id());
     drop(pair.slave);
 
@@ -168,16 +172,87 @@ fn spawn_server(
     }
 }
 
-fn ping_socket(socket_path: &Path) -> String {
-    let mut stream = UnixStream::connect(socket_path).expect("should connect to API socket");
+/// Use the shared transport's connect-before-send setup with a caller-chosen
+/// I/O bound. Pathname connect is synchronous,
+/// and timeouts bound individual I/O operations rather than the whole exchange.
+fn ping_socket(socket_path: &Path, timeout: Duration) -> String {
+    support::json_api::request(
+        socket_path,
+        r#"{"id":"1","method":"ping","params":{}}"#,
+        timeout,
+    )
+    .expect("headless API ping")
+    .trim()
+    .to_string()
+}
 
-    let request = r#"{"id":"1","method":"ping","params":{}}"#;
-    writeln!(stream, "{}", request).unwrap();
+/// ADR-0037 §1: a live silent peer fails the ping, while the parent also bounds
+/// a regressed child that never returns. The owned child is killed on timeout.
+#[tokio::test]
+async fn headless_ping_fails_when_peer_stays_alive_and_silent() {
+    const PROBE_SOCKET: &str = "FLOCK_TEST_HEADLESS_PING_SOCKET";
+    const CEILING: Duration = Duration::from_secs(5);
+    if let Some(socket) = std::env::var_os(PROBE_SOCKET) {
+        let response = ping_socket(Path::new(&socket), Duration::from_millis(100));
+        assert!(
+            response.contains("pong"),
+            "ping did not return pong: {response}"
+        );
+        return;
+    }
 
-    let mut reader = BufReader::new(stream);
-    let mut response = String::new();
-    reader.read_line(&mut response).unwrap();
-    response.trim().to_string()
+    struct ProbeDir(PathBuf);
+    impl Drop for ProbeDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let base = ProbeDir(unique_test_dir());
+    fs::create_dir(&base.0).unwrap();
+    let socket = base.0.join("silent.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let mut command = support::environment::Command::new(std::env::current_exe().unwrap());
+    command.args([
+        "--exact",
+        "headless_ping_fails_when_peer_stays_alive_and_silent",
+        "--nocapture",
+    ]);
+    for (key, _) in
+        std::env::vars_os().filter(|(key, _)| key.to_string_lossy().starts_with("FLOCK_"))
+    {
+        command.env_remove(key);
+    }
+    command.env(PROBE_SOCKET, &socket);
+    let mut command = tokio::process::Command::from(command.into_std());
+    command
+        .kill_on_drop(true)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    tokio::time::timeout(CEILING, async {
+        let mut child = command.spawn().expect("owned ping probe");
+        let (stream, _) = tokio::select! {
+            accepted = listener.accept() => accepted.expect("ping probe connects"),
+            status = child.wait() => panic!("ping probe exited before connecting: {status:?}"),
+        };
+        let mut peer = tokio::io::BufReader::new(stream);
+        let mut request = String::new();
+        let bytes = tokio::select! {
+            read = tokio::io::AsyncBufReadExt::read_line(&mut peer, &mut request) => read.expect("ping request"),
+            status = child.wait() => panic!("ping probe exited before its request: {status:?}"),
+        };
+        assert!(bytes > 0, "ping probe disconnected before its request");
+        assert_eq!(request, "{\"id\":\"1\",\"method\":\"ping\",\"params\":{}}\n");
+        // Keep the accepted stream alive without sending a response or EOF.
+        let output = child.wait_with_output().await.expect("ping probe completion");
+        drop(peer);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "silent peer unexpectedly passed");
+        assert!(stderr.contains("headless API ping"), "{stderr}");
+        assert!(stderr.contains("WouldBlock") || stderr.contains("TimedOut"), "{stderr}");
+    })
+    .await
+    .expect("silent ping probe exceeded its failure ceiling");
 }
 
 /// Sends a Hello message over the client socket and reads the Welcome response.
@@ -407,7 +482,7 @@ fn server_creates_both_sockets() {
     );
 
     // Verify the API socket works.
-    let response = ping_socket(&api_socket);
+    let response = ping_socket(&api_socket, Duration::from_secs(10));
     assert!(
         response.contains("pong"),
         "ping should return pong: {response}"
@@ -452,7 +527,7 @@ fn server_api_responds_to_ping() {
     wait_for_socket(&api_socket, Duration::from_secs(10));
 
     // Ping the API socket.
-    let response = ping_socket(&api_socket);
+    let response = ping_socket(&api_socket, Duration::from_secs(10));
     assert!(
         response.contains("pong"),
         "API should respond to ping: {response}"
@@ -517,7 +592,7 @@ fn server_cleans_up_stale_client_socket() {
     wait_for_socket(&api_socket, Duration::from_secs(10));
 
     // The API should work.
-    let response = ping_socket(&api_socket);
+    let response = ping_socket(&api_socket, Duration::from_secs(10));
     assert!(
         response.contains("pong"),
         "API should respond to ping: {response}"
@@ -549,7 +624,7 @@ fn server_persists_after_client_disconnect() {
     thread::sleep(Duration::from_millis(200));
 
     // The server should still be running and the API should still respond.
-    let response = ping_socket(&api_socket);
+    let response = ping_socket(&api_socket, Duration::from_secs(10));
     assert!(
         response.contains("pong"),
         "API should still respond after client disconnect: {response}"
@@ -583,14 +658,16 @@ fn duplicate_server_start_fails_gracefully() {
 
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flk"));
     cmd.arg("server");
-    cmd.env("XDG_CONFIG_HOME", &config_home);
-    cmd.env("XDG_RUNTIME_DIR", &runtime_dir);
+    for (key, value) in support::environment::isolated_env(&config_home, &runtime_dir) {
+        cmd.env(key, value);
+    }
     cmd.env("FLOCK_SOCKET_PATH", &api_socket);
     cmd.env_remove("FLOCK_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", "/bin/sh");
     cmd.env_remove("FLOCK_ENV");
 
-    let mut child2 = pair.slave.spawn_command(cmd).unwrap();
+    support::environment::assert_pty_isolated(&cmd);
+    let mut child2 = support::environment::spawn_pty(pair.slave.as_ref(), cmd).unwrap();
     register_spawned_flock_pid(child2.process_id());
     drop(pair.slave);
 
@@ -792,7 +869,7 @@ fn no_hello_client_closed_within_five_seconds() {
     assert!(error.is_none());
 
     // API should still work.
-    let response = ping_socket(&api_socket);
+    let response = ping_socket(&api_socket, Duration::from_secs(10));
     assert!(
         response.contains("pong"),
         "server should still respond to ping: {response}"

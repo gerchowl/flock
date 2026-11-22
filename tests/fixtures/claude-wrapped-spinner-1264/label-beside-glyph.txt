@@ -1,0 +1,14 @@
+  3m 2s
+  ⎿  $ ping -i 1 -c 300 127.0.0.1 | tail -1 (3m 1s)
+     (ctrl+b to run in background)
+
+✢ Investigating why every working pane reads idle
+  after a client detaches from the server…
+  ⎿  Tip: Use /btw to ask a quick side question
+     without interrupting Claude's current work
+
+
+────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on · gh auth login for PR

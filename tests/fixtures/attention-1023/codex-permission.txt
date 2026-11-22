@@ -1,0 +1,22 @@
+
+› PERM now
+
+
+• Running touch probe-1023.txt
+
+
+  Would you like to run the following command?
+
+  Environment: local
+
+  Reason: Create the probe file outside the sandbox?
+
+  $ touch probe-1023.txt
+
+
+› 1. Yes, proceed (y)
+  2. Yes, and don't ask again for commands that start
+     with `touch probe-1023.txt` (p)
+  3. No, and tell Codex what to do differently (esc)
+
+  Press enter to confirm or esc to cancel

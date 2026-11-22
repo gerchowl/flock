@@ -1,3 +1,4 @@
+use std::io;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -22,6 +23,7 @@ pub struct AgentSessionRef {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum AgentSessionRefKind {
     Id,
@@ -77,6 +79,24 @@ pub fn session_ref_from_report(
     }
 
     agent_session_id.and_then(AgentSessionRef::id)
+}
+
+/// Unvalidated Codex SessionStart data retained separately from resume identity.
+/// Runtime must validate path, launch and writer before consuming its transcript.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodexSessionStart {
+    pub thread: String,
+    pub transcript_path: Option<String>,
+    pub source: Option<String>,
+}
+
+/// Codex also reports fork; accepting it must not widen Claude's source set.
+pub fn normalize_session_start_source(agent: &str, value: Option<String>) -> Option<String> {
+    if agent == "codex" && value.as_deref().map(str::trim) == Some("fork") {
+        Some("fork".into())
+    } else {
+        normalize_claude_session_start_source(value)
+    }
 }
 
 /// Normalize the optional `session_start_source` field reported by the Claude
@@ -213,23 +233,50 @@ pub fn branch_plan(
 /// claude-internal and not worth replicating. A missing or empty transcript
 /// means `claude --resume` would print "No conversation found" and exit,
 /// leaving a dead pane, so fork callers refuse up front.
+///
+/// A session launched under an account profile (`CLAUDE_CONFIG_DIR`) keeps
+/// its transcripts under that directory instead of `~/.claude`. The
+/// server or `SessionStart` hook records which one (see `record_claude_config_dir`).
+/// Search that directory alone when recorded; only sessions without a record use
+/// `~/.claude`. A session id must have exactly one matching transcript in its store.
 pub fn claude_transcript_path(home: &Path, session_id: &str) -> Option<std::path::PathBuf> {
+    claude_transcript_path_in(home, &claude_config_dir_records_dir(), session_id)
+}
+
+/// Locate a unique transcript while retaining store read failures for recovery callers.
+pub(crate) fn claude_transcript_path_checked(
+    home: &Path,
+    session_id: &str,
+) -> io::Result<Option<std::path::PathBuf>> {
+    claude_transcript_path_checked_in(home, &claude_config_dir_records_dir(), session_id)
+}
+
+fn claude_transcript_path_in(
+    home: &Path,
+    records_dir: &Path,
+    session_id: &str,
+) -> Option<std::path::PathBuf> {
+    claude_transcript_path_checked_in(home, records_dir, session_id)
+        .ok()
+        .flatten()
+}
+
+fn claude_transcript_path_checked_in(
+    home: &Path,
+    records_dir: &Path,
+    session_id: &str,
+) -> io::Result<Option<std::path::PathBuf>> {
     if session_id.is_empty() || session_id.contains(['/', '\\']) || !valid_session_id(session_id) {
-        return None;
+        return Ok(None);
     }
-    let projects = home.join(".claude").join("projects");
-    let entries = std::fs::read_dir(projects).ok()?;
-    let file_name = format!("{session_id}.jsonl");
-    for entry in entries.flatten() {
-        let candidate = entry.path().join(&file_name);
-        if candidate
-            .metadata()
-            .is_ok_and(|meta| meta.is_file() && meta.len() > 0)
-        {
-            return Some(candidate);
-        }
-    }
-    None
+    let profile = crate::session_evidence::store::recorded_profile(&records_dir.join(session_id))?;
+    crate::session_evidence::store::lookup(
+        [profile
+            .unwrap_or_else(|| home.join(".claude"))
+            .join("projects")],
+        crate::session_evidence::store::Layout::Claude,
+        session_id,
+    )
 }
 
 /// The session id a Claude fork plan resumes, if `plan` is one (#178).
@@ -256,7 +303,7 @@ pub fn claude_resume_session_id(plan: &AgentResumePlan) -> Option<&str> {
 
 // --- Claude account-profile (CLAUDE_CONFIG_DIR) recall across a flk restart --
 //
-// `claude-auth <profile>` (the g-fleet account switcher) works by exporting
+// `claude-auth <profile>` (a fleet account switcher) works by exporting
 // `CLAUDE_CONFIG_DIR` into the interactive shell, so `claude` launched there
 // runs under that account. That env lives ONLY in that shell — but when flk
 // resumes an agent (server restart, reboot, hibernate/resume) it spawns a FRESH
@@ -287,9 +334,19 @@ fn safe_session_file_name(session_id: &str) -> Option<&str> {
 }
 
 /// Record which `CLAUDE_CONFIG_DIR` a Claude session was launched under.
-/// Best-effort and silent: a hook must never fail the parent agent.
+/// Best-effort: a hook must never fail the parent agent.
 pub fn record_claude_config_dir(session_id: &str, config_dir: &str) {
     record_claude_config_dir_in(&claude_config_dir_records_dir(), session_id, config_dir);
+}
+
+/// Fill a missing session record from launch evidence without replacing hook evidence.
+pub fn record_claude_config_dir_if_absent(session_id: &str, config_dir: &str) {
+    write_claude_config_dir_in(
+        &claude_config_dir_records_dir(),
+        session_id,
+        config_dir,
+        false,
+    );
 }
 
 /// The `CLAUDE_CONFIG_DIR` a Claude session was launched under, if recorded.
@@ -318,6 +375,10 @@ pub fn recorded_claude_profile(config_dir: String) -> std::collections::BTreeMap
 // Inner forms take the records dir explicitly so they're testable without
 // mutating process-global env (`state_dir()` reads `XDG_STATE_HOME`/`HOME`).
 fn record_claude_config_dir_in(dir: &Path, session_id: &str, config_dir: &str) {
+    write_claude_config_dir_in(dir, session_id, config_dir, true);
+}
+
+fn write_claude_config_dir_in(dir: &Path, session_id: &str, config_dir: &str, replace: bool) {
     let Some(name) = safe_session_file_name(session_id) else {
         return;
     };
@@ -327,7 +388,36 @@ fn record_claude_config_dir_in(dir: &Path, session_id: &str, config_dir: &str) {
     if std::fs::create_dir_all(dir).is_err() {
         return;
     }
-    let _ = std::fs::write(dir.join(name), config_dir);
+    let mut random = [0; 16];
+    if getrandom::fill(&mut random).is_err() {
+        return;
+    }
+    let temporary = dir.join(format!(".profile-{:032x}.tmp", u128::from_ne_bytes(random)));
+    let result = (|| -> io::Result<()> {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        file.write_all(config_dir.as_bytes())?;
+        file.sync_all()?;
+        if replace {
+            std::fs::rename(&temporary, dir.join(name))?;
+        } else {
+            // Publishing a complete file with no replacement closes the hook race.
+            match std::fs::hard_link(&temporary, dir.join(name)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
+            std::fs::remove_file(&temporary)?;
+        }
+        std::fs::File::open(dir)?.sync_all()
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+        tracing::warn!("failed to record Claude session config directory");
+    }
 }
 
 fn claude_config_dir_for_session_in(dir: &Path, session_id: &str) -> Option<String> {
@@ -436,10 +526,10 @@ mod tests {
 
         let sid = "session-round-trip";
         assert_eq!(claude_config_dir_for_session_in(&tmp, sid), None);
-        record_claude_config_dir_in(&tmp, sid, "/home/u/.claude-profiles/work");
+        record_claude_config_dir_in(&tmp, sid, "/home/u/.config/profile-a");
         assert_eq!(
             claude_config_dir_for_session_in(&tmp, sid).as_deref(),
-            Some("/home/u/.claude-profiles/work")
+            Some("/home/u/.config/profile-a")
         );
         // An empty config dir is never recorded, and junk ids never look up.
         record_claude_config_dir_in(&tmp, "blank", "");
@@ -741,7 +831,7 @@ mod tests {
         let home = std::env::temp_dir().join(format!("flock-home-{}-{nanos}", std::process::id()));
         let project = home.join(".claude/projects/-tmp-repo");
         std::fs::create_dir_all(&project).unwrap();
-        std::fs::write(project.join("sess-1.jsonl"), "{}\n").unwrap();
+        std::fs::write(project.join("sess-1.jsonl"), "{\"sessionId\":\"sess-1\"}\n").unwrap();
         std::fs::write(project.join("empty.jsonl"), "").unwrap();
 
         assert_eq!(
@@ -758,6 +848,185 @@ mod tests {
             "path traversal in a session id must never resolve"
         );
         let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn claude_transcript_path_reads_the_recorded_config_dir_profile_first() {
+        // #977: a pane launched under `claude-auth <profile>` writes its
+        // transcript under that CLAUDE_CONFIG_DIR, never under ~/.claude, so
+        // `agent result` failed with transcript_not_found on every such pane.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0);
+        let base =
+            std::env::temp_dir().join(format!("flock-profile-{}-{nanos}", std::process::id()));
+        let home = base.join("home");
+        let records = base.join("records");
+        let profile = home.join(".config/profile-b");
+        let profile_project = profile.join("projects/-tmp-repo");
+        let default_project = home.join(".claude/projects/-tmp-repo");
+        std::fs::create_dir_all(&profile_project).unwrap();
+        std::fs::create_dir_all(&default_project).unwrap();
+        std::fs::write(
+            profile_project.join("sess-profile.jsonl"),
+            "{\"sessionId\":\"sess-profile\"}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            default_project.join("sess-default.jsonl"),
+            "{\"sessionId\":\"sess-default\"}\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            claude_transcript_path_in(&home, &records, "sess-profile"),
+            None,
+            "without the record the profile is not searched"
+        );
+        record_claude_config_dir_in(&records, "sess-profile", &profile.to_string_lossy());
+        assert_eq!(
+            claude_transcript_path_in(&home, &records, "sess-profile"),
+            Some(profile_project.join("sess-profile.jsonl"))
+        );
+        record_claude_config_dir_in(&records, "sess-default", &profile.to_string_lossy());
+        assert_eq!(
+            claude_transcript_path_in(&home, &records, "sess-default"),
+            None,
+            "a recorded profile never falls back to a different config directory"
+        );
+        record_claude_config_dir_in(&records, "sess-relative", "relative/profile");
+        assert_eq!(
+            claude_transcript_path_in(&home, &records, "sess-relative"),
+            None,
+            "a relative record names no directory flock can trust"
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn claude_transcript_path_uses_recorded_store_when_default_reuses_the_id() {
+        let root = crate::test_support::TempDir::socket();
+        let home = root.path().join("home");
+        let records = root.path().join("records");
+        let profile = root.path().join("profile");
+        for config in [&profile, &home.join(".claude")] {
+            let project = config.join("projects/fixture");
+            std::fs::create_dir_all(&project).unwrap();
+            std::fs::write(
+                project.join("reused-session.jsonl"),
+                "{\"sessionId\":\"reused-session\"}\n",
+            )
+            .unwrap();
+        }
+        record_claude_config_dir_in(&records, "reused-session", profile.to_str().unwrap());
+        assert_eq!(
+            claude_transcript_path_in(&home, &records, "reused-session"),
+            Some(profile.join("projects/fixture/reused-session.jsonl"))
+        );
+        std::fs::write(profile.join("projects/fixture/reused-session.jsonl"), "").unwrap();
+        assert!(
+            claude_transcript_path_in(&home, &records, "reused-session").is_none(),
+            "an empty recorded transcript cannot select the default profile instead"
+        );
+    }
+
+    #[test]
+    fn claude_transcript_path_counts_an_aliased_default_store_once() {
+        let root = crate::test_support::TempDir::socket();
+        let home = root.path().join("home");
+        let records = root.path().join("records");
+        let config = home.join(".claude");
+        let project = config.join("projects/fixture");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join("only-session.jsonl"),
+            "{\"sessionId\":\"only-session\"}\n",
+        )
+        .unwrap();
+        record_claude_config_dir_in(&records, "only-session", config.to_str().unwrap());
+        assert_eq!(
+            claude_transcript_path_in(&home, &records, "only-session"),
+            Some(project.join("only-session.jsonl"))
+        );
+    }
+
+    fn assert_unreadable_claude_project_refuses(hidden_match: bool) {
+        use std::os::unix::fs::PermissionsExt;
+        let root = crate::test_support::TempDir::socket();
+        let home = root.path().join("home");
+        let records = root.path().join("records");
+        let projects = home.join(".claude/projects");
+        let visible = projects.join("visible");
+        let blocked = projects.join("blocked");
+        std::fs::create_dir_all(&visible).unwrap();
+        std::fs::create_dir_all(&blocked).unwrap();
+        std::fs::write(
+            visible.join("unique-session.jsonl"),
+            "{\"sessionId\":\"unique-session\"}\n",
+        )
+        .unwrap();
+        if hidden_match {
+            std::fs::write(
+                blocked.join("unique-session.jsonl"),
+                "{\"sessionId\":\"unique-session\"}\n",
+            )
+            .unwrap();
+        } else {
+            std::fs::write(
+                blocked.join("unrelated-session.jsonl"),
+                "{\"sessionId\":\"unrelated-session\"}\n",
+            )
+            .unwrap();
+        }
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let result = claude_transcript_path_in(&home, &records, "unique-session");
+        let checked = claude_transcript_path_checked_in(&home, &records, "unique-session");
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            result.is_none(),
+            "an unreadable project cannot establish uniqueness: {result:?}"
+        );
+        let error = checked.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(
+            error.to_string().contains(blocked.to_str().unwrap()),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn claude_transcript_path_rejects_an_unreadable_matching_project() {
+        assert_unreadable_claude_project_refuses(true);
+    }
+
+    #[test]
+    fn claude_transcript_path_rejects_an_unreadable_unrelated_project() {
+        assert_unreadable_claude_project_refuses(false);
+    }
+
+    #[test]
+    fn claude_transcript_path_skips_only_proven_non_directory_projects() {
+        let root = crate::test_support::TempDir::socket();
+        let home = root.path().join("home");
+        let records = root.path().join("records");
+        let projects = home.join(".claude/projects");
+        std::fs::create_dir_all(projects.join("visible")).unwrap();
+        let transcript = projects.join("visible/unique-session.jsonl");
+        std::fs::write(&transcript, "{\"sessionId\":\"unique-session\"}\n").unwrap();
+        std::fs::write(projects.join("ordinary-file"), "not a directory").unwrap();
+        assert_eq!(
+            claude_transcript_path_checked_in(&home, &records, "unique-session").unwrap(),
+            Some(transcript)
+        );
+        let loop_path = projects.join("loop");
+        std::os::unix::fs::symlink(&loop_path, &loop_path).unwrap();
+        let error =
+            claude_transcript_path_checked_in(&home, &records, "unique-session").unwrap_err();
+        assert!(
+            error.to_string().contains(loop_path.to_str().unwrap()),
+            "{error}"
+        );
     }
 
     #[test]

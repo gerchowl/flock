@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use super::{
-    api_helpers::{pane_agent_status, tab_attention_priority},
+    api_helpers::{agent_status_attention_priority, pane_agent_status_from_terminal},
     App, Mode,
 };
 use crate::{config::NewTerminalCwdConfig, workspace::Workspace};
@@ -26,6 +26,31 @@ pub(crate) fn resolve_new_terminal_cwd(
 }
 
 impl App {
+    pub(super) fn resolve_tab_create_cwd(
+        &self,
+        source_ws_idx: Option<usize>,
+        cwd_override: Option<PathBuf>,
+        sibling: bool,
+    ) -> PathBuf {
+        let pinned_cwd = if sibling {
+            sibling_spawn_seed(source_ws_idx.and_then(|idx| self.state.workspaces.get(idx))).1
+        } else {
+            None
+        };
+        cwd_override.or(pinned_cwd).unwrap_or_else(|| {
+            let follow_cwd = source_ws_idx.and_then(|idx| {
+                if sibling {
+                    self.seed_cwd_from_workspace(idx)
+                } else {
+                    self.state
+                        .focused_runtime_in_workspace(&self.terminal_runtimes, idx)
+                        .and_then(|runtime| runtime.cwd())
+                }
+            });
+            self.resolve_new_terminal_cwd(follow_cwd)
+        })
+    }
+
     pub(super) fn seed_cwd_from_workspace(&self, ws_idx: usize) -> Option<PathBuf> {
         self.state
             .workspaces
@@ -128,15 +153,8 @@ impl App {
         focus: bool,
     ) -> std::io::Result<usize> {
         let source = source_ws_idx.and_then(|ws_idx| self.state.workspaces.get(ws_idx));
-        let (membership, pinned_cwd) = sibling_spawn_seed(source);
-        let initial_cwd = match cwd_override.or(pinned_cwd) {
-            Some(path) => path,
-            None => {
-                let follow_cwd =
-                    source_ws_idx.and_then(|ws_idx| self.seed_cwd_from_workspace(ws_idx));
-                self.resolve_new_terminal_cwd(follow_cwd)
-            }
-        };
+        let (membership, _) = sibling_spawn_seed(source);
+        let initial_cwd = self.resolve_tab_create_cwd(source_ws_idx, cwd_override, true);
         let idx = self.create_workspace_with_options(initial_cwd, focus)?;
         if membership.is_some() {
             self.state.workspaces[idx].worktree_space = membership;
@@ -268,17 +286,23 @@ impl App {
     ) -> Option<crate::api::schema::TabInfo> {
         let ws = self.state.workspaces.get(ws_idx)?;
         let tab = ws.tabs.get(tab_idx)?;
-        let (agg_state, seen) = tab
+        let agent_status = tab
             .panes
             .values()
             .filter_map(|pane| {
                 self.state
                     .terminals
                     .get(&pane.attached_terminal_id)
-                    .map(|terminal| (terminal.state, pane.seen))
+                    .map(|terminal| {
+                        pane_agent_status_from_terminal(
+                            terminal,
+                            pane.seen,
+                            self.terminal_runtimes.get(&terminal.id).is_some(),
+                        )
+                    })
             })
-            .max_by_key(|(state, seen)| tab_attention_priority(*state, *seen))
-            .unwrap_or((crate::detect::AgentState::Unknown, true));
+            .max_by_key(|status| agent_status_attention_priority(*status))
+            .unwrap_or(crate::api::schema::AgentStatus::Unknown);
         Some(crate::api::schema::TabInfo {
             tab_id: self.public_tab_id(ws_idx, tab_idx)?,
             workspace_id: self.public_workspace_id(ws_idx),
@@ -286,7 +310,7 @@ impl App {
             label: tab.display_name(),
             focused: self.state.active == Some(ws_idx) && ws.active_tab == tab_idx,
             pane_count: tab.panes.len(),
-            agent_status: pane_agent_status(agg_state, seen),
+            agent_status,
         })
     }
 
@@ -350,10 +374,17 @@ impl App {
                 .foreground_cwd_for_pane(pane_id, &self.terminal_runtimes)
                 .map(|cwd| cwd.display().to_string()),
             label: terminal.manual_label.clone(),
-            agent: terminal.effective_agent_label().map(str::to_string),
+            agent: crate::terminal::agent_name::received(
+                terminal.effective_agent_label().map(str::to_string),
+                "pane_info",
+            ),
             title: presentation.title,
             display_agent: presentation.display_agent,
-            agent_status: super::api_helpers::pane_agent_status_from_terminal(terminal, pane.seen),
+            agent_status: super::api_helpers::pane_agent_status_from_terminal(
+                terminal,
+                pane.seen,
+                self.terminal_runtimes.get(&terminal.id).is_some(),
+            ),
             custom_status: presentation.custom_status,
             state_labels: presentation.state_labels,
             agent_session: terminal_agent_session_info(terminal),
@@ -391,7 +422,24 @@ impl App {
 
     pub(super) fn workspace_info(&self, index: usize) -> crate::api::schema::WorkspaceInfo {
         let ws = &self.state.workspaces[index];
-        let (agg_state, seen) = ws.aggregate_state(&self.state.terminals);
+        let agent_status = ws
+            .tabs
+            .iter()
+            .flat_map(|tab| tab.panes.values())
+            .filter_map(|pane| {
+                self.state
+                    .terminals
+                    .get(&pane.attached_terminal_id)
+                    .map(|terminal| {
+                        pane_agent_status_from_terminal(
+                            terminal,
+                            pane.seen,
+                            self.terminal_runtimes.get(&terminal.id).is_some(),
+                        )
+                    })
+            })
+            .max_by_key(|status| agent_status_attention_priority(*status))
+            .unwrap_or(crate::api::schema::AgentStatus::Unknown);
         crate::api::schema::WorkspaceInfo {
             workspace_id: self.public_workspace_id(index),
             number: index + 1,
@@ -402,7 +450,7 @@ impl App {
             active_tab_id: self.public_tab_id(index, ws.active_tab).unwrap_or_else(|| {
                 crate::workspace::public_tab_id_for_number(&ws.id, ws.active_tab + 1)
             }),
-            agent_status: pane_agent_status(agg_state, seen),
+            agent_status,
             // #197: the action view, not the raw membership. This field is
             // what `flk worktree kill` reads to pick a checkout to remove and
             // to run the merge gate over, so a membership live git places in

@@ -1,17 +1,17 @@
-# Fork-only: maintain the `latest` distribution channel for Nix users.
+# Maintain the `latest` distribution channel for Nix users.
 #
 # Every push to the integration branch builds the flake packages — exactly
 # what `github:gerchowl/flock/latest` consumers will get — and fast-forwards
-# `latest` only on success. Pin `latest` for newest-green, a tag/rev for
-# immutable, or the integration branch for bleeding edge.
+# `latest` only on success. Pin `latest` for newest-green, `stable` (or a
+# v* tag) for the last release, or `dev` itself for bleeding edge.
 #
-# The integration branch is `main` (graduated from feat/sidebar-row-gap,
-# PR #86).
+# The integration branch is `dev`. `main` moves only when a release is cut
+# (promote.yml), and `stable` follows each release (release.yml).
 name: latest-branch
 
 on:
   push:
-    branches: [main]
+    branches: [dev]
   workflow_dispatch:
 
 permissions:
@@ -28,7 +28,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Install Nix
-        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31.11.3
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes

@@ -1,0 +1,141 @@
+//! The flock desktop shell: a Tauri v2 window around the unchanged
+//! `web/client` bundle (ADR-0038 §6, #1601). See `desktop/README.md`.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+#[path = "platform/badge.rs"]
+mod badge;
+mod bridge;
+mod config;
+#[cfg(test)]
+mod hardening;
+mod mint;
+
+use std::sync::Arc;
+
+use tauri::{
+    ipc::Channel, webview::PageLoadEvent, Manager, State, Webview, WebviewUrl,
+    WebviewWindowBuilder, WindowEvent,
+};
+
+fn main() {
+    let context = tauri::generate_context!();
+    let dev_url = tauri::is_dev()
+        .then(|| context.config().build.dev_url.clone())
+        .flatten();
+    let ws = mint::ws_socket_path(&mint::socket_path(|key| std::env::var(key).ok()));
+    let bridge = bridge::Bridge::new(
+        ws,
+        Arc::new(mint::mint),
+        Arc::new(bridge::suspend_inclusive_ms),
+    );
+    tauri::Builder::default()
+        .manage(bridge)
+        .setup(move |app| {
+            WebviewWindowBuilder::new(app, "main", WebviewUrl::default())
+                .title("flock")
+                .inner_size(1280.0, 800.0)
+                .initialization_script(config::init_script())
+                .on_navigation(move |url| config::navigation_allowed(url, dev_url.as_ref()))
+                // A reload or navigation starts a new page: the old one's
+                // sessions end (`Bridge::webview_gone`), or each would live on.
+                .on_page_load(|webview, load| {
+                    if load.event() == PageLoadEvent::Started {
+                        webview
+                            .state::<bridge::Bridge>()
+                            .webview_gone(webview.label());
+                    }
+                })
+                .build()?;
+            Ok(())
+        })
+        .on_window_event(|window, event| {
+            if let WindowEvent::Destroyed = event {
+                window
+                    .state::<bridge::Bridge>()
+                    .webview_gone(window.label());
+            }
+        })
+        .invoke_handler(tauri::generate_handler![
+            bridge_open,
+            bridge_send,
+            bridge_close,
+            set_badge_count
+        ])
+        .run(context)
+        .expect("the Tauri runtime failed");
+}
+
+// The webview's bridge commands: open, send and close (ADR-0038 §6,
+// "Never in the webview"). None of them returns or reports the bearer.
+
+/// Opens a bridged session for this webview; its frames and close arrive
+/// on `events`. A send that fails means the webview is gone.
+#[tauri::command]
+async fn bridge_open(
+    bridge: State<'_, bridge::Bridge>,
+    webview: Webview,
+    renew: bool,
+    events: Channel<bridge::Event>,
+) -> Result<bridge::Opened, String> {
+    let sink = Arc::new(move |event| events.send(event).is_ok());
+    // The refusal, never the bearer: `open` has cut it out of every message.
+    let opened = bridge.open(webview.label(), renew, sink).await;
+    opened.inspect_err(|reason| eprintln!("flock-desktop: {reason}"))
+}
+
+/// A text frame for the session. Synchronous, so frames keep their order.
+#[tauri::command]
+fn bridge_send(bridge: State<'_, bridge::Bridge>, id: u64, text: String) -> Result<(), String> {
+    bridge.send(id, text)
+}
+
+/// Closes the session from the webview's side.
+#[tauri::command]
+fn bridge_close(
+    bridge: State<'_, bridge::Bridge>,
+    id: u64,
+    code: Option<u16>,
+    reason: Option<String>,
+) -> Result<(), String> {
+    bridge.close(id, code, reason)
+}
+
+// Keep the versioned Tauri contract on the native side, where the compiler checks it.
+#[tauri::command]
+fn set_badge_count(window: tauri::Window, count: u32, label: Option<String>) -> Result<(), String> {
+    badge::set(&window, count, label).map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod badge_contract {
+    use super::badge::{action, Badge};
+    #[test]
+    fn platform_badges_preserve_known_partial_and_unknown_values() {
+        for count in [0, 7] {
+            assert_eq!(action(count, None, true), Badge::Count(count));
+            assert_eq!(action(count, None, false), Badge::Count(count));
+        }
+        for (count, label) in [(2, "2+"), (0, "0+"), (0, "?")] {
+            assert_eq!(
+                action(count, Some(label.into()), true),
+                Badge::Label(label.into())
+            );
+            assert_eq!(
+                action(count, Some(label.into()), false),
+                Badge::Count(count)
+            );
+        }
+    }
+
+    #[test]
+    fn pinned_tauri_badge_setter_accepts_an_optional_i64() {
+        let _command: fn(tauri::Window, u32, Option<String>) -> Result<(), String> =
+            super::set_badge_count;
+        let _setter: fn(&tauri::Window, Option<i64>) -> tauri::Result<()> =
+            tauri::Window::set_badge_count;
+        // Tauri exposes this typed API only on macOS, while routing tests run on every platform.
+        #[cfg(target_os = "macos")]
+        let _label: fn(&tauri::Window, Option<String>) -> tauri::Result<()> =
+            tauri::Window::set_badge_label;
+    }
+}

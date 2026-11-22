@@ -19,18 +19,21 @@
 
 mod support;
 
+use support::paths::app_dir_name;
+
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use support::environment::Command;
 
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use support::{
     cleanup_test_base, register_runtime_dir, register_spawned_flock_pid,
-    unregister_spawned_flock_pid, wait_for_socket,
+    unregister_spawned_flock_pid,
 };
 
 /// Short settle window so the suite stays fast; the default is a contract
@@ -71,14 +74,6 @@ impl Drop for Server {
     }
 }
 
-fn app_dir_name() -> &'static str {
-    if cfg!(debug_assertions) {
-        "flock-dev"
-    } else {
-        "flock"
-    }
-}
-
 fn start_server() -> Server {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -107,17 +102,20 @@ fn start_server() -> Server {
         .unwrap();
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_flk"));
     cmd.arg("server");
-    cmd.env("XDG_CONFIG_HOME", &config_home);
-    cmd.env("XDG_RUNTIME_DIR", &runtime_dir);
+    for (key, value) in support::environment::isolated_env(&config_home, &runtime_dir) {
+        cmd.env(key, value);
+    }
     cmd.env("FLOCK_SOCKET_PATH", &socket);
     cmd.env_remove("FLOCK_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", "/bin/sh");
     cmd.env_remove("FLOCK_ENV");
     cmd.env_remove("FLOCK_HOST_NAME");
     cmd.env_remove("FLOCK_DISABLE_SOUND");
-    let child = pair.slave.spawn_command(cmd).unwrap();
+    support::environment::assert_pty_isolated(&cmd);
+    let child = support::environment::spawn_pty(pair.slave.as_ref(), cmd).unwrap();
     register_spawned_flock_pid(child.process_id());
-    wait_for_socket(&socket, Duration::from_secs(5));
+    drop(pair.slave);
+    support::readiness::wait_for_server(&*pair.master, &socket);
     Server {
         _master: pair.master,
         child,
@@ -411,10 +409,10 @@ fn a4_turn_completed_before_the_wait_still_counts() {
 }
 
 /// E6: a blocked agent is not settled; a `blocked` held for the settle
-/// window ends the wait with exit 3 and status "blocked", even before a new
+/// window ends the wait with exit 6 and status "blocked", even before a new
 /// working entry.
 #[test]
-fn a5_held_blocked_exits_3() {
+fn a5_held_blocked_exits_6() {
     let server = start_server();
     let pane = worker_pane(&server);
     let before = cursor(&server);
@@ -435,7 +433,13 @@ fn a5_held_blocked_exits_3() {
             "5000",
         ],
     );
-    assert_eq!(out.status.code(), Some(3), "stderr: {}", stderr(&out));
+    // 6 since #1025 (was 3), named on stderr for one release.
+    assert_eq!(out.status.code(), Some(6), "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("note: exit code is now 6 (was 3); see CHANGELOG"),
+        "stderr: {}",
+        stderr(&out)
+    );
     let line = stdout_json(&out);
     assert_eq!(line["status"], "blocked", "{line}");
     assert_eq!(line["agent_status"], "blocked", "{line}");

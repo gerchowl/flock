@@ -351,6 +351,9 @@ pub struct TerminalConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct SessionConfig {
+    /// Server-owned restart policy, with optional overrides keyed by agent name.
+    pub restart: crate::agent_restart::RestartPolicy,
+    pub restart_agents: std::collections::BTreeMap<String, crate::agent_restart::RestartPolicy>,
     /// Resume supported AI-agent panes into their native conversation sessions
     /// when restoring a Flock session. Default: true.
     pub resume_agents_on_restore: bool,
@@ -434,6 +437,8 @@ pub struct SessionConfig {
 impl Default for SessionConfig {
     fn default() -> Self {
         Self {
+            restart: Default::default(),
+            restart_agents: Default::default(),
             resume_agents_on_restore: true,
             stop_transcript_wait_ms: 1_000,
             stop_transcript_poll_ms: 50,
@@ -487,6 +492,14 @@ pub fn validated_sidebar_pane_gap(gap: u16) -> u16 {
 /// Clamp `[ui] prompt_float_lines` to its supported range (0 disables).
 pub fn validated_prompt_float_lines(lines: u16) -> u16 {
     lines.min(MAX_PROMPT_FLOAT_LINES)
+}
+
+/// Opt-in structured GUI endpoint; slice 2 owns the listener lifecycle.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ClientConfig {
+    /// IPv4 loopback address; port 0 selects an OS-assigned port reported by `client open`.
+    pub bind: Option<std::net::SocketAddr>,
 }
 
 /// Default bind for `flk web` — loopback only, xterm.js port.
@@ -552,9 +565,137 @@ impl Default for WebSectionConfig {
     }
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct EventsConfig {
+    /// The longest an `events.read` with `wait_ms` is held, in ms
+    /// (ADR-0028 owner decision 3). Default: 540000.
+    pub read_max_wait_ms: u64,
+}
+
+impl Default for EventsConfig {
+    fn default() -> Self {
+        Self {
+            read_max_wait_ms: crate::api::schema::EVENTS_READ_MAX_WAIT_MS,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct QuestionsConfig {
+    /// Third-party tools that ask a human, such as an MCP "ask me on
+    /// Telegram" tool, by the name the harness reports (ADR-0034 §3). A
+    /// delegate's call to one is refused like its own question tool. Empty by
+    /// default. `flk integration install claude` adds them to the question
+    /// hook's matcher, so reinstall after changing the list.
+    pub human_tools: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct SystemOneConfig {
+    pub urls: Vec<String>,
+    /// Sized for clef-flash on the fleet endpoint (#714): an uncached 4 KB tail with the
+    /// ten delegate questions measured p95 1.55 s, and the backend serves one
+    /// request at a time, so this leaves room for one request queued ahead.
+    pub timeout_s: f64,
+    /// `fast` asks `urls`. `full` asks `full_urls` (or `SYSTEMONE_URL_FULL`),
+    /// the larger and slower model, within `full_timeout_s`.
+    pub tier: SystemOneTier,
+    pub full_urls: Vec<String>,
+    /// The 27B full tier measured p95 5.0 s for the same request (#714).
+    pub full_timeout_s: f64,
+}
+
+impl Default for SystemOneConfig {
+    fn default() -> Self {
+        Self {
+            urls: Vec::new(),
+            timeout_s: 4.0,
+            tier: SystemOneTier::Fast,
+            full_urls: Vec::new(),
+            full_timeout_s: 12.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SystemOneTier {
+    #[default]
+    Fast,
+    Full,
+}
+
+/// Socket account policy, independent of structured launch identity.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SecurityConfig {
+    /// ADR-0036 §1a: default recognition fails closed while NSS is unavailable.
+    /// `none` explicitly forgoes dedicated-UID recognition and never queries NSS.
+    /// The setting is file-only and requires a server restart.
+    pub agent_account: AgentAccount,
+}
+
+/// Whether Unix callers are checked against the dedicated account.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub enum AgentAccount {
+    /// Recognize `flk-agent`, refusing operator authority on a UID collision.
+    #[default]
+    #[serde(rename = "flk-agent")]
+    FlkAgent,
+    /// No dedicated account is used; lease and pane checks still identify agents.
+    #[serde(rename = "none")]
+    None,
+}
+
+/// Default queue rewrite trigger: 8 MiB, independent of the per-record ceiling.
+pub const DEFAULT_QUEUE_REWRITE_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Session storage policy. Worker enforcement is wired by the next #1803 slice.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct SessionsConfig {
+    /// Replace eligible JSON blocks strictly larger than this many encoded bytes.
+    pub blob_min_bytes: usize,
+    /// Silence observation policy in milliseconds, inclusive range 5000..=3600000.
+    #[serde(deserialize_with = "crate::structured::blobs::stall_ms")]
+    pub stall_ms: u64,
+    /// Rewrite before the next append when committed bytes exceed this value.
+    /// Zero is invalid: checkpointing cannot be disabled for writable journals.
+    pub queue_rewrite_bytes: std::num::NonZeroU64,
+}
+impl Default for SessionsConfig {
+    fn default() -> Self {
+        Self {
+            blob_min_bytes: crate::structured::blobs::StorageConfig::default().blob_min_bytes,
+            stall_ms: crate::structured::blobs::StorageConfig::default().stall_ms,
+            queue_rewrite_bytes: std::num::NonZeroU64::new(DEFAULT_QUEUE_REWRITE_BYTES)
+                .expect("nonzero queue rewrite default"),
+        }
+    }
+}
+
+impl SessionsConfig {
+    /// Project the persistence and silence settings consumed by runtime workers.
+    pub fn storage(&self) -> crate::structured::blobs::StorageConfig {
+        crate::structured::blobs::StorageConfig {
+            blob_min_bytes: self.blob_min_bytes,
+            stall_ms: self.stall_ms,
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
+    /// Per-session durable queue and blob storage policy.
+    pub sessions: SessionsConfig,
+    /// Local socket identity policy (ADR-0036 §1a).
+    pub security: SecurityConfig,
+    /// Structured Claude launch policy (ADR-0036 §1); activation is #1439.
+    pub structured: crate::structured::launch::StructuredConfig,
     /// Friendly display name for THIS node (#42), shown on the local status
     /// line, self server row, and reported to peers — overriding the OS
     /// `gethostname()`. Empty falls back to the OS host name. Useful on
@@ -583,6 +724,25 @@ pub struct Config {
     /// load; an RTX 5090 is fine at 80 °C), so calibration lives with the
     /// host. Reporters must not read stdin — it is nulled.
     pub thermal_command: Option<String>,
+    /// Command THIS node runs to declare its own GPU utilization 0..=100 for
+    /// the servers band (#291). The dynamic sibling of
+    /// [`thermal_command`](Self::thermal_command): same subprocess runner,
+    /// same hard timeout, same "declare nothing on any failure" rule — but
+    /// run on EVERY sampler tick (≈2s) rather than the thermal slow stride,
+    /// because utilization is a fast-moving numeric metric like cpu/memory,
+    /// not a slow-moving ordinal like heat. Stdout must be one integer
+    /// 0..=100 (trailing whitespace is trimmed); non-zero exit, timeout,
+    /// unparseable output or out-of-range all declare `None` rather than a
+    /// synthesized value.
+    ///
+    /// When set, this value OVERRIDES the macOS IOAccelerator reading — a
+    /// microVM guest has no GPU of its own but can read its host's published
+    /// stats off a file, and the fleet-wide servers band is the whole point.
+    /// A persistently failing reporter is slowed down and logged but never
+    /// disabled, so a reporter that recovers (file reappears, driver
+    /// restarts) lights the column back up without a flock restart.
+    /// Reporters must not read stdin — it is nulled.
+    pub gpu_command: Option<String>,
     pub onboarding: Option<bool>,
     pub theme: ThemeConfig,
     pub terminal: TerminalConfig,
@@ -598,6 +758,8 @@ pub struct Config {
     /// `[title]` — host terminal window title publishing (#361).
     pub title: TitleConfig,
     pub web: WebSectionConfig,
+    /// Structured GUI loopback listener. Absent disables it; separate from the PTY bridge.
+    pub client: ClientConfig,
     pub gossip: GossipConfig,
     pub checks: crate::checks::ChecksConfig,
     /// `[fleet]` — limits on agent-initiated spawn (#329, ADR-0014).
@@ -605,6 +767,13 @@ pub struct Config {
     /// `[spawn]` — what a spawned child's environment is made of (#397).
     pub spawn: super::SpawnConfig,
     pub msg: MsgConfig,
+    /// `[events]` — the `events.read` socket method (ADR-0028 §3).
+    pub events: EventsConfig,
+    /// `[questions]` — question routing for delegates (ADR-0034).
+    pub questions: QuestionsConfig,
+    /// `[[channels]]` — external channel bindings (ADR-0028 §8, #1037).
+    pub channels: Vec<crate::channels::ChannelBinding>,
+    pub systemone: SystemOneConfig,
     pub peers: Vec<PeerConfig>,
 }
 
@@ -613,6 +782,48 @@ pub struct LoadedConfig {
     pub config: Config,
     pub diagnostics: Vec<String>,
     pub invalid_sections: Vec<String>,
+    /// The entries of `diagnostics` that are about one removed or unknown key,
+    /// so a caller that reports the same key with a source location can
+    /// replace them without matching message text (#860).
+    pub key_diagnostics: Vec<KeyDiagnostic>,
+}
+
+impl LoadedConfig {
+    /// Drop the key diagnostics `select` picks, from `diagnostics` as well.
+    pub fn remove_key_diagnostics(&mut self, mut select: impl FnMut(&KeyDiagnostic) -> bool) {
+        let (removed, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.key_diagnostics)
+            .into_iter()
+            .partition(|diagnostic| select(diagnostic));
+        self.key_diagnostics = kept;
+        for diagnostic in removed {
+            if let Some(index) = self
+                .diagnostics
+                .iter()
+                .position(|message| *message == diagnostic.message)
+            {
+                self.diagnostics.remove(index);
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyDiagnosticKind {
+    /// A key flock no longer reads, e.g. `msg.uplink_timeout_secs`.
+    Removed,
+    /// A key or top-level section flock never knew.
+    Unknown,
+}
+
+/// A config diagnostic with a safe canonical schema location. Unknown names
+/// stop at the nearest declared container, map entries use `<key>`, arrays use
+/// `[]`, and unknown roots use `document root`. Removed historical keys keep
+/// their closed schema spelling so loader/source-scan warnings compare equal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyDiagnostic {
+    pub kind: KeyDiagnosticKind,
+    pub key: String,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -796,7 +1007,7 @@ pub struct IndexedKeysConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct WorktreesConfig {
-    /// Root directory under which Flock creates <repo>/<branch-slug> checkouts.
+    /// Root directory under which Flock creates `<repo>/<branch-slug>` checkouts.
     pub directory: String,
     /// Adopt workspaces that sit in linked git worktrees Flock didn't create:
     /// they group under their open parent repo workspace and get the managed
@@ -814,6 +1025,19 @@ pub struct WorktreesConfig {
     /// regardless of config). A repo policy — long-lived `develop`, `release/*`.
     /// Extends the hardcoded floor; can never unprotect it (#121).
     pub protected_branches: Vec<String>,
+    /// Extra branches the merge gate treats as places work lands, beyond the
+    /// detected default branch and `dev`/`main`/`master` (#633). A repo whose
+    /// PRs land somewhere else -- `staging`, `trunk`, `next` -- names it here,
+    /// and the gate then reports `merged: true` with that branch named as the
+    /// evidence. Each entry is also protected from auto-deletion. Entries with
+    /// no such branch or `refs/remotes/origin/<entry>` are ignored.
+    pub integration_branches: Vec<String>,
+    /// Mark a linked worktree trusted in Claude Code's `.claude.json` before
+    /// flock launches `claude` in it, when the repository it was checked out
+    /// from is already trusted there (#605). Never widens trust: an untrusted
+    /// source, or a directory that is not a linked worktree, is left alone.
+    /// Default: true (false in test builds).
+    pub pretrust_claude: bool,
 }
 
 /// Peer-summary "gossip" cadence (#96): the SSH poll that populates the
@@ -956,13 +1180,7 @@ pub struct PeerConfig {
     /// there. Prefer a name that resolves everywhere (a tailnet name) or
     /// define the same alias on the clients.
     pub ssh: String,
-    /// Command run on the peer to fetch its summary. The default wraps the
-    /// `flk` CLI in a login shell so profile-managed PATHs (nix, brew) apply.
-    pub summary_command: String,
-    /// Command run on the peer to serve the held connection. Mirrors
-    /// `summary_command`: the default wraps `flk` in a login shell so
-    /// profile-managed PATHs (nix, brew) apply, and an override handles a peer
-    /// whose `flk` is not on the non-interactive PATH at all.
+    /// Command serving the held mesh edge, in a login shell by default.
     pub relay_command: String,
     /// Optional per-peer override for the summary poll cadence (#96). Unset
     /// falls back to `[gossip] poll_interval_secs`. Values below 1s fall
@@ -977,15 +1195,10 @@ impl Default for PeerConfig {
         Self {
             name: String::new(),
             ssh: String::new(),
-            summary_command: default_peer_summary_command().to_string(),
             relay_command: default_peer_relay_command().to_string(),
             poll_interval_secs: None,
         }
     }
-}
-
-pub fn default_peer_summary_command() -> &'static str {
-    "sh -lc 'flk peers summary --json'"
 }
 
 pub fn default_peer_relay_command() -> &'static str {
@@ -1000,6 +1213,24 @@ impl PeerConfig {
         } else {
             &self.ssh
         }
+    }
+}
+
+/// `[ui.injection_lock]` (#850): while flock types a guarded injection into a
+/// pane, the operator's keystrokes for that pane are held and replayed after
+/// it, and `agent send` or an inbox wake moves a one-row draft aside
+/// and types it back. Off restores the earlier behaviour: keystrokes go
+/// straight through and a draft refuses the injection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct InjectionLockConfig {
+    /// Default: true.
+    pub enabled: bool,
+}
+
+impl Default for InjectionLockConfig {
+    fn default() -> Self {
+        Self { enabled: true }
     }
 }
 
@@ -1163,7 +1394,7 @@ pub struct UiConfig {
     pub agents_agent_label: AgentLabelConfig,
     /// How the SPACES section names the agent in its agent field: "symbol"
     /// (default), "shortcut", or "name". Independent of
-    /// [`agents_agent_label`]; both default to `symbol`. See
+    /// [`Self::agents_agent_label`]; both default to `symbol`. See
     /// [`AgentLabelConfig`].
     pub spaces_agent_label: AgentLabelConfig,
     /// Accent color for highlights, borders, and navigation UI.
@@ -1175,6 +1406,8 @@ pub struct UiConfig {
     pub sound: SoundConfig,
     /// Idle sidebar animations (grazing sheep + screensaver): opt-out + thresholds.
     pub idle: IdleConfig,
+    /// Hold a pane's input while flock injects into it (#850).
+    pub injection_lock: InjectionLockConfig,
 }
 
 /// Cursor shape (DECSCUSR) used for the forced IME anchor.
@@ -1226,13 +1459,16 @@ pub struct AdvancedConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct MsgConfig {
+    /// Native tool-inbox read window after first harness delivery, in milliseconds.
+    /// Defaults to the pane mailbox window (24 hours). Custody is independent.
+    pub inbox_retention_ms: u64,
     /// Accept agent-to-agent messages at all. Default: true.
     ///
     /// A node that sets this false still SENDS — this governs what it is
     /// willing to have delivered into its own agents' turns.
     pub enabled: bool,
-    /// Hosts whose agents may message this node's agents. `["*"]` (the
-    /// default) allows the whole fleet.
+    /// Configured names of authenticated origin nodes allowed to send mail.
+    /// Forwarding hubs are never checked. `["*"]` allows the whole fleet.
     ///
     /// Open by default because a flock fleet is already one trust domain —
     /// SSH keys plus a host CA — so a mandatory allowlist would be friction
@@ -1244,11 +1480,6 @@ pub struct MsgConfig {
     /// sender the mute defers, so it is bounded like any other body, and a
     /// mute must never fail over its own explanation. Default: 200.
     pub mute_reason_max_chars: usize,
-    /// How many mute deferrals to other hosts may be in flight at once
-    /// (ADR-0018 §3). Each is an ssh hop; one mute over a full inbox of
-    /// remote questions owes up to a mailbox's worth, and the rest wait for
-    /// a slot rather than opening that many sessions at once. Default: 4.
-    pub deferral_relay_concurrency: usize,
     /// How many `blocking` messages one sender may send per rolling hour
     /// (ADR-0018 §1). Default: 6.
     ///
@@ -1258,23 +1489,6 @@ pub struct MsgConfig {
     /// Past it, a `blocking` message is still delivered, as `needs_reply`,
     /// and the send result says so. `0` downgrades every `blocking` message.
     pub blocking_per_hour: usize,
-    /// How long a send handed up to the hub waits for the hub's answer, in
-    /// seconds (#410). Default: 45.
-    ///
-    /// A spoke has no `[[peers]]` of its own, so a message for another host
-    /// goes up the relay the hub holds into it and the hub delivers it. The
-    /// hub's own hop to the recipient can take up to its ssh timeout (30s),
-    /// so this has to sit above that or a slow-but-successful delivery would
-    /// be reported to the sender as a failure.
-    pub uplink_timeout_secs: u64,
-    /// How long the hub's relay may wait on this server for a message to hand
-    /// up before asking again, in seconds (#410). Default: 20.
-    ///
-    /// Also the liveness signal: a relay that has not asked within this window
-    /// is treated as gone, and a send that needs the hub is refused
-    /// with "no hub holds a relay to this server" instead of waiting out
-    /// `uplink_timeout_secs` for an answer nobody will carry.
-    pub uplink_heartbeat_secs: u64,
     /// Wake an idle agent that has mail by typing a fixed sentence into its
     /// pane (ADR-0018 §2). Default: true. The kill switch: false leaves agents
     /// to find mail at their next turn boundary, as before.
@@ -1325,13 +1539,11 @@ pub struct MsgConfig {
 impl Default for MsgConfig {
     fn default() -> Self {
         Self {
+            inbox_retention_ms: crate::app::mailboxes::UNDELIVERED_TTL_MS,
             enabled: true,
             allow_from: vec!["*".to_string()],
             mute_reason_max_chars: 200,
-            deferral_relay_concurrency: 4,
             blocking_per_hour: 6,
-            uplink_timeout_secs: 45,
-            uplink_heartbeat_secs: 20,
             idle_wake: true,
             idle_wake_settle_ms: 2_000,
             idle_wake_operator_quiet_ms: 15_000,
@@ -1347,9 +1559,17 @@ impl Default for MsgConfig {
 impl MsgConfig {
     /// Whether a message originating on `host` may be delivered here.
     ///
-    /// A message with no known origin host is treated as LOCAL — it was
-    /// attested by this server's own process ancestry, so there is no remote
-    /// party to gate.
+    /// None is a local sender, attested or unattested, with no remote origin
+    /// to match. Remote import passes the store's authenticated origin name.
+    /// A remote origin without a configured name matches only the wildcard.
+    pub fn accepts_origin(&self, name: Option<&str>) -> bool {
+        self.enabled
+            && self
+                .allow_from
+                .iter()
+                .any(|rule| rule == "*" || name.is_some_and(|name| rule.eq_ignore_ascii_case(name)))
+    }
+
     pub fn accepts_from(&self, host: Option<&str>) -> bool {
         if !self.enabled {
             return false;
@@ -1648,6 +1868,10 @@ impl Default for WorktreesConfig {
             adopt_external: true,
             branch_pivot_message: default_branch_pivot_message().to_string(),
             protected_branches: Vec::new(),
+            integration_branches: Vec::new(),
+            // Off in test builds, so no test App can write to a real Claude
+            // config. A test that exercises it turns it on against a sandbox.
+            pretrust_claude: !cfg!(test),
         }
     }
 }
@@ -1696,6 +1920,7 @@ impl Default for UiConfig {
             toast: ToastConfig::default(),
             sound: SoundConfig::default(),
             idle: IdleConfig::default(),
+            injection_lock: InjectionLockConfig::default(),
         }
     }
 }

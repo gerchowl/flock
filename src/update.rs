@@ -1,6 +1,6 @@
 //! Self-update mechanism.
 //!
-//! Checks the hosted flock.dev update manifest for newer versions.
+//! Checks the update manifest published with each GitHub release for newer versions.
 //! Manual `flk update` downloads and installs the binary.
 //! Background checks only surface availability and release notes.
 //! Uses `curl` as a subprocess for HTTP — no additional Rust HTTP dependencies.
@@ -13,13 +13,48 @@ use std::io::{self, BufRead, BufReader, IsTerminal, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
+use crate::api::error_code::ErrorCode;
+use crate::checksum::AssetRef;
 use crate::process::TracedCommand;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Deserializer};
 
-const STABLE_UPDATE_MANIFEST_URL: &str = "https://flock.dev/latest.json";
-const PREVIEW_UPDATE_MANIFEST_URL: &str = "https://flock.dev/preview.json";
+const STABLE_UPDATE_MANIFEST_URL: &str =
+    "https://github.com/gerchowl/flock/releases/latest/download/latest.json";
+const PREVIEW_UPDATE_MANIFEST_URL: &str =
+    "https://raw.githubusercontent.com/gerchowl/flock/dev/website/preview.json";
+/// The only origin a release binary may be downloaded from. A manifest is
+/// fetched over the network, so its asset URLs are data, not trust (ADR-0025).
+pub(crate) const RELEASE_ASSET_URL_PREFIX: &str =
+    "https://github.com/gerchowl/flock/releases/download/";
+
+/// Refuse an asset URL that is not exactly `<prefix><tag>/<asset>`. A bare
+/// prefix check is not enough: curl normalises `..` segments, so a URL that
+/// starts with the prefix can still fetch from another repository.
+pub(crate) fn ensure_release_asset_origin(url: &str) -> Result<(), String> {
+    let refuse = || {
+        Err(format!(
+            "refusing to download {url}: update assets must be <tag>/<asset> under {RELEASE_ASSET_URL_PREFIX}"
+        ))
+    };
+    let Some(rest) = url.strip_prefix(RELEASE_ASSET_URL_PREFIX) else {
+        return refuse();
+    };
+    let segment_ok = |segment: &str| {
+        !segment.is_empty()
+            && segment != "."
+            && segment != ".."
+            && segment
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'+' | b'-'))
+    };
+    match rest.split_once('/') {
+        Some((tag, asset)) if segment_ok(tag) && segment_ok(asset) => Ok(()),
+        _ => refuse(),
+    }
+}
+
 const HOMEBREW_FORMULA_API_URL: &str = "https://formulae.brew.sh/api/formula/flock.json";
 const FLOCK_UPDATE_COMMAND: &str = "flk update";
 const HOMEBREW_UPDATE_COMMAND: &str = "brew update && brew upgrade flock";
@@ -108,46 +143,6 @@ impl UpdateChannel {
         match self {
             Self::Stable => "stable",
             Self::Preview => "preview",
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct AssetRef {
-    url: String,
-    sha256: Option<String>,
-}
-
-impl<'de> Deserialize<'de> for AssetRef {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let value = serde_json::Value::deserialize(deserializer)?;
-        match value {
-            serde_json::Value::String(url) if !url.trim().is_empty() => Ok(Self {
-                url: url.trim().to_string(),
-                sha256: None,
-            }),
-            serde_json::Value::Object(mut object) => {
-                let url = object
-                    .remove("url")
-                    .and_then(|value| value.as_str().map(str::to_string))
-                    .ok_or_else(|| serde::de::Error::custom("asset object is missing url"))?;
-                let sha256 = object
-                    .remove("sha256")
-                    .and_then(|value| value.as_str().map(str::to_string));
-                if url.trim().is_empty() {
-                    return Err(serde::de::Error::custom("asset url must not be empty"));
-                }
-                Ok(Self {
-                    url: url.trim().to_string(),
-                    sha256: sha256.filter(|value| !value.trim().is_empty()),
-                })
-            }
-            _ => Err(serde::de::Error::custom(
-                "asset must be a URL string or object with url",
-            )),
         }
     }
 }
@@ -286,6 +281,8 @@ where
     let output = TracedCommand::new("curl", "update")
         .args([
             "-sfL",
+            "--proto-redir",
+            "=https",
             "--retry",
             "3",
             "--connect-timeout",
@@ -498,6 +495,8 @@ fn check_homebrew_latest() -> Result<Option<Version>, String> {
     let output = TracedCommand::new("curl", "update")
         .args([
             "-sfL",
+            "--proto-redir",
+            "=https",
             "--retry",
             "2",
             "--connect-timeout",
@@ -520,6 +519,49 @@ fn check_homebrew_latest() -> Result<Option<Version>, String> {
 // Download + install
 // ---------------------------------------------------------------------------
 
+/// Preserve a checksum refusal through the updater's CLI boundary (ADR-0029).
+#[derive(Debug)]
+pub(crate) enum UpdateError {
+    /// A declared checksum is malformed or differs from the downloaded bytes.
+    Checksum(String),
+    /// Existing updater failures retain their original diagnostics and exit.
+    Other(String),
+}
+
+impl UpdateError {
+    pub(crate) fn code(&self) -> Option<ErrorCode> {
+        matches!(self, Self::Checksum(_)).then_some(ErrorCode::ChecksumMismatch)
+    }
+    pub(crate) fn exit(&self) -> i32 {
+        self.code()
+            .map_or(crate::cli::exit::FAILURE, ErrorCode::exit)
+    }
+    pub(crate) fn message(&self) -> &str {
+        match self {
+            Self::Checksum(message) | Self::Other(message) => message,
+        }
+    }
+}
+impl From<String> for UpdateError {
+    fn from(message: String) -> Self {
+        Self::Other(message)
+    }
+}
+impl From<&str> for UpdateError {
+    fn from(message: &str) -> Self {
+        Self::Other(message.into())
+    }
+}
+impl std::fmt::Display for UpdateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(code) = self.code() {
+            write!(f, "{code}: ")?;
+        }
+        f.write_str(self.message())
+    }
+}
+impl std::error::Error for UpdateError {}
+
 struct DownloadedUpdate {
     current_exe: PathBuf,
     tmp_path: Option<PathBuf>,
@@ -534,7 +576,7 @@ impl Drop for DownloadedUpdate {
 }
 
 /// Download a release to a prepared executable temp file without touching the running server.
-fn download_update(release: &ReleaseInfo) -> Result<DownloadedUpdate, String> {
+fn download_update(release: &ReleaseInfo) -> Result<DownloadedUpdate, UpdateError> {
     let current_exe = env::current_exe().map_err(|e| format!("can't find current binary: {e}"))?;
 
     let parent = current_exe.parent().ok_or("can't find binary directory")?;
@@ -547,16 +589,19 @@ fn download_update(release: &ReleaseInfo) -> Result<DownloadedUpdate, String> {
             "install directory not writable: {} ({}). Try running with appropriate permissions.",
             parent.display(),
             e
-        ));
+        )
+        .into());
     }
     let _ = fs::remove_file(&test_path);
 
     // Unique temp file (avoids races with concurrent instances)
     let tmp_path = parent.join(format!(".flock-update-{}.tmp", std::process::id()));
 
+    ensure_release_asset_origin(&release.download_url)?;
+
     // Download the exact asset URL (pinned to the release we checked)
     let status = TracedCommand::new("curl", "update")
-        .args(["-sfL", "--max-time", "120", "-o"])
+        .args(["-sfL", "--proto-redir", "=https", "--max-time", "120", "-o"])
         .arg(&tmp_path)
         .arg(&release.download_url)
         .status_traced()
@@ -567,13 +612,16 @@ fn download_update(release: &ReleaseInfo) -> Result<DownloadedUpdate, String> {
         return Err("download failed".into());
     }
 
+    if let Err(e) = crate::checksum::verify_asset(&tmp_path, release.sha256.as_deref()) {
+        let _ = fs::remove_file(&tmp_path);
+        let message = format!("downloaded update checksum verification failed: {e}");
+        return Err(if e.kind() == io::ErrorKind::InvalidData {
+            UpdateError::Checksum(message)
+        } else {
+            UpdateError::Other(message)
+        });
+    }
     if let Some(expected) = &release.sha256 {
-        if let Err(e) = crate::checksum::verify_sha256(&tmp_path, expected) {
-            let _ = fs::remove_file(&tmp_path);
-            return Err(format!(
-                "downloaded update checksum verification failed: {e}"
-            ));
-        }
         crate::logging::update_checksum_verified(expected);
     }
 
@@ -583,7 +631,7 @@ fn download_update(release: &ReleaseInfo) -> Result<DownloadedUpdate, String> {
         use std::os::unix::fs::PermissionsExt;
         if let Err(e) = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o755)) {
             let _ = fs::remove_file(&tmp_path);
-            return Err(format!("chmod failed: {e}"));
+            return Err(format!("chmod failed: {e}").into());
         }
     }
 
@@ -1396,6 +1444,7 @@ fn live_handoff_server_via_api_for_release_at(
         import_exe: Some(updated_exe.display().to_string()),
         expected_protocol: release.target_protocol,
         expected_version: Some(release.label().to_string()),
+        skip_undrained: false,
     };
 
     send_server_update_method_at(
@@ -1875,7 +1924,7 @@ fn homebrew_cellar_keg_root(path: &Path) -> Option<PathBuf> {
     clippy::print_stderr,
     reason = "user-facing progress on the controlling terminal during self-update — download / install / already-up-to-date lines belong on the operator's stderr"
 )]
-pub fn self_update(options: SelfUpdateOptions) -> Result<Version, String> {
+pub(crate) fn self_update(options: SelfUpdateOptions) -> Result<Version, UpdateError> {
     let channel = UpdateChannel::configured();
     if is_homebrew_managed_install() {
         if channel == UpdateChannel::Preview {
@@ -1885,7 +1934,8 @@ pub fn self_update(options: SelfUpdateOptions) -> Result<Version, String> {
         }
         return Err(format!(
             "self-update is disabled for Homebrew installs; run `{HOMEBREW_UPDATE_COMMAND}`"
-        ));
+        )
+        .into());
     }
 
     if is_mise_managed_install() {
@@ -1896,7 +1946,8 @@ pub fn self_update(options: SelfUpdateOptions) -> Result<Version, String> {
         }
         return Err(format!(
             "self-update is disabled for mise installs; run `{MISE_UPDATE_COMMAND}`"
-        ));
+        )
+        .into());
     }
 
     if is_nix_managed_install() {
@@ -2130,6 +2181,38 @@ fn platform_target() -> (&'static str, &'static str) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn release_asset_origin_accepts_only_this_repository() {
+        assert!(super::ensure_release_asset_origin(
+            "https://github.com/gerchowl/flock/releases/download/v0.8.0/flock-linux-x86_64"
+        )
+        .is_ok());
+        for foreign in [
+            "https://example.com/flock",
+            "https://flock.dev/flock-linux-x86_64",
+            "https://github.com/other/flock/releases/download/v1/flock",
+            "http://github.com/gerchowl/flock/releases/download/v1/flock",
+            "https://github.com/gerchowl/flock/releases/download/../../../attacker/repo/releases/download/v1/x",
+            "https://github.com/gerchowl/flock/releases/download/%2e%2e/%2e%2e/attacker/x",
+            "https://github.com/gerchowl/flock/releases/download.evil.com/v1/x",
+            "https://github.com/gerchowl/flockfork/releases/download/v1/x",
+            "https://github.com/gerchowl/flock/releases/download/@evil.com/x",
+            "https://GITHUB.com/gerchowl/flock/releases/download/v1/x",
+            "https://github.com/gerchowl/flock/releases/download/v1/x?a=b",
+            "https://github.com/gerchowl/flock/releases/download/v1/x#frag",
+            "https://github.com/gerchowl/flock/releases/download/v1/x/y",
+            "https://github.com/gerchowl/flock/releases/download/v1/",
+            "https://github.com/gerchowl/flock/releases/download/v1",
+            "https://github.com/gerchowl/flock/releases/download/v1/..",
+            "https://github.com/gerchowl/flock/releases/download/v1\\x",
+        ] {
+            assert!(
+                super::ensure_release_asset_origin(foreign).is_err(),
+                "{foreign}"
+            );
+        }
+    }
+
     use super::*;
     use std::os::unix::net::UnixListener;
     use std::sync::{
@@ -2581,6 +2664,8 @@ mod tests {
             protocol: Some(2),
             capabilities: None,
             session_health: None,
+            api_listener: None,
+            agent_account_diagnostic: None,
         };
         let compatible_release = ReleaseInfo {
             version: Version::parse("0.5.6").unwrap(),
@@ -2634,8 +2719,19 @@ mod tests {
             server: crate::api::RuntimeStatus {
                 version: Some("0.6.2".to_string()),
                 protocol: Some(76),
-                capabilities: Some(crate::api::schema::ServerCapabilities { live_handoff: true }),
+                capabilities: Some(crate::api::schema::ServerCapabilities {
+                    live_handoff: true,
+                    node_id: None,
+                    clone_detection_warning: None,
+                    agent_start_label: true,
+                    agent_questions: true,
+                    structured_agents: true,
+                    pane_input_write_ack: false,
+                    events_live_start: false,
+                }),
                 session_health: None,
+                api_listener: None,
+                agent_account_diagnostic: None,
             },
         };
 
@@ -2832,6 +2928,8 @@ mod tests {
             protocol: Some(2),
             capabilities: None,
             session_health: None,
+            api_listener: None,
+            agent_account_diagnostic: None,
         };
         let release = ReleaseInfo {
             version: Version::parse("0.5.6").unwrap(),
@@ -3278,6 +3376,52 @@ mod tests {
     }
 
     #[test]
+    fn stable_asset_shapes_and_checksum_mismatch_refuse_corrupt_download() {
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = env_lock().lock().unwrap();
+        let fixture = crate::test_support::TempDir::socket();
+        let curl = fixture.path().join("curl");
+        fs::write(&curl, b"#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do\nif [ \"$1\" = -o ]; then shift; printf corrupt > \"$1\"; exit 0; fi\nshift\ndone\nexit 1\n").unwrap();
+        fs::set_permissions(&curl, fs::Permissions::from_mode(0o755)).unwrap();
+        let (os, arch) = platform_target();
+        let url = format!("{RELEASE_ASSET_URL_PREFIX}v99.0.0/flock-fixture");
+        for asset in [
+            serde_json::json!(&url),
+            serde_json::json!({"url":url, "sha256":"a".repeat(64)}),
+        ] {
+            let manifest: UpdateManifest = serde_json::from_value(serde_json::json!({
+                "version":"99.0.0", "notes":"fixture", "assets":{format!("{os}-{arch}"): asset.clone()}
+            })).unwrap();
+            let release = release_info_from_manifest(&manifest).unwrap().unwrap();
+            if asset.is_string() {
+                assert!(release.sha256.is_none());
+            } else {
+                assert_eq!(release.sha256.as_deref(), Some("a".repeat(64).as_str()));
+                let prior = std::env::var_os("PATH");
+                // Nextest isolates this test process, and env_lock serializes its fixtures.
+                unsafe {
+                    std::env::set_var("PATH", fixture.path());
+                }
+                let result = download_update(&release);
+                unsafe {
+                    match prior {
+                        Some(path) => std::env::set_var("PATH", path),
+                        None => std::env::remove_var("PATH"),
+                    }
+                }
+                let error = match result {
+                    Err(error) => error,
+                    Ok(_) => panic!("checksum mismatch must refuse"),
+                };
+                assert!(error.to_string().contains("sha256 mismatch"));
+                assert_eq!(error.code(), Some(ErrorCode::ChecksumMismatch));
+                assert_eq!(error.exit(), crate::cli::exit::REFUSED);
+                assert_eq!(ErrorCode::from_code("checksum_mismatch"), error.code());
+            }
+        }
+    }
+
+    #[test]
     fn preview_manifest_reports_update_when_build_id_differs() {
         let (os, arch) = platform_target();
         let asset_key = format!("{os}-{arch}");
@@ -3324,9 +3468,46 @@ mod tests {
         assert_eq!(release.sha256.as_deref(), Some("deadbeef"));
     }
 
+    /// Parse a manifest asset with the updater's own `AssetRef` path. A bare
+    /// URL string is the legacy form; an object must also carry a
+    /// 64-lowercase-hex `sha256` (the updater itself tolerates a missing one
+    /// until #2076, so this is a stricter rule for the checked-in manifest).
+    fn parse_manifest_asset(value: &serde_json::Value) -> Result<AssetRef, String> {
+        let asset: AssetRef = serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
+        if value.is_object() {
+            let digest = value
+                .get("sha256")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| "object asset is missing sha256".to_string())?;
+            if digest.len() != 64
+                || !digest
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            {
+                return Err(format!("bad sha256: {digest}"));
+            }
+        }
+        Ok(asset)
+    }
+
+    #[test]
+    fn manifest_asset_object_without_sha256_is_rejected() {
+        let url = "https://example.invalid/releases/download/v1.0.0/flock-linux-x86_64";
+        assert!(parse_manifest_asset(&serde_json::json!(url)).is_ok());
+        let err = parse_manifest_asset(&serde_json::json!({ "url": url })).unwrap_err();
+        assert!(err.contains("missing sha256"), "{err}");
+        assert!(parse_manifest_asset(&serde_json::json!({ "url": url, "sha256": "AB" })).is_err());
+        assert!(
+            parse_manifest_asset(&serde_json::json!({ "url": url, "sha256": "a".repeat(64) }))
+                .is_ok()
+        );
+    }
+
     #[test]
     fn checked_in_website_manifest_matches_update_schema() {
-        let manifest: UpdateManifest = serde_json::from_str(include_str!("../website/latest.json"))
+        let raw_text = include_str!("../website/latest.json");
+        let raw: serde_json::Value = serde_json::from_str(raw_text).expect("raw manifest json");
+        let manifest: UpdateManifest = serde_json::from_str(raw_text)
             .expect("website/latest.json should match updater schema");
 
         assert!(!manifest
@@ -3347,11 +3528,13 @@ mod tests {
             "macos-x86_64",
             "macos-aarch64",
         ] {
-            let url = &manifest
-                .assets
-                .get(target)
-                .unwrap_or_else(|| panic!("missing asset URL for {target}"))
-                .url;
+            let asset = parse_manifest_asset(
+                raw.get("assets")
+                    .and_then(|assets| assets.get(target))
+                    .unwrap_or_else(|| panic!("missing asset URL for {target}")),
+            )
+            .unwrap_or_else(|e| panic!("bad asset for {target}: {e}"));
+            let url = asset.url();
             assert!(
                 url.contains(&format!("/releases/download/v{}/", manifest.version)),
                 "unexpected release URL for {target}: {url}"
@@ -3373,10 +3556,14 @@ mod tests {
                 "macos-x86_64",
                 "macos-aarch64",
             ] {
-                let url = assets
-                    .get(target)
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_else(|| panic!("missing asset URL for {version} {target}"));
+                // Same string-or-object parse path the updater uses.
+                let asset = parse_manifest_asset(
+                    assets
+                        .get(target)
+                        .unwrap_or_else(|| panic!("missing asset for {version} {target}")),
+                )
+                .unwrap_or_else(|e| panic!("bad asset for {version} {target}: {e}"));
+                let url = asset.url();
                 assert!(
                     url.contains(&format!("/releases/download/v{version}/")),
                     "unexpected release URL for {version} {target}: {url}"
@@ -3389,3 +3576,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod checksum_tests;

@@ -1,0 +1,365 @@
+//! Direct-edge collection runs off the app loop. Import precedes acknowledgement.
+use super::{delivery::Deliver, key::MessageKey};
+use serde::{Deserialize, Serialize};
+
+pub const BATCH_CAP: usize = 16;
+pub(crate) const POLL_CONCURRENCY: usize = 4;
+
+#[derive(Debug, Default)]
+pub(crate) struct Batch {
+    pub receipts_acked: Vec<Receipt>,
+    pub receipt: Option<String>,
+    pub deliveries: Vec<Deliver>,
+    pub quarantined: Vec<OutboundAck>,
+}
+
+/// Idle and failed edges use the same bounded cadence as answer collection.
+#[derive(Debug, Default)]
+pub(crate) struct Poll {
+    pub pending: bool,
+    pub pinned: bool,
+    deadline: Option<std::time::Instant>,
+    attempts: usize,
+    /// Consecutive failed polls. A failure backs off on its own ladder, so a
+    /// first failure after a long idle history waits 5 s, not the idle 299 s
+    /// (#879). The hub's offer lease expires on the same 5 s step.
+    failures: usize,
+    generation: u64,
+    failed: bool,
+    receipts_pending: bool,
+    receipts_deferred: bool,
+}
+impl Poll {
+    pub fn note_wake(&mut self) {
+        self.pending = true;
+    }
+
+    pub fn note_receipts(&mut self, pending: bool) {
+        self.receipts_pending |= pending;
+    }
+
+    pub fn ready(&mut self, now: std::time::Instant, pinned: bool, generation: u64) -> bool {
+        if pinned && (!self.pinned || self.generation != generation) {
+            self.deadline = None;
+            self.attempts = 0;
+            self.failures = 0;
+            self.failed = false;
+            self.receipts_deferred = false;
+        }
+        self.pinned = pinned;
+        self.generation = generation;
+        pinned
+            && (self.deadline.is_none_or(|at| at <= now)
+                || (!self.failed
+                    && (self.pending || (self.receipts_pending && !self.receipts_deferred))))
+    }
+    /// Unaccepted receipts wait for the bounded poll deadline, but a healthy
+    /// edge can still wake for new mail or retry a lost custody acknowledgement.
+    pub fn finished_receipts(&mut self, now: std::time::Instant, failed: bool, unacked: bool) {
+        self.finished(now, failed);
+        self.receipts_deferred = unacked;
+    }
+
+    pub fn finished(&mut self, now: std::time::Instant, failed: bool) {
+        self.pending = false;
+        self.receipts_pending = false;
+        self.failed = failed;
+        let step = if failed { self.failures } else { self.attempts };
+        let seconds = [5, 60, 299][step.min(2)];
+        self.attempts = self.attempts.saturating_add(1);
+        self.failures = if failed {
+            self.failures.saturating_add(1)
+        } else {
+            0
+        };
+        let mut random = [0; 2];
+        let _ = getrandom::fill(&mut random);
+        let jitter = u64::from(u16::from_le_bytes(random) % 1001);
+        self.deadline = Some(now + std::time::Duration::from_millis(seconds * 1000 + jitter));
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Collect {
+    Answers(AnswerCollect),
+    Outbound { outbound: OutboundCollect },
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutboundCollect {
+    #[serde(default)]
+    pub receipts: Vec<Receipt>,
+    #[serde(default)]
+    pub ack: Vec<OutboundAck>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Receipt {
+    pub key: MessageKey,
+    pub token: Vec<u8>,
+    pub state: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutboundAck {
+    pub key: MessageKey,
+    pub token: Vec<u8>,
+    pub refusal: Option<String>,
+    #[serde(default = "delivered_by_default")]
+    pub delivered: bool,
+    /// The recipient's signed terminal receipt for a refused forward (#872).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<Box<crate::mesh::store::Envelope>>,
+}
+
+fn delivered_by_default() -> bool {
+    true
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AnswerCollect {
+    pub request: MessageKey,
+    pub token: Vec<u8>,
+    #[serde(default)]
+    pub ack: Vec<MessageKey>,
+}
+
+#[derive(Debug)]
+pub(crate) struct Completion {
+    pub peer: crate::config::PeerConfig,
+    pub query: Collect,
+    pub result: Result<Batch, String>,
+}
+
+pub(crate) fn work(
+    peer: crate::config::PeerConfig,
+    query: Collect,
+) -> crate::app::message_relay::RelayWork {
+    use crate::events::AppEvent;
+    let failure = AppEvent::MeshCollected(Box::new(Completion {
+        peer: peer.clone(),
+        query: query.clone(),
+        result: Err("collection worker panicked".into()),
+    }));
+    crate::app::message_relay::RelayWork {
+        failure,
+        run: Box::new(move || {
+            let result = fetch(&peer, &query);
+            AppEvent::MeshCollected(Box::new(Completion {
+                peer,
+                query,
+                result,
+            }))
+        }),
+    }
+}
+
+fn fetch(peer: &crate::config::PeerConfig, query: &Collect) -> Result<Batch, String> {
+    super::hello::with_store(|store| {
+        if store.clock().map_err(|e| e.to_string())?.paused {
+            return Err("fleet_paused".into());
+        }
+        Ok(())
+    })?;
+    let raw = crate::peer_stream::request(
+        peer,
+        "mesh.collect",
+        serde_json::to_value(query).map_err(|e| e.to_string())?,
+    )?;
+    decode(&raw)
+}
+
+fn decode(raw: &str) -> Result<Batch, String> {
+    let response: serde_json::Value = serde_json::from_str(raw).map_err(|e| e.to_string())?;
+    if let Some(error) = response.get("error") {
+        let reason = error["message"].as_str().unwrap_or("unknown refusal");
+        if matches!(reason, "fleet_paused" | "mailbox_full" | "mail_store_full") {
+            return Err(reason.into());
+        }
+        return Err(format!("mesh collection refused: {reason}"));
+    }
+    let answers = response["result"]["answers"]
+        .as_array()
+        .ok_or("invalid collection batch")?;
+    if answers.len() > BATCH_CAP {
+        return Err("mesh collection batch too large".into());
+    }
+    let mut batch = Batch {
+        receipts_acked: serde_json::from_value(response["result"]["receipts_acked"].clone())
+            .unwrap_or_default(),
+        receipt: response["result"]["receipt"].as_str().map(str::to_owned),
+        ..Batch::default()
+    };
+    if batch.receipts_acked.len() > BATCH_CAP {
+        return Err("mesh receipt acknowledgement batch too large".into());
+    }
+    for value in answers {
+        match serde_json::from_value::<Deliver>(value.clone()) {
+            Ok(delivery) => batch.deliveries.push(delivery),
+            Err(_) => {
+                // Keep the authenticated identity/token even when the payload is undecodable.
+                // Unidentifiable garbage is isolated here and never discards other records.
+                if let (Ok(key), Ok(token)) = (
+                    serde_json::from_value(value["envelope"]["key"].clone()),
+                    serde_json::from_value(
+                        value["envelope"]["return_binding"]["collection_token"].clone(),
+                    ),
+                ) {
+                    batch.quarantined.push(OutboundAck {
+                        delivered: false,
+                        key,
+                        token,
+                        refusal: Some("invalid_envelope".into()),
+                        receipt: None,
+                    });
+                }
+            }
+        }
+    }
+    Ok(batch)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn unacked_receipts_back_off_without_blocking_custody_wakes() {
+        let now = std::time::Instant::now();
+        let mut poll = super::Poll::default();
+        assert!(poll.ready(now, true, 1));
+        poll.finished_receipts(now, false, true);
+        poll.note_receipts(true);
+        assert!(!poll.ready(now, true, 1));
+        poll.note_wake();
+        assert!(poll.ready(now, true, 1));
+        poll.finished_receipts(now, false, true);
+        poll.note_receipts(true);
+        assert!(!poll.ready(now, true, 1));
+        assert!(poll.ready(now + std::time::Duration::from_secs(61), true, 1));
+    }
+
+    #[test]
+    fn wake_does_not_bypass_failed_backoff() {
+        let now = std::time::Instant::now();
+        let mut poll = super::Poll::default();
+        assert!(poll.ready(now, true, 1));
+        poll.finished(now, false);
+        poll.note_wake();
+        assert!(poll.ready(now, true, 1));
+        poll.finished(now, true);
+        for second in 0..5 {
+            poll.note_wake();
+            assert!(!poll.ready(now + std::time::Duration::from_secs(second), true, 1));
+        }
+        let retry = now + std::time::Duration::from_secs(6);
+        assert!(poll.ready(retry, true, 1));
+        // A second consecutive failure holds wakes off for the next step.
+        poll.finished(retry, true);
+        for second in 0..60 {
+            poll.note_wake();
+            assert!(!poll.ready(retry + std::time::Duration::from_secs(second), true, 1));
+        }
+        assert!(poll.ready(retry + std::time::Duration::from_secs(61), true, 1));
+    }
+
+    #[test]
+    fn first_failure_after_idle_history_retries_on_the_offer_lease_not_idle_cadence() {
+        let now = std::time::Instant::now();
+        let mut poll = super::Poll::default();
+        assert!(poll.ready(now, true, 1));
+        for _ in 0..4 {
+            poll.finished(now, false);
+        }
+        assert!(!poll.ready(now + std::time::Duration::from_secs(298), true, 1));
+        poll.note_wake();
+        assert!(poll.ready(now, true, 1));
+        poll.finished(now, true);
+        poll.note_wake();
+        assert!(!poll.ready(now + std::time::Duration::from_secs(4), true, 1));
+        assert!(poll.ready(now + std::time::Duration::from_secs(7), true, 1));
+    }
+
+    #[test]
+    fn receipts_wake_idle_poll_but_failed_receipt_commit_keeps_backoff() {
+        let now = std::time::Instant::now();
+        let mut poll = super::Poll::default();
+        assert!(poll.ready(now, true, 1));
+        poll.finished(now, false);
+        assert!(!poll.ready(now, true, 1));
+        poll.note_receipts(true);
+        assert!(poll.ready(now, true, 1));
+        // Transport succeeded but persisting receipts_sent failed.
+        poll.finished(now, true);
+        for second in 0..5 {
+            poll.note_receipts(true);
+            assert!(!poll.ready(now + std::time::Duration::from_secs(second), true, 1));
+        }
+        assert!(poll.ready(now + std::time::Duration::from_secs(6), true, 1));
+        poll.finished(now + std::time::Duration::from_secs(6), false);
+        assert!(!poll.ready(now + std::time::Duration::from_secs(7), true, 1));
+    }
+
+    #[test]
+    fn spoke_custody_idle_and_failed_polls_back_off_without_busy_waiting() {
+        let now = std::time::Instant::now();
+        let mut poll = super::Poll::default();
+        assert!(poll.ready(now, true, 1));
+        poll.finished(now, false);
+        for seconds in 0..5 {
+            assert!(!poll.ready(now + std::time::Duration::from_secs(seconds), true, 1));
+        }
+        assert!(poll.ready(now + std::time::Duration::from_secs(6), true, 1));
+        poll.finished(now, false);
+        assert!(!poll.ready(now + std::time::Duration::from_secs(59), true, 1));
+        poll.pending = true;
+        assert!(poll.ready(now, true, 1));
+        // Consecutive failures climb their own 5/60/299 s ladder.
+        for (failure, wait) in [5, 60, 299].into_iter().enumerate() {
+            poll.finished(now, true);
+            poll.pending = true;
+            assert!(
+                !poll.ready(now + std::time::Duration::from_secs(wait - 1), true, 1),
+                "failure {failure}"
+            );
+            assert!(poll.ready(now + std::time::Duration::from_secs(wait + 1), true, 1));
+        }
+        poll.finished(now, true);
+        assert!(!poll.ready(now + std::time::Duration::from_secs(298), true, 1));
+        assert!(poll.ready(now, true, 2));
+        assert!(!poll.ready(now, false, 2));
+        assert!(poll.ready(now, true, 1));
+    }
+
+    #[test]
+    fn spoke_custody_undecodable_records_are_quarantined_individually() {
+        let raw = serde_json::json!({"result":{"answers":[
+            {"envelope":{"key":{"origin_node":"spoke.example","message_id":"bad"},
+                "return_binding":{"collection_token":[1,2,3]}}, "remaining_ms":"broken"},
+            null
+        ]}});
+        let batch = super::decode(&raw.to_string()).unwrap();
+        assert!(batch.deliveries.is_empty());
+        assert_eq!(batch.quarantined.len(), 1);
+        assert_eq!(
+            batch.quarantined[0].refusal.as_deref(),
+            Some("invalid_envelope")
+        );
+    }
+
+    #[test]
+    fn remote_pause_and_backpressure_do_not_spend_the_import_failure_budget() {
+        for reason in ["fleet_paused", "mailbox_full", "mail_store_full"] {
+            let raw = serde_json::json!({"error": {
+                "code": "mesh_collection_refused", "message": reason
+            }});
+            assert_eq!(super::decode(&raw.to_string()).unwrap_err(), reason);
+        }
+        assert!(super::decode(r#"{"error":{"message":"invalid envelope"}}"#)
+            .unwrap_err()
+            .starts_with("mesh collection refused:"));
+    }
+}

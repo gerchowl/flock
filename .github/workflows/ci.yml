@@ -5,7 +5,7 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
   push:
-    branches: [main]
+    branches: [dev, main]
     paths-ignore:
       - "website/**"
   # Required for the merge queue. GitHub runs required checks against the
@@ -50,34 +50,138 @@ jobs:
       # job still reports success so it can stay a required context, which the
       # queue needs in order to gate on it.
 
-  check:
-    name: check (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            nextest_filter: all()
-          # Pinned to macos-15, NOT macos-latest: GitHub rotated macos-latest to
-          # the macOS 26 ("Tahoe") image, whose SDK the vendored libghostty-vt
-          # zig 0.15.2 build can't link against (undefined libSystem symbols like
-          # __availability_version_check). macos-15 is the last image this
-          # toolchain builds on. Revisit when zig gains macOS 26 SDK support.
-          - os: macos-15
-            nextest_filter: not binary(live_handoff)
-    runs-on: ${{ matrix.os }}
-    # Serializing the heavy multi-process PTY suites (see .config/nextest.toml)
-    # adds wall-clock; give the job headroom over the previous 10-minute cap.
-    #
-    # 15 was then reached, and jobs CANCELLED at 15m0s-15m2s on PRs that touch
-    # no Rust at all, so the budget was the variable rather than the change. A
-    # cancelled job is worse than a red one: nextest fail-fasts, so the tail of
-    # the suite never runs, and a cancellation is reported as neither success nor
-    # a test failure, so it reads as inconclusive. #462 and #539 each lost most
-    # of a leg this way (#539 stopped at 1522 of 4401). 25 leaves room for the
-    # mac leg's zig build of the vendored libghostty-vt, which has no cache
-    # entry, plus the serialized suites, on a runner that may be carrying other
-    # work.
+  # Fail-safe change detection (scripts/ci_changes.py). Only an ordinary
+  # pull_request touching nothing but docs/website/markdown or the web client
+  # may skip the Rust legs; any other path, a `land/` batch head, merge_group,
+  # push, or a detection failure leaves `skip_rust` != 'true' and runs
+  # everything. The check jobs below still report either way.
+  changes:
+    name: changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      skip_rust: ${{ steps.decide.outputs.skip_rust }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Decide
+        id: decide
+        env:
+          EVENT: ${{ github.event_name }}
+          HEAD_REF: ${{ github.head_ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [ "$EVENT" != pull_request ]; then
+            echo "skip_rust=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git diff --no-renames --name-only "$BASE_SHA...$HEAD_SHA" > changed.txt
+          python3 scripts/ci_changes.py "$EVENT" "$HEAD_REF" < changed.txt >> "$GITHUB_OUTPUT"
+
+  # Maintenance-script tests and the platform test-gap ratchet (#597). Some of
+  # them read docs/website/README files, so they run on EVERY event, outside
+  # the skippable Rust legs, and `check (ubuntu-latest)` requires them.
+  script-tests:
+    name: script-tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31.11.3
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            always-allow-substitutes = true
+
+      - name: Restore Nix store
+        uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7.0.2
+        with:
+          primary-key: nix-v1-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**') }}
+          restore-prefixes-first-match: nix-v1-${{ runner.os }}-
+          save: ${{ github.ref == 'refs/heads/dev' }}
+          gc-max-store-size-linux: 2G
+          gc-max-store-size-macos: 2G
+
+      - name: Run maintenance script tests
+        run: nix develop -c just script-tests
+
+  # One platform each, split into lint, build and parallel test-shard jobs
+  # (ci-leg.yml, #991). Each OS is its own reusable-workflow call so its
+  # result can be judged alone in the check jobs below.
+  ubuntu:
+    name: ubuntu-latest
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.skip_rust != 'true' }}
+    uses: ./.github/workflows/ci-leg.yml
+    with:
+      leg: ubuntu-latest
+
+  # The Tauri desktop shell's tests (#2477), one reusable-workflow call per
+  # platform like the legs above. They follow `skip_rust`: desktop/ is never
+  # allow-listed in scripts/ci_changes.py, so any change to the shell runs them,
+  # and only docs/web-client-only PRs skip them, visibly, in the gates below.
+  desktop-ubuntu:
+    name: desktop (ubuntu-latest)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.skip_rust != 'true' }}
+    uses: ./.github/workflows/ci-desktop.yml
+    with:
+      leg: ubuntu-latest
+
+  # The web client (ADR-0038 G1): lockfile install, bun tests, the fixture
+  # screenshots, the strict type check and the Vite build. One platform is
+  # enough: the bundle is static assets. It reports as its own `client` check.
+  client:
+    name: client
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust tools
+        uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2
+        with:
+          tool: just
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.3.13
+
+      # The design-conformance allow-list may only shrink against dev's copy (#2896).
+      - name: Fetch dev for the allow-list guard
+        run: git fetch --no-tags --depth=1 origin +refs/heads/dev:refs/remotes/origin/dev
+
+      - name: Install Chromium for the screenshot test
+        run: just client-browsers
+
+      - name: Client check
+        run: just client-check
+
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: client-screenshots
+          path: web/client/artifacts/screenshots/
+          if-no-files-found: error
+
+  gui-e2e-fleet:
+    name: gui-e2e-fleet
+    runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
       - name: Checkout
@@ -88,24 +192,256 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Read nextest version
+        id: nextest-version
+        shell: bash
+        run: |
+          version="$(python3 scripts/nextest_version.py)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
       - name: Install Rust tools
-        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2
+        uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2
         with:
-          tool: just,cargo-nextest
+          tool: just,cargo-nextest@${{ steps.nextest-version.outputs.version }}
 
       - name: Install Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.15.2
+          use-cache: false
 
-      - name: Install macOS build tools
-        if: runner.os == 'macOS'
-        run: brew install cmake ninja
+      - name: Restore Zig build cache
+        id: zig-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ github.workspace }}/.zig-cache
+          key: setup-zig-cache-v2-${{ github.job }}-zig-x86_64-linux-0.15.2--dev-${{ hashFiles('vendor/libghostty-vt/**', 'build.rs') }}
+          restore-keys: setup-zig-cache-v2-${{ github.job }}-zig-x86_64-linux-0.15.2--
 
       - name: Restore cargo cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
+          save-if: ${{ github.ref == 'refs/heads/dev' }}
           cache-bin: false
 
-      - name: Run checks
-        run: just ci '${{ matrix.nextest_filter }}'
+      - name: Install Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.3.13
+
+      - name: Install client dependencies
+        working-directory: web/client
+        run: bun install --frozen-lockfile
+
+      - name: Read Playwright version
+        id: playwright
+        working-directory: web/client
+        run: echo "version=$(bun -p 'require("playwright/package.json").version')" >> "$GITHUB_OUTPUT"
+
+      - name: Restore Chromium cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ steps.playwright.outputs.version }}
+
+      - name: Install Chromium
+        timeout-minutes: 5
+        working-directory: web/client
+        run: bun x playwright install --with-deps chromium
+
+      - name: Run the real GUI fleet
+        run: just gui-e2e-fleet
+
+      - name: Save Zig build cache from dev
+        if: github.ref == 'refs/heads/dev' && steps.zig-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ github.workspace }}/.zig-cache
+          key: ${{ steps.zig-cache.outputs.cache-primary-key }}
+
+      - name: Upload fleet failure evidence
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: gui-e2e-fleet-failure
+          path: web/client/artifacts/gui-e2e-fleet/
+          if-no-files-found: warn
+
+  # Pinned to macos-15, NOT macos-latest: GitHub rotated macos-latest to the
+  # macOS 26 ("Tahoe") image, whose SDK the vendored libghostty-vt zig 0.15.2
+  # build can't link against (undefined libSystem symbols like
+  # __availability_version_check). macos-15 is the last image this toolchain
+  # builds on. Revisit when zig gains macOS 26 SDK support.
+  macos:
+    name: macos-15
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.skip_rust != 'true' }}
+    uses: ./.github/workflows/ci-leg.yml
+    with:
+      leg: macos-15
+      # Policy (#1613, docs/next/ci-platform-policy.md): ordinary PRs run macOS
+      # build + lint and targeted native suspend-timer tests; the full matrix runs for `land/` batch
+      # PRs, merge_group and pushes. check-macos below asserts this expectation.
+      # Batch PRs use head_ref; ref is refs/pull/<number>/merge on PR events.
+      run-tests: ${{ github.event_name != 'pull_request' || startsWith(github.head_ref, 'land/') }}
+
+  desktop-macos:
+    name: desktop (macos-15)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.skip_rust != 'true' }}
+    uses: ./.github/workflows/ci-desktop.yml
+    with:
+      leg: macos-15
+
+  # The required checks. Branch protection and the landing driver wait on
+  # exactly `check (macos-15)` and `check (ubuntu-latest)`, so these keep the
+  # names of the single job they replace, and pass only when every job of
+  # their leg passed. `always()` is required: branch protection treats a
+  # skipped required check as passing. Cancelled, failed or skipped legs must
+  # run the result gate and fail explicitly, rather than permit an untested merge.
+  check-ubuntu:
+    name: check (ubuntu-latest)
+    needs: [changes, ubuntu, desktop-ubuntu, script-tests, gui-e2e-fleet]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Download JUnit reports
+        uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          pattern: junit-ubuntu-latest-*
+          path: junit
+
+      - name: Summarize shards
+        continue-on-error: true
+        run: python3 scripts/ci_shards.py summary --title 'check (ubuntu-latest)' --strip-prefix junit-ubuntu-latest- junit >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Require the GUI fleet
+        if: always()
+        env:
+          RESULT: ${{ needs.gui-e2e-fleet.result }}
+        run: test "$RESULT" = success
+
+      - name: Require the maintenance script tests
+        if: always()
+        env:
+          SCRIPT_TESTS: ${{ needs.script-tests.result }}
+        run: |
+          if [ "$SCRIPT_TESTS" != success ]; then
+            echo "script-tests ended as $SCRIPT_TESTS" >&2
+            exit 1
+          fi
+
+      - name: Require every job of the leg
+        if: always()
+        env:
+          RESULT: ${{ needs.ubuntu.result }}
+          SKIP_RUST: ${{ needs.changes.outputs.skip_rust }}
+        run: |
+          # `skipped` is acceptable only when change detection succeeded and
+          # chose to skip (docs/web-only PR); every other state fails.
+          if [ "$RESULT" = skipped ] && [ "$SKIP_RUST" = true ]; then
+            echo "ubuntu-latest leg skipped: docs/web-only change"
+            exit 0
+          fi
+          if [ "$RESULT" != success ]; then
+            echo "ubuntu-latest leg ended as $RESULT" >&2
+            exit 1
+          fi
+
+      - name: Require the desktop shell tests
+        if: always()
+        env:
+          RESULT: ${{ needs.desktop-ubuntu.result }}
+          SKIP_RUST: ${{ needs.changes.outputs.skip_rust }}
+        run: |
+          # Same rule as the leg: `skipped` passes only when change detection
+          # succeeded and chose to skip; failed, cancelled or missing fails.
+          if [ "$RESULT" = skipped ] && [ "$SKIP_RUST" = true ]; then
+            echo "desktop (ubuntu-latest) skipped: docs/web-only change"
+            exit 0
+          fi
+          if [ "$RESULT" != success ]; then
+            echo "desktop (ubuntu-latest) ended as $RESULT" >&2
+            exit 1
+          fi
+
+  check-macos:
+    name: check (macos-15)
+    needs: [changes, macos, desktop-macos]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Download JUnit reports
+        uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          pattern: junit-macos-15-*
+          path: junit
+
+      - name: Summarize shards
+        continue-on-error: true
+        run: python3 scripts/ci_shards.py summary --title 'check (macos-15)' --strip-prefix junit-macos-15- junit >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Require every job of the leg
+        if: always()
+        env:
+          RESULT: ${{ needs.macos.result }}
+          SKIP_RUST: ${{ needs.changes.outputs.skip_rust }}
+        run: |
+          # `skipped` is acceptable only when change detection succeeded and
+          # chose to skip (docs/web-only PR); every other state fails.
+          if [ "$RESULT" = skipped ] && [ "$SKIP_RUST" = true ]; then
+            echo "macos-15 leg skipped: docs/web-only change"
+            exit 0
+          fi
+          if [ "$RESULT" != success ]; then
+            echo "macos-15 leg ended as $RESULT" >&2
+            exit 1
+          fi
+
+      - name: Require the desktop shell tests
+        if: always()
+        env:
+          RESULT: ${{ needs.desktop-macos.result }}
+          SKIP_RUST: ${{ needs.changes.outputs.skip_rust }}
+        run: |
+          # Same rule as the leg: `skipped` passes only when change detection
+          # succeeded and chose to skip; failed, cancelled or missing fails.
+          if [ "$RESULT" = skipped ] && [ "$SKIP_RUST" = true ]; then
+            echo "desktop (macos-15) skipped: docs/web-only change"
+            exit 0
+          fi
+          if [ "$RESULT" != success ]; then
+            echo "desktop (macos-15) ended as $RESULT" >&2
+            exit 1
+          fi
+
+      # A skipped test job counts as success for the leg, so on full-matrix
+      # events (batch PRs, merge_group, push) prove the shards really ran:
+      # one JUnit report per shard the build planned.
+      - name: Require the expected test shards when the full matrix is due
+        if: always()
+        env:
+          FULL: ${{ github.event_name != 'pull_request' || startsWith(github.head_ref, 'land/') }}
+          SHARDS: ${{ needs.macos.outputs.shards }}
+        run: |
+          [ "$FULL" = true ] || exit 0
+          expected="$(python3 -c 'import json,os; print(len(json.loads(os.environ["SHARDS"] or "[]")))')"
+          actual="$(find junit -name junit.xml 2>/dev/null | wc -l | tr -d ' ')"
+          if [ "$expected" -lt 1 ] || [ "$actual" != "$expected" ]; then
+            echo "full macOS matrix due: expected $expected shard reports, found $actual" >&2
+            exit 1
+          fi

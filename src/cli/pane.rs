@@ -25,6 +25,7 @@ pub(super) fn run_pane_command(args: &[String]) -> std::io::Result<i32> {
         "split" => pane_split(&args[1..]),
         "move" => pane_move(&args[1..]),
         "close" => pane_close(&args[1..]),
+        "stash" => pane_stash(&args[1..]),
         "send-text" => pane_send_text(&args[1..]),
         "send-keys" => pane_send_keys(&args[1..]),
         "arm-self-compact" => pane_arm_self_compact(&args[1..]),
@@ -75,29 +76,29 @@ fn pane_list(args: &[String]) -> std::io::Result<i32> {
 
 fn pane_get(args: &[String]) -> std::io::Result<i32> {
     let Some(raw_pane_id) = args.first() else {
-        eprintln!("usage: flk pane get <pane_id>");
+        eprintln!("usage: flk pane get <target>");
         return Ok(2);
     };
     if args.len() != 1 {
-        eprintln!("usage: flk pane get <pane_id>");
+        eprintln!("usage: flk pane get <target>");
         return Ok(2);
     }
 
     super::print_response(&super::send_request(&Request {
         id: "cli:pane:get".into(),
         method: Method::PaneGet(PaneTarget {
-            pane_id: super::normalize_pane_id(raw_pane_id),
+            pane_id: super::resolve_pane_arg(raw_pane_id),
         }),
     })?)
 }
 
 fn pane_rename(args: &[String]) -> std::io::Result<i32> {
     let Some(raw_pane_id) = args.first() else {
-        eprintln!("usage: flk pane rename <pane_id> <label>|--clear");
+        eprintln!("usage: flk pane rename <target> <label>|--clear");
         return Ok(2);
     };
     if args.len() < 2 {
-        eprintln!("usage: flk pane rename <pane_id> <label>|--clear");
+        eprintln!("usage: flk pane rename <target> <label>|--clear");
         return Ok(2);
     }
     let label = if args.len() == 2 && args[1] == "--clear" {
@@ -109,19 +110,27 @@ fn pane_rename(args: &[String]) -> std::io::Result<i32> {
     super::print_response(&super::send_request(&Request {
         id: "cli:pane:rename".into(),
         method: Method::PaneRename(PaneRenameParams {
-            pane_id: super::normalize_pane_id(raw_pane_id),
+            pane_id: super::resolve_pane_arg(raw_pane_id),
             label,
         }),
     })?)
 }
 
+const PANE_TARGET_HELP: &str = "Target: pane id, terminal id, or unique agent name/label. A pane id wins over a same-named agent.";
+
+pub(super) const PANE_READ_USAGE: &str = "flk pane read <target> [--source visible|recent|recent-unwrapped|detection] [--lines N] [--format text|ansi] [--ansi]\n  Target: pane id, terminal id, or unique agent name/label. A pane id wins over a same-named agent.";
+pub(super) const PANE_CLOSE_USAGE: &str = "flk pane close <target>\n  Target: pane id, terminal id, or unique agent name/label. A pane id wins over a same-named agent.";
+pub(super) const PANE_SEND_TEXT_USAGE: &str = "flk pane send-text [--raw] <target> <text>\n  Target: pane id, terminal id, or unique agent name/label. A pane id wins over a same-named agent.\n  Pastes text (bracketed when enabled), without sending Enter.\n  Into an agent pane whose composer holds a draft it refuses with input_not_empty (exit 10), and while a flock injection holds the pane with injection_pending (exit 10), before typing anything. --raw types anyway.\n  To submit a prompt to an agent, use flk agent send <target> <text>: it submits and confirms the turn. Do not follow send-text with send-keys Enter.\n  Use pane send-keys for control keys (C-c, Esc, dialog answers).";
+pub(super) const PANE_RUN_USAGE: &str = "flk pane run [--raw | --if-input-empty [--min-age-secs N] [--if-session ID]] <target> <command>\n  Types the command, waits 120 ms and presses Enter. It confirms nothing and needs no idle agent.\n  Into an agent pane whose composer holds a draft it refuses with input_not_empty (exit 10), and while a flock injection holds the pane with injection_pending (exit 10), before typing anything. --raw types anyway.\n  --if-input-empty is the guarded submit that also requires an idle agent. To submit a prompt and confirm the turn, use flk agent send.";
+pub(super) const PANE_SEND_KEYS_USAGE: &str = "flk pane send-keys <target> <key> [key ...]\n  Target: pane id, terminal id, or unique agent name/label. A pane id wins over a same-named agent.";
+
 fn pane_read(args: &[String]) -> std::io::Result<i32> {
     let Some(raw_pane_id) = args.first() else {
-        eprintln!("usage: flk pane read <pane_id> [--source visible|recent|recent-unwrapped] [--lines N] [--format text|ansi] [--ansi]");
+        eprintln!("usage: {PANE_READ_USAGE}");
         return Ok(2);
     };
 
-    let pane_id = super::normalize_pane_id(raw_pane_id);
+    let pane_id = super::resolve_pane_arg(raw_pane_id);
     let mut source = ReadSource::Recent;
     let mut lines = None;
     let mut format = ReadFormat::Text;
@@ -182,8 +191,12 @@ fn pane_read(args: &[String]) -> std::io::Result<i32> {
     })?;
 
     if let Some(error) = response.get("error") {
-        eprintln!("{}", serde_json::to_string(error).unwrap());
-        return Ok(1);
+        let line = serde_json::to_string(error).unwrap();
+        return Ok(super::output::error_as(
+            &response,
+            line,
+            super::exit::FAILURE,
+        ));
     }
 
     if let Some(text) = response["result"]["read"]["text"].as_str() {
@@ -195,15 +208,16 @@ fn pane_read(args: &[String]) -> std::io::Result<i32> {
 fn pane_split(args: &[String]) -> std::io::Result<i32> {
     let Some(raw_pane_id) = args.first() else {
         eprintln!(
-            "usage: flk pane split <pane_id> --direction right|down [--cwd PATH] [--focus] [--no-focus]"
+            "usage: flk pane split <target> --direction right|down [--cwd PATH] [--focus] [--no-focus] [--dry-run]"
         );
         return Ok(2);
     };
 
-    let pane_id = super::normalize_pane_id(raw_pane_id);
+    let pane_id = super::resolve_pane_arg(raw_pane_id);
     let mut direction = None;
     let mut cwd = None;
     let mut focus = false;
+    let mut dry_run = false;
 
     let mut index = 1;
     while index < args.len() {
@@ -221,8 +235,12 @@ fn pane_split(args: &[String]) -> std::io::Result<i32> {
                     eprintln!("missing value for --cwd");
                     return Ok(2);
                 };
-                cwd = Some(value.clone());
+                cwd = Some(super::worktree::normalize_path_arg(value)?);
                 index += 2;
+            }
+            "--dry-run" => {
+                dry_run = true;
+                index += 1;
             }
             "--focus" => {
                 focus = true;
@@ -247,6 +265,7 @@ fn pane_split(args: &[String]) -> std::io::Result<i32> {
     super::print_response(&super::send_request(&Request {
         id: "cli:pane:split".into(),
         method: Method::PaneSplit(PaneSplitParams {
+            dry_run,
             workspace_id: None,
             target_pane_id: pane_id,
             direction,
@@ -257,7 +276,7 @@ fn pane_split(args: &[String]) -> std::io::Result<i32> {
 }
 
 fn pane_move(args: &[String]) -> std::io::Result<i32> {
-    let params = match parse_pane_move_args(args) {
+    let mut params = match parse_pane_move_args(args) {
         Ok(params) => params,
         Err(message) => {
             eprintln!("{message}");
@@ -265,6 +284,14 @@ fn pane_move(args: &[String]) -> std::io::Result<i32> {
         }
     };
 
+    params.pane_id = super::resolve_pane_arg(&params.pane_id);
+    if let PaneMoveDestination::Tab {
+        target_pane_id: Some(target),
+        ..
+    } = &mut params.destination
+    {
+        *target = super::resolve_pane_arg(target);
+    }
     super::print_response(&super::send_request(&Request {
         id: "cli:pane:move".into(),
         method: Method::PaneMove(params),
@@ -416,7 +443,7 @@ fn parse_pane_move_args(args: &[String]) -> Result<PaneMoveParams, String> {
 }
 
 fn pane_move_usage() -> String {
-    "usage: flk pane move <pane_id> --tab <tab_id> --split right|down [--target-pane ID] [--ratio FLOAT] [--focus|--no-focus]\n       flk pane move <pane_id> --new-tab [--workspace ID] [--label TEXT] [--focus|--no-focus]\n       flk pane move <pane_id> --new-workspace [--label TEXT] [--tab-label TEXT] [--focus|--no-focus]"
+    "usage: flk pane move <target> --tab <tab_id> --split right|down [--target-pane ID] [--ratio FLOAT] [--focus|--no-focus]\n       flk pane move <target> --new-tab [--workspace ID] [--label TEXT] [--focus|--no-focus]\n       flk pane move <target> --new-workspace [--label TEXT] [--tab-label TEXT] [--focus|--no-focus]"
         .into()
 }
 
@@ -432,42 +459,110 @@ fn parse_move_split_direction(value: &str) -> Result<SplitDirection, String> {
 
 fn pane_close(args: &[String]) -> std::io::Result<i32> {
     let Some(raw_pane_id) = args.first() else {
-        eprintln!("usage: flk pane close <pane_id>");
+        eprintln!("usage: {PANE_CLOSE_USAGE}");
         return Ok(2);
     };
     if args.len() != 1 {
-        eprintln!("usage: flk pane close <pane_id>");
+        eprintln!("usage: {PANE_CLOSE_USAGE}");
         return Ok(2);
     }
 
     super::print_response(&super::send_request(&Request {
         id: "cli:pane:close".into(),
         method: Method::PaneClose(PaneTarget {
-            pane_id: super::normalize_pane_id(raw_pane_id),
+            pane_id: super::resolve_pane_arg(raw_pane_id),
         }),
     })?)
 }
 
+pub(super) const PANE_STASH_USAGE: &str = "flk pane stash show|restore <pane_id> [--json]\n  Drafts flock kept because an injection could not type them back; restore types the oldest into the pane's empty composer.";
+
+/// `flk pane stash show|restore` (#850). The drafts print one per line, so
+/// a kept draft can be read or copied as it was typed.
+fn pane_stash(args: &[String]) -> std::io::Result<i32> {
+    let json = super::output::json();
+    let rest: Vec<_> = args.iter().filter(|arg| *arg != "--json").collect();
+    let (verb, raw_pane_id) = match rest.as_slice() {
+        [verb, pane] => (verb.as_str(), pane.as_str()),
+        _ => {
+            eprintln!("usage: {PANE_STASH_USAGE}");
+            return Ok(2);
+        }
+    };
+    let target = PaneTarget {
+        pane_id: super::resolve_pane_arg(raw_pane_id),
+    };
+    let method = match verb {
+        "show" => Method::PaneStashShow(target),
+        "restore" => Method::PaneStashRestore(target),
+        _ => {
+            eprintln!("usage: {PANE_STASH_USAGE}");
+            return Ok(2);
+        }
+    };
+    let response = super::send_request(&Request {
+        id: format!("cli:pane:stash:{verb}"),
+        method,
+    })?;
+    if response.get("error").is_some() && verb == "restore" {
+        return super::print_send_response(&response);
+    }
+    if json || response.get("error").is_some() {
+        return super::print_response(&response);
+    }
+    let drafts = response
+        .pointer("/result/drafts")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for draft in drafts.iter().filter_map(serde_json::Value::as_str) {
+        println!("{draft}");
+    }
+    Ok(0)
+}
+
 fn pane_send_text(args: &[String]) -> std::io::Result<i32> {
+    let (raw, args) = take_raw(args);
     if args.len() < 2 {
-        eprintln!("usage: flk pane send-text <pane_id> <text>");
+        eprintln!("usage: {PANE_SEND_TEXT_USAGE}");
         return Ok(2);
     }
 
-    let pane_id = super::normalize_pane_id(&args[0]);
+    let pane_id = super::resolve_pane_arg(&args[0]);
     let text = args[1..].join(" ");
-    super::send_ok_request(Method::PaneSendText(PaneSendTextParams { pane_id, text }))
+    super::print_send_response(&super::send_request(&Request {
+        id: "cli:pane:send-text".into(),
+        method: Method::PaneSendText(PaneSendTextParams {
+            write_timeout_ms: None,
+            pane_id,
+            text,
+            raw,
+        }),
+    })?)
+}
+
+/// Split a leading `--raw` off a text verb's argv (#1162). Only the leading
+/// position is a flag: after the target every word is the text.
+fn take_raw(args: &[String]) -> (bool, &[String]) {
+    match args.split_first() {
+        Some((first, rest)) if first == "--raw" => (true, rest),
+        _ => (false, args),
+    }
 }
 
 fn pane_send_keys(args: &[String]) -> std::io::Result<i32> {
     if args.len() < 2 {
-        eprintln!("usage: flk pane send-keys <pane_id> <key> [key ...]");
+        eprintln!("usage: {PANE_SEND_KEYS_USAGE}");
         return Ok(2);
     }
 
-    let pane_id = super::normalize_pane_id(&args[0]);
+    let pane_id = super::resolve_pane_arg(&args[0]);
     let keys = args[1..].to_vec();
-    super::send_ok_request(Method::PaneSendKeys(PaneSendKeysParams { pane_id, keys }))
+    super::send_ok_request(Method::PaneSendKeys(PaneSendKeysParams {
+        write_timeout_ms: None,
+        pane_id,
+        keys,
+    }))
 }
 
 /// Arm a self-compaction of the calling agent's own session (#540).
@@ -482,7 +577,9 @@ fn pane_send_keys(args: &[String]) -> std::io::Result<i32> {
 /// its own id first, which is one more step between "context is full" and
 /// acting on it.
 fn pane_arm_self_compact(args: &[String]) -> std::io::Result<i32> {
-    let params = match parse_arm_self_compact(args) {
+    let params = match parse_arm_self_compact(args, |path| {
+        std::fs::read_to_string(path).map_err(|err| format!("--instructions-file {path}: {err}"))
+    }) {
         Ok(params) => params,
         Err(usage) => {
             eprintln!("{usage}");
@@ -490,21 +587,55 @@ fn pane_arm_self_compact(args: &[String]) -> std::io::Result<i32> {
         }
     };
 
-    super::print_response(&super::send_request(&Request {
+    let steered = params.instructions.is_some();
+    let pane = params.pane.clone();
+    let response = super::send_request(&Request {
         id: "cli:pane:arm-self-compact".into(),
         method: Method::PaneArmSelfCompact(params),
-    })?)
+    })?;
+    // #854: an older server ignores `instructions` and arms a plain `/compact`.
+    // Undo that arming rather than print a success that lost them.
+    if crate::agent_self_compact::instructions_dropped(steered, &response["result"]) {
+        let aborted = super::send_request(&Request {
+            id: "cli:pane:arm-self-compact".into(),
+            method: crate::agent_self_compact::abort_dropped_arming(pane),
+        });
+        // A failed abort keeps the explanation rather than losing it to `?`.
+        match aborted {
+            Ok(reply) if reply.get("error").is_none() => {
+                eprintln!("{}", crate::agent_self_compact::INSTRUCTIONS_DROPPED);
+            }
+            Ok(reply) => eprintln!(
+                "{} ({})",
+                crate::agent_self_compact::INSTRUCTIONS_DROPPED_ABORT_FAILED,
+                reply["error"]
+            ),
+            Err(err) => eprintln!(
+                "{} ({err})",
+                crate::agent_self_compact::INSTRUCTIONS_DROPPED_ABORT_FAILED
+            ),
+        }
+        return Ok(crate::api::compatibility::EXIT_CODE);
+    }
+    super::print_response(&response)
 }
 
 /// Pure: the flags and the trailing text of `arm-self-compact` to the params
 /// the verb takes, or the usage line to print. Split out from the command so
 /// the parsing — which is where the interesting refusals live — is testable
 /// without a socket.
-fn parse_arm_self_compact(args: &[String]) -> Result<PaneArmSelfCompactParams, String> {
-    const USAGE: &str =
-        "usage: flk pane arm-self-compact [--pane <pane_id>] [--abort] <handoff prompt>";
+///
+/// `read_file` resolves `--instructions-file`, injected so the parse stays
+/// testable without touching the filesystem.
+fn parse_arm_self_compact(
+    args: &[String],
+    read_file: impl Fn(&str) -> Result<String, String>,
+) -> Result<PaneArmSelfCompactParams, String> {
+    const USAGE: &str = "usage: flk pane arm-self-compact [--pane <pane_id>] [--abort] \
+         [--instructions <text> | --instructions-file <path>] <handoff prompt>";
     let mut pane = None;
     let mut continuation: Option<String> = None;
+    let mut instructions: Option<String> = None;
     let mut abort = false;
     let mut index = 0;
     while index < args.len() {
@@ -514,6 +645,29 @@ fn parse_arm_self_compact(args: &[String]) -> Result<PaneArmSelfCompactParams, S
                     return Err("--pane needs a pane id".to_string());
                 };
                 pane = Some(super::normalize_pane_id(value));
+                index += 2;
+            }
+            flag @ ("--instructions" | "--instructions-file") => {
+                if instructions.is_some() {
+                    return Err(
+                        "give --instructions or --instructions-file once, not both".to_string()
+                    );
+                }
+                let Some(value) = args.get(index + 1) else {
+                    return Err(format!("{flag} needs a value"));
+                };
+                instructions = Some(if flag == "--instructions" {
+                    value.clone()
+                } else {
+                    // A file almost always ends in a newline nobody meant as
+                    // content. Only that one is dropped: a newline inside is
+                    // still refused by the server, never folded into a space.
+                    let text = read_file(value)?;
+                    text.strip_suffix('\n')
+                        .map(|text| text.strip_suffix('\r').unwrap_or(text))
+                        .unwrap_or(&text)
+                        .to_string()
+                });
                 index += 2;
             }
             "--abort" => {
@@ -542,10 +696,14 @@ fn parse_arm_self_compact(args: &[String]) -> Result<PaneArmSelfCompactParams, S
     if !abort && continuation.is_none() {
         return Err(USAGE.to_string());
     }
+    if abort && instructions.is_some() {
+        return Err("--abort drops the armed compaction; it takes no instructions".to_string());
+    }
 
     Ok(PaneArmSelfCompactParams {
         pane,
         continuation,
+        instructions,
         abort,
     })
 }
@@ -598,31 +756,137 @@ fn pane_run_steps(pane_id: &str, text: &str) -> Vec<PaneRunStep> {
     ]
 }
 
+fn parse_guarded_pane_run(
+    args: &[String],
+) -> Result<Option<crate::api::schema::PaneSubmitParams>, String> {
+    let flag = if args.first().is_some_and(|arg| arg == "--if-input-empty") {
+        0
+    } else if args.get(1).is_some_and(|arg| arg == "--if-input-empty") {
+        1
+    } else {
+        return Ok(None);
+    };
+    let mut at = flag + 1;
+    let mut pane = (flag == 1).then(|| super::normalize_pane_id(&args[0]));
+    let mut session = None;
+    let mut min_age_secs = 0;
+    while at < args.len() {
+        match args[at].as_str() {
+            "--if-session" | "--min-age-secs" => {
+                let name = &args[at];
+                let value = args
+                    .get(at + 1)
+                    .ok_or_else(|| format!("missing value for {name}"))?;
+                if name == "--if-session" {
+                    session = Some(value.clone());
+                } else {
+                    min_age_secs = value
+                        .parse()
+                        .map_err(|_| "--min-age-secs requires a nonnegative integer")?;
+                }
+                at += 2;
+            }
+            "--" => {
+                at += 1;
+                break;
+            }
+            "--if-status" => {
+                return Err(
+                    "--if-status is unsupported; guarded submit requires idle or done".into(),
+                )
+            }
+            _ => break,
+        }
+    }
+    if pane.is_none() {
+        pane = args.get(at).map(|arg| super::normalize_pane_id(arg));
+        at += 1;
+    }
+    let pane_id = pane.ok_or("missing pane id")?;
+    if at >= args.len() {
+        return Err("missing text".into());
+    }
+    Ok(Some(crate::api::schema::PaneSubmitParams {
+        self_submit_confirmed: None,
+        pane_id,
+        text: args[at..].join(" "),
+        if_session: session,
+        min_age_secs,
+    }))
+}
+
 fn pane_run(args: &[String]) -> std::io::Result<i32> {
+    let (raw, args) = take_raw(args);
     if args.len() < 2 {
-        eprintln!("usage: flk pane run <pane_id> <command>");
+        eprintln!("usage: {PANE_RUN_USAGE}");
         return Ok(2);
     }
+    if raw && args.iter().take(2).any(|arg| arg == "--if-input-empty") {
+        eprintln!("pane run: --raw and --if-input-empty cannot be combined");
+        return Ok(super::exit::USAGE);
+    }
+    if raw {
+        let pane_id = super::resolve_pane_arg(&args[0]);
+        return submit_sequence(&pane_id, &args[1..].join(" "), true);
+    }
 
-    let pane_id = super::normalize_pane_id(&args[0]);
+    match parse_guarded_pane_run(args) {
+        Ok(Some(mut params)) => {
+            params.pane_id = super::resolve_pane_arg(&params.pane_id);
+            return super::send_guarded_request(Method::PaneSubmit(params));
+        }
+        Err(reason) => {
+            eprintln!("pane run: {reason}");
+            return Ok(2);
+        }
+        Ok(None) => (),
+    }
+    let pane_id = super::resolve_pane_arg(&args[0]);
     let text = args[1..].join(" ");
-    for step in pane_run_steps(&pane_id, &text) {
+    // The same type, settle, Enter in every pane. In an agent pane the server
+    // refuses the typed step before writing when the composer holds a draft
+    // (#1162), and then no Enter is sent.
+    submit_sequence(&pane_id, &text, false)
+}
+
+/// Type `text` into `pane_id` and press Enter, as the same two separate writes
+/// `flk pane run` has always made, and report what the server said (#578 P18).
+///
+/// The executor beside the existing value: `pane_run_steps` is the ordering
+/// contract and stays a value a test can assert on, while this walks it and
+/// issues the requests. The delegate deliberately MIRRORS this sequence —
+/// same type-then-Enter, same `PANE_RUN_SUBMIT_GAP` — on BOUNDED requests
+/// (see `delegate::submit_brief`): sharing `pane_run_steps` would hand the
+/// delegate the unbounded `send_ok_request` through this executor, and a
+/// server that goes quiet mid-type would then hang `start`/`send` forever
+/// (P578 r4-4 W2). The gap value is the single source of truth; the walking
+/// code is split by whether a stall must be bounded.
+///
+/// The exit code is what [`super::send_guarded_request`] returns: 0, or the
+/// server's refusal printed to stderr, exiting `REFUSED` (10) for one that
+/// changed nothing (`input_not_empty` for a draft in an agent's composer,
+/// #1162) and 1 otherwise. A refused type step sends no Enter.
+pub(super) fn submit_sequence(pane_id: &str, text: &str, raw: bool) -> std::io::Result<i32> {
+    for step in pane_run_steps(pane_id, text) {
         let method = match step {
             PaneRunStep::Type { pane_id, text } => Method::PaneSendInput(PaneSendInputParams {
+                write_timeout_ms: None,
                 pane_id,
                 text,
                 keys: Vec::new(),
+                raw,
             }),
             PaneRunStep::Settle(gap) => {
                 std::thread::sleep(gap);
                 continue;
             }
             PaneRunStep::Submit { pane_id } => Method::PaneSendKeys(PaneSendKeysParams {
+                write_timeout_ms: None,
                 pane_id,
                 keys: vec!["Enter".into()],
             }),
         };
-        let exit_code = super::send_ok_request(method)?;
+        let exit_code = super::send_guarded_request(method)?;
         if exit_code != 0 {
             return Ok(exit_code);
         }
@@ -833,12 +1097,7 @@ fn pane_report_agent(args: &[String]) -> std::io::Result<i32> {
 }
 
 fn pane_report_metadata(args: &[String]) -> std::io::Result<i32> {
-    let Some(raw_pane_id) = args.first() else {
-        eprintln!("usage: flk pane report-metadata <pane_id> --source ID [--agent LABEL] [--applies-to-source ID] [--title TEXT|--clear-title] [--display-agent TEXT|--clear-display-agent] [--custom-status TEXT|--clear-custom-status] [--state-label STATUS=TEXT] [--clear-state-labels] [--seq N] [--ttl-ms N]");
-        return Ok(2);
-    };
-
-    let pane_id = super::normalize_pane_id(raw_pane_id);
+    let mut pane_id = None;
     let mut source = None;
     let mut agent = None;
     let mut applies_to_source = None;
@@ -853,9 +1112,28 @@ fn pane_report_metadata(args: &[String]) -> std::io::Result<i32> {
     let mut seq = None;
     let mut ttl_ms = None;
 
-    let mut index = 1;
+    let mut index = 0;
     while index < args.len() {
-        match args[index].as_str() {
+        let arg = args[index].as_str();
+        if index == 0 && !arg.starts_with('-') {
+            pane_id = Some(super::normalize_pane_id(arg));
+            index += 1;
+            continue;
+        }
+        match arg {
+            "--pane" => {
+                let Some(value) = args.get(index + 1).filter(|value| !value.starts_with('-'))
+                else {
+                    eprintln!("missing value for --pane");
+                    return Ok(2);
+                };
+                if pane_id.is_some() {
+                    eprintln!("the pane id was already given");
+                    return Ok(2);
+                }
+                pane_id = Some(super::normalize_pane_id(value));
+                index += 2;
+            }
             "--source" => {
                 let Some(value) = args.get(index + 1) else {
                     eprintln!("missing value for --source");
@@ -999,7 +1277,7 @@ fn pane_report_metadata(args: &[String]) -> std::io::Result<i32> {
     }
 
     super::send_ok_request(Method::PaneReportMetadata(PaneReportMetadataParams {
-        pane_id,
+        pane_id: pane_id.unwrap_or_else(calling_pane_id),
         source,
         agent,
         applies_to_source,
@@ -1306,34 +1584,39 @@ fn pane_help_text() -> String {
     use std::fmt::Write as _;
     let _ = writeln!(out, "flk pane commands:");
     let _ = writeln!(out, "  flk pane list [--workspace <workspace_id>]");
-    let _ = writeln!(out, "  flk pane get <pane_id>");
-    let _ = writeln!(out, "  flk pane rename <pane_id> <label>|--clear");
-    let _ = writeln!(out, "  flk pane read <pane_id> [--source visible|recent|recent-unwrapped] [--lines N] [--format text|ansi] [--ansi]");
+    let _ = writeln!(out, "  flk pane get <target>");
+    let _ = writeln!(out, "  flk pane rename <target> <label>|--clear");
+    let _ = writeln!(out, "  flk pane read <target> [--source visible|recent|recent-unwrapped|detection] [--lines N] [--format text|ansi] [--ansi]");
     let _ = writeln!(
         out,
-        "  flk pane split <pane_id> --direction right|down [--cwd PATH] [--focus] [--no-focus]"
+        "  flk pane split <target> --direction right|down [--cwd PATH] [--focus] [--no-focus] [--dry-run]"
     );
     let _ = writeln!(
         out,
-        "  flk pane move <pane_id> --tab <tab_id> --split right|down [--target-pane ID] [--ratio FLOAT] [--focus|--no-focus]"
+        "  flk pane move <target> --tab <tab_id> --split right|down [--target-pane ID] [--ratio FLOAT] [--focus|--no-focus]"
     );
     let _ = writeln!(
         out,
-        "  flk pane move <pane_id> --new-tab [--workspace ID] [--label TEXT] [--focus|--no-focus]"
+        "  flk pane move <target> --new-tab [--workspace ID] [--label TEXT] [--focus|--no-focus]"
     );
     let _ = writeln!(
         out,
-        "  flk pane move <pane_id> --new-workspace [--label TEXT] [--tab-label TEXT] [--focus|--no-focus]"
+        "  flk pane move <target> --new-workspace [--label TEXT] [--tab-label TEXT] [--focus|--no-focus]"
     );
-    let _ = writeln!(out, "  flk pane close <pane_id>");
-    let _ = writeln!(out, "  flk pane send-text <pane_id> <text>");
-    let _ = writeln!(out, "  flk pane send-keys <pane_id> <key> [key ...]");
+    let _ = writeln!(out, "  flk pane close <target>");
+    let _ = writeln!(out, "  {PANE_STASH_USAGE}");
+    let _ = writeln!(out, "  {PANE_SEND_TEXT_USAGE}");
+    let _ = writeln!(out, "  flk pane send-keys <target> <key> [key ...]");
     let _ = writeln!(
         out,
-        "  flk pane arm-self-compact [--pane <pane_id>] [--abort] <handoff prompt>"
+        "  read, send-text, send-keys, close: {PANE_TARGET_HELP}"
+    );
+    let _ = writeln!(
+        out,
+        "  flk pane arm-self-compact [--pane <pane_id>] [--abort] [--instructions <text> | --instructions-file <path>] <handoff prompt>"
     );
     let _ = writeln!(out, "  flk pane report-agent [<pane_id>] --source ID --agent LABEL --state idle|working|blocked|unknown [--pane <pane_id>] [--message TEXT] [--custom-status TEXT] [--seq N] [--agent-session-id ID] [--agent-session-path PATH]");
-    let _ = writeln!(out, "  flk pane report-metadata <pane_id> --source ID [--agent LABEL] [--applies-to-source ID] [--title TEXT|--clear-title] [--display-agent TEXT|--clear-display-agent] [--custom-status TEXT|--clear-custom-status] [--state-label STATUS=TEXT] [--clear-state-labels] [--seq N] [--ttl-ms N]");
+    let _ = writeln!(out, "  flk pane report-metadata [<pane_id>] [--pane <pane_id>] --source ID [--agent LABEL] [--applies-to-source ID] [--title TEXT|--clear-title] [--display-agent TEXT|--clear-display-agent] [--custom-status TEXT|--clear-custom-status] [--state-label STATUS=TEXT] [--clear-state-labels] [--seq N] [--ttl-ms N]");
     let _ = writeln!(
         out,
         "  flk pane report-recap --source ID --agent LABEL --recap TEXT [--seq N] [--pane <pane_id>]"
@@ -1347,7 +1630,7 @@ fn pane_help_text() -> String {
         "  flk pane set-field <key> <value> [--ttl <secs>] [--pane <pane_id>]"
     );
     let _ = writeln!(out, "  flk pane clear-field <key> [--pane <pane_id>]");
-    let _ = writeln!(out, "  flk pane run <pane_id> <command>");
+    let _ = writeln!(out, "  {PANE_RUN_USAGE}");
     let _ = writeln!(out);
     let _ = writeln!(
         out,
@@ -1409,6 +1692,13 @@ mod tests {
     };
     use crate::api::schema::PaneAgentState;
 
+    /// The parse with no file to read: a test that reaches for one fails.
+    fn parse_arm_self_compact_no_files(
+        args: &[String],
+    ) -> Result<super::PaneArmSelfCompactParams, String> {
+        super::parse_arm_self_compact(args, |path| panic!("unexpected file read: {path}"))
+    }
+
     fn argv(args: &[&str]) -> Vec<String> {
         args.iter().map(|arg| (*arg).to_string()).collect()
     }
@@ -1442,8 +1732,9 @@ mod tests {
     /// still compact its own context instead of waiting for a human.
     #[test]
     fn arm_self_compact_defaults_to_my_own_pane_and_keeps_the_whole_prompt() {
-        let params = super::parse_arm_self_compact(&argv(&["open", "the", "PR,", "--watch", "CI"]))
-            .expect("arms");
+        let params =
+            parse_arm_self_compact_no_files(&argv(&["open", "the", "PR,", "--watch", "CI"]))
+                .expect("arms");
         assert_eq!(
             params.pane, None,
             "an agent compacting itself should not have to look up its own id"
@@ -1463,22 +1754,119 @@ mod tests {
     #[test]
     fn arm_self_compact_refuses_a_missing_or_empty_prompt() {
         for words in [vec![], vec!["", "  "]] {
-            let err = super::parse_arm_self_compact(&argv(&words))
+            let err = parse_arm_self_compact_no_files(&argv(&words))
                 .expect_err("an arming with no prompt is refused");
             assert!(!err.is_empty(), "a refusal must say something");
         }
     }
 
     #[test]
+    fn arm_self_compact_carries_instructions_from_a_flag_or_a_file() {
+        let params = parse_arm_self_compact_no_files(&argv(&[
+            "--instructions",
+            "keep GOAL.md and open PRs",
+            "carry",
+            "on",
+        ]))
+        .expect("arms");
+        assert_eq!(
+            params.instructions.as_deref(),
+            Some("keep GOAL.md and open PRs")
+        );
+        assert_eq!(params.continuation.as_deref(), Some("carry on"));
+
+        let from_file = super::parse_arm_self_compact(
+            &argv(&["--instructions-file", "keep.txt", "carry on"]),
+            |path| {
+                assert_eq!(path, "keep.txt");
+                Ok("keep STATUS.md\r\n".to_string())
+            },
+        )
+        .expect("arms");
+        assert_eq!(
+            from_file.instructions.as_deref(),
+            Some("keep STATUS.md"),
+            "only the file's trailing line ending is dropped"
+        );
+
+        let bare = parse_arm_self_compact_no_files(&argv(&["carry on"])).expect("arms");
+        assert_eq!(bare.instructions, None, "omitted stays omitted");
+    }
+
+    #[test]
+    fn arm_self_compact_refuses_conflicting_or_unreadable_instructions() {
+        for words in [
+            vec!["--instructions", "a", "--instructions-file", "b", "go"],
+            vec!["--instructions"],
+            vec!["--abort", "--instructions", "a"],
+        ] {
+            parse_arm_self_compact_no_files(&argv(&words)).expect_err("refused before the socket");
+        }
+        let err = super::parse_arm_self_compact(
+            &argv(&["--instructions-file", "missing.txt", "go"]),
+            |path| Err(format!("--instructions-file {path}: not found")),
+        )
+        .expect_err("an unreadable file is refused");
+        assert!(err.contains("missing.txt"), "{err}");
+    }
+
+    #[test]
     fn arm_self_compact_abort_needs_no_prompt() {
-        let params = super::parse_arm_self_compact(&argv(&["--abort"])).expect("aborts");
+        let params = parse_arm_self_compact_no_files(&argv(&["--abort"])).expect("aborts");
         assert!(params.abort);
         assert_eq!(params.continuation, None);
 
-        let named = super::parse_arm_self_compact(&argv(&["--pane", "w2:p1", "--abort"]))
+        let named = parse_arm_self_compact_no_files(&argv(&["--pane", "w2:p1", "--abort"]))
             .expect("aborts a named pane");
         assert!(named.abort);
         assert_eq!(named.pane.as_deref(), Some("w2:p1"));
+    }
+
+    #[test]
+    fn guarded_pane_run_parses_options_before_and_after_target() {
+        for words in [
+            vec![
+                "--if-input-empty",
+                "--min-age-secs",
+                "3",
+                "--if-session",
+                "session",
+                "1-1",
+                "hello",
+            ],
+            vec![
+                "1-1",
+                "--if-input-empty",
+                "--min-age-secs",
+                "3",
+                "--if-session",
+                "session",
+                "hello",
+            ],
+        ] {
+            let args = words
+                .iter()
+                .map(|word| word.to_string())
+                .collect::<Vec<_>>();
+            let parsed = super::parse_guarded_pane_run(&args).unwrap().unwrap();
+            assert_eq!(parsed.text, "hello");
+            assert_eq!(parsed.min_age_secs, 3);
+            assert_eq!(parsed.if_session.as_deref(), Some("session"));
+        }
+        let args = ["1-1", "--if-input-empty", "--if-status", "working", "hello"].map(String::from);
+        assert!(super::parse_guarded_pane_run(&args).is_err());
+    }
+
+    #[test]
+    fn only_a_leading_raw_is_a_flag() {
+        let leading = argv(&["--raw", "1-1", "hi"]);
+        let (raw, rest) = super::take_raw(&leading);
+        assert!(raw);
+        assert_eq!(rest, argv(&["1-1", "hi"]));
+        let trailing = argv(&["1-1", "--raw"]);
+        let (raw, rest) = super::take_raw(&trailing);
+        assert!(!raw);
+        assert_eq!(rest, trailing);
     }
 
     #[test]
@@ -1513,6 +1901,18 @@ mod tests {
             !super::PANE_RUN_SUBMIT_GAP.is_zero(),
             "a zero gap puts the Enter back in the same read as the text"
         );
+    }
+
+    #[test]
+    fn pane_help_documents_agent_targets_and_pane_id_precedence() {
+        // `send-text`'s `--raw` opt-out (#1162) sits before the target.
+        let help = super::pane_help_text().replace(" [--raw]", "");
+        for verb in ["read", "send-text", "send-keys", "close"] {
+            assert!(help.contains(&format!("flk pane {verb} <target>")));
+        }
+        assert!(help.contains(super::PANE_TARGET_HELP));
+        assert!(help.contains("pane id, terminal id, or unique agent name/label"));
+        assert!(help.contains("A pane id wins over a same-named agent"));
     }
 
     #[test]

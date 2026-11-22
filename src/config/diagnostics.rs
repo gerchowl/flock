@@ -1,0 +1,395 @@
+use std::collections::HashMap;
+
+use super::model::{KeyDiagnostic, KeyDiagnosticKind};
+use super::safe_diagnostic::{schema_key, Diagnostic, Source};
+use super::{config_overlay_path, config_path, Config};
+
+pub(super) fn syntax_position(
+    source: &str,
+    span: Option<std::ops::Range<usize>>,
+) -> Option<(usize, usize)> {
+    let span = span?;
+    if span.start > span.end || span.end > source.len() {
+        return None;
+    }
+    let prefix = &source.as_bytes()[..span.start];
+    let line = prefix.iter().filter(|&&b| b == b'\n').count() + 1;
+    let column = prefix.len()
+        - prefix
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map_or(0, |i| i + 1)
+        + 1;
+    Some((line, column))
+}
+
+/// Source warnings are independent of merging: even a shadowed obsolete key
+/// needs to be deleted from the file that declares it.
+pub(crate) fn removed_config_warnings() -> Vec<String> {
+    [
+        (config_path(), Source::Base),
+        (config_overlay_path(), Source::Overlay),
+    ]
+    .iter()
+    .filter_map(|(path, source)| {
+        std::fs::read_to_string(path)
+            .ok()
+            .map(|text| (*source, text))
+    })
+    .flat_map(|(source, text)| super::io::removed_key_diagnostics(&text, source))
+    .map(|diagnostic| diagnostic.message)
+    .collect()
+}
+
+pub(crate) fn file_key_diagnostics() -> Vec<KeyDiagnostic> {
+    [
+        (config_path(), Source::Base),
+        (config_overlay_path(), Source::Overlay),
+    ]
+    .iter()
+    .filter_map(|(path, source)| {
+        std::fs::read_to_string(path)
+            .ok()
+            .map(|text| (*source, text))
+    })
+    .flat_map(|(source, text)| key_diagnostics(&text, source))
+    .collect()
+}
+
+#[derive(Clone, Copy)]
+enum Scope {
+    AllFields,
+    Loader,
+}
+
+pub(super) fn key_diagnostics(text: &str, source: Source) -> Vec<KeyDiagnostic> {
+    scan_keys(text, source, Scope::AllFields)
+}
+
+/// Enrich the loader's existing unknown-key policy; CLI keeps its broader scan.
+pub(super) fn loader_key_diagnostics(text: &str, source: Source) -> Vec<KeyDiagnostic> {
+    scan_keys(text, source, Scope::Loader)
+}
+
+fn scan_keys(text: &str, source: Source, scope: Scope) -> Vec<KeyDiagnostic> {
+    let mut diagnostics = super::io::removed_key_diagnostics(text, source);
+    let Ok(document) = toml_edit::Document::parse(text) else {
+        return diagnostics;
+    };
+    let mut locations = HashMap::new();
+    collect_locations(document.as_item(), "", text, &mut locations);
+    let Ok(table) = toml::from_str::<toml::Table>(text) else {
+        return diagnostics;
+    };
+    let mut unknown = Vec::new();
+    for (key, value) in &table {
+        // An unknown top-level table gets the loader's section wording,
+        // including the [ui.toast] hint, rather than a second warning (#860).
+        if super::io::unknown_top_level_section_diagnostic(key, value).is_some() {
+            let position = locations.get(key).copied();
+            diagnostics.push(KeyDiagnostic {
+                kind: KeyDiagnosticKind::Unknown,
+                key: schema_key(key),
+                message: Diagnostic::unknown(key, None)
+                    .with_position(position)
+                    .with_source(source)
+                    .to_string(),
+            });
+            continue;
+        }
+        // Deserialize sections independently so one invalid section cannot hide
+        // unknown keys in another. Serde owns the schema, including aliases.
+        if matches!(scope, Scope::AllFields) || key == "msg" {
+            unknown_keys(&[Segment::Key(key.clone())], value, &mut unknown);
+        }
+    }
+    for key in unknown {
+        let position = locations.get(&key).copied();
+        let canonical = key
+            .split('.')
+            .filter(|part| part.parse::<usize>().is_err())
+            .collect::<Vec<_>>()
+            .join(".");
+        if diagnostics.iter().any(|diagnostic| {
+            diagnostic.kind == KeyDiagnosticKind::Removed && diagnostic.key == canonical
+        }) {
+            continue;
+        }
+        diagnostics.push(KeyDiagnostic {
+            kind: KeyDiagnosticKind::Unknown,
+            message: Diagnostic::unknown(&key, None)
+                .with_position(position)
+                .with_source(source)
+                .to_string(),
+            key: schema_key(&key),
+        });
+    }
+    diagnostics
+}
+
+/// One step from the config root down to the value being checked.
+#[derive(Clone)]
+enum Segment {
+    Key(String),
+    /// An entry of an array of tables such as `[[peers]]`, checked alone.
+    Index(usize),
+}
+
+/// Collect the dotted paths serde ignores under `value`, which sits at `path`.
+/// Serde stops at the first type error, so a table that fails is retried one
+/// key at a time, and an array of tables one entry at a time: a bad value then
+/// hides nothing but itself (#860).
+fn unknown_keys(path: &[Segment], value: &toml::Value, found: &mut Vec<String>) {
+    let mut section = value.clone();
+    for segment in path.iter().rev() {
+        section = match segment {
+            Segment::Key(key) => toml::Value::Table([(key.clone(), section)].into_iter().collect()),
+            Segment::Index(_) => toml::Value::Array(vec![section]),
+        };
+    }
+    let result: Result<Config, _> = serde_ignored::deserialize(section, |ignored| {
+        let mut parts: Vec<String> = ignored
+            .to_string()
+            .split('.')
+            .filter(|part| *part != "?")
+            .map(String::from)
+            .collect();
+        // An entry checked alone sits at index 0, so put its real index back.
+        for (part, segment) in parts.iter_mut().zip(path) {
+            if let Segment::Index(index) = segment {
+                *part = index.to_string();
+            }
+        }
+        let key = parts.join(".");
+        if !found.contains(&key) {
+            found.push(key);
+        }
+    });
+    if result.is_err() {
+        let mut descend = |segment: Segment, child: &toml::Value| {
+            let mut child_path = path.to_vec();
+            child_path.push(segment);
+            unknown_keys(&child_path, child, found);
+        };
+        if let Some(table) = value.as_table() {
+            for (key, child) in table {
+                descend(Segment::Key(key.clone()), child);
+            }
+        } else if let Some(entries) = value.as_array() {
+            for (index, child) in entries.iter().enumerate().filter(|(_, v)| v.is_table()) {
+                descend(Segment::Index(index), child);
+            }
+        }
+    }
+}
+
+fn collect_locations(
+    item: &toml_edit::Item,
+    prefix: &str,
+    text: &str,
+    locations: &mut HashMap<String, (usize, usize)>,
+) {
+    if let Some(table) = item.as_table_like() {
+        for (key, value) in table.iter() {
+            let path = if prefix.is_empty() {
+                key.to_string()
+            } else {
+                format!("{prefix}.{key}")
+            };
+            if let Some(position) = syntax_position(text, table.key(key).and_then(|key| key.span()))
+            {
+                locations.insert(path.clone(), position);
+            }
+            collect_locations(value, &path, text, locations);
+        }
+    } else if let Some(array) = item.as_array_of_tables() {
+        for (index, table) in array.iter().enumerate() {
+            collect_locations(
+                &toml_edit::Item::Table(table.clone()),
+                &format!("{prefix}.{index}"),
+                text,
+                locations,
+            );
+        }
+    } else if let Some(array) = item.as_array() {
+        for (index, value) in array.iter().enumerate() {
+            collect_locations(
+                &toml_edit::Item::Value(value.clone()),
+                &format!("{prefix}.{index}"),
+                text,
+                locations,
+            );
+        }
+    }
+}
+
+/// Safe peer source metadata, indexed in original TOML array order.
+/// No names, target strings or paths are retained.
+pub(super) struct PeerLocation {
+    pub source: Source,
+    pub name: Option<(usize, usize)>,
+    pub ssh: Option<(usize, usize)>,
+}
+
+pub(super) fn peer_locations(text: &str, source: Source) -> Vec<PeerLocation> {
+    let Ok(document) = toml_edit::Document::parse(text) else {
+        return Vec::new();
+    };
+    let Some(peers) = document.get("peers") else {
+        return Vec::new();
+    };
+    let count = peers
+        .as_array_of_tables()
+        .map(|a| a.len())
+        .or_else(|| peers.as_array().map(|a| a.len()))
+        .unwrap_or(0);
+    let mut locations = HashMap::new();
+    collect_locations(document.as_item(), "", text, &mut locations);
+    (0..count)
+        .map(|index| PeerLocation {
+            source,
+            name: locations.get(&format!("peers.{index}.name")).copied(),
+            ssh: locations.get(&format!("peers.{index}.ssh")).copied(),
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+    fn toml_syntax_error(error: &toml::de::Error, text: &str, _path: &Path) -> String {
+        super::Diagnostic::syntax(
+            error,
+            text,
+            super::Source::Base,
+            crate::config::safe_diagnostic::Outcome::KeepCurrent,
+        )
+        .to_string()
+    }
+    fn messages(text: &str) -> Vec<String> {
+        super::key_diagnostics(text, super::Source::Base)
+            .into_iter()
+            .map(|diagnostic| diagnostic.message)
+            .collect()
+    }
+
+    #[test]
+    fn security2384_invalid_syntax_spans_are_unavailable() {
+        for span in [0..5, 5..5, std::ops::Range { start: 3, end: 1 }] {
+            assert_eq!(super::syntax_position("text", Some(span)), None);
+        }
+        assert_eq!(super::syntax_position("text", Some(4..4)), Some((1, 5)));
+    }
+
+    #[test]
+    fn security2384_syntax_positions_are_byte_columns_and_missing_spans_are_explicit() {
+        let source = "a = \"π\" nope\n";
+        let error = toml::from_str::<toml::Table>(source).unwrap_err();
+        let path = Path::new("fixture.toml");
+        let diagnostic = toml_syntax_error(&error, source, path);
+        assert!(diagnostic.contains("source=base file; at 1:10"));
+        assert!(!diagnostic.contains("π") && !diagnostic.contains("nope"));
+        let error: toml::de::Error = serde::de::Error::custom("PRIVATE_2384_no_span_message");
+        let diagnostic = toml_syntax_error(&error, source, path);
+        assert!(diagnostic.contains("location unavailable"));
+        assert!(!diagnostic.contains("PRIVATE_2384") && !diagnostic.contains(source));
+    }
+
+    #[test]
+    fn unknown_keys_have_source_locations_including_peer_arrays() {
+        let diagnostics = messages(
+            "future = true\n[msg]\nfuture_setting = true\n[[peers]]\nname='nodea'\nfuture_peer=1\nsummary_command='false'\n",
+        );
+        assert!(
+            diagnostics.contains(
+                &"unknown_config_key; key=document root; source=base file; at 1:1; setting ignored"
+                    .to_string()
+            ),
+            "{diagnostics:?}"
+        );
+        assert!(
+            diagnostics.contains(
+                &"unknown_config_key; key=msg; source=base file; at 3:1; setting ignored"
+                    .to_string()
+            ),
+            "{diagnostics:?}"
+        );
+        assert!(
+            diagnostics.contains(
+                &"unknown_config_key; key=peers[]; source=base file; at 6:1; setting ignored"
+                    .to_string()
+            ),
+            "{diagnostics:?}"
+        );
+        assert_eq!(diagnostics.len(), 4, "{diagnostics:?}");
+    }
+
+    /// Serde stops at the first type error, so a bad value ahead of an unknown
+    /// key in the same table used to hide the unknown key (#860).
+    #[test]
+    fn a_type_error_does_not_hide_unknown_keys_in_the_same_table() {
+        let diagnostics = messages(
+            "[msg]\nenabled = \"yes\"\nfuture_setting = true\n[ui.toast]\ndelay_seconds = \"soon\"\nfuture_toast = 1\n",
+        );
+        assert_eq!(
+            diagnostics,
+            vec![
+                "unknown_config_key; key=msg; source=base file; at 3:1; setting ignored"
+                    .to_string(),
+                "unknown_config_key; key=ui.toast; source=base file; at 6:1; setting ignored"
+                    .to_string(),
+            ]
+        );
+    }
+
+    /// The same holds inside one `[[peers]]` entry, and the reported index is
+    /// the entry's own, not the 0 it had while checked alone.
+    #[test]
+    fn a_type_error_does_not_hide_unknown_keys_in_a_peer_entry() {
+        assert_eq!(
+            messages(
+                "[[peers]]\nname = \"nodea\"\n[[peers]]\nname = \"nodeb\"\nssh = 5\nfuture_peer = 1\n",
+            ),
+            vec!["unknown_config_key; key=peers[]; source=base file; at 6:1; setting ignored".to_string()]
+        );
+    }
+
+    /// A misplaced `[toast]` is one mistake, so it gets one warning: the
+    /// section hint, with its location (#860).
+    #[test]
+    fn an_unknown_top_level_table_gets_one_located_section_warning() {
+        assert_eq!(
+            messages("onboarding = false\n[toast]\ndelivery = \"flock\"\n"),
+            vec![
+                "unknown_config_key; key=document root; source=base file; at 2:2; expected [ui.toast] section; did you mean [ui.toast]?; setting ignored"
+                    .to_string()
+            ]
+        );
+    }
+
+    /// The hand-written and untagged deserializers must not make serde_ignored
+    /// report keys they do read: the legacy `ui.toast.enabled`, both shapes of
+    /// a keybinding, and the string-parsed `ui` settings.
+    #[test]
+    fn custom_deserializers_report_no_false_unknown_keys() {
+        assert_eq!(
+            messages(
+                "[ui]\nright_click_passthrough_modifier = \"alt\"\n[ui.toast]\nenabled = true\ndelay_seconds = 2\n[ui.toast.flock]\nposition = \"bottom_right\"\n[keys]\nhelp = \"prefix+?\"\nsettings = [\"prefix+s\", \"f2\"]\n",
+            ),
+            Vec::<String>::new()
+        );
+    }
+}
+
+#[cfg(test)]
+mod sink_security_tests {
+    #[test]
+    fn security2384_s3b1_file_key_scan() {
+        let result = super::key_diagnostics(
+            "[SECRET_SECTION_2384]\nx=1\n[ui]\nSECRET_LEAF_2384=true",
+            super::Source::Base,
+        );
+        assert!(!format!("{result:?}").contains("SECRET_"));
+        assert_eq!(result.len(), 2);
+    }
+}

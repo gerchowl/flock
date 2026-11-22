@@ -73,6 +73,35 @@ _STRING_LITERAL = re.compile(r'"([^"\\]*)"')
 _PROSE_USER_AT_HOST = re.compile(
     r"(?<![/\w.-])[A-Za-z0-9._-]+@([A-Za-z0-9][A-Za-z0-9.-]{3,})\b"
 )
+# `name@latest` / `name@1.2.3`: a package-version specifier, not `user@host`.
+# Dependabot release notes are full of them (#2848: 43 hits on one body, every one
+# `<code>tool@latest</code>`). The exemption is deliberately narrow and needs BOTH:
+#   - the part after `@` is exactly `latest` or a full three-part semver, so an
+#     IPv4 address, a dotted quad, a digit-led host and a dist-tag-word host
+#     (`alice@main`, `ops@next`) are all still judged; and
+#   - the token sits in a package context: inside a backtick or `<code>` span, or
+#     right after an installer command.
+_VERSION_SPEC = re.compile(r"(?:latest|v?\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)\Z")
+_IPV4_SHAPED = re.compile(r"\d{1,3}(?:\.\d{1,3}){3}\Z")
+_CODE_SPAN = re.compile(r"`[^`\n]*`|<code>.*?</code>", re.IGNORECASE)
+_INSTALLER_BEFORE = re.compile(
+    r"\b(?:npx|uvx|pipx\s+(?:run|install)|go\s+install|cargo\s+install|npm\s+(?:i|install))\s+$"
+)
+
+
+def _is_package_spec(line: str, match: re.Match[str]) -> bool:
+    """True when `name@spec` at this match is a package specifier in package context."""
+    spec = match.group(1)
+    if _IPV4_SHAPED.match(spec) or not _VERSION_SPEC.match(spec):
+        return False
+    if _INSTALLER_BEFORE.search(line[: match.start()]):
+        return True
+    return any(
+        span.start() <= match.start() and match.end() <= span.end()
+        for span in _CODE_SPAN.finditer(line)
+    )
+
+
 # Shapes that appear in documentation ABOUT this syntax rather than as a machine.
 # This is a vocabulary of placeholders, not a list of anything private.
 _PLACEHOLDER_HOSTS = {"host", "hostname", "machine", "example", "your-host", "yourhost"}
@@ -236,6 +265,8 @@ def check_free_text(
         # `user@host` is a host however it is spelled, so the bare form is fine
         # here — unlike a keyed field.
         for match in _PROSE_USER_AT_HOST.finditer(line):
+            if _is_package_spec(line, match):
+                continue
             if match.group(1).lower() not in _PLACEHOLDER_HOSTS:
                 seen.add(match.group(1))
         for match in _PROSE_TAILNET.finditer(line):

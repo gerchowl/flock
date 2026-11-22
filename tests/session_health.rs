@@ -34,8 +34,9 @@ mod support;
 
 use std::fs;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use support::environment::Command;
 
 use support::{cleanup_test_base, register_runtime_dir, wait_for_socket};
 
@@ -74,10 +75,12 @@ impl Harness {
         let base = PathBuf::from(format!("/tmp/fs-{label}-{}-{nanos}", std::process::id()));
         let config_home = base.join("cfg");
         let runtime_dir = base.join("rt");
-        fs::create_dir_all(config_home.join("flock")).expect("config home");
+        fs::create_dir_all(config_home.join(support::paths::app_dir_name())).expect("config home");
         fs::create_dir_all(&runtime_dir).expect("runtime dir");
         fs::write(
-            config_home.join("flock/config.toml"),
+            config_home
+                .join(support::paths::app_dir_name())
+                .join("config.toml"),
             "onboarding = false\n",
         )
         .expect("seed config");
@@ -102,19 +105,21 @@ impl Harness {
         } else {
             Command::new(env!("CARGO_BIN_EXE_flk"))
         };
-        let child = command
+        command
             .arg("server")
-            .env("XDG_CONFIG_HOME", &self.config_home)
-            .env("XDG_RUNTIME_DIR", &self.runtime_dir)
+            .envs(support::environment::isolated_env(
+                &self.config_home,
+                &self.runtime_dir,
+            ))
             .env("FLOCK_SOCKET_PATH", &self.socket)
             .env_remove("FLOCK_CLIENT_SOCKET_PATH")
             .env_remove("FLOCK_ENV")
             .env("SHELL", "/bin/sh")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("server should spawn");
+            .stderr(Stdio::null());
+        support::environment::assert_command_isolated(&command);
+        let child = command.spawn().expect("server should spawn");
         self.server = Some(child);
         wait_for_socket(&self.socket, Duration::from_secs(30));
     }
@@ -128,8 +133,10 @@ impl Harness {
     fn client(&self, args: &[&str]) -> std::process::Output {
         Command::new(env!("CARGO_BIN_EXE_flk"))
             .args(args)
-            .env("XDG_CONFIG_HOME", &self.config_home)
-            .env("XDG_RUNTIME_DIR", &self.runtime_dir)
+            .envs(support::environment::isolated_env(
+                &self.config_home,
+                &self.runtime_dir,
+            ))
             .env("FLOCK_SOCKET_PATH", &self.socket)
             .env_remove("FLOCK_CLIENT_SOCKET_PATH")
             .env_remove("FLOCK_ENV")
@@ -307,7 +314,10 @@ fn a_broken_session_is_logged_once_not_repeated() {
     // Past one TTL (5s), so at least two probes have happened: the one at
     // startup and one refresh. A per-probe log line would make this 2+.
     std::thread::sleep(Duration::from_secs(7));
-    let log = harness.config_home.join("flock-dev/flock-server.log");
+    let log = harness
+        .config_home
+        .join(support::paths::app_dir_name())
+        .join("flock-server.log");
     let text = fs::read_to_string(&log).unwrap_or_default();
     let count = text
         .lines()

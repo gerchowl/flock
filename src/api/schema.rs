@@ -12,8 +12,27 @@ pub struct Request {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "method", content = "params")]
 pub enum Method {
+    /// Operator-only immutable binding review; never executes profile assets.
+    #[serde(rename = "profile.plan")]
+    ProfilePlan(crate::structured::profiles::bindings::transactions::PlanRequest),
+    /// Operator-only compare-and-swap of the exact reviewed binding.
+    #[serde(rename = "profile.bind")]
+    ProfileBind(ProfileBindParams),
+    /// Operator-only terminal binding revocation, without preview.
+    #[serde(rename = "profile.revoke")]
+    ProfileRevoke(crate::structured::profiles::bindings::transactions::RevokeRequest),
+    /// Read-only binding metadata, redacted for non-operator callers.
+    #[serde(rename = "profile.status")]
+    ProfileStatus(EmptyParams),
+    /// Operator-only request to enable reviewed profile execution (ADR-0052 §9).
+    #[serde(rename = "profile.enable")]
+    ProfileEnable(ProfileEnableParams),
     #[serde(rename = "ping")]
     Ping(PingParams),
+    #[serde(rename = "structured.grants.list")]
+    StructuredGrantsList(crate::structured::permissions::grants::GrantsList),
+    #[serde(rename = "structured.grants.revoke")]
+    StructuredGrantsRevoke(crate::structured::permissions::grants::GrantsRevoke),
     #[serde(rename = "server.stop")]
     ServerStop(EmptyParams),
     #[serde(rename = "server.live_handoff")]
@@ -81,8 +100,11 @@ pub enum Method {
     PeersCheckoutPrepare(PeersCheckoutPrepareParams),
     #[serde(rename = "agent.list")]
     AgentList(EmptyParams),
-    #[serde(rename = "agent.get")]
+    #[serde(rename = "agent.get", alias = "agent.status")]
     AgentGet(AgentTarget),
+    /// Stop a structured worker without inventing a pane or restart plan.
+    #[serde(rename = "agent.stop")]
+    AgentStop(AgentTarget),
     #[serde(rename = "agent.read")]
     AgentRead(AgentReadParams),
     /// #276: an agent's own conversation, from the session transcript.
@@ -121,8 +143,17 @@ pub enum Method {
     AgentHibernate(AgentTarget),
     #[serde(rename = "agent.resume")]
     AgentResume(AgentTarget),
+    #[serde(rename = "agent.restart")]
+    AgentRestart(AgentRestartParams),
     #[serde(rename = "agent.lineage")]
     AgentLineage(LineageParams),
+    /// #960 (ADR-0027 §2): an architect's delegates, from the edge index
+    /// joined with cached state only.
+    #[serde(rename = "delegate.list")]
+    DelegateList(DelegateListParams),
+    /// Authorize an explicit local registry repair without changing ownership.
+    #[serde(rename = "delegate.rebind")]
+    DelegateRebind(DelegateRebindParams),
     #[serde(rename = "msg.send")]
     MsgSend(MsgSendParams),
     #[serde(rename = "msg.reply")]
@@ -131,6 +162,11 @@ pub enum Method {
     MsgList(MsgListParams),
     #[serde(rename = "msg.read")]
     MsgRead(MsgReadParams),
+    /// Operator recovery for one legacy pane inbox (#3089).
+    #[serde(rename = "msg.operator_list")]
+    MsgOperatorList(MsgOperatorInboxParams),
+    #[serde(rename = "msg.operator_read")]
+    MsgOperatorRead(MsgOperatorInboxParams),
     #[serde(rename = "msg.status")]
     MsgStatus(MsgStatusParams),
     /// #576: block until a message is answered, deferred or expires.
@@ -138,20 +174,33 @@ pub enum Method {
     /// event hub rather than a poll — see [`MsgWaitReplyParams`].
     #[serde(rename = "msg.wait_reply")]
     MsgWaitReply(MsgWaitReplyParams),
-    /// #410: a spoke's held relay collecting the messages this server hands up
-    /// to its hub. Long-polled — see [`MsgUplinkTakeParams`].
-    #[serde(rename = "msg.uplink_take")]
-    MsgUplinkTake(MsgUplinkTakeParams),
-    /// #410: the hub's relay binds itself to this server's uplink. Every other
-    /// relay method is accepted only from the process that did.
-    #[serde(rename = "peers.relay_attach")]
-    PeersRelayAttach(EmptyParams),
-    /// #410: the hub's answer to a message a spoke handed up, sent back down
-    /// the same relay.
-    #[serde(rename = "msg.uplink_result")]
-    MsgUplinkResult(MsgUplinkResultParams),
+    #[serde(rename = "mesh.hello")]
+    MeshHello(crate::mesh::hello::Hello),
+    #[serde(rename = "mesh.routes")]
+    MeshRoutes { adverts: Vec<serde_json::Value> },
+    /// Inspect envelope kinds against the session before decoding the payload.
+    #[serde(rename = "mesh.deliver")]
+    MeshDeliver(serde_json::Value),
+    /// Inspect the complete acknowledgement batch before any custody mutation.
+    #[serde(rename = "mesh.collect")]
+    MeshCollect(serde_json::Value),
+    #[serde(rename = "peers.enroll_reset")]
+    PeersEnrollReset(PeersEnrollResetParams),
+    #[serde(rename = "peers.enrollment")]
+    PeersEnrollment(EmptyParams),
+    /// ADR-0035 §3 / §6.2 (#1195): the repo's committed owner policy, the
+    /// version the operator adopted, and whether a newer one is pending.
+    #[serde(rename = "owner.policy.show")]
+    OwnerPolicyShow(OwnerPolicyParams),
+    /// ADR-0035 §6.2 (#1195): the operator adopts the default branch's
+    /// current owner policy. Operator-only (ADR-0014).
+    #[serde(rename = "owner.policy.adopt")]
+    OwnerPolicyAdopt(OwnerPolicyParams),
     #[serde(rename = "msg.wake")]
     MsgWake(MsgWakeParams),
+    /// ADR-0034 §1: a harness hook asks the server for its verdict.
+    #[serde(rename = "hook.decide")]
+    HookDecide(HookDecideParams),
     #[serde(rename = "msg.mute")]
     MsgMute(MsgMuteParams),
     #[serde(rename = "pane.split")]
@@ -166,12 +215,30 @@ pub enum Method {
     PaneRename(PaneRenameParams),
     #[serde(rename = "pane.send_text")]
     PaneSendText(PaneSendTextParams),
+    #[serde(rename = "pane.write_text")]
+    PaneWriteText(PaneSendTextParams),
     #[serde(rename = "pane.send_keys")]
     PaneSendKeys(PaneSendKeysParams),
+    /// Explicit retry/fork, refused unless the pane currently shows the Codex lock.
+    #[serde(rename = "pane.resolve_codex_lock")]
+    PaneResolveCodexLock(PaneResolveCodexLockParams),
     #[serde(rename = "pane.send_input")]
     PaneSendInput(PaneSendInputParams),
+    #[serde(rename = "pane.write_keys")]
+    PaneWriteKeys(PaneSendKeysParams),
+    #[serde(rename = "pane.write_input")]
+    PaneWriteInput(PaneSendInputParams),
+    #[serde(rename = "pane.submit")]
+    PaneSubmit(PaneSubmitParams),
     #[serde(rename = "pane.arm_self_compact")]
     PaneArmSelfCompact(PaneArmSelfCompactParams),
+    /// Drafts an injection kept for a pane because it could not type them
+    /// back (#850).
+    #[serde(rename = "pane.stash_show")]
+    PaneStashShow(PaneTarget),
+    /// Type the oldest kept draft back into the pane's empty composer.
+    #[serde(rename = "pane.stash_restore")]
+    PaneStashRestore(PaneTarget),
     #[serde(rename = "pane.read")]
     PaneRead(PaneReadParams),
     #[serde(rename = "pane.report_agent")]
@@ -200,6 +267,70 @@ pub enum Method {
     EventsSubscribe(EventsSubscribeParams),
     #[serde(rename = "events.wait")]
     EventsWait(EventsWaitParams),
+    #[serde(rename = "events.read")]
+    EventsRead(EventsReadParams),
+    #[serde(rename = "session.retained.list")]
+    SessionRetainedList(EmptyParams),
+    #[serde(rename = "session.retained.purge")]
+    SessionRetainedPurge(super::retained::PurgeParams),
+    #[serde(rename = "client.grant.add")]
+    ClientGrantAdd(super::gateway_grants::Grant),
+    #[serde(rename = "client.grant.list")]
+    ClientGrantList(EmptyParams),
+    #[serde(rename = "client.grant.revoke")]
+    ClientGrantRevoke(super::gateway_grants::Revoke),
+    #[serde(rename = "client.token.add")]
+    ClientTokenAdd(super::client_tokens::AddParams),
+    #[serde(rename = "client.token.rm")]
+    ClientTokenRemove(super::client_tokens::RemoveParams),
+    #[serde(rename = "client.token.list")]
+    ClientTokenList(EmptyParams),
+    #[serde(rename = "client.open")]
+    ClientOpen(EmptyParams),
+    /// Fixed-scope, process-bound app credential, admitted only from LocalOperator.
+    #[serde(rename = "client.app.mint")]
+    ClientAppMint(super::client_tokens::MintParams),
+    #[serde(rename = "channel.hello")]
+    ChannelHello(ChannelHelloParams),
+    /// ADR-0028 §5 (#1031): park the calling agent on a registered wait and
+    /// return at once, so the agent can end its turn.
+    #[serde(rename = "wait.park")]
+    WaitPark(WaitParkParams),
+    /// In-process only: a held `events.read` registers its blocking wait
+    /// against the attested caller. Never on the wire, so no client can open
+    /// or close a wait it does not hold.
+    #[serde(skip)]
+    WaitHold(crate::api::wait_predicate::WaitPredicate, u64),
+    /// In-process only: the held `events.read` returned.
+    #[serde(skip)]
+    WaitRelease(String),
+    /// ADR-0035 §1: bind a repo to its resident owner. Operator verb.
+    #[serde(rename = "owner.bind")]
+    OwnerBind(OwnerBindParams),
+    /// ADR-0035 §1: end a repo's owner binding. Operator verb.
+    #[serde(rename = "owner.unbind")]
+    OwnerUnbind(OwnerRepoParams),
+    #[serde(rename = "owner.list")]
+    OwnerList(EmptyParams),
+    #[serde(rename = "owner.show")]
+    OwnerShow(OwnerRepoParams),
+    /// ADR-0030 §1: arm a goal for an agent. Written by the operator or by
+    /// the goal's own agent.
+    #[serde(rename = "goal.arm")]
+    GoalArm(GoalArmParams),
+    /// ADR-0030 §1: an agent's goal record. Open to every caller.
+    #[serde(rename = "goal.status")]
+    GoalStatus(GoalTargetParams),
+    /// ADR-0030 §1 (amended 2026-10-12): pause a goal, recorded as
+    /// `GoalPaused`.
+    #[serde(rename = "goal.pause")]
+    GoalPause(GoalPauseParams),
+    /// Resume a paused goal, recorded as `GoalResumed`.
+    #[serde(rename = "goal.resume")]
+    GoalResume(GoalTargetParams),
+    /// Stop (disarm) a goal, recorded as `GoalDisarmed`.
+    #[serde(rename = "goal.stop")]
+    GoalStop(GoalStopParams),
     #[serde(rename = "pane.wait_for_output")]
     PaneWaitForOutput(PaneWaitForOutputParams),
     #[serde(rename = "integration.install")]
@@ -240,6 +371,251 @@ pub enum Method {
     /// a fresh `revert/<run-id>` branch — never on `main`.
     #[serde(rename = "revert.run")]
     RevertRun(RevertRunParams),
+}
+
+impl Method {
+    pub(crate) fn is_allocation_preview(&self) -> bool {
+        match self {
+            Self::WorkspaceCreate(p) => p.dry_run,
+            Self::WorktreeCreate(p) => p.dry_run,
+            Self::TabCreate(p) => p.dry_run,
+            Self::PaneSplit(p) => p.dry_run,
+            Self::AgentStart(p) => p.dry_run,
+            Self::AgentFork(p) => p.dry_run,
+            _ => false,
+        }
+    }
+
+    /// Can this request be sent again after a transport error that left its
+    /// fate unknown (#910)?
+    ///
+    /// The anonymous-UID boundary also relies on this being reads/previews only.
+    /// Only reads qualify: a read timeout on a write says nothing about
+    /// whether the server applied it, and sending a `pane.close` twice turns
+    /// "closed" into `pane_not_found`. `msg.read` is left out on purpose, it
+    /// consumes the inbox it reads. An allocation preview writes nothing, so
+    /// it reads like a list.
+    pub(crate) fn is_retry_safe(&self) -> bool {
+        matches!(
+            self,
+            Self::Ping(_)
+                | Self::ProfileStatus(_)
+                | Self::SessionRetainedList(_)
+                | Self::StructuredGrantsList(_)
+                | Self::NotificationList(_)
+                | Self::HandoffList(_)
+                | Self::HandoffRead(_)
+                | Self::WorkspaceList(_)
+                | Self::WorkspaceGet(_)
+                | Self::WorktreeList(_)
+                | Self::TabList(_)
+                | Self::TabGet(_)
+                | Self::PeersSummary(_)
+                | Self::AgentList(_)
+                | Self::AgentGet(_)
+                | Self::AgentRead(_)
+                | Self::AgentHistory(_)
+                | Self::AgentResult(_)
+                | Self::AgentLineage(_)
+                | Self::OwnerList(_)
+                | Self::OwnerShow(_)
+                | Self::GoalStatus(_)
+                | Self::DelegateList(_)
+                | Self::MsgList(_)
+                | Self::MsgOperatorList(_)
+                | Self::MsgStatus(_)
+                | Self::PeersEnrollment(_)
+                | Self::OwnerPolicyShow(_)
+                | Self::PaneList(_)
+                | Self::PaneGet(_)
+                | Self::PaneRead(_)
+                | Self::ChecksList(_)
+                | Self::FleetStatus(_)
+        ) || self.is_allocation_preview()
+    }
+
+    /// Must a CLI refuse to send this to a server older than itself (#868)?
+    ///
+    /// True for every request that changes session state: sent to an older
+    /// server it can allocate a workspace or start an agent and then fail at
+    /// a later step the server does not understand, leaving the work half
+    /// done. Reads, waits, previews and hook reports stay false so a skewed
+    /// client can still look around, and the server's own lifecycle stays
+    /// false because `flk server live-handoff` is how the skew is fixed.
+    /// Exhaustive on purpose, so every new method has to take a side.
+    pub(crate) fn needs_current_protocol(&self) -> bool {
+        if matches!(self, Self::PaneReportAgentSession(params) if params.rebind_agent_id.is_some())
+        {
+            return true;
+        }
+        if self.is_allocation_preview() {
+            return false;
+        }
+        match self {
+            Self::ProfileStatus(_)
+            | Self::Ping(_)
+            | Self::StructuredGrantsList(_)
+            | Self::ServerStop(_)
+            | Self::ServerLiveHandoff(_)
+            | Self::ServerReloadConfig(_)
+            | Self::SessionRetainedList(_)
+            | Self::NotificationList(_)
+            | Self::HandoffList(_)
+            | Self::HandoffRead(_)
+            | Self::WorkspaceList(_)
+            | Self::WorkspaceGet(_)
+            | Self::WorktreeList(_)
+            | Self::TabList(_)
+            | Self::TabGet(_)
+            | Self::PeersSummary(_)
+            | Self::PeersHubFleet(_)
+            | Self::PeersEnrollment(_)
+            | Self::OwnerPolicyShow(_)
+            | Self::AgentList(_)
+            | Self::AgentGet(_)
+            | Self::AgentRead(_)
+            | Self::AgentHistory(_)
+            | Self::AgentResult(_)
+            | Self::AgentLineage(_)
+            | Self::OwnerList(_)
+            | Self::OwnerShow(_)
+            | Self::GoalStatus(_)
+            | Self::DelegateList(_)
+            | Self::MsgList(_)
+            | Self::MsgRead(_)
+            | Self::MsgOperatorList(_)
+            | Self::MsgOperatorRead(_)
+            | Self::MsgStatus(_)
+            | Self::MsgWaitReply(_)
+            | Self::MeshHello(_)
+            | Self::MeshRoutes { .. }
+            | Self::MeshDeliver(_)
+            | Self::MeshCollect(_)
+            | Self::PaneList(_)
+            | Self::PaneGet(_)
+            | Self::PaneRead(_)
+            | Self::PaneReportAgent(_)
+            | Self::PaneReportAgentSession(_)
+            | Self::PaneReportPrompt(_)
+            | Self::PaneReportRecap(_)
+            | Self::PaneReportReply(_)
+            | Self::PaneReportMetadata(_)
+            | Self::PaneStashShow(_)
+            | Self::EventsSubscribe(_)
+            | Self::EventsWait(_)
+            | Self::EventsRead(_)
+            | Self::PaneWaitForOutput(_)
+            | Self::ChecksList(_)
+            | Self::DigestRender(_)
+            | Self::FleetStatus(_)
+            | Self::WaitHold(..)
+            | Self::WaitRelease(_) => false,
+            Self::NotificationShow(_)
+            | Self::NotificationAck(_)
+            | Self::WorkspaceCreate(_)
+            | Self::WorkspaceFocus(_)
+            | Self::WorkspaceRename(_)
+            | Self::WorkspaceClose(_)
+            | Self::WorktreeCreate(_)
+            | Self::WorktreeOpen(_)
+            | Self::WorktreeRemove(_)
+            | Self::WorktreeKill(_)
+            | Self::TabCreate(_)
+            | Self::TabFocus(_)
+            | Self::TabRename(_)
+            | Self::TabClose(_)
+            | Self::PeersCheckoutPrepare(_)
+            | Self::PeersEnrollReset(_)
+            | Self::OwnerPolicyAdopt(_)
+            | Self::AgentSend(_)
+            | Self::AgentSpawn(_)
+            | Self::AgentRename(_)
+            | Self::AgentFocus(_)
+            | Self::AgentStart(_)
+            | Self::AgentStop(_)
+            | Self::AgentFork(_)
+            | Self::AgentHibernate(_)
+            | Self::AgentResume(_)
+            | Self::AgentRestart(_)
+            | Self::MsgSend(_)
+            | Self::MsgReply(_)
+            | Self::MsgWake(_)
+            | Self::MsgMute(_)
+            | Self::HookDecide(_)
+            | Self::PaneSplit(_)
+            | Self::PaneMove(_)
+            | Self::PaneRename(_)
+            | Self::SessionRetainedPurge(_)
+            | Self::ClientGrantAdd(_)
+            | Self::ClientGrantList(_)
+            | Self::ClientGrantRevoke(_)
+            | Self::ClientTokenAdd(_)
+            | Self::ClientTokenRemove(_)
+            | Self::ClientTokenList(_)
+            | Self::ClientOpen(_)
+            | Self::ClientAppMint(_)
+            | Self::ChannelHello(_)
+            | Self::WaitPark(_)
+            | Self::DelegateRebind(_)
+            | Self::OwnerBind(_)
+            | Self::OwnerUnbind(_)
+            | Self::GoalArm(_)
+            | Self::GoalPause(_)
+            | Self::GoalResume(_)
+            | Self::GoalStop(_)
+            | Self::PaneSendText(_)
+            | Self::PaneWriteText(_)
+            | Self::PaneSendKeys(_)
+            | Self::PaneResolveCodexLock(_)
+            | Self::PaneSendInput(_)
+            | Self::PaneWriteKeys(_)
+            | Self::PaneWriteInput(_)
+            | Self::PaneSubmit(_)
+            | Self::PaneArmSelfCompact(_)
+            | Self::PaneStashRestore(_)
+            | Self::PaneSetHeaderField(_)
+            | Self::PaneClearHeaderField(_)
+            | Self::PaneClearAgentAuthority(_)
+            | Self::PaneReleaseAgent(_)
+            | Self::PaneClose(_)
+            | Self::IntegrationInstall(_)
+            | Self::IntegrationUninstall(_)
+            | Self::ChecksAck(_)
+            | Self::ChecksRun(_)
+            | Self::FleetPause(_)
+            | Self::FleetResume(_)
+            | Self::StructuredGrantsRevoke(_)
+            | Self::ProfileEnable(_)
+            | Self::ProfilePlan(_)
+            | Self::ProfileBind(_)
+            | Self::ProfileRevoke(_)
+            | Self::RevertRun(_) => true,
+        }
+    }
+}
+
+/// Operator-selected identity for a client-side delegate record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegateRebindParams {
+    pub name: String,
+    pub agent_id: String,
+    pub previous_agent_id: Option<String>,
+}
+
+/// Binding commits use the same closed plan/digest shape as reviewed enablement.
+pub type ProfileBindParams = ProfileEnableParams;
+
+/// Reviewed enable transaction identifiers (ADR-0052 §9).
+///
+/// Slice 1 refuses before consulting a plan. Slice 17 implements plan lookup,
+/// digest/revision validation and the complete production activation transaction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileEnableParams {
+    /// Operator-reviewed plan identifier.
+    pub plan: String,
+    /// Expected immutable review-plan digest.
+    pub expect: String,
 }
 
 /// `revert.run` params.
@@ -561,6 +937,9 @@ pub struct TabTarget {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceCreateParams {
+    /// Resolve the allocation plan without creating resources.
+    #[serde(default)]
+    pub dry_run: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     #[serde(default)]
@@ -593,6 +972,9 @@ pub struct WorktreeListParams {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct WorktreeCreateParams {
+    /// Resolve the allocation plan without creating resources.
+    #[serde(default)]
+    pub dry_run: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -674,10 +1056,17 @@ pub struct WorktreeKillParams {
     /// cwd inside the checkout when a kill is run from in there.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub caller_pid: Option<u32>,
+    /// MCP self-kill confirmation: Some(false) guards the caller's workspace,
+    /// Some(true) permits it. None preserves the CLI's existing behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_kill_confirmed: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TabCreateParams {
+    /// Resolve the allocation plan without creating resources.
+    #[serde(default)]
+    pub dry_run: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -701,6 +1090,7 @@ pub struct TabRenameParams {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct AgentTarget {
     pub target: String,
 }
@@ -757,6 +1147,10 @@ pub const AGENT_RESULT_MAX_CHARS: u32 = 64 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentResultInfo {
     pub pane_id: String,
+    /// Terminal resolved together with the session used for this read.
+    /// Older servers omit this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_id: Option<String>,
     pub workspace_id: String,
     /// `claude` or `opencode`: whose store the reply was read from.
     pub agent: String,
@@ -764,6 +1158,10 @@ pub struct AgentResultInfo {
     /// The newest turn has finished. False means the agent is still working
     /// (or a prompt is pending), and `text` is the reply of an EARLIER turn.
     pub finished: bool,
+    /// The turn ended with background shells or agents still running
+    /// (#922), as `agent.get` reports it. Omitted when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub settled_with_background_shells: bool,
     /// From the reply's final `DONE:` / `BLOCKED:` / `VERDICT:` line,
     /// lower-cased; absent when it ends on none of them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -780,6 +1178,12 @@ pub struct AgentResultInfo {
     pub next_offset: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub at_ms: Option<u64>,
+    /// When the newest turn began, while the harness's own record shows it
+    /// still running (#1257); the same value rides on a `no_result` refusal as
+    /// `data.turn_open_at_ms`. Claude only. Absent when the turn is over or
+    /// the record cannot date it, and older servers never send it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_open_at_ms: Option<u64>,
 }
 
 /// Turns returned by `agent.history` when the caller names no `limit`.
@@ -790,10 +1194,69 @@ pub const AGENT_HISTORY_DEFAULT_TURNS: u32 = 20;
 /// poll and a response nobody can read.
 pub const AGENT_HISTORY_MAX_TURNS: u32 = 200;
 
+/// Durable `agent.send` acknowledgement shared with the operator queue API.
+/// This lifecycle UUID names custody; execution is reported by queue facts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct AgentSendResult {
+    /// Canonical queue item identity, stable across identical admission retries.
+    pub item_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentSendParams {
+    /// Optional canonical UUID for idempotent structured admission retries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_id: Option<String>,
+    /// Raw-write milliseconds: integer 1..=30000, default 10000. Not a submit budget.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_write_timeout"
+    )]
+    pub write_timeout_ms: Option<serde_json::Value>,
     pub target: String,
     pub text: String,
+    /// Terminal: guard the composer, send delayed Enter and confirm the submit.
+    /// Structured: admit one durable at-idle item and acknowledge its lifecycle UUID.
+    /// False is refused for structured targets before queue or stdin work.
+    #[serde(default)]
+    pub submit: bool,
+    /// Without `submit`, type even when the target is an agent pane whose composer holds a
+    /// draft, or while an injection holds the pane (#1162). Off by default:
+    /// the server then refuses with `input_not_empty` or `injection_pending`
+    /// before typing, so automated text never merges into an operator draft.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub raw: bool,
+}
+
+/// A one-time launch selector omitted from a same-session restart.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestartDroppedFlag {
+    /// The option name or alias, without its original value.
+    pub flag: String,
+    /// Why the existing session or working directory replaces this selector.
+    pub reason: String,
+}
+
+/// Queue a server-owned restart. The caller must finish its requesting turn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct AgentRestartParams {
+    #[serde(default = "restart_self")]
+    pub target: String,
+    pub reason: String,
+    #[serde(default)]
+    pub continue_with: Option<String>,
+    #[serde(default = "restart_after_turn")]
+    pub when: String,
+}
+fn restart_self() -> String {
+    "self".into()
+}
+fn restart_after_turn() -> String {
+    "after_turn".into()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -803,8 +1266,34 @@ pub struct AgentRenameParams {
     pub name: Option<String>,
 }
 
+/// Execution mode; omitted selectors preserve the terminal start contract.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub enum AgentRuntime {
+    /// Traditional terminal-backed launch.
+    #[default]
+    Pty,
+    /// Restricted pane-free Claude session.
+    Structured,
+}
+impl AgentRuntime {
+    fn is_pty(&self) -> bool {
+        *self == Self::Pty
+    }
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct AgentStartParams {
+    /// Explicit opt-in, sent only to a server advertising structured_agents.
+    #[serde(default, skip_serializing_if = "AgentRuntime::is_pty")]
+    pub runtime: AgentRuntime,
+    /// Structured model selector, never raw launch flags.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Resolve the allocation plan without creating resources.
+    #[serde(default)]
+    pub dry_run: bool,
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
@@ -837,6 +1326,20 @@ pub struct AgentStartParams {
     #[serde(default)]
     pub focus: bool,
     pub argv: Vec<String>,
+    /// #959: free text recorded on the delegation edge, e.g. `#614`. Sent
+    /// only to a server advertising `ServerCapabilities::agent_start_label`
+    /// (#868): an older one would drop it without a word.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// #1179, ADR-0034 §2: where the new agent's questions go. Omitted, it
+    /// is defaulted from the caller. Sent only to a server advertising
+    /// `ServerCapabilities::agent_questions` (#868).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub questions: Option<QuestionPolicy>,
+    /// #1179: nobody will watch this agent's pane, so its default policy is
+    /// `ask_operator` rather than `ask_human`. Refused for an agent caller.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub unattended: bool,
 }
 
 /// `skip_serializing_if` predicate for a defaulted `bool` flag: absent on the
@@ -850,6 +1353,12 @@ fn is_false(value: &bool) -> bool {
 /// `AgentStartParams`: no argv, no cwd, no pane placement.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentSpawnParams {
+    /// Explicit structured opt-in, sent only after capability negotiation.
+    #[serde(default, skip_serializing_if = "AgentRuntime::is_pty")]
+    pub runtime: AgentRuntime,
+    /// Structured model selector; PTY callers must omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// Which agent to launch. A closed set — see `spawn::AgentKind`.
     pub agent: String,
     /// The child's opening turn. Passed to the agent as a single positional
@@ -863,6 +1372,15 @@ pub struct AgentSpawnParams {
     pub name: Option<String>,
     #[serde(default)]
     pub focus: bool,
+    /// #1179, ADR-0034 §2: where the new agent's questions go. Omitted, it
+    /// is defaulted from the caller. Sent only to a server advertising
+    /// `ServerCapabilities::agent_questions` (#868).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub questions: Option<QuestionPolicy>,
+    /// #1179: nobody will watch this agent's pane, so its default policy is
+    /// `ask_operator` rather than `ask_human`. Refused for an agent caller.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub unattended: bool,
 }
 
 /// Where an `agent.spawn` child runs (#329).
@@ -893,6 +1411,9 @@ pub enum SpawnLocation {
 /// optionally seeded with a pivot prompt as its opening turn.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentForkParams {
+    /// Resolve the allocation plan without creating resources.
+    #[serde(default)]
+    pub dry_run: bool,
     /// Pane id, terminal id, or agent name — same grammar as `agent.send`.
     pub target: String,
     /// New branch name; a slug is generated when omitted.
@@ -915,6 +1436,15 @@ pub struct AgentForkParams {
     pub pivot: Option<String>,
     #[serde(default)]
     pub focus: bool,
+    /// #1179, ADR-0034 §2: where the new agent's questions go. Omitted, it
+    /// is defaulted from the caller. Sent only to a server advertising
+    /// `ServerCapabilities::agent_questions` (#868).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub questions: Option<QuestionPolicy>,
+    /// #1179: nobody will watch this agent's pane, so its default policy is
+    /// `ask_operator` rather than `ask_human`. Refused for an agent caller.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub unattended: bool,
 }
 
 /// Walk the fork ancestry of a pane/worktree (#175 O1, US-4). Target uses
@@ -946,6 +1476,63 @@ pub struct LineageNode {
     pub worktree: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+}
+
+/// `delegate.list` (#960, ADR-0027 §2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegateListParams {
+    /// `self` (the attested caller), `all`, or an architect's agent id.
+    #[serde(default = "delegate_list_self")]
+    pub architect: String,
+    /// Only the edge whose delegate works on this branch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    /// Only edges in this repository (the edge's repo key).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+}
+
+fn delegate_list_self() -> String {
+    "self".to_string()
+}
+
+/// One architect -> delegate edge joined with what the server has cached
+/// about the delegate. Nothing here costs a git or `gh` call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegateRow {
+    pub architect: String,
+    pub delegate: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub via: DelegationVia,
+    /// `live` | `hibernated, awaiting merge` | `gone` |
+    /// `gone, worktree retained` | `orphaned` | `closed, not merged`.
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// The harness, when the delegate is still an agent here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_status: Option<AgentStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_age_secs: Option<u64>,
+    pub edge_age_secs: u64,
+    pub workspace_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    /// The PR poller's cached answer for the branch, never a live read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr: Option<PrInfo>,
+    /// The delegate's question policy (#1179), while it is an agent here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub questions: Option<QuestionPolicy>,
 }
 
 /// Does the sender want an answer (#280, R4 of #213)?
@@ -1032,19 +1619,6 @@ impl MsgIntent {
         !matches!(self, Self::Fyi)
     }
 
-    /// Parse a spelling that arrived over the cross-host relay, where the
-    /// sender may run a newer build than this one (ADR-0018 §1). An unknown
-    /// tier is read as `needs_reply`: version skew fails toward the recipient
-    /// hearing about it, never toward silence. The flag is true when that
-    /// degradation happened, so the caller can log it.
-    #[must_use]
-    pub fn from_wire_relayed(value: &str) -> (Self, bool) {
-        match Self::from_wire(value) {
-            Some(intent) => (intent, false),
-            None => (Self::NeedsReply, true),
-        }
-    }
-
     /// Parse a caller-supplied spelling. `needs-reply` is accepted alongside
     /// `needs_reply` because every prose mention of this field hyphenates it,
     /// and refusing the spelling people already write buys nothing.
@@ -1074,6 +1648,50 @@ pub enum MessageTarget {
     /// means the same thing on every host: pane ids name a placement on ONE
     /// server, so they cannot address across machines.
     Agent { agent: String },
+}
+
+/// Accepted human-facing message addresses (ADR-0029 §5).
+pub(crate) const MESSAGE_TARGET_EXPECTED: &str =
+    "a pane id, terminal id, unique agent name or fleet agent id as a string, \
+     or a tagged pane, repo_pane or agent object";
+
+impl MessageTarget {
+    /// Whether an unscoped address has a well-formed agent id (ADR-0029 §5).
+    ///
+    /// Both `Pane` and `Agent` fields can contain an agent id. `RepoPane` is
+    /// always repo-scoped, even when its pane text looks like an agent id.
+    /// This checks format only, not existence or routing; server and MCP use
+    /// it to avoid suggesting a new shape for an unknown but valid id.
+    /// Format and length limits come from [`crate::terminal::AgentId::is_well_formed`].
+    pub(crate) fn is_well_formed_agent_id(&self) -> bool {
+        match self {
+            Self::Pane { pane: target } | Self::Agent { agent: target } => {
+                crate::terminal::AgentId::is_well_formed(target)
+            }
+            Self::RepoPane { .. } => false,
+        }
+    }
+
+    /// Accepted argument forms for CLI/socket/MCP target refusals.
+    pub(crate) fn expected_shapes() -> serde_json::Value {
+        serde_json::json!([
+            "a pane id, terminal id, unique agent name or fleet agent id as a string",
+            {"type": "pane", "pane": "<pane>"},
+            {"type": "repo_pane", "repo": "<repo>", "pane": "<pane>"},
+            {"type": "agent", "agent": "<agent_id>"},
+        ])
+    }
+
+    /// Convert CLI/MCP shorthand to the existing wire shape. Fleet identities
+    /// retain their routing semantics instead of becoming server-local panes
+    /// (ADR-0008, Mesh amendment). Other strings use the shared pane resolver.
+    pub(crate) fn from_bare(target: String) -> Self {
+        if crate::terminal::AgentId::is_well_formed(&target) {
+            Self::Agent { agent: target }
+        } else {
+            Self::Pane { pane: target }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1111,58 +1729,6 @@ pub struct MsgSendParams {
     /// never authorization, so a claim is all this ever needs to be.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from_agent: Option<String>,
-    /// Host the sender is on, asserted alongside `from_agent` by a relay.
-    ///
-    /// The receiver cannot derive this: the sending host is by definition not
-    /// itself, and its directory may not carry the sender. Without it the
-    /// receiver had to guess, and guessed its own host.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub from_host: Option<String>,
-    /// The spelling a relay carried when this build did not recognise it
-    /// (ADR-0018 §1). The receiving CLI has already read it as `needs_reply`;
-    /// this travels on so the SERVER — the process with a log — records the
-    /// skew, instead of the note dying on the stderr of an ssh-invoked CLI.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub intent_unrecognised: Option<String>,
-}
-
-/// One message a spoke hands up to its hub (#410).
-///
-/// A spoke has no `[[peers]]` — deliberately, the fleet refuses N×N trust —
-/// so the only channel it has to the rest of the fleet is the relay the hub
-/// holds INTO it. The frame rides that relay upward as a push, the hub runs
-/// its ordinary `msg.send` on `message`, and the answer comes back down keyed
-/// by `uplink_id`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct UplinkFrame {
-    /// Correlates the hub's answer with the send waiting for it. The message's
-    /// own `correlation_id` is the idempotency key end to end; this one only
-    /// pairs a result with its caller.
-    pub uplink_id: String,
-    /// The send as the spoke attested it: `from_agent` and `from_host` are the
-    /// ORIGINATING sender, never the hub.
-    pub message: MsgSendParams,
-}
-
-/// `msg.uplink_take` — the relay collecting frames to push up (#410).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MsgUplinkTakeParams {
-    /// Frames the relay has already written up the pipe. Until a frame is
-    /// acknowledged it is re-offered, so a relay that died between taking a
-    /// frame and writing it does not lose the message; the recipient's mailbox
-    /// dedupes on `correlation_id`, so a re-offer cannot double-deliver.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub ack: Vec<String>,
-}
-
-/// `msg.uplink_result` — the hub's answer to one handed-up frame (#410).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct MsgUplinkResultParams {
-    pub uplink_id: String,
-    /// The hub's own name for itself: what the spoke reports as `via <hub>`.
-    pub hub: String,
-    /// The hub's `msg.send` response, verbatim: a success or an error body.
-    pub response: serde_json::Value,
 }
 
 /// Reply to a delivered message: routed back to the original sender's pane,
@@ -1189,12 +1755,12 @@ pub struct MsgReplyParams {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct MsgListParams {
-    /// Restrict to one recipient pane (any bare-pane target shape).
+    /// Recipient target. Omitted means attested self, or an audited operator global list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pane: Option<String>,
 }
 
-/// `msg.read` — CONSUME a pane's inbox (ADR-0008).
+/// `msg.read` — CONSUME the attested caller's inbox (ADR-0008, ADR-0036 §3).
 ///
 /// Deliberately a separate verb from `msg.list` rather than a flag on it:
 /// peeking and consuming differ in their side effects, and a boolean that
@@ -1203,10 +1769,17 @@ pub struct MsgListParams {
 /// non-destructive view; this is the recipient's read.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MsgReadParams {
-    /// Whose inbox. Omitted means the caller's own pane, resolved from the
-    /// connection the way `msg.send` resolves its sender.
+    /// Omitted means the caller's own pane or structured identity, attested from
+    /// the connection. A native target cannot claim another agent's inbox.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pane: Option<String>,
+}
+
+/// A required local pane target; operator authority is checked before lookup.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MsgOperatorInboxParams {
+    pub pane: String,
 }
 
 /// `msg.status` — what became of one message, asked by whoever sent it.
@@ -1216,6 +1789,8 @@ pub struct MsgReadParams {
 /// correlation id and then the trail went cold.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MsgStatusParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference: Option<crate::mesh::store::StatusReference>,
     pub correlation_id: String,
 }
 
@@ -1226,6 +1801,8 @@ pub struct MsgStatusParams {
 /// a sender with no pane (an ssh shell, a script) can still be told.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MsgWaitReplyParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference: Option<crate::mesh::store::StatusReference>,
     pub correlation_id: String,
     /// How long to hold the request. Absent means
     /// [`MSG_WAIT_REPLY_MAX_MS`], the age at which an unread message is
@@ -1288,6 +1865,62 @@ pub struct MsgWakeParams {
     pub pane: Option<String>,
 }
 
+/// `hook.decide` — the verdict for one harness hook call (ADR-0034 §1).
+///
+/// The calling pane is attested from the caller's process ancestry, never
+/// taken from the request, and its agent record's question policy decides.
+/// A caller the server cannot attest gets `no_caller_pane`, which the hook
+/// treats like an unreachable server (ADR-0034 §4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HookDecideParams {
+    pub point: HookPoint,
+    pub harness: HookHarness,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// The tool the harness is about to run, as the harness names it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+}
+
+/// The policy points `hook.decide` serves (ADR-0034 §1). Only `question` is
+/// wired so far: the shell gate's `tool.before` lands with #1181.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HookPoint {
+    #[serde(rename = "question")]
+    Question,
+}
+
+/// The harness whose hook is asking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookHarness {
+    Claude,
+    Codex,
+    Opencode,
+}
+
+impl HookHarness {
+    /// The harness's own question tools (ADR-0034 inventory): the tools a
+    /// `question` point is about, beside `[questions] human_tools`.
+    pub fn question_tools(self) -> &'static [&'static str] {
+        match self {
+            Self::Claude => &["AskUserQuestion", "ExitPlanMode"],
+            Self::Codex => &["request_user_input"],
+            Self::Opencode => &["question"],
+        }
+    }
+}
+
+/// A `hook.decide` verdict. `answer` and `defer` arrive with #1183.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookVerdict {
+    /// Let the call through: the harness behaves as it would without flk.
+    Pass,
+    /// Refuse the call. The reason goes to the model.
+    Deny,
+}
+
 /// `msg.mute` — the recipient declines to be woken, for a bounded window
 /// (#316 C).
 ///
@@ -1310,8 +1943,40 @@ pub struct MsgMuteParams {
     pub reason: Option<String>,
 }
 
+/// Local keyboard submission evidence, independent of mailbox read receipts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeliveryAttempt {
+    pub attempt_id: String,
+    pub pane: String,
+    pub correlation_ids: Vec<String>,
+    pub wake: bool,
+    pub state: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+    pub queued_at_ms: u64,
+    #[serde(default)]
+    pub typed_at_ms: Option<u64>,
+    #[serde(default)]
+    pub submit_sent_at_ms: Option<u64>,
+    #[serde(default)]
+    pub finished_at_ms: Option<u64>,
+    pub retried: bool,
+    /// An operator draft moved aside for this injection (#850): `stashed`
+    /// while it is held, then `restored`, `untouched` (never cleared) or
+    /// `kept` (left in the pane's stash for `flk pane stash`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft: Option<String>,
+    /// Operator keystrokes held for this injection (#850) could not be
+    /// replayed because the pane refused them (a closed pane or a writer
+    /// accepting zero bytes, #1011). They are lost.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub held_input_not_written: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueuedMessageInfo {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attempts: Vec<DeliveryAttempt>,
     pub correlation_id: String,
     pub to_pane: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1361,6 +2026,9 @@ pub struct InboxMessage {
     /// `from_pane` is absent — surfaced so the recipient never attempts a
     /// reply that would fail.
     pub replyable: bool,
+    /// Durable return binding, or explicit best-effort pre-mesh routing.
+    #[serde(default)]
+    pub reply_contract: String,
     /// What the sender said it wanted (#280). A field on the envelope, which
     /// is the whole point: `needs_reply` is knowable before the body is read,
     /// where a sentence asking for an answer is not.
@@ -1371,6 +2039,9 @@ pub struct InboxMessage {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneSplitParams {
+    /// Resolve the allocation plan without creating resources.
+    #[serde(default)]
+    pub dry_run: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_id: Option<String>,
     pub target_pane_id: String,
@@ -1383,6 +2054,7 @@ pub struct PaneSplitParams {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum SplitDirection {
     Right,
     Down,
@@ -1462,14 +2134,67 @@ pub struct PaneRenameParams {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneSendTextParams {
+    /// Raw-write milliseconds: integer 1..=30000, default 10000. Not a submit budget.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_write_timeout"
+    )]
+    pub write_timeout_ms: Option<serde_json::Value>,
     pub pane_id: String,
     pub text: String,
+    /// Type even when the target is an agent pane whose composer holds a
+    /// draft, or while an injection holds the pane (#1162). Off by default:
+    /// the server then refuses with `input_not_empty` or `injection_pending`
+    /// before typing, so automated text never merges into an operator draft.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub raw: bool,
+}
+
+/// Preserve explicit null for validation; only an absent timeout gets the default.
+fn present_write_timeout<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<serde_json::Value>, D::Error> {
+    serde_json::Value::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneSendKeysParams {
+    /// Integer milliseconds, validated before admission: 1..=30000, default 10000.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_write_timeout"
+    )]
+    pub write_timeout_ms: Option<serde_json::Value>,
     pub pane_id: String,
     pub keys: Vec<String>,
+}
+
+/// An operator's explicit choice on Codex's conversation-lock screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexLockChoice {
+    /// Continue the existing conversation in this pane.
+    Retry,
+    /// Fork the conversation in this pane.
+    Fork,
+}
+
+/// A single guarded key, never an automatic reply or a submitted brief.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneResolveCodexLockParams {
+    /// Same validated write budget as `pane.send_keys`; absent means 10000 ms.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_write_timeout"
+    )]
+    pub write_timeout_ms: Option<serde_json::Value>,
+    /// The pane whose live screen must still show the lock before writing.
+    pub pane_id: String,
+    /// Exactly one `r` or `f`, without Enter.
+    pub choice: CodexLockChoice,
 }
 
 /// `pane.arm_self_compact` params.
@@ -1503,19 +2228,59 @@ pub struct PaneArmSelfCompactParams {
     /// and non-empty unless `abort` is set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continuation: Option<String>,
+    /// What the compaction's summary should keep, typed after the compact
+    /// command as `/compact <instructions>` (#854). Omitted means a bare
+    /// `/compact`, exactly as before this field existed. One line, checked by
+    /// [`crate::agent_self_compact::check_instructions`], and refused for a
+    /// harness whose compact command takes no argument.
+    ///
+    /// Additive and optional, so it needed no protocol bump: an older client
+    /// never sends it, and an older server that ignores it is caught by the
+    /// `instructions` flag on the answer instead (see
+    /// [`crate::agent_self_compact::instructions_dropped`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
     /// Drop an armed self-compaction instead of arming one, for an agent that
     /// armed by mistake. Answers what it dropped.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub abort: bool,
 }
 
+/// Server-side guarded agent submission for clients that cannot safely read then send.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PaneSubmitParams {
+    /// MCP caller-workspace confirmation, matching the worktree teardown guard.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_submit_confirmed: Option<bool>,
+    pub pane_id: String,
+    pub text: String,
+    #[serde(default)]
+    pub if_session: Option<String>,
+    #[serde(default)]
+    pub min_age_secs: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneSendInputParams {
+    /// Integer milliseconds, validated before admission: 1..=30000, default 10000.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_write_timeout"
+    )]
+    pub write_timeout_ms: Option<serde_json::Value>,
     pub pane_id: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub text: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub keys: Vec<String>,
+    /// Type `text` even when the target is an agent pane whose composer holds a
+    /// draft, or while an injection holds the pane (#1162). Off by default:
+    /// the server then refuses with `input_not_empty` or `injection_pending`
+    /// before typing, so automated text never merges into an operator draft.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub raw: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1526,6 +2291,28 @@ pub struct ServerLiveHandoffParams {
     pub expected_protocol: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_version: Option<String>,
+    /// Hand off even when a pane's queued input will not drain, dropping and
+    /// reporting what was pending per pane (#981, #1011). Opt-in: without it a
+    /// stuck pane fails the handoff and the error names it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub skip_undrained: bool,
+}
+
+/// A pane whose queued PTY input did not drain before a live handoff (#981).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UndrainedPane {
+    /// The public pane id (`wX:pN`), or the internal number when the pane has
+    /// no public id.
+    pub pane_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    pub pending_bytes: usize,
+    /// The pane's writer kept accepting zero bytes, rather than the drain
+    /// simply running out of time.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub writer_stuck: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1594,6 +2381,9 @@ pub struct PaneReportReplyParams {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneReportAgentSessionParams {
+    /// Recovery must still address the recorded agent at this pane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rebind_agent_id: Option<String>,
     pub pane_id: String,
     pub source: String,
     pub agent: String,
@@ -1678,6 +2468,12 @@ pub enum ReadSource {
     Visible,
     Recent,
     RecentUnwrapped,
+    /// The unscrolled screen used by agent detection, excluding scrollback.
+    Detection,
+    /// `Detection`, plus the same rows with faint cells blanked in the
+    /// result's `unfaint`, from one read. A composer whose text is all faint
+    /// shows only the agent's own suggestion (#892).
+    DetectionUnfaint,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1691,11 +2487,22 @@ pub enum ReadFormat {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventsSubscribeParams {
     pub subscriptions: Vec<Subscription>,
+    /// Legacy replay cursor. Loss retains the `lagged` wire frame.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<u64>,
+    /// Explicit opt-in to typed loss and resumable sequences, strictly after
+    /// this cursor. Requires `events_live_start`; mutually exclusive with `after`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_sequence: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum Subscription {
+    #[serde(rename = "mesh.routes_changed")]
+    MeshRoutesChanged {},
+    #[serde(rename = "mesh.outbound_pending")]
+    MeshOutboundPending {},
     #[serde(rename = "workspace.created")]
     WorkspaceCreated {},
     #[serde(rename = "workspace.updated")]
@@ -1753,6 +2560,170 @@ pub enum Subscription {
     MsgQueued { pane: String },
 }
 
+/// `events.read` (ADR-0028 §3): every durable event with `seq > after`,
+/// served from the ring and then from the rotated log files on disk.
+/// Delivery is at-least-once, so consumers dedupe on `seq`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventsReadParams {
+    #[serde(default)]
+    pub after: u64,
+    /// Durable kinds only; empty means every durable kind.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kinds: Vec<EventKind>,
+    /// Matches an event whose data carries one of these as a top-level
+    /// string value (a pane, workspace, agent or message id).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subjects: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    /// Hold the request until a matching event arrives, at most
+    /// `[events] read_max_wait_ms`. Absent or 0 answers at once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_ms: Option<u64>,
+}
+
+/// `wait.park` (ADR-0028 §5, #1031). `until` is a predicate text the server
+/// parses (`crate::api::wait_predicate`); `deadline_ms` is relative and
+/// mandatory: a park that never opens still ends.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WaitParkParams {
+    pub until: String,
+    pub deadline_ms: u64,
+}
+
+/// `owner.policy.show` and `owner.policy.adopt` (ADR-0035 §6.2, #1195).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnerPolicyParams {
+    /// Any path inside the repo: a checkout or one of its worktrees. The
+    /// server reads through the repo's git common dir either way.
+    pub repo: String,
+    /// `adopt` only: the version the operator saw in `show`, the `.flk.toml`
+    /// blob id, or null when the default branch has no `.flk.toml`. Adoption
+    /// is refused when it is no longer the current one.
+    #[serde(default)]
+    pub policy_version: Option<String>,
+}
+
+/// `channel.hello` (ADR-0028 §8, #1037): a channel adapter's first call,
+/// proving it holds the binding's capability token. Gated as state-changing
+/// (#868) so an adapter refuses to start against a server without it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelHelloParams {
+    pub binding: String,
+    pub token: crate::channels::ChannelToken,
+}
+
+/// `owner.bind` (ADR-0035 §1). The node is the serving node and the
+/// `AgentId` is minted by the server, so neither is a parameter.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnerBindParams {
+    /// The GitHub slug, `owner/name`.
+    pub repo: String,
+    /// Absolute path of the owner's checkout on the serving node.
+    pub checkout: String,
+    pub harness: OwnerHarness,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// The profile ladder, first choice first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub profiles: Vec<String>,
+}
+
+/// `owner.unbind` and `owner.show`: the GitHub slug of a bound repo.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnerRepoParams {
+    pub repo: String,
+}
+
+/// `goal.arm` (ADR-0030 §1). `target` names the agent: `self` (the
+/// default when empty) is the agent whose pane runs the caller.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoalArmParams {
+    #[serde(default)]
+    pub target: String,
+    pub goal: String,
+    /// The frozen check commands of the done gate (rung 6).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checks: Vec<String>,
+}
+
+/// `goal.status` and `goal.resume`: the agent whose goal is meant. `self`
+/// (the default when empty) is the caller's own agent. An `AgentId` that has
+/// a goal names it even when the agent has no live pane.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoalTargetParams {
+    #[serde(default)]
+    pub target: String,
+}
+
+/// `goal.pause`. Without `minutes` the goal stays paused until resumed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoalPauseParams {
+    #[serde(default)]
+    pub target: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minutes: Option<u64>,
+}
+
+/// `goal.stop`. `reason` is recorded on the `GoalDisarmed` event.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoalStopParams {
+    #[serde(default)]
+    pub target: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// The harness an owner binding names (ADR-0035 §1, `bind --harness`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OwnerHarness {
+    Claude,
+    Codex,
+    Opencode,
+}
+
+/// A repo's resident-owner binding (ADR-0035 §1): durable server state set
+/// only by operator verbs, never read from the repo (§6.2). The owner keeps
+/// `agent_id` for life: binding a bound repo again changes the other fields
+/// and keeps it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnerBinding {
+    pub repo: String,
+    /// The home node, named statically: no lease, no failover.
+    pub node: String,
+    pub agent_id: String,
+    pub checkout: String,
+    pub harness: OwnerHarness,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub profiles: Vec<String>,
+    /// When the repo was first bound (Unix ms). A re-bind keeps it.
+    pub since_ms: u64,
+}
+
+/// ADR-0028 owner decision 3: the default for `[events] read_max_wait_ms`.
+pub const EVENTS_READ_MAX_WAIT_MS: u64 = 540_000;
+pub const EVENTS_READ_DEFAULT_LIMIT: u32 = 256;
+pub const EVENTS_READ_MAX_LIMIT: u32 = 4096;
+
+/// Sequences this server no longer retains, both ends inclusive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventGap {
+    pub from: u64,
+    pub to: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SequencedEvent {
+    pub seq: u64,
+    #[serde(flatten)]
+    pub envelope: EventEnvelope,
+}
+
+/// The ADR-0028 successor is `events.read`. This variant still has no
+/// handler.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventsWaitParams {
     pub match_event: EventMatch,
@@ -1879,6 +2850,13 @@ pub enum EventMatch {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventKind {
+    /// ADR-0028 §3: re-read the merged directory after this durable invalidation.
+    DirectoryChanged,
+    StructuredGrantRevoked,
+    /// ADR-0036 §4: committed queue item transition, linked to its queue cursor.
+    QueueItemState,
+    MeshRoutesChanged,
+    MeshOutboundPending,
     WorkspaceCreated,
     WorkspaceUpdated,
     WorkspaceClosed,
@@ -1897,6 +2875,13 @@ pub enum EventKind {
     PaneAgentDetected,
     PaneAgentStatusChanged,
     AgentForked,
+    /// #959 / ADR-0027 §1: an attested agent started another agent. See
+    /// `EventData::AgentDelegated`.
+    AgentDelegated,
+    /// Operator approved a local registry rebind; not an ownership edge.
+    DelegateRebindAuthorized,
+    AgentRemoved,
+    DeliveryAttemptUpdated,
     MessageQueued,
     MessageDelivered,
     MessageReplied,
@@ -1904,6 +2889,22 @@ pub enum EventKind {
     /// ADR-0018 §3: a muted recipient answered a waiting message with an
     /// automatic deferral. See `EventData::MessageDeferred`.
     MessageDeferred,
+    /// ADR-0030 §1 / ADR-0031: an agent's goal record. Every change to a
+    /// goal is one of these durable kinds, and the live record is their fold
+    /// (`app::goals::GoalIndex`). See the matching `EventData` variants.
+    GoalArmed,
+    GoalAmended,
+    GoalStatusSet,
+    GoalSubtaskChanged,
+    GoalVerdict,
+    GoalMet,
+    GoalPaused,
+    GoalResumed,
+    GoalDisarmed,
+    /// ADR-0035 §1: a repo's owner binding. The live bindings are the fold
+    /// of these (`app::owners::OwnerIndex`).
+    OwnerBound,
+    OwnerUnbound,
     /// #175 phase 4 check-runner telemetry.
     CheckRan,
     CheckFired,
@@ -1920,6 +2921,7 @@ pub enum EventKind {
     /// stashed). `AgentResumedFromHibernation` fires when the plan runs.
     AgentHibernated,
     AgentResumedFromHibernation,
+    AgentRestart,
     /// #175 C4 issue-guard: `TriggerFired` on a matched owner-authored
     /// trigger, `TriggerIgnored` on a non-owner post (audit trail),
     /// `TriggerErrored` on a bad fence / YAML.
@@ -1944,6 +2946,44 @@ pub enum EventKind {
     /// here; the BYTES never do. A JSONL audit log is not a blob store, and
     /// ADR-0005's rotation should not be holding 16 MB of base64 hostage.
     FileHandedOver,
+    /// ADR-0028 §2 (#1027): derived supervisor facts, emitted once a phase
+    /// has held for the server settle window. `AgentNeedsHuman`,
+    /// `AgentLimitReached` and `AgentGone` repeat the `AgentPhaseChanged` that
+    /// entered that phase as a kind of their own, for notification routing.
+    /// See `EventData::AgentPhaseChanged`.
+    #[serde(rename = "agent.phase_changed")]
+    AgentPhaseChanged,
+    #[serde(rename = "agent.needs_human")]
+    AgentNeedsHuman,
+    #[serde(rename = "agent.limit_reached")]
+    AgentLimitReached,
+    #[serde(rename = "agent.gone")]
+    AgentGone,
+    /// ADR-0028 §8a (#1038): a question opened on an agent, and closed. See
+    /// `EventData::AgentQuestionOpened`.
+    #[serde(rename = "agent.question_opened")]
+    AgentQuestionOpened,
+    #[serde(rename = "agent.question_closed")]
+    AgentQuestionClosed,
+    /// #1020 / ADR-0028 §2: facts from the batched PR poller. One
+    /// `pr.ci_completed` per head SHA, one `pr.merged` / `pr.closed` per PR.
+    #[serde(rename = "pr.ci_completed")]
+    PrCiCompleted,
+    #[serde(rename = "pr.merged")]
+    PrMerged,
+    #[serde(rename = "pr.closed")]
+    PrClosed,
+    /// ADR-0028 §5 (#1031): a registered wait reached its deadline while
+    /// still open. Emitted once, and the wait is gone.
+    #[serde(rename = "wait.expired")]
+    WaitExpired,
+    /// ADR-0035 §6.2 (#1195): the operator adopted a repo's owner policy.
+    /// See `EventData::OwnerPolicyAdopted`.
+    OwnerPolicyAdopted,
+    /// Audited operator access to a named pane inbox, without message bodies.
+    OperatorInboxAccess,
+    /// Best-effort authenticated wire refusal or bounded suppression summary.
+    WireRefused,
 }
 
 impl EventKind {
@@ -1954,7 +2994,10 @@ impl EventKind {
     /// story; every lifecycle + lineage kind persists.
     pub fn is_persisted(self) -> bool {
         match self {
-            Self::WorkspaceCreated
+            Self::DirectoryChanged
+            | Self::StructuredGrantRevoked
+            | Self::QueueItemState
+            | Self::WorkspaceCreated
             | Self::WorkspaceUpdated
             | Self::WorkspaceClosed
             | Self::WorkspaceRenamed
@@ -1970,7 +3013,22 @@ impl EventKind {
             | Self::PaneExited
             | Self::PaneAgentDetected
             | Self::PaneAgentStatusChanged
+            | Self::AgentRemoved
             | Self::AgentForked
+            | Self::DelegateRebindAuthorized
+            | Self::AgentDelegated
+            | Self::GoalArmed
+            | Self::GoalAmended
+            | Self::GoalStatusSet
+            | Self::GoalSubtaskChanged
+            | Self::GoalVerdict
+            | Self::GoalMet
+            | Self::GoalPaused
+            | Self::GoalResumed
+            | Self::GoalDisarmed
+            | Self::OwnerBound
+            | Self::OwnerUnbound
+            | Self::DeliveryAttemptUpdated
             | Self::MessageQueued
             | Self::MessageDelivered
             | Self::MessageReplied
@@ -1984,6 +3042,7 @@ impl EventKind {
             | Self::WorktreeQuarantined
             | Self::AgentHibernated
             | Self::AgentResumedFromHibernation
+            | Self::AgentRestart
             | Self::TriggerFired
             | Self::TriggerIgnored
             | Self::TriggerErrored
@@ -1992,8 +3051,21 @@ impl EventKind {
             | Self::RunReverted
             | Self::NotificationFiled
             | Self::NotificationSeen
-            | Self::FileHandedOver => true,
-            Self::PaneOutputChanged => false,
+            | Self::FileHandedOver
+            | Self::AgentPhaseChanged
+            | Self::AgentNeedsHuman
+            | Self::AgentLimitReached
+            | Self::AgentGone
+            | Self::AgentQuestionOpened
+            | Self::AgentQuestionClosed
+            | Self::PrCiCompleted
+            | Self::PrMerged
+            | Self::PrClosed
+            | Self::WaitExpired
+            | Self::OwnerPolicyAdopted
+            | Self::OperatorInboxAccess
+            | Self::WireRefused => true,
+            Self::PaneOutputChanged | Self::MeshRoutesChanged | Self::MeshOutboundPending => false,
         }
     }
 }
@@ -2012,18 +3084,169 @@ pub struct ErrorResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ErrorBody {
+    /// Additive detail; malformed shapes are ignored so the primary code survives.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_error_data"
+    )]
+    pub data: Option<Box<ErrorData>>,
     pub code: String,
     pub message: String,
 }
 
+/// Optional detail is advisory: incompatible fields must not hide a refusal.
+fn deserialize_error_data<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Box<ErrorData>>, D::Error> {
+    let raw = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(raw).ok())
+}
+
+/// Structured error evidence with room for unrelated method-specific details.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ErrorData {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_write: Option<InputWriteDetails>,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Encoded-byte evidence, never an assertion about agent consumption.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InputWriteDetails {
+    /// Null for an unknown transport outcome; server receipts carry exact counts.
+    pub bytes_written: Option<u64>,
+    pub bytes_total: Option<u64>,
+    /// Deadline, writer_broken, owner_changed, pane_gone, admission_limit, transport_lost or invalid_reply.
+    pub reason: String,
+    /// True only once remainder retirement is complete, including a late full write.
+    pub remainder_discarded: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeersEnrollResetParams {
+    pub peer: String,
+    #[serde(default)]
+    pub source: crate::mesh::store::PinSource,
+    #[serde(default)]
+    pub preview: bool,
+    #[serde(default)]
+    pub expected_node_id: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerCapabilities {
+    /// Explicit `after_sequence` opt-in, resumable stream sequences and
+    /// typed ring loss.
+    #[serde(default)]
+    pub events_live_start: bool,
+    /// Complete structured CLI/socket and narrowed MCP admission contract.
+    #[serde(default)]
+    pub structured_agents: bool,
+    /// Enabled only after the complete server and client contract (#1639) ships.
+    #[serde(default)]
+    pub pane_input_write_ack: bool,
     pub live_handoff: bool,
+    /// SHA-256 of the persisted Ed25519 public key, not a mesh enrollment claim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clone_detection_warning: Option<String>,
+    /// #959: `agent.start` accepts `label` and records it on the delegation
+    /// edge. Absent on an older server, which is how a client knows to omit
+    /// the field (#868).
+    #[serde(default)]
+    pub agent_start_label: bool,
+    /// #1179: `agent.start`, `agent.spawn` and `agent.fork` accept
+    /// `questions` and `unattended`, and the agent record carries the policy.
+    /// Absent on an older server, which is how a client knows to omit them.
+    #[serde(default)]
+    pub agent_questions: bool,
+}
+
+/// Confirmed local account-policy fault, retained until server restart.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "code", rename_all = "snake_case")]
+pub enum AgentAccountDiagnostic {
+    /// The dedicated agent and server share a UID and cannot be distinguished.
+    AgentAccountUidCollision { uid: u32 },
+}
+
+/// Accept failures retained for the lifetime of the API listener.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApiListenerHealth {
+    #[serde(default)]
+    pub stopped: bool,
+    pub accept_errors: u64,
+    pub last_accept_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponseResult {
+    /// Operator review data or a durable binding mutation receipt.
+    ProfileTransaction {
+        /// Identifiers and reviewed metadata, never resolved credential bytes.
+        #[serde(flatten)]
+        data: serde_json::Value,
+    },
+    /// Inactive binding state, containing no metadata for non-operator callers.
+    ProfileStatus {
+        /// Authorized operator fields; empty for other principals.
+        #[serde(flatten)]
+        status: serde_json::Value,
+    },
+    Retained {
+        records: Vec<crate::structured::registry::RetainedInfo>,
+        forward: usize,
+        dead: usize,
+        removed: usize,
+        purge_hint: Option<String>,
+    },
+    StructuredGrants {
+        agent_id: String,
+        generation: u64,
+        grants: Vec<crate::structured::permissions::grants::SessionGrant>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        revoked: Option<crate::structured::permissions::grants::GrantHandle>,
+    },
+    /// Durable structured admission, before eventual harness delivery.
+    AgentQueued {
+        item_id: String,
+    },
+    ClientTokenIssued {
+        issued: super::client_tokens::Issued,
+    },
+    ClientGrantList {
+        listing: super::gateway_grants::Listing,
+    },
+    ClientTokenList {
+        entries: Vec<super::client_tokens::Listed>,
+    },
+    ClientOpen {
+        url: super::client_tokens::Bearer,
+    },
+    Paste {
+        outcome: String,
+        reason: String,
+        evidence: serde_json::Value,
+    },
+    PaneStash {
+        pane_id: String,
+        drafts: Vec<String>,
+    },
+    GuardedSubmit {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attempt: Option<DeliveryAttempt>,
+        outcome: String,
+        reason: Option<String>,
+        retried: bool,
+    },
+    AllocationPlan {
+        operation: String,
+        plan: serde_json::Value,
+    },
     Pong {
         version: String,
         protocol: u32,
@@ -2035,6 +3258,14 @@ pub enum ResponseResult {
         /// can, and it is the server's context that panes inherit.
         #[serde(default)]
         session_health: Option<crate::platform::SessionHealth>,
+        #[serde(default)]
+        api_listener: Option<ApiListenerHealth>,
+        /// Confirmed structured listener state; failure never stops the server or its PTYs.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_listener: Option<super::client_listener::Status>,
+        /// Missing on older servers; observing status never starts an NSS lookup.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_account_diagnostic: Option<AgentAccountDiagnostic>,
     },
     NotificationShow {
         shown: bool,
@@ -2069,7 +3300,44 @@ pub enum ResponseResult {
         encoding: HandoffEncoding,
         content: String,
     },
+    MeshCollected {
+        #[serde(default)]
+        receipts_acked: Vec<crate::mesh::collect::Receipt>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        receipt: Option<String>,
+        answers: Vec<crate::mesh::delivery::Deliver>,
+    },
+    MeshHello {
+        challenge: crate::mesh::hello::Challenge,
+    },
+    PeersEnrollReset {
+        peer: String,
+        source: crate::mesh::store::PinSource,
+        node_id: Option<String>,
+    },
+    /// `owner.policy.show` / `owner.policy.adopt` (ADR-0035 §6.2, #1195).
+    OwnerPolicy(Box<crate::owner_policy::OwnerPolicyReport>),
+    MeshRoutes {
+        adverts: Vec<crate::mesh::routes::Advert>,
+    },
+    PeersEnrollment {
+        #[serde(default)]
+        mesh_quarantined: usize,
+        #[serde(default)]
+        route_generation: u64,
+        routes: Vec<crate::mesh::routes::Route>,
+        peers: Vec<crate::mesh::hello::Enrollment>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mesh_suspended_reason: Option<String>,
+    },
     PeersSummary {
+        #[serde(default)]
+        outbound_pending: bool,
+        /// This server's persistent per-user node identity.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        node_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        clone_detection_warning: Option<String>,
         /// Short hostname of the answering server.
         host: String,
         /// flock version string of the answering server (spot un-deployed peers).
@@ -2089,6 +3357,13 @@ pub enum ResponseResult {
         /// status-line sampler (no extra sampling cost).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         system: Option<PeerSystemSummary>,
+        /// Pane-free identities; optional for mixed-version fleets (mesh v5).
+        #[serde(
+            default,
+            skip_serializing_if = "Vec::is_empty",
+            deserialize_with = "crate::api::peer_discovery::deserialize"
+        )]
+        structured_agents: Vec<PeerStructuredAgentSummary>,
         workspaces: Vec<PeerWorkspaceSummary>,
         /// Gossip v3 (#101): the answering server's OWN polled peers, so the
         /// polling hub can render two-hop fleet visibility (hub polls spoke2,
@@ -2136,6 +3411,10 @@ pub enum ResponseResult {
         tab: TabInfo,
         root_pane: PaneInfo,
         worktree: WorktreeInfo,
+        /// The public id of the parent workspace when THIS call created it, and
+        /// `None` otherwise.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_workspace_id: Option<String>,
     },
     WorktreeOpened {
         workspace: WorkspaceInfo,
@@ -2171,6 +3450,16 @@ pub enum ResponseResult {
         /// Refused because the branch is the repo default or config-protected
         /// (#121), independent of merge state.
         protected: bool,
+        /// The branch heads an OPEN pull request (#1278). Only ever true on a
+        /// dry run or a `keep_branch` kill: any other real kill of such a
+        /// checkout is refused with `worktree_open_pr` before anything moves.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        open_pr: bool,
+        /// gh could not say whether the branch heads an open PR (#1278), so
+        /// the same refusal applies, as `worktree_merge_unknown`; `evidence`
+        /// carries the reason.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        merge_unknown: bool,
         /// False for a dry run.
         removed: bool,
         branch_deleted: bool,
@@ -2210,9 +3499,24 @@ pub enum ResponseResult {
     AgentInfo {
         agent: AgentInfo,
     },
+    /// Launch admitted but native placement failed. Do not retry as a new start.
+    StructuredAgentStartedUnplaced {
+        agent_id: String,
+        generation: u64,
+        placement_error: ErrorBody,
+    },
+    StructuredAgentInfo {
+        agent: crate::api::structured_agent::StructuredAgentInfo,
+    },
     AgentStarted {
         agent: AgentInfo,
         argv: Vec<String>,
+        /// #959: what this start recorded as its delegation edge:
+        /// `architect <agent id>` for an attested agent caller, or
+        /// `none (unattested)` when ancestry placed the caller in no agent
+        /// pane. Absent from an older server.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        edge: Option<String>,
     },
     AgentForked {
         /// Unique id for this fork, stamped on the lineage event (#175 O2).
@@ -2233,6 +3537,9 @@ pub enum ResponseResult {
     },
     AgentList {
         agents: Vec<AgentInfo>,
+        /// Additive pane-free records. Older responses omit this collection.
+        #[serde(default)]
+        structured_agents: Vec<crate::api::structured_agent::StructuredAgentInfo>,
         /// The fleet directory (#320): every agent this server can address,
         /// local ones included, each stamped with the host it lives on.
         ///
@@ -2244,6 +3551,16 @@ pub enum ResponseResult {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         fleet: Vec<FleetAgentInfo>,
     },
+    AgentRestartQueued {
+        pane_id: String,
+        session: String,
+        #[serde(default)]
+        stop_only: bool,
+        /// One-time selectors replaced by the native session and preserved cwd.
+        /// Older results omit this field; empty reports keep their existing shape.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        dropped_flags: Vec<RestartDroppedFlag>,
+    },
     AgentHistory {
         history: AgentHistoryResult,
     },
@@ -2253,7 +3570,15 @@ pub enum ResponseResult {
     Lineage {
         chain: Vec<LineageEdge>,
     },
+    DelegateList {
+        delegates: Vec<DelegateRow>,
+    },
     MsgQueued {
+        /// Durable structured queue identity; absent for legacy terminal mail.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_key: Option<crate::mesh::key::MessageKey>,
         correlation_id: String,
         /// "queued" | "duplicate" | "relayed"
         state: String,
@@ -2268,18 +3593,14 @@ pub enum ResponseResult {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         path: Option<String>,
     },
-    /// #410: the frames a spoke's relay should push up to its hub.
-    MsgUplinkFrames {
-        frames: Vec<UplinkFrame>,
-    },
-    /// #410: whether an uplink result matched a send still waiting for it.
-    MsgUplinkResultAck {
-        matched: bool,
-    },
     MsgList {
         messages: Vec<QueuedMessageInfo>,
     },
     MsgStatus {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reference: Option<crate::mesh::store::StatusReference>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attempts: Vec<DeliveryAttempt>,
         correlation_id: String,
         /// `queued` (waiting in a local inbox), `read` (the recipient took
         /// it), `dropped` (aged out unread), or `relayed` (handed to another
@@ -2304,14 +3625,70 @@ pub enum ResponseResult {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reply: Option<MsgReplyInfo>,
     },
+    /// `events.read`: a `gap` first when the cursor is older than what is
+    /// retained, then the events, then the cursor to resume from.
+    EventsRead {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        gap: Option<EventGap>,
+        events: Vec<SequencedEvent>,
+        next_after: u64,
+    },
+    /// `wait.park`: the wait now open and when it expires (Unix ms).
+    WaitParked {
+        wait_id: String,
+        agent_id: String,
+        /// The predicate in its canonical form.
+        predicate: String,
+        deadline: u64,
+    },
+    /// The in-process `WaitHold`: the wait it opened, `None` when the caller
+    /// is no agent and nothing was recorded.
+    WaitHeld {
+        wait_id: Option<String>,
+    },
+    /// `owner.bind`: the binding as recorded. `rebound` is true when the
+    /// repo was already bound and kept its `agent_id`.
+    OwnerBound {
+        binding: OwnerBinding,
+        rebound: bool,
+    },
+    /// `owner.unbind`: the binding that ended.
+    OwnerUnbound {
+        binding: OwnerBinding,
+    },
+    OwnerList {
+        bindings: Vec<OwnerBinding>,
+    },
+    OwnerShow {
+        binding: OwnerBinding,
+    },
+    /// Every `goal.*` method: the agent's goal record after the call. For
+    /// `goal.stop` it is the record as it was when it was dropped.
+    Goal {
+        agent_id: String,
+        goal: GoalRecord,
+    },
+    /// `channel.hello`: the binding the token unlocked, never the token.
+    ChannelHello {
+        binding: String,
+        owner_node: String,
+        target: crate::channels::ChannelTarget,
+        scopes: Vec<crate::channels::ChannelScope>,
+    },
     /// #576: how a `msg.wait_reply` ended.
     MsgReplyAwaited {
         correlation_id: String,
         /// `replied`, `deferred` (a muted recipient's automatic answer),
-        /// `expired` (dropped unread), or `timeout`.
+        /// `expired` (dropped unread), `refused` (the receiver declined
+        /// custody, reason in `detail`), `undeliverable` (a forwarding hub
+        /// could not deliver it, reason in `detail`), `recipient_gone`,
+        /// `outcome_retention_elapsed`, or `timeout`.
         outcome: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reply: Option<MsgReplyInfo>,
+        /// On `refused`: the receiver's reason. On `undeliverable`: the hub's.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
         /// On `timeout`: the message's last known delivery state (`queued`,
         /// `read`, `relayed`), so "read but unanswered" is visible.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2321,6 +3698,12 @@ pub enum ResponseResult {
         /// The messages just consumed, oldest first. Each is marked delivered
         /// as part of this call, so a second read returns an empty list.
         messages: Vec<InboxMessage>,
+    },
+    HookDecide {
+        verdict: HookVerdict,
+        /// What the model is told on `deny`. Absent on `pass`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     MsgWake {
         /// The inbox this count is for, as a public pane id (#438). Lets a
@@ -2371,6 +3754,11 @@ pub enum ResponseResult {
         /// claims the compaction happened — it has not, at the moment the tool
         /// returns.
         detail: String,
+        /// The arming stored compaction instructions (#854). Absent from an
+        /// older server's answer, which is how a client that sent some tells
+        /// that they were silently dropped.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        instructions: bool,
     },
     PaneInfo {
         pane: PaneInfo,
@@ -2384,7 +3772,12 @@ pub enum ResponseResult {
     PaneRead {
         read: PaneReadResult,
     },
-    SubscriptionStarted {},
+    SubscriptionStarted {
+        /// Initial cursor shared by all accepted filters. New servers always
+        /// include it; absence identifies an older acknowledgement.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        start_sequence: Option<u64>,
+    },
     WaitMatched {
         event: EventEnvelope,
     },
@@ -2433,6 +3826,11 @@ pub enum ResponseResult {
         dry_run: bool,
         results: Vec<RevertRepoResult>,
     },
+    /// A live handoff that went ahead under `--skip-undrained` and dropped the
+    /// listed panes' pending input. A handoff that dropped nothing answers `Ok`.
+    LiveHandoff {
+        skipped_undrained: Vec<UndrainedPane>,
+    },
     Ok {},
 }
 
@@ -2462,12 +3860,20 @@ pub struct RevertRepoResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct WorkspaceInfo {
     pub workspace_id: String,
+    /// JSON number; JavaScript integer precision requires a magnitude below 2^53.
+    #[cfg_attr(feature = "ts", ts(as = "f64"))]
     pub number: usize,
     pub label: String,
     pub focused: bool,
+    /// JSON number; JavaScript integer precision requires a magnitude below 2^53.
+    #[cfg_attr(feature = "ts", ts(as = "f64"))]
     pub pane_count: usize,
+    /// JSON number; JavaScript integer precision requires a magnitude below 2^53.
+    #[cfg_attr(feature = "ts", ts(as = "f64"))]
     pub tab_count: usize,
     pub active_tab_id: String,
     pub agent_status: AgentStatus,
@@ -2476,6 +3882,7 @@ pub struct WorkspaceInfo {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct WorkspaceWorktreeInfo {
     pub repo_key: String,
     pub repo_name: String,
@@ -2563,13 +3970,17 @@ pub struct WorktreeInfo {
 /// to rescue work that was never at risk (#287).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KillVerdictInfo {
-    /// `merged` | `not_merged` | `checkout_missing`.
+    /// `merged` | `not_merged` | `open_pr` | `unknown` | `checkout_missing`.
     ///
     /// `checkout_missing` is not a judgement about the branch: the checkout is
-    /// not on disk, so there was no question to put to git (#360).
+    /// not on disk, so there was no question to put to git (#360). `open_pr`
+    /// means the branch heads an open pull request: live work, which a kill
+    /// refuses (#1278). `unknown` means gh could not answer the PR question,
+    /// which is refused the same way.
     pub verdict: String,
     /// What proved it, when merged — `already in main (squashed or rebased)`,
-    /// `PR #351 merged`, `contained in origin/main`, ...
+    /// `PR #351 merged`, `merged into dev`, ... — or why the verdict is
+    /// `unknown`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<String>,
     /// The branch is the repo default or config-protected (#121), so a kill
@@ -2637,16 +4048,21 @@ pub struct TabInfo {
 /// this carries only what addressing needs, and is the same shape whether the
 /// agent is here or three machines away.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(optional_fields))]
 pub struct FleetAgentInfo {
     /// The address. Fleet-global and restart-stable — the ONLY target shape
     /// that means the same thing on every host, so this is what goes in a
     /// `msg.send` `{"type":"agent"}` target.
     pub agent_id: String,
-    /// Short host name of the server the agent lives on.
+    /// Viewer-safe server label, including a badge for unverified claims.
+    /// Presentation only: delivery targets `agent_id`, never this label.
     pub host: String,
     /// Public pane id **on that host**. A routing detail, not an address:
     /// meaningless as a `{"type":"pane"}` target unless `local` is true.
-    pub pane_id: String,
+    /// Absent for a pane-free structured identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_id: Option<String>,
     /// `true` when the agent is on the server that answered. Only these are
     /// addressable by pane id; the rest need `agent_id`.
     pub local: bool,
@@ -2662,10 +4078,23 @@ pub struct FleetAgentInfo {
     /// convenience and does not travel with the gossip summary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Pane-free remote agents report structured; older summaries omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<AgentRuntime>,
     pub status: AgentStatus,
+    /// The agent's `state` (#1019). A local row carries the full record's
+    /// value. A remote row is all `unknown`: the mesh summary carries no
+    /// state, and the mesh protocol is unchanged.
+    #[serde(
+        default,
+        deserialize_with = "crate::api::agent_state::lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub state: Option<crate::api::agent_state::AgentState>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct AgentInfo {
     /// Fleet-global, restart-stable identity — the name to address this agent
     /// by. `terminal_id` names a running PTY and is re-minted every restart;
@@ -2673,27 +4102,65 @@ pub struct AgentInfo {
     pub agent_id: String,
     pub terminal_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub agent: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub display_agent: Option<String>,
     pub agent_status: AgentStatus,
+    /// The cross-harness state (ADR-0028 §1, #1019): orthogonal axes with a
+    /// per-axis `source`, and the derived `phase` supervisors branch on.
+    /// Additive: absent from older servers, and a client reads a missing or
+    /// unparseable value as absent, so it falls back to `agent_status`.
+    #[serde(
+        default,
+        deserialize_with = "crate::api::agent_state::lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub state: Option<crate::api::agent_state::AgentState>,
+    /// The agent is `idle`/`done` because its turn ended (Claude's
+    /// `done <time>` marker) while background shells or agents it started are
+    /// still running (#922). Carried from the server's own screen detector,
+    /// so a socket or MCP supervisor can tell that settle apart from one with
+    /// nothing left running.
+    ///
+    /// Additive and optional, so it needed no protocol bump: omitted when
+    /// false, and an older server never sends it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub settled_with_background_shells: bool,
+    /// Provider-limit wait or `resume_failed` while a retained identity is offline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub blocked_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// JSON number; JavaScript integer precision requires a magnitude below 2^53.
+    #[cfg_attr(feature = "ts", ts(as = "Option<f64>"))]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub retry_after_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub custom_status: Option<String>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub state_labels: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub agent_session: Option<AgentSessionInfo>,
     pub workspace_id: String,
     pub tab_id: String,
     pub pane_id: String,
     pub focused: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub foreground_cwd: Option<String>,
     /// Whether the operator has seen the agent's latest completed turn
     /// (#175 F3). `agent_status` already folds this bit (`done` is
@@ -2704,6 +4171,9 @@ pub struct AgentInfo {
     /// Seconds since the agent's semantic state last changed (#175 F3).
     /// Absent when the pane never reported a state transition.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// JSON number; JavaScript integer precision requires a magnitude below 2^53.
+    #[cfg_attr(feature = "ts", ts(as = "Option<f64>"))]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub status_age_secs: Option<u64>,
     /// The run id this agent was spawned under (#332), when it was spawned
     /// by an agent or the scheduler rather than by the operator.
@@ -2713,6 +4183,7 @@ pub struct AgentInfo {
     /// `agent → commits → PR` is a lookup rather than an inference from
     /// `cwd`. `flk revert-run <id>` consumes the same value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub run_id: Option<String>,
     /// The opaque turn cursor for this agent's terminal (#553), identical to
     /// the one on the pane record.
@@ -2729,11 +4200,28 @@ pub struct AgentInfo {
     /// start work after I said so?". Absent on remote, peer and fleet
     /// summaries, and on servers predating #553.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub turn_cursor: Option<String>,
+    /// The agent has a resume plan and no running process (#1010): it was
+    /// hibernated, or a restart restored it and its deferred resume has not
+    /// launched yet. `agent resume` brings it back either way.
+    ///
+    /// Additive and optional, so it needed no protocol bump: omitted when
+    /// false, and an older server never sends it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub resumable: bool,
+    /// Where this agent's questions go (#1179, ADR-0034 §2). Absent on
+    /// remote, peer and fleet summaries, and from servers predating #1179.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub questions: Option<QuestionPolicy>,
+    /// JSON number; JavaScript integer precision requires a magnitude below 2^53.
+    #[cfg_attr(feature = "ts", ts(as = "f64"))]
     pub revision: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct PaneInfo {
     pub pane_id: String,
     pub terminal_id: String,
@@ -2741,23 +4229,31 @@ pub struct PaneInfo {
     pub tab_id: String,
     pub focused: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub foreground_cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub agent: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub display_agent: Option<String>,
     pub agent_status: AgentStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub custom_status: Option<String>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub state_labels: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub agent_session: Option<AgentSessionInfo>,
     /// Whether the operator has seen the pane's latest completed turn
     /// (#175 F3). Missing on older servers ⇒ treated as seen.
@@ -2765,6 +4261,9 @@ pub struct PaneInfo {
     pub seen: bool,
     /// Seconds since the pane's semantic agent state last changed (#175 F3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// JSON number; JavaScript integer precision requires a magnitude below 2^53.
+    #[cfg_attr(feature = "ts", ts(as = "Option<f64>"))]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub status_age_secs: Option<u64>,
     /// The opaque turn cursor for the pane's terminal (#553), the same string
     /// `agent get` reports for the agent in this pane.
@@ -2779,11 +4278,15 @@ pub struct PaneInfo {
     ///
     /// Opaque to callers; pass it to `--after` on a settled wait.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub turn_cursor: Option<String>,
+    /// JSON number; JavaScript integer precision requires a magnitude below 2^53.
+    #[cfg_attr(feature = "ts", ts(as = "f64"))]
     pub revision: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct AgentSessionInfo {
     pub source: String,
     pub agent: String,
@@ -2844,6 +4347,9 @@ pub struct PaneReadResult {
     pub source: ReadSource,
     pub format: ReadFormat,
     pub text: String,
+    /// `text` with faint cells blanked, row for row. Only for `detection_unfaint`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unfaint: Option<String>,
     pub revision: u64,
     pub truncated: bool,
 }
@@ -2862,6 +4368,130 @@ pub struct IntegrationUninstallResult {
 pub struct EventEnvelope {
     pub event: EventKind,
     pub data: EventData,
+}
+
+/// An agent's goal as the server holds it (ADR-0030 §1). It is a fold over
+/// the `Goal*` events and keeps only what must survive a restart: verdict
+/// history stays in the log, the record keeps the latest verdict.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoalRecord {
+    pub goal: String,
+    /// The frozen check commands of the done gate (rung 6).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checks: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subtasks: Vec<GoalSubtask>,
+    /// Present while paused. `until_ms` absent means until resumed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused: Option<GoalPause>,
+    #[serde(default)]
+    pub met: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_verdict: Option<GoalVerdictRecord>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoalPause {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until_ms: Option<u64>,
+}
+
+/// One checklist item. `owner` is the delegate `AgentId` working on it, which
+/// is what parks an architect on its edges (ADR-0030 §2, rung 5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoalSubtask {
+    pub id: String,
+    pub text: String,
+    #[serde(default)]
+    pub done: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+}
+
+/// A stop decision. Later slices add optional fields (judge scores, G3c),
+/// which an older reader ignores.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoalVerdictRecord {
+    pub decision: GoalDecision,
+    /// The ladder rung that decided (ADR-0030 §2, 1 to 8).
+    pub rung: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalDecision {
+    Allow,
+    Parked,
+    Block,
+}
+
+/// Which verb produced an `AgentDelegated` edge (#959).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DelegationVia {
+    Start,
+    Spawn,
+    Fork,
+}
+
+impl DelegationVia {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Spawn => "spawn",
+            Self::Fork => "fork",
+        }
+    }
+}
+
+/// Where an agent's questions go (ADR-0034 §2, #1179). An attribute of the
+/// agent record, set at start, spawn and fork and kept across a restart, a
+/// resume, a hibernation and a live handoff.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum QuestionPolicy {
+    /// The harness shows its dialog to the operator watching the pane. The
+    /// default for an operator start, and for a record written before #1179.
+    #[default]
+    AskHuman,
+    /// Nobody watches the pane: questions go to the operator's queue. The
+    /// default for an agent the server starts itself, or an `--unattended`
+    /// start.
+    AskOperator,
+    /// Questions go to the architect as structured questions. The default
+    /// for an agent another agent started.
+    Route,
+    /// Questions are refused with a reason. Explicit only.
+    Deny,
+}
+
+impl QuestionPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AskHuman => "ask_human",
+            Self::AskOperator => "ask_operator",
+            Self::Route => "route",
+            Self::Deny => "deny",
+        }
+    }
+
+    /// Parse the CLI spelling, which is the wire spelling.
+    pub fn parse(raw: &str) -> Option<Self> {
+        [Self::AskHuman, Self::AskOperator, Self::Route, Self::Deny]
+            .into_iter()
+            .find(|policy| policy.as_str() == raw)
+    }
+
+    /// A policy that reaches a human. Granting one is an operator verb: an
+    /// agent caller may only narrow, to `route` or `deny` (ADR-0034 §2).
+    pub fn reaches_human(self) -> bool {
+        matches!(self, Self::AskHuman | Self::AskOperator)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2909,9 +4539,50 @@ pub struct PaneAgentStatusChangedEvent {
     pub state_labels: HashMap<String, String>,
 }
 
+/// A settled phase transition of one local agent (ADR-0028 §2, #1027).
+/// `from` is `unknown` for the first transition a server announces for an
+/// agent its log has no earlier phase for. Phases read leniently, so a
+/// newer server's phase never makes the line unreadable (§3a).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentPhaseEvent {
+    pub agent_id: String,
+    /// The public pane id the agent ran in.
+    pub pane: String,
+    #[serde(default, deserialize_with = "crate::api::agent_state::or_unknown")]
+    pub from: crate::api::agent_state::Phase,
+    #[serde(default, deserialize_with = "crate::api::agent_state::or_unknown")]
+    pub to: crate::api::agent_state::Phase,
+    /// The `state` that settled into `to`, as `agent.get` reported it.
+    pub state: crate::api::agent_state::AgentState,
+    /// How long `to` had held when it was announced.
+    pub held_ms: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EventData {
+    /// Successful operator peek or consumption of pane inboxes.
+    OperatorInboxAccess {
+        /// Named pane, or `None` for a global operator list.
+        pane: Option<String>,
+        operation: String,
+        peer_pid: Option<u32>,
+        peer_uid: Option<u32>,
+        message_count: usize,
+    },
+    /// Payload-free directory invalidation; the envelope sequence is its version.
+    DirectoryChanged {},
+    StructuredGrantRevoked {
+        agent_id: String,
+        generation: u64,
+        request_id: String,
+        request_seq: u64,
+        principal: String,
+    },
+    /// ADR-0036 §4: only state changes, never adds, edits or checkpoints.
+    QueueItemState(crate::api::queue_event::QueueItemState),
+    MeshRoutesChanged {},
+    MeshOutboundPending {},
     WorkspaceCreated {
         workspace: WorkspaceInfo,
     },
@@ -3000,7 +4671,12 @@ pub enum EventData {
         state_labels: HashMap<String, String>,
     },
     /// Message telemetry (#175 O2 message-side, emitted with the verbs).
+    DeliveryAttemptUpdated {
+        attempt: DeliveryAttempt,
+    },
     MessageQueued {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_key: Option<crate::mesh::key::MessageKey>,
         correlation_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         from_pane: Option<String>,
@@ -3134,6 +4810,8 @@ pub enum EventData {
     CheckFired {
         name: String,
         episode: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
     },
     /// #175 phase 4 check-runner: the last outcome was Error; the runner
     /// leaves the debounce counter untouched but records the reason.
@@ -3170,6 +4848,119 @@ pub enum EventData {
     /// #175 C3: a pane's agent process has been asked to exit and its resume
     /// plan is stashed on the pane; the next focus (or explicit
     /// `agent.resume`) respawns it into the same pane.
+    AgentRestart {
+        pane_id: String,
+        agent_id: String,
+        phase: String,
+        old_pid: Option<u32>,
+        new_pid: Option<u32>,
+        session: String,
+        reason: String,
+        forced: bool,
+        #[serde(default)]
+        stop_only: bool,
+        rss_before: u64,
+        rss_after: Option<u64>,
+        detail: String,
+    },
+    AgentRemoved {
+        agent_id: String,
+        session: String,
+        reason: String,
+    },
+    /// Authorization to update a local client record, not proof it was written.
+    DelegateRebindAuthorized {
+        name: String,
+        previous_agent_id: Option<String>,
+        agent_id: String,
+    },
+    /// #959 / ADR-0027 §1: the architect -> delegate edge. `architect` is the
+    /// caller `spawn_caller()` attested, never a request parameter, because
+    /// the edge will carry teardown authority. `reissued` marks the copy a
+    /// server start re-emits for every open edge, so log rotation cannot
+    /// drop one.
+    AgentDelegated {
+        architect: String,
+        delegate: String,
+        via: DelegationVia,
+        workspace: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        worktree: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        branch: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repo: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+        #[serde(default)]
+        reissued: bool,
+    },
+    /// ADR-0030 §1: a goal was armed for `agent_id` (an `AgentId`, never a
+    /// pane). `record` is the whole record: a fresh arm carries the goal and
+    /// its checks, and the copy re-issued on every server start and log
+    /// rotation (ADR-0031 §4, `reissued: true`) carries everything the fold
+    /// knew, so the fold replaces the record either way.
+    GoalArmed {
+        agent_id: String,
+        record: GoalRecord,
+        #[serde(default)]
+        reissued: bool,
+    },
+    /// The goal text and its frozen checks were replaced.
+    GoalAmended {
+        agent_id: String,
+        goal: String,
+        #[serde(default)]
+        checks: Vec<String>,
+    },
+    /// The agent recorded its current status (ADR-0030 §6).
+    GoalStatusSet {
+        agent_id: String,
+        status: String,
+    },
+    /// One checklist item was added or changed, keyed by `subtask.id`.
+    GoalSubtaskChanged {
+        agent_id: String,
+        subtask: GoalSubtask,
+    },
+    /// The server decided a stop (ADR-0030 §2). The record keeps the latest.
+    GoalVerdict {
+        agent_id: String,
+        verdict: GoalVerdictRecord,
+    },
+    /// The done gate passed. The record stays, marked met, and is no longer
+    /// re-issued.
+    GoalMet {
+        agent_id: String,
+    },
+    /// Stops are allowed until `until_ms` (Unix ms), or until `GoalResumed`
+    /// when absent.
+    GoalPaused {
+        agent_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        until_ms: Option<u64>,
+    },
+    GoalResumed {
+        agent_id: String,
+    },
+    /// The goal was stopped, or its agent was removed. The record is dropped.
+    GoalDisarmed {
+        agent_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    /// ADR-0035 §1: `repo` is bound to `binding`. The copy re-issued on every
+    /// server start and log rotation carries `reissued: true` and the whole
+    /// binding, so the fold replaces it either way.
+    OwnerBound {
+        binding: OwnerBinding,
+        #[serde(default)]
+        reissued: bool,
+    },
+    /// ADR-0035 §1: the binding of `repo` ended.
+    OwnerUnbound {
+        repo: String,
+    },
     AgentHibernated {
         pane_id: String,
         workspace_id: String,
@@ -3280,6 +5071,96 @@ pub enum EventData {
         origin_host: String,
         received_at_ms: u64,
     },
+    /// ADR-0028 §2 (#1027): a settled phase transition. Every
+    /// `agent.needs_human`, `agent.limit_reached` and `agent.gone` carries the
+    /// same payload as the `agent.phase_changed` it accompanies.
+    #[serde(rename = "agent.phase_changed")]
+    AgentPhaseChanged(AgentPhaseEvent),
+    #[serde(rename = "agent.needs_human")]
+    AgentNeedsHuman(AgentPhaseEvent),
+    #[serde(rename = "agent.limit_reached")]
+    AgentLimitReached(AgentPhaseEvent),
+    #[serde(rename = "agent.gone")]
+    AgentGone(AgentPhaseEvent),
+    /// ADR-0028 §8a (#1038): an agent's screen draws a question it did not
+    /// draw at the last read. Emitted at once, with no settle window: a
+    /// redraw keeps its `question_id`, so it cannot repeat. `question_id` is
+    /// repeated beside `question` so `events.read` subjects match it.
+    #[serde(rename = "agent.question_opened")]
+    AgentQuestionOpened {
+        agent_id: String,
+        pane: String,
+        question_id: String,
+        question: crate::api::question::Question,
+    },
+    /// The question left the agent's screen, was replaced by the next one, or
+    /// the agent went.
+    #[serde(rename = "agent.question_closed")]
+    AgentQuestionClosed {
+        agent_id: String,
+        pane: String,
+        question_id: String,
+        #[serde(default, deserialize_with = "crate::api::agent_state::or_unknown")]
+        reason: crate::api::question::QuestionCloseReason,
+        /// The question as it closed, its `state` `withdrawn`, so a channel
+        /// can update what it rendered. Read leniently: a line without it, or
+        /// with a shape this build cannot read, still reads.
+        #[serde(
+            default,
+            deserialize_with = "crate::api::agent_state::or_unknown",
+            skip_serializing_if = "Option::is_none"
+        )]
+        question: Option<crate::api::question::Question>,
+    },
+    /// #1020: every check on `head_sha` has concluded. `conclusion` is the
+    /// rollup (`success`, `failure`, `error`).
+    #[serde(rename = "pr.ci_completed")]
+    PrCiCompleted {
+        repo: String,
+        branch: String,
+        pr: u64,
+        head_sha: String,
+        conclusion: String,
+        failed_checks: Vec<String>,
+    },
+    #[serde(rename = "pr.merged")]
+    PrMerged {
+        repo: String,
+        branch: String,
+        pr: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        head_sha: Option<String>,
+    },
+    #[serde(rename = "pr.closed")]
+    PrClosed {
+        repo: String,
+        branch: String,
+        pr: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        head_sha: Option<String>,
+    },
+    /// #1031: `predicate` in its canonical form, `since` and `deadline` in
+    /// Unix ms.
+    #[serde(rename = "wait.expired")]
+    WaitExpired {
+        wait_id: String,
+        agent_id: String,
+        predicate: String,
+        since: u64,
+        deadline: u64,
+    },
+    /// ADR-0035 §6.2 (#1195): from now on `repo`'s owner runs on
+    /// `policy_version`, the `.flk.toml` blob id on its default branch (null:
+    /// the branch had no `.flk.toml`). The latest one per repo applies
+    /// (`owner_policy::OwnerPolicyIndex`); every start and log rotation
+    /// writes it again with `reissued: true`.
+    OwnerPolicyAdopted {
+        /// The repo's git common dir, the key `AgentForked.parent_repo` uses.
+        repo: String,
+        policy_version: Option<String>,
+        #[serde(default)]
+        reissued: bool,
+    },
     /// Fork lineage edge + telemetry (#175 O1/O2, emitted with the verb per
     /// the epic's telemetry design). One event per `agent.fork`.
     AgentForked {
@@ -3295,6 +5176,17 @@ pub enum EventData {
         child_branch: String,
         /// Whether a pivot prompt seeded the fork's opening turn.
         seeded: bool,
+    },
+    /// Authenticated command refused before dispatch; no command body or secret.
+    /// `suppressed == 0` is an individual event. Positive counts summarize one
+    /// window; null identity/verb/reason denotes aggregate capacity overflow.
+    WireRefused {
+        principal: Option<String>,
+        token_id: Option<String>,
+        verb: Option<String>,
+        target: Option<String>,
+        reason: Option<String>,
+        suppressed: u64,
     },
 }
 
@@ -3322,8 +5214,8 @@ pub struct PollerHealthSummary {
     pub pr: PollerHealth,
     /// The periodic git working-tree refresh that keeps sidebar branch /
     /// dirty / ahead-behind numbers accurate (#295). `None` from a peer on
-    /// the previous release; `Some` here always, because the refresher runs
-    /// as long as any workspace exists.
+    /// the previous release. A closed viewer gate or absent/ineligible
+    /// workspaces reports `idle` with its reason; it does not stamp success.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_refresh: Option<PollerHealth>,
     /// The `[checks]` runner tick — the scheduler that dispatches script /
@@ -3342,6 +5234,25 @@ pub struct PollerHealthSummary {
     pub peer_poll: Option<PollerHealth>,
 }
 
+/// Why a poller is intentionally inactive or awaiting its next refresh.
+/// Codes contain no paths or host identifiers. Future peer values decode as
+/// `Unknown`; the optional field is ignored by older JSON readers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PollerReason {
+    /// No rendering app client is attached; the viewer-only gate is closed.
+    NoViewer,
+    /// No workspace exists to refresh.
+    NoWorkspaces,
+    /// Workspaces exist but none supplies a nonempty working directory.
+    NoEligibleWorkspaces,
+    /// No failure is known, but fresh results have not arrived yet.
+    AwaitingRefresh,
+    /// A newer peer supplied an unrecognized reason.
+    #[serde(other)]
+    Unknown,
+}
+
 /// One poller's health.
 ///
 /// Carries the raw facts AND a computed verdict on purpose: a watchdog wants
@@ -3350,8 +5261,11 @@ pub struct PollerHealthSummary {
 /// colour a badge. Making either reconstruct the other guarantees they disagree.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PollerHealth {
-    /// `ok` | `degraded` | `broken`.
+    /// `ok` | `idle` | `degraded` | `broken`; unknown future values remain readable.
     pub status: String,
+    /// Typed inactivity or pending-refresh reason; absent for other pollers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<PollerReason>,
     /// Seconds since the last SUCCESSFUL round. `None` = never succeeded,
     /// which is not the same as "0 seconds ago" and must not render as fresh.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3371,16 +5285,20 @@ pub struct PollerHealth {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct PeerSystemSummary {
     /// Global CPU utilization, 0..=100 (rounded; keeps the response `Eq`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu_percent: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<f64>"))]
     pub mem_used: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<f64>"))]
     pub mem_total: Option<u64>,
     /// Free space on the volume holding $HOME, in bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<f64>"))]
     pub disk_free: Option<u64>,
     /// Best-effort GPU utilization, 0..=100. Sampled locally since the status
     /// line shipped, but until #291 it never left the box — every peer row
@@ -3411,6 +5329,7 @@ impl PeerSystemSummary {
 /// Mac, the card on a GPU box. Flock never infers it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub enum ThermalComponent {
     /// Tint the CPU glyph.
     #[default]
@@ -3430,6 +5349,7 @@ pub enum ThermalComponent {
 /// flock would false-alarm on every inference run. The host owns calibration —
 /// flock ships no temperature table and colours by rank alone.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ThermalReport {
     /// 0 nominal / 1 fair / 2 serious / 3 critical. Clamped on receive.
     pub severity: u8,
@@ -3490,7 +5410,7 @@ pub struct PeerWorkspaceSummary {
     /// Workspace display name (custom name or derived label).
     pub workspace: String,
     /// Machine-independent project identity (normalized origin URL or
-    /// "dir:<name>"), used to fold remote rows into local project groups.
+    /// `dir:<name>`), used to fold remote rows into local project groups.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_key: Option<String>,
     /// Repo folder name, labels remote-only project groups.
@@ -3502,6 +5422,7 @@ pub struct PeerWorkspaceSummary {
     pub is_linked_worktree: bool,
     /// Short agent label of the workspace's attention-leading pane (e.g. "cc").
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::terminal::agent_name::deserialize")]
     pub agent: Option<String>,
     pub status: AgentStatus,
     /// Seconds since the leading pane's state last changed.
@@ -3530,21 +5451,26 @@ pub struct PeerWorkspaceSummary {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerAgentSummary {
     pub agent_id: String,
-    /// Public pane id on the owning server. A routing detail, not a name.
+    /// Public pane id on the owning server, always present even when empty (v5).
     pub pane_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::terminal::agent_name::deserialize")]
     pub agent: Option<String>,
     pub status: AgentStatus,
 }
 
-/// One fleet peer relayed through a `peers.summary` response (#101 gossip v3).
-///
-/// Provenance is explicit via [`origin`](Self::origin): the SHORT HOST NAME of
-/// the polling server that last talked to this peer. Loop prevention rides on
-/// this field — a receiver drops any relayed entry whose `origin` equals its
-/// own short host, and the answering server NEVER re-relays entries it received
-/// via relay (only its own polled peers). Result: entries travel exactly one
-/// hop.
+/// A pane-free identity in the additive JSON discovery list (ADR-0008).
+/// Kept separate so workspace rows retain their required v5 pane field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerStructuredAgentSummary {
+    pub agent_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "crate::terminal::agent_name::deserialize")]
+    pub agent: Option<String>,
+    pub status: AgentStatus,
+    pub runtime: crate::structured::registry::StructuredRuntime,
+}
+
 /// `peers.hub_fleet` — down-gossip from a hub to a spoke it polls (#410).
 ///
 /// Gossip otherwise flows only UP: a poller learns what its pollee relays. A
@@ -3570,8 +5496,18 @@ pub struct PeersHubFleetParams {
     pub hub_self: Option<Box<RelayedFleetPeer>>,
 }
 
+/// One fleet peer relayed through a `peers.summary` response (#101 gossip v3).
+///
+/// Provenance is explicit via [`origin`](Self::origin): the SHORT HOST NAME of
+/// the polling server that last talked to this peer. Loop prevention rides on
+/// this field — a receiver drops any relayed entry whose `origin` equals its
+/// own short host, and the answering server NEVER re-relays entries it received
+/// via relay (only its own polled peers). Result: entries travel exactly one
+/// hop.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RelayedFleetPeer {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
     /// Peer name (config-owned label on the origin's `[[peers]]`).
     pub name: String,
     /// SSH destination the ORIGIN uses to reach this peer.
@@ -3589,6 +5525,13 @@ pub struct RelayedFleetPeer {
     pub system: Option<PeerSystemSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latency_ms: Option<u64>,
+    /// Pane-free agent directory, relayed unchanged by supporting peers.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "crate::api::peer_discovery::deserialize"
+    )]
+    pub structured_agents: Vec<PeerStructuredAgentSummary>,
     #[serde(default)]
     pub workspaces: Vec<PeerWorkspaceSummary>,
     /// Seconds since the origin's last successful poll, at relay capture time.
@@ -3660,6 +5603,7 @@ pub struct PeerDialReport {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum AgentStatus {
     Idle,
@@ -3671,6 +5615,8 @@ pub enum AgentStatus {
     /// pane; the next focus (or explicit `agent.resume`) respawns it.
     /// Ranked at the Idle attention tier — hibernated is a settled state.
     Hibernated,
+    /// The identity and mail survive a failed attempt to resume its process.
+    Offline,
 }
 
 fn default_true() -> bool {
@@ -3680,6 +5626,37 @@ fn default_true() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn message_target_agent_id_check_accepts_only_unscoped_well_formed_ids() {
+        let oversized = format!("agent_atlas_{}", "a".repeat(200));
+        for (raw, expected) in [
+            ("agent_atlas_123abc", true),
+            ("agent_atlas_ABC-123", true),
+            ("", false),
+            ("agent_", false),
+            ("reviewer", false),
+            ("w3:p2", false),
+            ("term_fixture", false),
+            ("agent_atlas_1\n", false),
+            ("agent_atlas_1 value", false),
+            ("agent_atlas_é", false),
+            ("agent_atlas_/1", false),
+            (oversized.as_str(), false),
+        ] {
+            for target in [
+                MessageTarget::Pane { pane: raw.into() },
+                MessageTarget::Agent { agent: raw.into() },
+            ] {
+                assert_eq!(target.is_well_formed_agent_id(), expected, "{target:?}");
+            }
+            let scoped = MessageTarget::RepoPane {
+                repo: "fixture-repo".into(),
+                pane: raw.into(),
+            };
+            assert!(!scoped.is_well_formed_agent_id(), "{scoped:?}");
+        }
+    }
 
     #[test]
     fn request_round_trips_for_pane_read() {
@@ -3726,6 +5703,7 @@ mod tests {
         let request = Request {
             id: "req_session".into(),
             method: Method::PaneReportAgentSession(PaneReportAgentSessionParams {
+                rebind_agent_id: None,
                 pane_id: "1-1".into(),
                 source: "flock:claude".into(),
                 agent: "claude".into(),
@@ -3845,6 +5823,7 @@ mod tests {
         let request = Request {
             id: "req_1".into(),
             method: Method::WorkspaceCreate(WorkspaceCreateParams {
+                dry_run: false,
                 cwd: Some("/tmp".into()),
                 focus: true,
                 label: Some("api".into()),
@@ -4006,6 +5985,16 @@ mod tests {
     }
 
     #[test]
+    fn subscription_accepts_explicit_after_sequence() {
+        let params: EventsSubscribeParams = serde_json::from_value(serde_json::json!({
+            "subscriptions": [], "after_sequence": 7
+        }))
+        .unwrap();
+        assert_eq!(params.after, None);
+        assert_eq!(params.after_sequence, Some(7));
+    }
+
+    #[test]
     fn subscribe_request_parses_parameterized_subscriptions() {
         let json = r#"
         {
@@ -4068,6 +6057,7 @@ mod tests {
                     source: ReadSource::Recent,
                     format: ReadFormat::Text,
                     text: "auth: received\n".into(),
+                    unfaint: None,
                     revision: 0,
                     truncated: false,
                 },
@@ -4087,8 +6077,20 @@ mod tests {
             result: ResponseResult::Pong {
                 version: "0.1.2".into(),
                 protocol: 6,
-                capabilities: Some(ServerCapabilities { live_handoff: true }),
+                capabilities: Some(ServerCapabilities {
+                    live_handoff: true,
+                    node_id: None,
+                    clone_detection_warning: None,
+                    agent_start_label: true,
+                    agent_questions: true,
+                    structured_agents: true,
+                    pane_input_write_ack: false,
+                    events_live_start: false,
+                }),
                 session_health: Some(crate::platform::SessionHealth::Healthy),
+                api_listener: None,
+                client_listener: None,
+                agent_account_diagnostic: None,
             },
         };
 
@@ -4176,6 +6178,7 @@ mod tests {
                     last_commit_at: None,
                     kill_verdict: None,
                 },
+                parent_workspace_id: None,
             },
         };
         let json = serde_json::to_string(&response).unwrap();
@@ -4239,9 +6242,65 @@ mod tests {
             EventKind::PaneClosed,
             EventKind::PaneAgentStatusChanged,
             EventKind::AgentForked,
+            EventKind::AgentDelegated,
         ] {
             assert!(kind.is_persisted(), "{kind:?} must persist");
         }
+    }
+
+    /// #959: the edge is read back from the durable log by the fold, so its
+    /// wire shape is the persistence format.
+    #[test]
+    fn agent_delegated_event_round_trips() {
+        let envelope = EventEnvelope {
+            event: EventKind::AgentDelegated,
+            data: EventData::AgentDelegated {
+                architect: "agent_arch".into(),
+                delegate: "agent_child".into(),
+                via: DelegationVia::Fork,
+                workspace: "w3".into(),
+                worktree: Some("/wt/child".into()),
+                branch: Some("feat/child".into()),
+                repo: Some("/repo/.git".into()),
+                label: Some("#614".into()),
+                reissued: true,
+            },
+        };
+        let json = serde_json::to_string(&envelope).unwrap();
+        assert!(json.contains("\"event\":\"agent_delegated\""), "{json}");
+        assert!(json.contains("\"via\":\"fork\""), "{json}");
+        let restored: EventEnvelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, envelope);
+
+        let minimal: EventEnvelope = serde_json::from_str(
+            r#"{"event":"agent_delegated","data":{"type":"agent_delegated","architect":"a","delegate":"d","via":"start","workspace":"w1"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            minimal.data,
+            EventData::AgentDelegated {
+                reissued: false,
+                label: None,
+                worktree: None,
+                ..
+            }
+        ));
+    }
+
+    /// #959 / #868: `label` is absent on the wire unless set, and a ping from
+    /// an older server, which has no `agent_start_label`, reads as "does not
+    /// take it" rather than failing to parse.
+    #[test]
+    fn agent_start_label_is_optional_on_the_wire_and_absent_from_old_capabilities() {
+        let params: AgentStartParams =
+            serde_json::from_str(r#"{"name":"n","argv":["sh"]}"#).unwrap();
+        assert_eq!(params.label, None);
+        let json = serde_json::to_string(&params).unwrap();
+        assert!(!json.contains("label"), "{json}");
+
+        let old: ServerCapabilities = serde_json::from_str(r#"{"live_handoff":true}"#).unwrap();
+        assert!(!old.events_live_start);
+        assert!(!old.agent_start_label);
     }
 
     #[test]
@@ -4460,6 +6519,10 @@ mod tests {
             title: None,
             display_agent: None,
             agent_status: AgentStatus::Working,
+            state: None,
+            settled_with_background_shells: false,
+            blocked_reason: None,
+            retry_after_ms: None,
             custom_status: None,
             state_labels: HashMap::new(),
             agent_session: None,
@@ -4473,8 +6536,36 @@ mod tests {
             status_age_secs: None,
             run_id: None,
             turn_cursor: Some("term_1:0:3:9:w".into()),
+            resumable: false,
+            questions: None,
             revision: 4,
         }
+    }
+
+    #[test]
+    fn provider_limit_check_detail_is_optional_for_old_events() {
+        let event: EventData = serde_json::from_str(
+            r#"{"type":"check_fired","name":"blocked_alert","episode":"fixture"}"#,
+        )
+        .unwrap();
+        assert!(matches!(event, EventData::CheckFired { detail: None, .. }));
+    }
+
+    #[test]
+    fn session_unbound_uses_an_open_json_error_code_and_client_exit_mapping() {
+        let error: ErrorResponse = serde_json::from_str(
+            r#"{"id":"recovery","error":{"code":"session_unbound","message":"missing launch evidence"}}"#,
+        ).unwrap();
+        assert_eq!(error.error.code, "session_unbound");
+        assert_eq!(crate::cli::error_code_exit(&error.error.code, false), 12);
+        // JSON error codes stay strings. Clients without a code in their local
+        // registry retain its text and apply the generic unknown-error exit.
+        let future: ErrorResponse = serde_json::from_str(
+            r#"{"id":"recovery","error":{"code":"future_session_state","message":"new state"}}"#,
+        )
+        .unwrap();
+        assert_eq!(future.error.code, "future_session_state");
+        assert_eq!(crate::cli::error_code_exit(&future.error.code, false), 1);
     }
 
     #[test]
@@ -4482,6 +6573,7 @@ mod tests {
         let response = ErrorResponse {
             id: "req_1".into(),
             error: ErrorBody {
+                data: None,
                 code: "pane_not_found".into(),
                 message: "pane p_1 not found".into(),
             },
@@ -4503,6 +6595,7 @@ mod tests {
         assert_eq!(
             request.method,
             Method::MsgWaitReply(MsgWaitReplyParams {
+                reference: None,
                 correlation_id: "c-1".into(),
                 timeout_ms: Some(500),
             })
@@ -4523,6 +6616,7 @@ mod tests {
             correlation_id: "c-1".into(),
             outcome: "timeout".into(),
             reply: None,
+            detail: None,
             state: Some("read".into()),
         };
         let value = serde_json::to_value(&result).unwrap();
@@ -4631,5 +6725,42 @@ mod pr_info_tests {
         let json = serde_json::to_string(&with_pr).expect("serialisable");
         assert!(json.contains("\"pr\""), "{json}");
         assert!(json.contains("\"merged\""), "{json}");
+    }
+
+    #[test]
+    fn s3a_error_envelopes_preserve_exact_and_unknown_input_write_details() {
+        for (written, total, discarded) in [
+            (serde_json::json!(2), serde_json::json!(5), true),
+            (serde_json::Value::Null, serde_json::Value::Null, false),
+        ] {
+            let code = if written.is_null() {
+                "input_write_unknown"
+            } else {
+                "input_write_failed"
+            };
+            let raw = serde_json::json!({"id":"same-id", "error": {
+                "code":code, "message":"inspect the pane",
+                "data":{"input_write":{"bytes_written":written,"bytes_total":total,
+                    "reason":"deadline","remainder_discarded":discarded}, "other_detail":7}
+            }});
+            let parsed: ErrorResponse = serde_json::from_value(raw.clone()).unwrap();
+            assert_eq!(serde_json::to_value(parsed).unwrap(), raw);
+        }
+        let legacy = serde_json::json!({"id":"old","error":{"code":"invalid_key","message":"key"}});
+        let parsed: ErrorResponse = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), legacy);
+    }
+    #[test]
+    fn s3a_write_capability_defaults_false_and_negative_counts_are_invalid() {
+        let old: ServerCapabilities = serde_json::from_str(r#"{"live_handoff":true}"#).unwrap();
+        assert!(!old.events_live_start);
+        assert!(!old.pane_input_write_ack);
+        assert_eq!(
+            serde_json::to_value(old).unwrap()["pane_input_write_ack"],
+            false
+        );
+        let invalid = serde_json::json!({"bytes_written":-1,"bytes_total":5,
+            "reason":"deadline","remainder_discarded":true});
+        assert!(serde_json::from_value::<InputWriteDetails>(invalid).is_err());
     }
 }

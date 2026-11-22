@@ -7,8 +7,8 @@
 //!
 //! Structured as pure logic + a shell adapter so the unit tests can
 //! drive the whole revert flow against fake fixture repos without
-//! shelling out. The App-side entry point ([`RevertRun::from_app`]) is
-//! thin — build the repo list, call [`RevertRun::run`], collect the
+//! shelling out. The App-side entry point (`src/app/api/revert.rs`) is
+//! thin — build the repo list, call [`RevertRun::run_with_git`], collect the
 //! per-repo results, emit `RunReverted` events, and return.
 
 use std::collections::BTreeSet;

@@ -1,3 +1,11 @@
+mod atomic_write;
+pub(crate) mod claude_trust;
+mod codex_hook_trust;
+mod jsonc;
+pub(crate) mod launch;
+mod mcp_config;
+pub(crate) mod sync;
+pub(crate) use mcp_config::pinned_path_notices;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -7,14 +15,13 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 use portable_pty::CommandBuilder;
 use serde_json::{json, Map, Value};
 
+use crate::api::schema::QuestionPolicy;
 use crate::layout::PaneId;
 
 pub(crate) const FLOCK_PANE_ID_ENV_VAR: &str = "FLOCK_PANE_ID";
-/// Absolute path to the flock binary running this pane's server. Thin hook
-/// stubs exec `"$FLOCK_BIN" hook <agent> <action>` so they reach `flk hook`
-/// without depending on PATH inside the agent's shell (#158). Stamped at spawn
-/// from `current_exe()`, so it always matches the running flock — install and
-/// `integration manifest` (nix/off-host) alike, no baked-in path to drift.
+/// Stable absolute launch path for hook stubs, without resolving profile
+/// symlinks into immutable store paths where possible, with the server's own
+/// executable as the fallback for installations without a stable path.
 pub(crate) const FLOCK_BIN_ENV_VAR: &str = "FLOCK_BIN";
 const PI_EXTENSION_INSTALL_NAME: &str = "flock-agent-state.ts";
 const PI_EXTENSION_ASSET: &str = include_str!("assets/pi/flock-agent-state.ts");
@@ -25,7 +32,7 @@ const OMP_INTEGRATION_VERSION: u32 = 2;
 const PI_CODING_AGENT_DIR_ENV_VAR: &str = "PI_CODING_AGENT_DIR";
 const CLAUDE_HOOK_INSTALL_NAME: &str = "flock-agent-state.sh";
 const CLAUDE_HOOK_ASSET: &str = include_str!("assets/claude/flock-agent-state.sh");
-const CLAUDE_INTEGRATION_VERSION: u32 = 9;
+const CLAUDE_INTEGRATION_VERSION: u32 = 11;
 const CLAUDE_CONFIG_DIR_ENV_VAR: &str = "CLAUDE_CONFIG_DIR";
 // Canonical settings.json hook entries flock installs for Claude Code, as
 // (event, hook-script arg, matcher). Single source of truth shared by
@@ -43,13 +50,161 @@ const CLAUDE_HOOK_ENTRIES: &[(&str, &str, Option<&str>)] = &[
 /// Seconds Claude gives each installed hook before killing it. Also the
 /// ceiling on how long `flk hook claude stop` may wait for its transcript.
 pub(crate) const CLAUDE_HOOK_TIMEOUT: u64 = 10;
+/// Seconds Claude gives the question hook (ADR-0034 §3): the hold plus 30 s,
+/// and the hold is 0 until answers are held for (#1183). Above the stub's
+/// 10 s watchdog and `flk hook`'s 5 s deadline, so the harness's own timeout
+/// fires only when the shell itself is stuck.
+pub(crate) const CLAUDE_QUESTION_HOOK_TIMEOUT: u64 = 30;
+/// The first Claude Code that honours a hook's `onFailure` (ADR-0034 P4, P9).
+const CLAUDE_ON_FAILURE_SINCE: crate::update::Version = crate::update::Version {
+    major: 2,
+    minor: 1,
+    patch: 295,
+};
+
+/// Claude's `PreToolUse` entry for the question point (ADR-0034 §3). Unlike
+/// [`CLAUDE_HOOK_ENTRIES`] its shape depends on the machine: the matcher on
+/// `[questions] human_tools`, and `onFailure` on the installed Claude Code.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ClaudeQuestionHook {
+    /// Tools matched beside Claude's own question tools.
+    pub(crate) human_tools: Vec<String>,
+    /// Whether to install `onFailure: "block"`, which makes a hook that
+    /// cannot start or times out refuse the call instead of drawing the
+    /// dialog. Claude Code older than 2.1.295 has no such key, so it is left
+    /// out there, or when the version cannot be read, and the entry fails
+    /// open on those two failures (ADR-0034 §4).
+    pub(crate) on_failure_block: bool,
+}
+
+impl ClaudeQuestionHook {
+    /// The entry for `human_tools` and the Claude Code `version` found on
+    /// this machine (`None`: not found, or unreadable).
+    pub(crate) fn new(human_tools: Vec<String>, version: Option<crate::update::Version>) -> Self {
+        Self {
+            human_tools,
+            on_failure_block: version.is_some_and(|version| version >= CLAUDE_ON_FAILURE_SINCE),
+        }
+    }
+
+    /// For a CLI process: the config on disk, which is the only config it
+    /// has, and [`probe_claude_version`]. The server never calls this. It
+    /// passes its live config, and probes off its loop.
+    pub(crate) fn detect() -> Self {
+        Self::new(
+            crate::config::Config::load().config.questions.human_tools,
+            probe_claude_version(),
+        )
+    }
+
+    /// Only question tools, so no other tool call starts a process. Claude
+    /// reads a matcher of letters, digits, `_` and `|` as a list of exact
+    /// names and anything else as a regex, so a list with a configured name
+    /// in it is anchored and escaped: unanchored, `mcp__x__ask` would also
+    /// match `mcp__x__ask_later`.
+    fn matcher(&self) -> String {
+        let own = crate::api::schema::HookHarness::Claude.question_tools();
+        if self.human_tools.is_empty() {
+            return own.join("|");
+        }
+        let names: Vec<String> = own
+            .iter()
+            .map(|tool| (*tool).to_string())
+            .chain(self.human_tools.iter().map(|tool| regex::escape(tool)))
+            .collect();
+        format!("^({})$", names.join("|"))
+    }
+
+    fn entry(&self, command: String) -> Value {
+        let mut hook = json!({
+            "type": "command",
+            "command": command,
+            "timeout": CLAUDE_QUESTION_HOOK_TIMEOUT,
+        });
+        if self.on_failure_block {
+            hook["onFailure"] = json!("block");
+        }
+        json!({ "matcher": self.matcher(), "hooks": [hook] })
+    }
+
+    /// What `flk integration install` says about the entry it wrote.
+    fn install_note(&self) -> &'static str {
+        if self.on_failure_block {
+            "question hook: fails closed (onFailure: block)"
+        } else {
+            QUESTION_HOOK_FAILS_OPEN
+        }
+    }
+}
+
+/// The installed Claude Code's version, from `claude --version` on PATH.
+/// Blocks for up to 10 s, so it must never run on the server's App loop: the
+/// server calls it from a worker thread (see `App::spawn_integration_install`).
+pub(crate) fn probe_claude_version() -> Option<crate::update::Version> {
+    crate::process::TracedCommand::new("claude", "integration")
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .output_traced_with_timeout(std::time::Duration::from_secs(10))
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| claude_version(&String::from_utf8_lossy(&output.stdout)))
+}
+
+/// What install and `flk integration status` say about a question entry
+/// without `onFailure` (ADR-0034 §4).
+pub(crate) const QUESTION_HOOK_FAILS_OPEN: &str =
+    "question hook: fails open on timeout (claude < 2.1.295, or its version unreadable at install)";
+
+/// ADR-0034 §4's status line for the installed Claude question entry: the
+/// fail-open note when the entry carries no `onFailure: "block"`. Nothing
+/// when it does, or when there is no entry (the drift check reports that).
+pub(crate) fn question_hook_notes(target: crate::api::schema::IntegrationTarget) -> Vec<String> {
+    if target != crate::api::schema::IntegrationTarget::Claude {
+        return Vec::new();
+    }
+    let Ok(dir) = claude_dir() else {
+        return Vec::new();
+    };
+    let quoted = shell_single_quote(&effective_claude_hook_path(&dir).display().to_string());
+    let command = format!("bash {quoted} question");
+    let Some(settings) = fs::read_to_string(dir.join("settings.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+    else {
+        return Vec::new();
+    };
+    let hooks = settings["hooks"]["PreToolUse"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry["hooks"].as_array())
+        .flatten()
+        .filter(|hook| hook["command"].as_str() == Some(command.as_str()));
+    let mut found = false;
+    for hook in hooks {
+        found = true;
+        if hook["onFailure"].as_str() == Some("block") {
+            return Vec::new();
+        }
+    }
+    if found {
+        vec![QUESTION_HOOK_FAILS_OPEN.to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
+/// `2.1.296 (Claude Code)` → 2.1.296.
+fn claude_version(output: &str) -> Option<crate::update::Version> {
+    crate::update::Version::parse(output.split_whitespace().next()?)
+}
 const CODEX_HOOK_INSTALL_NAME: &str = "flock-agent-state.sh";
 const CODEX_HOOK_ASSET: &str = include_str!("assets/codex/flock-agent-state.sh");
-const CODEX_INTEGRATION_VERSION: u32 = 6;
+const CODEX_INTEGRATION_VERSION: u32 = 7;
 const CODEX_HOME_ENV_VAR: &str = "CODEX_HOME";
 const KIMI_HOOK_INSTALL_NAME: &str = "flock-agent-state.sh";
 const KIMI_HOOK_ASSET: &str = include_str!("assets/kimi/flock-agent-state.sh");
-const KIMI_INTEGRATION_VERSION: u32 = 2;
+const KIMI_INTEGRATION_VERSION: u32 = 3;
 const KIMI_CODE_HOME_ENV_VAR: &str = "KIMI_CODE_HOME";
 const KIMI_CONFIG_BLOCK_BEGIN: &str = "# >>> flock kimi integration";
 const KIMI_CONFIG_BLOCK_END: &str = "# <<< flock kimi integration";
@@ -68,11 +223,11 @@ const KIMI_HOOK_EVENTS: [(&str, &str); 10] = [
 ];
 const COPILOT_HOOK_INSTALL_NAME: &str = "flock-agent-state.sh";
 const COPILOT_HOOK_ASSET: &str = include_str!("assets/copilot/flock-agent-state.sh");
-const COPILOT_INTEGRATION_VERSION: u32 = 1;
+const COPILOT_INTEGRATION_VERSION: u32 = 2;
 const COPILOT_HOME_ENV_VAR: &str = "COPILOT_HOME";
 const OPENCODE_PLUGIN_INSTALL_NAME: &str = "flock-agent-state.js";
 const OPENCODE_PLUGIN_ASSET: &str = include_str!("assets/opencode/flock-agent-state.js");
-const OPENCODE_INTEGRATION_VERSION: u32 = 5;
+const OPENCODE_INTEGRATION_VERSION: u32 = 6;
 const HERMES_PLUGIN_INSTALL_NAME: &str = "flock-agent-state";
 const HERMES_PLUGIN_MANIFEST_INSTALL_NAME: &str = "plugin.yaml";
 const HERMES_PLUGIN_INIT_INSTALL_NAME: &str = "__init__.py";
@@ -81,7 +236,7 @@ const HERMES_PLUGIN_INIT_ASSET: &str = include_str!("assets/hermes/__init__.py")
 const HERMES_INTEGRATION_VERSION: u32 = 2;
 const QODERCLI_HOOK_INSTALL_NAME: &str = "flock-agent-state.sh";
 const QODERCLI_HOOK_ASSET: &str = include_str!("assets/qodercli/flock-agent-state.sh");
-const QODERCLI_INTEGRATION_VERSION: u32 = 2;
+const QODERCLI_INTEGRATION_VERSION: u32 = 3;
 const QODERCLI_CONFIG_DIR_ENV_VAR: &str = "QODER_CONFIG_DIR";
 const INTEGRATION_VERSION_MARKER: &str = "FLOCK_INTEGRATION_VERSION=";
 
@@ -105,6 +260,9 @@ pub(crate) const RUN_TRAILER_INTEGRATION_VERSION: u32 = 1;
 /// pane carries `Agent-Run: <FLOCK_RUN_ID>`. Kept here (not in the
 /// crate root) so both sides of the trailer story import the same name.
 pub(crate) const FLOCK_RUN_ID_ENV_VAR: &str = "FLOCK_RUN_ID";
+/// The question-policy hint (#1179, ADR-0034 §2). Never authority: only the
+/// fail-closed path of ADR-0034 §4 reads it, when the server cannot answer.
+pub(crate) const FLOCK_QUESTIONS_ENV_VAR: &str = "FLOCK_QUESTIONS";
 
 #[derive(Debug)]
 pub(crate) struct ClaudeInstallPaths {
@@ -278,9 +436,13 @@ pub(crate) fn apply_pane_env(cmd: &mut CommandBuilder, pane_id: PaneId) {
     }
     cmd.env(crate::api::SOCKET_PATH_ENV_VAR, crate::api::socket_path());
     cmd.env(FLOCK_PANE_ID_ENV_VAR, format!("p_{}", pane_id.raw()));
-    // Best-effort: a hook stub falls back to `flk` on PATH if this is unset.
-    if let Ok(exe) = std::env::current_exe() {
-        cmd.env(FLOCK_BIN_ENV_VAR, exe);
+    // Stamp this server's executable rather than an outer pane's inherited
+    // FLOCK_BIN. Keep the current executable as a Nix-only fallback (#158).
+    if let Ok(current) = std::env::current_exe() {
+        cmd.env(
+            FLOCK_BIN_ENV_VAR,
+            launch::pane_launch_path(&current, launch::stable_launch_path()),
+        );
     }
     // #175 S3 commit 4 (ops): consume the one-shot FLOCK_RUN_ID set by
     // the caller right before spawn. Thread-local because pane spawn is
@@ -299,6 +461,13 @@ pub(crate) fn apply_pane_env(cmd: &mut CommandBuilder, pane_id: PaneId) {
     // Should a future key appear in both tables, the deliberate carry must win.
     for (key, value) in take_pending_spawn_env() {
         cmd.env(key, value);
+    }
+    // #1179: stamped last, from the agent record, so neither the server's own
+    // environment nor a carried profile key can supply a hint the record does
+    // not hold. `ask_human` and every non-agent pane carry none (ADR-0034 §4).
+    match take_pending_questions().filter(|policy| *policy != QuestionPolicy::AskHuman) {
+        Some(policy) => cmd.env(FLOCK_QUESTIONS_ENV_VAR, policy.as_str()),
+        None => cmd.env_remove(FLOCK_QUESTIONS_ENV_VAR),
     }
 }
 
@@ -495,6 +664,35 @@ fn take_pending_spawn_env() -> Vec<(String, String)> {
     PENDING_SPAWN_ENV.with(|slot| std::mem::take(&mut *slot.borrow_mut()))
 }
 
+thread_local! {
+    /// The question policy of the agent the NEXT pane spawn on this thread
+    /// launches (#1179). The same one-shot shape as the run id.
+    static PENDING_QUESTIONS: std::cell::Cell<Option<QuestionPolicy>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Disarms the pending question policy on drop.
+#[must_use = "hold the guard across the spawn; dropping it immediately disarms the policy"]
+pub(crate) struct PendingQuestionsGuard;
+
+impl Drop for PendingQuestionsGuard {
+    fn drop(&mut self) {
+        let _ = take_pending_questions();
+    }
+}
+
+/// Arm the question policy the NEXT pane spawn on this thread stamps as
+/// `FLOCK_QUESTIONS`. A guard for the run id's reason: a failed spawn never
+/// reaches `apply_pane_env`, and a leaked policy would land on the next pane.
+pub(crate) fn set_pending_questions(policy: QuestionPolicy) -> PendingQuestionsGuard {
+    PENDING_QUESTIONS.with(|slot| slot.set(Some(policy)));
+    PendingQuestionsGuard
+}
+
+fn take_pending_questions() -> Option<QuestionPolicy> {
+    PENDING_QUESTIONS.with(std::cell::Cell::take)
+}
+
 pub(crate) fn set_pending_run_id(run_id: String) -> PendingRunIdGuard {
     PENDING_RUN_ID.with(|slot| *slot.borrow_mut() = Some(run_id));
     PendingRunIdGuard
@@ -505,10 +703,25 @@ fn take_pending_run_id() -> Option<String> {
     PENDING_RUN_ID.with(|slot| slot.borrow_mut().take())
 }
 
+/// Install `target`. `question` builds Claude's question entry, and is only
+/// called for Claude: a CLI passes [`ClaudeQuestionHook::detect`], and the
+/// server its live config with a version probed off its loop.
 pub(crate) fn install_target(
     target: crate::api::schema::IntegrationTarget,
+    question: impl FnOnce() -> ClaudeQuestionHook,
 ) -> io::Result<Vec<String>> {
-    let messages = match target {
+    install_target_with_hook_trust(target, true, question)
+}
+
+pub(crate) fn install_target_with_hook_trust(
+    target: crate::api::schema::IntegrationTarget,
+    trust_hooks: bool,
+    question: impl FnOnce() -> ClaudeQuestionHook,
+) -> io::Result<Vec<String>> {
+    // Codex hooks and MCP share a config file. Capture ownership before the
+    // hook adapter can replace it, so MCP registration respects its owner.
+    let mcp_config_externally_owned = mcp_config::externally_owned(target);
+    let mut messages = match target {
         crate::api::schema::IntegrationTarget::Pi => {
             let path = install_pi()?;
             vec![format!("installed pi integration to {}", path.display())]
@@ -532,7 +745,8 @@ pub(crate) fn install_target(
             messages
         }
         crate::api::schema::IntegrationTarget::Claude => {
-            let installed = install_claude()?;
+            let question = question();
+            let installed = install_claude(&question)?;
             let mut messages = Vec::new();
             if installed.removed_legacy_hook {
                 messages.push(
@@ -548,10 +762,11 @@ pub(crate) fn install_target(
                 "ensured claude settings at {}",
                 installed.settings_path.display()
             ));
+            messages.push(question.install_note().to_string());
             messages
         }
         crate::api::schema::IntegrationTarget::Codex => {
-            let installed = install_codex()?;
+            let installed = install_codex_with_trust(trust_hooks)?;
             vec![
                 format!(
                     "installed codex integration hook to {}",
@@ -622,6 +837,10 @@ pub(crate) fn install_target(
             ]
         }
     };
+
+    if let Some(message) = mcp_config::install(target, mcp_config_externally_owned) {
+        messages.push(message);
+    }
 
     crate::logging::integration_action("install", integration_target_label(target), "ok");
     Ok(messages)
@@ -959,7 +1178,7 @@ fn integration_specs() -> [(
         ),
         (
             crate::api::schema::IntegrationTarget::Claude,
-            claude_dir().map(|dir| dir.join("hooks").join(CLAUDE_HOOK_INSTALL_NAME)),
+            claude_dir().map(|dir| effective_claude_hook_path(&dir)),
             CLAUDE_INTEGRATION_VERSION,
         ),
         (
@@ -1131,7 +1350,35 @@ fn remove_legacy_pi_extension_from_omp_dir(dir: &Path) -> io::Result<bool> {
     Ok(false)
 }
 
-pub(crate) fn install_claude() -> io::Result<ClaudeInstallPaths> {
+/// Serialises every read-modify-write of Claude's settings.json in this
+/// process. The server installs on worker threads (#1180), so two installs,
+/// or an install and an uninstall, can overlap, and each rewrites the whole
+/// file from what it read.
+fn claude_settings_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Refuse a file flk would rewrite when it is a symlink. A Home Manager or
+/// other declarative profile links `settings.json` and the hook stub into a
+/// read-only store: writing through fails, and replacing the link (as an
+/// atomic rename would) breaks the next switch. Either way the file belongs to
+/// its owner, who merges `flk integration manifest claude` instead.
+fn refuse_symlink(path: &Path) -> io::Result<()> {
+    if fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        return Err(io::Error::other(format!(
+            "{} is a symlink, so it is managed elsewhere (for example by Home Manager); \
+             flk leaves it untouched. Merge the fragment from \
+             `flk integration manifest claude` into its source instead",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn install_claude(question: &ClaudeQuestionHook) -> io::Result<ClaudeInstallPaths> {
+    let _settings = claude_settings_lock();
     let dir = claude_dir()?;
     if !dir.is_dir() {
         return Err(io::Error::other(format!(
@@ -1140,11 +1387,14 @@ pub(crate) fn install_claude() -> io::Result<ClaudeInstallPaths> {
         )));
     }
 
+    // Refused before anything is created or written.
+    let hook_path = effective_claude_hook_path(&dir);
+    refuse_symlink(&hook_path)?;
+    refuse_symlink(&dir.join("settings.json"))?;
     let hooks_dir = dir.join("hooks");
     fs::create_dir_all(&hooks_dir)?;
-
-    let hook_path = hooks_dir.join(CLAUDE_HOOK_INSTALL_NAME);
-    fs::write(&hook_path, CLAUDE_HOOK_ASSET)?;
+    // Atomic, so a Claude session running the stub never reads half of it.
+    atomic_write::replace(&hook_path, CLAUDE_HOOK_ASSET.as_bytes())?;
     make_executable(&hook_path)?;
     // Rebrand cleanup: drop the dead `herdr-agent-state.sh` shim left by a
     // pre-flock install (its `HERDR_ENV` gate is never set now).
@@ -1233,8 +1483,23 @@ pub(crate) fn install_claude() -> io::Result<ClaudeInstallPaths> {
             *matcher,
         )?;
     }
+    // ADR-0034 §3: rewritten on every install, because its matcher and
+    // onFailure follow the config and the Claude version, and
+    // `ensure_command_hook` leaves an entry it already has untouched.
+    let question_command = format!("bash {quoted_hook_path} question");
+    remove_command_hook(hooks, "PreToolUse", &question_command)?;
+    hooks
+        .entry("PreToolUse".to_string())
+        .or_insert_with(|| Value::Array(Vec::new()))
+        .as_array_mut()
+        .ok_or_else(|| io::Error::other("hook entries for PreToolUse must be an array"))?
+        .push(question.entry(question_command));
 
-    fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)?;
+    // Atomic, so Claude and a concurrent reader never see a half-written file.
+    atomic_write::replace(
+        &settings_path,
+        serde_json::to_string_pretty(&settings)?.as_bytes(),
+    )?;
 
     Ok(ClaudeInstallPaths {
         hook_path,
@@ -1248,7 +1513,7 @@ pub(crate) fn install_claude() -> io::Result<ClaudeInstallPaths> {
 /// writes via [`ensure_command_hook`]. This is the canonical thing a consumer
 /// merges into its own (possibly read-only / externally-managed) settings.json
 /// instead of relying on flock to patch the file — the manifest "seam".
-fn claude_hooks_fragment(hook_path: &Path) -> Value {
+fn claude_hooks_fragment(hook_path: &Path, question: &ClaudeQuestionHook) -> Value {
     let quoted_hook_path = shell_single_quote(&hook_path.display().to_string());
     let mut hooks = Map::new();
     for (event, arg, matcher) in CLAUDE_HOOK_ENTRIES {
@@ -1271,7 +1536,26 @@ fn claude_hooks_fragment(hook_path: &Path) -> Value {
             Value::Array(vec![Value::Object(entry)]),
         );
     }
+    hooks.insert(
+        "PreToolUse".to_string(),
+        json!([question.entry(format!("bash {quoted_hook_path} question"))]),
+    );
     Value::Object(hooks)
+}
+
+/// [`integration_manifest`] for Claude, with the question entry this machine
+/// gets (see [`ClaudeQuestionHook::detect`]).
+fn claude_manifest(question: &ClaudeQuestionHook) -> io::Result<Value> {
+    let dir = claude_dir()?;
+    let hook_path = effective_claude_hook_path(&dir);
+    let settings_path = dir.join("settings.json");
+    Ok(json!({
+        "target": integration_target_label(crate::api::schema::IntegrationTarget::Claude),
+        "version": CLAUDE_INTEGRATION_VERSION,
+        "hookScript": hook_path.display().to_string(),
+        "settingsPath": settings_path.display().to_string(),
+        "hooks": claude_hooks_fragment(&hook_path, question),
+    }))
 }
 
 /// Verdict returned by [`verify_integration_manifest`] (#175 S2 gate for
@@ -1354,7 +1638,7 @@ pub(crate) fn verify_integration_manifest() -> ManifestVerdict {
 /// (nothing to drift against — the reap is not stopped for missing files).
 fn verify_claude_settings_drift() -> Option<Vec<String>> {
     let dir = claude_dir().ok()?;
-    let hook_path = dir.join("hooks").join(CLAUDE_HOOK_INSTALL_NAME);
+    let hook_path = effective_claude_hook_path(&dir);
     let settings_path = dir.join("settings.json");
     // Half-state is asymmetric and both directions are drift (#143):
     //  * shim missing but settings still register it  -> hooks fire nothing
@@ -1386,7 +1670,10 @@ fn verify_claude_settings_drift() -> Option<Vec<String>> {
     let raw = fs::read_to_string(&settings_path).ok()?;
     let parsed: Value = serde_json::from_str(&raw).ok()?;
     let installed_hooks = parsed.get("hooks").cloned().unwrap_or(Value::Null);
-    let expected_hooks = claude_hooks_fragment(&hook_path);
+    // Only commands are compared below, so the question entry's
+    // machine-dependent matcher and onFailure do not matter here, and the
+    // reap gate never runs `claude --version`.
+    let expected_hooks = claude_hooks_fragment(&hook_path, &ClaudeQuestionHook::default());
 
     // SUBSET semantics, matching the installer (#309). `ensure_command_hook`
     // APPENDS flock's entry and treats the event as satisfied when any entry
@@ -1478,16 +1765,7 @@ pub(crate) fn integration_manifest(
 ) -> io::Result<Value> {
     match target {
         crate::api::schema::IntegrationTarget::Claude => {
-            let dir = claude_dir()?;
-            let hook_path = dir.join("hooks").join(CLAUDE_HOOK_INSTALL_NAME);
-            let settings_path = dir.join("settings.json");
-            Ok(json!({
-                "target": integration_target_label(target),
-                "version": CLAUDE_INTEGRATION_VERSION,
-                "hookScript": hook_path.display().to_string(),
-                "settingsPath": settings_path.display().to_string(),
-                "hooks": claude_hooks_fragment(&hook_path),
-            }))
+            claude_manifest(&ClaudeQuestionHook::detect())
         }
         other => Err(io::Error::other(format!(
             "manifest is not available for {} yet; use `flk integration install {}`",
@@ -1497,7 +1775,12 @@ pub(crate) fn integration_manifest(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn install_codex() -> io::Result<CodexInstallPaths> {
+    install_codex_with_trust(true)
+}
+
+fn install_codex_with_trust(trust_hooks: bool) -> io::Result<CodexInstallPaths> {
     let dir = codex_dir()?;
     if !dir.is_dir() {
         return Err(io::Error::other(format!(
@@ -1507,8 +1790,6 @@ pub(crate) fn install_codex() -> io::Result<CodexInstallPaths> {
     }
 
     let hook_path = dir.join(CODEX_HOOK_INSTALL_NAME);
-    fs::write(&hook_path, CODEX_HOOK_ASSET)?;
-    make_executable(&hook_path)?;
 
     let hooks_path = dir.join("hooks.json");
     let mut hooks_file = if hooks_path.is_file() {
@@ -1555,7 +1836,7 @@ pub(crate) fn install_codex() -> io::Result<CodexInstallPaths> {
         None,
     )?;
 
-    fs::write(&hooks_path, serde_json::to_string_pretty(&hooks_file)?)?;
+    let new_hooks = serde_json::to_string_pretty(&hooks_file)?;
 
     let config_path = dir.join("config.toml");
     let existing_config = if config_path.is_file() {
@@ -1563,9 +1844,23 @@ pub(crate) fn install_codex() -> io::Result<CodexInstallPaths> {
     } else {
         String::new()
     };
-    let new_config = build_codex_config_with_hooks(&existing_config);
+    existing_config
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(io::Error::other)?;
+    let mut new_config = build_codex_config_with_hooks(&existing_config)?;
+    if trust_hooks {
+        new_config = codex_hook_trust::trust_flock_hook(
+            &new_config,
+            &hooks_path,
+            &hooks_file,
+            &format!("bash {quoted_hook_path} session"),
+        )?;
+    }
+    fs::write(&hook_path, CODEX_HOOK_ASSET)?;
+    make_executable(&hook_path)?;
+    atomic_write::replace(&hooks_path, new_hooks.as_bytes())?;
     if new_config != existing_config {
-        fs::write(&config_path, new_config)?;
+        atomic_write::replace(&config_path, new_config.as_bytes())?;
     }
 
     Ok(CodexInstallPaths {
@@ -1746,8 +2041,11 @@ pub(crate) fn uninstall_omp() -> io::Result<OmpUninstallResult> {
 }
 
 pub(crate) fn uninstall_claude() -> io::Result<ClaudeUninstallResult> {
+    let _settings = claude_settings_lock();
     let hook_path = claude_dir()?.join("hooks").join(CLAUDE_HOOK_INSTALL_NAME);
     let settings_path = claude_dir()?.join("settings.json");
+    refuse_symlink(&hook_path)?;
+    refuse_symlink(&settings_path)?;
     let mut updated_settings = false;
 
     if settings_path.is_file() {
@@ -1793,6 +2091,11 @@ pub(crate) fn uninstall_claude() -> io::Result<ClaudeUninstallResult> {
             )?;
             updated_settings |= remove_command_hook(
                 hooks,
+                "PreToolUse",
+                &format!("bash {quoted_hook_path} question"),
+            )?;
+            updated_settings |= remove_command_hook(
+                hooks,
                 "PermissionRequest",
                 &format!("bash {quoted_hook_path} blocked"),
             )?;
@@ -1821,7 +2124,10 @@ pub(crate) fn uninstall_claude() -> io::Result<ClaudeUninstallResult> {
         }
 
         if updated_settings {
-            fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)?;
+            atomic_write::replace(
+                &settings_path,
+                serde_json::to_string_pretty(&settings)?.as_bytes(),
+            )?;
         }
     }
 
@@ -2598,58 +2904,47 @@ fn join_yaml_lines(lines: Vec<String>, trailing_newline: bool) -> String {
     result
 }
 
-fn build_codex_config_with_hooks(content: &str) -> String {
-    let mut lines: Vec<String> = content.lines().map(str::to_string).collect();
-    let trailing_newline = content.ends_with('\n');
-    let mut in_top_level_features = false;
-    let mut features_header_index = None;
-    let mut hooks_index = None;
-    let mut deprecated_hooks_indexes = Vec::new();
-
-    for (index, line) in lines.iter().enumerate() {
-        if let Some(header) = toml_table_header(line) {
-            in_top_level_features = header == "[features]";
-            if in_top_level_features && features_header_index.is_none() {
-                features_header_index = Some(index);
+fn build_codex_config_with_hooks(content: &str) -> io::Result<String> {
+    let mut doc: toml_edit::DocumentMut = content.parse().map_err(io::Error::other)?;
+    let item = doc
+        .entry("features")
+        .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
+    let features = item
+        .as_table_like_mut()
+        .ok_or_else(|| io::Error::other("invalid Codex features table"))?;
+    let order: Vec<String> = features
+        .iter()
+        .map(|(key, _)| {
+            if key == "codex_hooks" {
+                "hooks".to_string()
+            } else {
+                key.to_string()
             }
-            continue;
+        })
+        .collect();
+    if features.get("hooks").and_then(toml_edit::Item::as_bool) != Some(true) {
+        let mut value = toml_edit::Value::from(true);
+        if let Some(previous) = features.get("hooks").and_then(toml_edit::Item::as_value) {
+            *value.decor_mut() = previous.decor().clone();
         }
-
-        if !in_top_level_features {
-            continue;
-        }
-
-        if is_toml_key(line, "codex_hooks") {
-            deprecated_hooks_indexes.push(index);
-        } else if is_toml_key(line, "hooks") {
-            hooks_index = Some(index);
-        }
+        features.insert("hooks", toml_edit::Item::Value(value));
     }
-
-    if let Some(index) = hooks_index {
-        lines[index] = "hooks = true".to_string();
+    features.remove("codex_hooks");
+    if let Some(table) = item.as_table_mut() {
+        table.sort_values_by(|a, _, b, _| {
+            order
+                .iter()
+                .position(|key| key == a.get())
+                .unwrap_or(usize::MAX)
+                .cmp(
+                    &order
+                        .iter()
+                        .position(|key| key == b.get())
+                        .unwrap_or(usize::MAX),
+                )
+        });
     }
-
-    for index in deprecated_hooks_indexes.into_iter().rev() {
-        lines.remove(index);
-    }
-
-    if hooks_index.is_none() {
-        if let Some(index) = features_header_index {
-            lines.insert(index + 1, "hooks = true".to_string());
-            return join_toml_lines(lines, trailing_newline);
-        }
-
-        let mut result = content.trim_end_matches('\n').to_string();
-        if !result.is_empty() {
-            result.push('\n');
-            result.push('\n');
-        }
-        result.push_str("[features]\nhooks = true\n");
-        return result;
-    }
-
-    join_toml_lines(lines, trailing_newline)
+    Ok(doc.to_string())
 }
 
 fn build_kimi_config_with_hooks(content: &str, hook_path: &Path) -> String {
@@ -2749,35 +3044,6 @@ fn join_toml_lines(lines: Vec<String>, trailing_newline: bool) -> String {
     result
 }
 
-fn toml_table_header(line: &str) -> Option<&str> {
-    let trimmed = line.trim_start();
-    if trimmed.starts_with('#') || !trimmed.starts_with('[') {
-        return None;
-    }
-
-    let header_end = if trimmed.starts_with("[[") {
-        trimmed.find("]]").map(|index| index + 2)?
-    } else {
-        trimmed.find(']').map(|index| index + 1)?
-    };
-    let header = &trimmed[..header_end];
-    let rest = trimmed[header_end..].trim_start();
-    if !rest.is_empty() && !rest.starts_with('#') {
-        return None;
-    }
-
-    Some(header)
-}
-
-fn is_toml_key(line: &str, key: &str) -> bool {
-    let trimmed = line.trim();
-    if trimmed.starts_with('#') || !trimmed.starts_with(key) {
-        return false;
-    }
-
-    trimmed[key.len()..].trim_start().starts_with('=')
-}
-
 fn shell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
@@ -2807,6 +3073,44 @@ fn omp_extension_dir() -> io::Result<PathBuf> {
         config_dir_from_env_or_home(PI_CODING_AGENT_DIR_ENV_VAR, &[".omp", "agent"])?
             .join("extensions"),
     )
+}
+
+/// Profiles can register the shared hook with the same command fragment that
+/// flock installs. Read the registration instead of assuming a profile copy.
+fn effective_claude_hook_path(dir: &Path) -> PathBuf {
+    let registered = fs::read_to_string(dir.join("settings.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|settings| {
+            let entries = settings.get("hooks")?.get("SessionStart")?.as_array()?;
+            entries.iter().find_map(|entry| {
+                entry.get("hooks")?.as_array()?.iter().find_map(|hook| {
+                    if hook.get("type")?.as_str()? != "command" {
+                        return None;
+                    }
+                    let command = hook.get("command")?.as_str()?;
+                    let raw = command.strip_prefix("bash ")?.strip_suffix(" session")?;
+                    let decoded = raw
+                        .strip_prefix('\'')
+                        .and_then(|raw| raw.strip_suffix('\''))
+                        .map(|raw| raw.replace("'\"'\"'", "'"))
+                        .unwrap_or_else(|| raw.to_owned());
+                    let path = PathBuf::from(decoded);
+                    if !path.is_absolute() || path.file_name()? != CLAUDE_HOOK_INSTALL_NAME {
+                        return None;
+                    }
+                    let quoted = format!(
+                        "bash {} session",
+                        shell_single_quote(&path.display().to_string())
+                    );
+                    let unquoted = format!("bash {} session", path.display());
+                    (command == quoted
+                        || (command == unquoted && !raw.chars().any(char::is_whitespace)))
+                    .then_some(path)
+                })
+            })
+        });
+    registered.unwrap_or_else(|| dir.join("hooks").join(CLAUDE_HOOK_INSTALL_NAME))
 }
 
 fn claude_dir() -> io::Result<PathBuf> {
@@ -3441,21 +3745,100 @@ mod tests {
         );
     }
 
+    /// #1179: the hint comes from the armed record only. `ask_human`, and a
+    /// pane nobody armed, carry none, even where the server's own
+    /// environment (inherited into `cmd`) has one.
     #[test]
-    fn apply_pane_env_stamps_flock_bin_to_current_exe() {
+    fn apply_pane_env_stamps_the_question_hint_from_the_record_only() {
+        let stamped = |armed: Option<QuestionPolicy>| {
+            let mut cmd = CommandBuilder::new("/bin/sh");
+            cmd.env(FLOCK_QUESTIONS_ENV_VAR, "route");
+            let _guard = armed.map(set_pending_questions);
+            apply_pane_env(&mut cmd, PaneId::from_raw(31));
+            cmd.get_env(FLOCK_QUESTIONS_ENV_VAR)
+                .map(|value| value.to_string_lossy().into_owned())
+        };
+        assert_eq!(stamped(Some(QuestionPolicy::Deny)).as_deref(), Some("deny"));
+        assert_eq!(
+            stamped(Some(QuestionPolicy::AskOperator)).as_deref(),
+            Some("ask_operator")
+        );
+        assert_eq!(stamped(Some(QuestionPolicy::AskHuman)), None);
+        assert_eq!(stamped(None), None);
+    }
+
+    #[test]
+    fn apply_pane_env_stamps_flock_bin_to_stable_launch_path() {
         let mut cmd = CommandBuilder::new("/bin/sh");
+        cmd.env_remove(FLOCK_BIN_ENV_VAR);
         apply_pane_env(&mut cmd, PaneId::from_raw(7));
-        let expected = std::env::current_exe().expect("current_exe in test");
+        let expected = launch::stable_launch_path().expect("stable launch in test");
         assert_eq!(
             cmd.get_env(FLOCK_BIN_ENV_VAR),
             Some(expected.as_os_str()),
-            "FLOCK_BIN must point at the running flock binary so hook stubs \
-             reach `flk hook` without relying on PATH"
+            "FLOCK_BIN must retain a stable launch path for hook stubs"
         );
         assert_eq!(
             cmd.get_env(FLOCK_PANE_ID_ENV_VAR),
             Some(std::ffi::OsStr::new("p_7"))
         );
+    }
+
+    #[test]
+    fn claude_profile_status_and_install_use_shared_registered_hook() {
+        let _lock = integration_env_lock();
+        let base = unique_base();
+        let shared = base.join("shared hooks").join(CLAUDE_HOOK_INSTALL_NAME);
+        let profile = base.join("profile");
+        fs::create_dir_all(shared.parent().unwrap()).unwrap();
+        fs::create_dir_all(&profile).unwrap();
+        fs::write(&shared, CLAUDE_HOOK_ASSET).unwrap();
+        let settings =
+            json!({"hooks": claude_hooks_fragment(&shared, &ClaudeQuestionHook::default())});
+        fs::write(profile.join("settings.json"), settings.to_string()).unwrap();
+        std::env::set_var(CLAUDE_CONFIG_DIR_ENV_VAR, &profile);
+        let status = installed_integration_statuses()
+            .into_iter()
+            .find(|status| status.target == crate::api::schema::IntegrationTarget::Claude)
+            .unwrap();
+        assert_eq!(status.path, shared);
+        assert_eq!(status.state, IntegrationStatusKind::Current);
+        assert!(verify_claude_settings_drift().is_none());
+        let installed = install_claude(&ClaudeQuestionHook::default()).unwrap();
+        assert_eq!(installed.hook_path, shared);
+        assert!(!profile
+            .join("hooks")
+            .join(CLAUDE_HOOK_INSTALL_NAME)
+            .exists());
+        let after: Value =
+            serde_json::from_str(&fs::read_to_string(profile.join("settings.json")).unwrap())
+                .unwrap();
+        for (event, _, _) in CLAUDE_HOOK_ENTRIES {
+            assert_eq!(after["hooks"][event].as_array().unwrap().len(), 1);
+        }
+        fs::remove_file(&shared).unwrap();
+        let status = installed_integration_statuses()
+            .into_iter()
+            .find(|status| status.target == crate::api::schema::IntegrationTarget::Claude)
+            .unwrap();
+        assert_eq!(status.state, IntegrationStatusKind::NotInstalled);
+        assert!(verify_claude_settings_drift().is_some());
+        clear_integration_path_env();
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn pane_env_supersedes_outer_launch_and_replaces_inherited_store_pin() {
+        let mut cmd = CommandBuilder::new("/bin/sh");
+        cmd.env(FLOCK_BIN_ENV_VAR, "/nix/store/fixture-flock/bin/flk");
+        apply_pane_env(&mut cmd, PaneId::from_raw(7));
+        let selected = PathBuf::from(cmd.get_env(FLOCK_BIN_ENV_VAR).unwrap());
+        assert!(!launch::is_store_path(&selected));
+        let custom = crate::test_support::unique_temp_path("custom-flk");
+        cmd.env(FLOCK_BIN_ENV_VAR, &custom);
+        apply_pane_env(&mut cmd, PaneId::from_raw(7));
+        let own = std::env::current_exe().unwrap();
+        assert_eq!(cmd.get_env(FLOCK_BIN_ENV_VAR), Some(own.as_os_str()));
     }
 
     fn kimi_hook_command(hook_path: &Path, action: &str) -> String {
@@ -3852,7 +4235,7 @@ mod tests {
         .unwrap();
         std::env::set_var("HOME", &home);
 
-        let installed = install_claude().unwrap();
+        let installed = install_claude(&ClaudeQuestionHook::default()).unwrap();
 
         assert!(installed.removed_legacy_hook);
         assert!(
@@ -3884,11 +4267,276 @@ mod tests {
         fs::create_dir_all(&claude_dir).unwrap();
         std::env::set_var("HOME", &home);
 
-        let installed = install_claude().unwrap();
+        let installed = install_claude(&ClaudeQuestionHook::default()).unwrap();
         assert!(
             !installed.removed_legacy_hook,
             "clean install should not report a legacy removal"
         );
+    }
+
+    /// The legacy `PreToolUse ... working` entry is gone, and the question
+    /// entry is there exactly once (ADR-0034 §3).
+    fn assert_only_the_question_entry(settings: &Value) {
+        let entries = settings["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert!(entries[0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .ends_with(" question"));
+    }
+
+    /// Claude reads the matcher as a regex once it holds anything but
+    /// letters, digits, `_` and `|` (an anchored list, or a configured name
+    /// with a `-`). Either way it must match the question tools and the
+    /// configured names exactly, and nothing else: a non-question tool call
+    /// must start no process (ADR-0034 §1).
+    #[test]
+    fn the_question_matcher_names_only_question_tools() {
+        let plain = ClaudeQuestionHook::default().matcher();
+        assert_eq!(plain, "AskUserQuestion|ExitPlanMode");
+        assert!(plain
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '|'));
+
+        let configured = ClaudeQuestionHook {
+            human_tools: vec!["mcp__tg-mcp__ask".into(), "mcp__a.b__ask".into()],
+            on_failure_block: false,
+        }
+        .matcher();
+        let regex = regex::Regex::new(&configured).unwrap();
+        for tool in [
+            "AskUserQuestion",
+            "ExitPlanMode",
+            "mcp__tg-mcp__ask",
+            "mcp__a.b__ask",
+        ] {
+            assert!(regex.is_match(tool), "{configured} misses {tool}");
+        }
+        for tool in [
+            "Bash",
+            "Read",
+            "Edit",
+            "mcp__tg-mcp__ask_later",
+            "xAskUserQuestion",
+            "mcp__aXb__ask",
+        ] {
+            assert!(!regex.is_match(tool), "{configured} matches {tool}");
+        }
+    }
+
+    /// `onFailure: "block"` only where Claude Code honours it (ADR-0034 §3,
+    /// P4, P9); an older Claude gets the key-less entry.
+    #[test]
+    fn on_failure_is_installed_from_claude_2_1_295() {
+        let entry = |on_failure_block| {
+            ClaudeQuestionHook {
+                human_tools: Vec::new(),
+                on_failure_block,
+            }
+            .entry("cmd".into())
+        };
+        assert_eq!(entry(true)["hooks"][0]["onFailure"], "block");
+        assert!(entry(false)["hooks"][0].get("onFailure").is_none());
+        assert_eq!(
+            entry(true)["hooks"][0]["timeout"],
+            CLAUDE_QUESTION_HOOK_TIMEOUT
+        );
+
+        let at_least = |raw: &str| claude_version(raw).map(|v| v >= CLAUDE_ON_FAILURE_SINCE);
+        assert_eq!(at_least("2.1.296 (Claude Code)\n"), Some(true));
+        assert_eq!(at_least("2.1.295 (Claude Code)"), Some(true));
+        assert_eq!(at_least("2.1.294 (Claude Code)"), Some(false));
+        assert_eq!(at_least("1.9.999"), Some(false));
+        assert_eq!(at_least("not a version"), None);
+        assert_eq!(at_least(""), None);
+    }
+
+    /// #1180: the server installs on worker threads, so an install can race
+    /// an uninstall. Each spans two files (the stub and settings.json), so
+    /// without the lock one's write lands between the other's, leaving the
+    /// #143 half-state: a registration whose stub is gone, or a stub nothing
+    /// registers. With it, every round ends wholly installed or wholly not,
+    /// and the user's own hook survives.
+    #[test]
+    fn an_install_racing_an_uninstall_never_leaves_a_half_state() {
+        let _lock = integration_env_lock();
+        let base = unique_base();
+        let claude_dir = base.join("claude");
+        fs::create_dir_all(claude_dir.join("hooks")).unwrap();
+        let settings_path = claude_dir.join("settings.json");
+        fs::write(
+            &settings_path,
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"echo mine"}]}]}}"#,
+        )
+        .unwrap();
+        std::env::set_var(CLAUDE_CONFIG_DIR_ENV_VAR, &claude_dir);
+        let stub = claude_dir.join("hooks").join(CLAUDE_HOOK_INSTALL_NAME);
+        let question = ClaudeQuestionHook::default();
+
+        let mut half_states = Vec::new();
+        for round in 0..300 {
+            let start = std::sync::Barrier::new(2);
+            std::thread::scope(|scope| {
+                let install = scope.spawn(|| {
+                    start.wait();
+                    install_claude(&question).map(|_| ())
+                });
+                let uninstall = scope.spawn(|| {
+                    start.wait();
+                    uninstall_claude().map(|_| ())
+                });
+                install.join().expect("install").expect("install succeeds");
+                uninstall
+                    .join()
+                    .expect("uninstall")
+                    .expect("uninstall succeeds");
+            });
+            let raw = fs::read_to_string(&settings_path).unwrap();
+            let registered = raw.contains(" question\"");
+            assert!(
+                raw.contains("echo mine"),
+                "round {round} lost the user's hook"
+            );
+            if registered != stub.exists() {
+                half_states.push((round, registered));
+            }
+        }
+
+        assert!(
+            half_states.is_empty(),
+            "(round, registered) where the stub disagreed: {half_states:?}"
+        );
+        clear_integration_path_env();
+        let _ = fs::remove_dir_all(base);
+    }
+
+    /// A Home Manager profile links settings.json and the stub into a
+    /// read-only store. Install and uninstall both refuse, naming the path
+    /// and the manifest, and leave the link exactly as it was.
+    #[test]
+    fn a_symlinked_settings_file_or_stub_is_refused_and_left_alone() {
+        let _lock = integration_env_lock();
+        let base = unique_base();
+        let claude_dir = base.join("claude");
+        let store = base.join("store");
+        fs::create_dir_all(claude_dir.join("hooks")).unwrap();
+        fs::create_dir_all(&store).unwrap();
+        std::env::set_var(CLAUDE_CONFIG_DIR_ENV_VAR, &claude_dir);
+        let managed_settings = store.join("settings.json");
+        let managed_stub = store.join(CLAUDE_HOOK_INSTALL_NAME);
+        fs::write(&managed_settings, r#"{"hooks":{}}"#).unwrap();
+        fs::write(&managed_stub, "#!/bin/sh\n").unwrap();
+        let settings = claude_dir.join("settings.json");
+        let stub = claude_dir.join("hooks").join(CLAUDE_HOOK_INSTALL_NAME);
+
+        for (link, target) in [(&settings, &managed_settings), (&stub, &managed_stub)] {
+            std::os::unix::fs::symlink(target, link).unwrap();
+            let refusals = [
+                install_claude(&ClaudeQuestionHook::default())
+                    .map(|_| ())
+                    .unwrap_err(),
+                uninstall_claude().map(|_| ()).unwrap_err(),
+            ];
+            for refusal in refusals {
+                let message = refusal.to_string();
+                assert!(message.contains(&link.display().to_string()), "{message}");
+                assert!(
+                    message.contains("flk integration manifest claude"),
+                    "{message}"
+                );
+            }
+            assert!(fs::symlink_metadata(link).unwrap().file_type().is_symlink());
+            assert_eq!(&fs::read_link(link).unwrap(), target);
+            fs::remove_file(link).unwrap();
+        }
+        assert_eq!(
+            fs::read_to_string(&managed_settings).unwrap(),
+            r#"{"hooks":{}}"#
+        );
+        assert_eq!(fs::read_to_string(&managed_stub).unwrap(), "#!/bin/sh\n");
+
+        clear_integration_path_env();
+        let _ = fs::remove_dir_all(base);
+    }
+
+    /// ADR-0034 §4: `flk integration status` says when the installed question
+    /// entry fails open, and is silent once it carries `onFailure: "block"`.
+    #[test]
+    fn status_reports_a_question_entry_that_fails_open() {
+        let _lock = integration_env_lock();
+        let base = unique_base();
+        let claude_dir = base.join("claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+        std::env::set_var(CLAUDE_CONFIG_DIR_ENV_VAR, &claude_dir);
+        let claude = crate::api::schema::IntegrationTarget::Claude;
+
+        assert!(question_hook_notes(claude).is_empty(), "nothing installed");
+        install_claude(&ClaudeQuestionHook::new(
+            Vec::new(),
+            claude_version("2.1.294"),
+        ))
+        .unwrap();
+        assert_eq!(
+            question_hook_notes(claude),
+            [QUESTION_HOOK_FAILS_OPEN.to_string()]
+        );
+        assert!(QUESTION_HOOK_FAILS_OPEN
+            .starts_with("question hook: fails open on timeout (claude < 2.1.295"));
+        install_claude(&ClaudeQuestionHook::new(
+            Vec::new(),
+            claude_version("2.1.296"),
+        ))
+        .unwrap();
+        assert!(question_hook_notes(claude).is_empty());
+        assert!(question_hook_notes(crate::api::schema::IntegrationTarget::Codex).is_empty());
+
+        clear_integration_path_env();
+        let _ = fs::remove_dir_all(base);
+    }
+
+    /// A reinstall rewrites the question entry rather than keeping a stale
+    /// matcher or adding a second one, keeps a user's own PreToolUse hook,
+    /// and an uninstall removes only flk's.
+    #[test]
+    fn the_question_entry_is_rewritten_on_reinstall_and_removed_on_uninstall() {
+        let _lock = integration_env_lock();
+        let base = unique_base();
+        let claude_dir = base.join("claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+        fs::write(
+            claude_dir.join("settings.json"),
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"echo mine"}]}]}}"#,
+        )
+        .unwrap();
+        std::env::set_var(CLAUDE_CONFIG_DIR_ENV_VAR, &claude_dir);
+        let read = || -> Value {
+            serde_json::from_str(&fs::read_to_string(claude_dir.join("settings.json")).unwrap())
+                .unwrap()
+        };
+
+        install_claude(&ClaudeQuestionHook::default()).unwrap();
+        let widened = ClaudeQuestionHook {
+            human_tools: vec!["mcp__x__ask".into()],
+            on_failure_block: true,
+        };
+        install_claude(&widened).unwrap();
+
+        let pre = read()["hooks"]["PreToolUse"].clone();
+        assert_eq!(pre.as_array().unwrap().len(), 2, "{pre}");
+        assert_eq!(pre[0]["hooks"][0]["command"], "echo mine");
+        assert_eq!(
+            pre[1]["matcher"],
+            "^(AskUserQuestion|ExitPlanMode|mcp__x__ask)$"
+        );
+        assert_eq!(pre[1]["hooks"][0]["onFailure"], "block");
+
+        uninstall_claude().unwrap();
+        let pre = read()["hooks"]["PreToolUse"].clone();
+        assert_eq!(pre.as_array().unwrap().len(), 1, "{pre}");
+        assert_eq!(pre[0]["hooks"][0]["command"], "echo mine");
+
+        clear_integration_path_env();
+        let _ = fs::remove_dir_all(base);
     }
 
     #[test]
@@ -3905,7 +4553,7 @@ mod tests {
         .unwrap();
         std::env::set_var("HOME", &home);
 
-        let installed = install_claude().unwrap();
+        let installed = install_claude(&ClaudeQuestionHook::default()).unwrap();
         let hook_content = fs::read_to_string(&installed.hook_path).unwrap();
         let settings: Value =
             serde_json::from_str(&fs::read_to_string(&installed.settings_path).unwrap()).unwrap();
@@ -3940,7 +4588,15 @@ mod tests {
             .as_str()
             .unwrap()
             .ends_with(" stop"));
-        assert!(settings["hooks"].get("PreToolUse").is_none());
+        // ADR-0034 §3: the only PreToolUse entry is the question point.
+        assert_eq!(
+            settings["hooks"]["PreToolUse"],
+            json!([{"matcher": "AskUserQuestion|ExitPlanMode", "hooks": [{
+                "type": "command",
+                "command": format!("bash '{}' question", installed.hook_path.display()),
+                "timeout": CLAUDE_QUESTION_HOOK_TIMEOUT,
+            }]}])
+        );
         assert!(settings["hooks"].get("PermissionRequest").is_none());
         assert!(settings["hooks"].get("PostToolUse").is_none());
         assert!(settings["hooks"].get("PostToolUseFailure").is_none());
@@ -4000,13 +4656,17 @@ mod tests {
         std::env::set_var(CLAUDE_CONFIG_DIR_ENV_VAR, &claude_dir);
 
         // install writes the canonical hook entries into settings.json...
-        let installed = install_claude().unwrap();
+        let question = ClaudeQuestionHook {
+            human_tools: vec!["mcp__tg-mcp__ask".into()],
+            on_failure_block: true,
+        };
+        let installed = install_claude(&question).unwrap();
         let settings: Value =
             serde_json::from_str(&fs::read_to_string(&installed.settings_path).unwrap()).unwrap();
 
         // ...and the manifest emits the EXACT same fragment a consumer declares,
         // so the two sources of truth cannot drift (ADR on #136).
-        let manifest = integration_manifest(crate::api::schema::IntegrationTarget::Claude).unwrap();
+        let manifest = claude_manifest(&question).unwrap();
         assert_eq!(manifest["hooks"], settings["hooks"]);
         assert_eq!(manifest["version"], json!(CLAUDE_INTEGRATION_VERSION));
         assert_eq!(
@@ -4049,7 +4709,7 @@ mod tests {
         .unwrap();
         std::env::set_var(CLAUDE_CONFIG_DIR_ENV_VAR, &claude_dir);
 
-        let installed = install_claude().unwrap();
+        let installed = install_claude(&ClaudeQuestionHook::default()).unwrap();
         let settings: Value =
             serde_json::from_str(&fs::read_to_string(&installed.settings_path).unwrap()).unwrap();
         let manifest = integration_manifest(crate::api::schema::IntegrationTarget::Claude).unwrap();
@@ -4077,7 +4737,7 @@ mod tests {
         fs::create_dir_all(&claude_dir).unwrap();
         std::env::set_var(CLAUDE_CONFIG_DIR_ENV_VAR, &claude_dir);
 
-        let installed = install_claude().unwrap();
+        let installed = install_claude(&ClaudeQuestionHook::default()).unwrap();
 
         assert_eq!(installed.settings_path, claude_dir.join("settings.json"));
         assert_eq!(
@@ -4098,8 +4758,8 @@ mod tests {
         fs::create_dir_all(&claude_dir).unwrap();
         std::env::set_var("HOME", &home);
 
-        install_claude().unwrap();
-        install_claude().unwrap();
+        install_claude(&ClaudeQuestionHook::default()).unwrap();
+        install_claude(&ClaudeQuestionHook::default()).unwrap();
 
         let settings: Value =
             serde_json::from_str(&fs::read_to_string(claude_dir.join("settings.json")).unwrap())
@@ -4127,7 +4787,7 @@ mod tests {
             .as_str()
             .unwrap()
             .ends_with(" stop"));
-        assert!(settings["hooks"].get("PreToolUse").is_none());
+        assert_only_the_question_entry(&settings);
         assert!(settings["hooks"].get("PermissionRequest").is_none());
         assert!(settings["hooks"].get("PostToolUse").is_none());
         assert!(settings["hooks"].get("PostToolUseFailure").is_none());
@@ -4160,7 +4820,7 @@ mod tests {
         .unwrap();
         std::env::set_var("HOME", &home);
 
-        install_claude().unwrap();
+        install_claude(&ClaudeQuestionHook::default()).unwrap();
 
         let settings: Value =
             serde_json::from_str(&fs::read_to_string(claude_dir.join("settings.json")).unwrap())
@@ -4194,7 +4854,7 @@ mod tests {
                 .unwrap()
                 .ends_with(" prompt")
         );
-        assert!(settings["hooks"].get("PreToolUse").is_none());
+        assert_only_the_question_entry(&settings);
         // v7: Stop is now installed (recap+reply scrape). It should not be
         // absent here — only the LEGACY `Stop ... idle` command is removed.
         // The presence assertion mirrors `install_claude_writes_hook_*`.
@@ -4231,7 +4891,7 @@ mod tests {
 
         assert_eq!(claude.path, hook_path);
         assert_eq!(claude.installed_version, Some(1));
-        assert_eq!(claude.expected_version, 9);
+        assert_eq!(claude.expected_version, CLAUDE_INTEGRATION_VERSION);
         assert_eq!(claude.state, IntegrationStatusKind::Outdated);
 
         std::env::remove_var("HOME");
@@ -4261,7 +4921,7 @@ mod tests {
 
         assert_eq!(claude.path, hook_path);
         assert_eq!(claude.installed_version, Some(2));
-        assert_eq!(claude.expected_version, 9);
+        assert_eq!(claude.expected_version, CLAUDE_INTEGRATION_VERSION);
         assert_eq!(claude.state, IntegrationStatusKind::Outdated);
 
         std::env::remove_var("HOME");
@@ -4334,7 +4994,9 @@ mod tests {
         fs::create_dir_all(&home).unwrap();
         std::env::set_var("HOME", &home);
 
-        let err = install_claude().unwrap_err().to_string();
+        let err = install_claude(&ClaudeQuestionHook::default())
+            .unwrap_err()
+            .to_string();
 
         assert!(err.contains("claude directory not found"));
 
@@ -4412,6 +5074,42 @@ mod tests {
     }
 
     #[test]
+    fn codex_install_trusts_only_its_hook_and_can_opt_out() {
+        let _lock = integration_env_lock();
+        let base = unique_base();
+        fs::create_dir_all(&base).unwrap();
+        std::env::set_var(CODEX_HOME_ENV_VAR, &base);
+        fs::write(
+            base.join("config.toml"),
+            "[hooks.state.other]\nenabled = false\ntrusted_hash = \"keep\"\n",
+        )
+        .unwrap();
+        fs::write(base.join("hooks.json"), r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"echo unrelated","timeout":10}]}]}}"#).unwrap();
+        install_codex_with_trust(false).unwrap();
+        let before = fs::read_to_string(base.join("config.toml")).unwrap();
+        assert!(!before.contains("sha256:"));
+        install_codex_with_trust(true).unwrap();
+        let after = fs::read_to_string(base.join("config.toml")).unwrap();
+        let config: toml::Value = toml::from_str(&after).unwrap();
+        let states = config["hooks"]["state"].as_table().unwrap();
+        assert_eq!(states.len(), 2);
+        assert_eq!(states["other"]["trusted_hash"].as_str(), Some("keep"));
+        assert_eq!(states["other"]["enabled"].as_bool(), Some(false));
+        let key = format!(
+            "{}:session_start:1:0",
+            base.join("hooks.json").canonicalize().unwrap().display()
+        );
+        assert!(states[&key]["trusted_hash"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:"));
+        install_codex_with_trust(true).unwrap();
+        assert_eq!(after, fs::read_to_string(base.join("config.toml")).unwrap());
+        std::env::remove_var(CODEX_HOME_ENV_VAR);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
     fn install_codex_uses_codex_home_env() {
         let _lock = integration_env_lock();
         let base = unique_base();
@@ -4463,6 +5161,56 @@ mod tests {
 
         std::env::remove_var("HOME");
         let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn codex_install_preserves_comments_key_order_and_existing_trust_format() {
+        let _lock = integration_env_lock();
+        let base = unique_base();
+        fs::create_dir_all(&base).unwrap();
+        std::env::set_var(CODEX_HOME_ENV_VAR, &base);
+        let original = "# keep this header\nz_custom = 'last alphabetically, first in file'\nmodel = \"gpt-5.4\" # keep inline comment\n\n[features]\nother = true # before hooks\nhooks  =  true # keep spacing\n\n[profiles.work.features]\nhooks = false\n";
+        fs::write(base.join("config.toml"), original).unwrap();
+        install_codex().unwrap();
+        let installed = fs::read_to_string(base.join("config.toml")).unwrap();
+        assert!(installed.starts_with(original), "{installed}");
+        let decorated = installed.replace("trusted_hash = ", "# trust comment\ntrusted_hash  =  ");
+        fs::write(base.join("config.toml"), &decorated).unwrap();
+        install_codex().unwrap();
+        assert_eq!(
+            fs::read_to_string(base.join("config.toml")).unwrap(),
+            decorated
+        );
+        assert!(!fs::read_dir(&base).unwrap().any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".flock-write-")));
+        std::env::remove_var(CODEX_HOME_ENV_VAR);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn invalid_codex_config_leaves_both_registration_files_untouched() {
+        let _lock = integration_env_lock();
+        let base = unique_base();
+        fs::create_dir_all(&base).unwrap();
+        std::env::set_var(CODEX_HOME_ENV_VAR, &base);
+        let config = "# broken config\nmodel = [\n";
+        let hooks = r#"{ "hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "echo keep", "timeout": 10}]}]} }"#;
+        fs::write(base.join("config.toml"), config).unwrap();
+        fs::write(base.join("hooks.json"), hooks).unwrap();
+        for trust in [true, false] {
+            assert!(install_codex_with_trust(trust).is_err());
+            assert_eq!(
+                fs::read_to_string(base.join("config.toml")).unwrap(),
+                config
+            );
+            assert_eq!(fs::read_to_string(base.join("hooks.json")).unwrap(), hooks);
+            assert!(!base.join(CODEX_HOOK_INSTALL_NAME).exists());
+        }
+        std::env::remove_var(CODEX_HOME_ENV_VAR);
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
@@ -4756,7 +5504,7 @@ mod tests {
     }
 
     #[test]
-    fn copilot_v1_integration_status_is_current() {
+    fn copilot_v1_integration_status_is_outdated() {
         let _lock = integration_env_lock();
         let base = unique_base();
         let home = base.join("home");
@@ -4778,8 +5526,8 @@ mod tests {
 
         assert_eq!(copilot.path, hook_path);
         assert_eq!(copilot.installed_version, Some(1));
-        assert_eq!(copilot.expected_version, 1);
-        assert_eq!(copilot.state, IntegrationStatusKind::Current);
+        assert_eq!(copilot.expected_version, COPILOT_INTEGRATION_VERSION);
+        assert_eq!(copilot.state, IntegrationStatusKind::Outdated);
 
         std::env::remove_var("HOME");
         let _ = fs::remove_dir_all(base);
@@ -5067,7 +5815,7 @@ mod tests {
         assert!(CLAUDE_HOOK_ASSET.contains("hook claude"));
         assert!(!CLAUDE_HOOK_ASSET.contains("pane.report_agent_session"));
         assert!(!CLAUDE_HOOK_ASSET.contains("pane.release_agent"));
-        // Codex, kimi and qodercli are thin stubs now too (#238): their bodies
+        // Codex, Copilot, kimi and qodercli are thin stubs now too (#238): their bodies
         // were an embedded python3 heredoc and now live in `flk hook <agent>`
         // (cli::hook::tests). The stubs only delegate — and crucially no longer
         // need an interpreter resolved from ambient PATH.
@@ -5078,19 +5826,19 @@ mod tests {
         assert!(QODERCLI_HOOK_ASSET.contains("hook qodercli"));
         assert!(!QODERCLI_HOOK_ASSET.contains("pane.report_agent"));
         for (name, asset) in [
+            ("claude", CLAUDE_HOOK_ASSET),
+            ("copilot", COPILOT_HOOK_ASSET),
             ("codex", CODEX_HOOK_ASSET),
             ("kimi", KIMI_HOOK_ASSET),
             ("qodercli", QODERCLI_HOOK_ASSET),
         ] {
             assert!(
-                !asset.contains("command -v python3"),
+                !asset.contains("command -v python3") && !asset.contains("python3 -"),
                 "{name} still guards on an ambient python3 (#238)"
             );
         }
-        assert!(COPILOT_HOOK_ASSET.contains("agent_session_id"));
-        assert!(COPILOT_HOOK_ASSET.contains("notification_type"));
-        assert!(COPILOT_HOOK_ASSET.contains("ask_user"));
-        assert!(COPILOT_HOOK_ASSET.contains("exit_plan_mode"));
+        assert!(COPILOT_HOOK_ASSET.contains("hook copilot event"));
+        assert!(!COPILOT_HOOK_ASSET.contains("pane.report_agent"));
         // Opencode is a thin plugin now (#158): it maps session events and
         // delegates to `flk hook opencode session`; the report lives in Rust.
         assert!(OPENCODE_PLUGIN_ASSET.contains("properties?.sessionID"));
@@ -5268,7 +6016,7 @@ mod tests {
         std::env::set_var("HOME", &home);
         // Fresh install: the settings hooks fragment matches the expected
         // fragment byte-for-byte (that's what install_claude produces).
-        let _ = install_claude().unwrap();
+        let _ = install_claude(&ClaudeQuestionHook::default()).unwrap();
         let verdict = verify_integration_manifest();
         assert_eq!(verdict, ManifestVerdict::Ok, "expected Ok, got {verdict:?}");
         std::env::remove_var("HOME");
@@ -5284,7 +6032,7 @@ mod tests {
         fs::create_dir_all(&claude_dir).unwrap();
         std::env::set_var("HOME", &home);
         // Install so the hook script is Current…
-        let _ = install_claude().unwrap();
+        let _ = install_claude(&ClaudeQuestionHook::default()).unwrap();
         // …then clobber `hooks.Stop` to a different command; that's the
         // #143 half-state: hook file present but settings registration
         // drifted.
@@ -5329,7 +6077,7 @@ mod tests {
         let claude_dir = home.join(".claude");
         fs::create_dir_all(&claude_dir).unwrap();
         std::env::set_var("HOME", &home);
-        let _ = install_claude().unwrap();
+        let _ = install_claude(&ClaudeQuestionHook::default()).unwrap();
 
         // Prepend a personal hook to Stop, keeping flock's entry.
         let settings_path = claude_dir.join("settings.json");
@@ -5363,7 +6111,7 @@ mod tests {
         let claude_dir = home.join(".claude");
         fs::create_dir_all(&claude_dir).unwrap();
         std::env::set_var("HOME", &home);
-        let _ = install_claude().unwrap();
+        let _ = install_claude(&ClaudeQuestionHook::default()).unwrap();
 
         // Replace Stop with only a personal hook — the real-world shape of a
         // read-only, externally-owned settings.json.

@@ -20,10 +20,14 @@
 // TracedCommand funnel polices flock's own subprocesses, not the harness's.
 #![allow(clippy::disallowed_methods)]
 
+mod support;
+
+use support::paths::app_dir_name;
+
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
+use support::environment::Command;
 
 /// A filled-in `flk report template bug`, written by hand rather than by the
 /// command that emits it — a fixture that depends on the code under test can
@@ -68,17 +72,6 @@ fn unique_dir(tag: &str) -> PathBuf {
         "/tmp/flock-report-{tag}-{}-{nanos}",
         std::process::id()
     ))
-}
-
-/// `flock`/`flock-dev` under the profile that built this test binary, mirroring
-/// `app_dir_name()` — the log tail is read out of the config dir, so a test
-/// that guessed the wrong one would silently assert that no diagnostics exist.
-fn app_dir_name() -> &'static str {
-    if cfg!(debug_assertions) {
-        "flock-dev"
-    } else {
-        "flock"
-    }
 }
 
 struct Sandbox {

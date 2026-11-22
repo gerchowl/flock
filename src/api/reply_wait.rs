@@ -37,6 +37,12 @@ pub(crate) enum Answer {
     Replied(MsgReplyInfo),
     Deferred(MsgReplyInfo),
     Expired,
+    RetentionElapsed,
+    RecipientGone,
+    /// The receiver refused custody; the reason, when it gave one.
+    Refused(Option<String>),
+    /// A forwarding hub could not deliver it; the hub's reason (#876).
+    Undeliverable(Option<String>),
 }
 
 impl Answer {
@@ -45,6 +51,10 @@ impl Answer {
             Self::Replied(_) => "replied",
             Self::Deferred(_) => "deferred",
             Self::Expired => "expired",
+            Self::RetentionElapsed => "outcome_retention_elapsed",
+            Self::RecipientGone => "recipient_gone",
+            Self::Refused(_) => "refused",
+            Self::Undeliverable(_) => "undeliverable",
         }
     }
 
@@ -57,14 +67,29 @@ impl Answer {
         match self {
             Self::Replied(_) => 3,
             Self::Deferred(_) => 2,
-            Self::Expired => 1,
+            Self::Expired
+            | Self::RetentionElapsed
+            | Self::RecipientGone
+            | Self::Refused(_)
+            | Self::Undeliverable(_) => 1,
+        }
+    }
+
+    fn detail(&self) -> Option<String> {
+        match self {
+            Self::Refused(reason) | Self::Undeliverable(reason) => reason.clone(),
+            _ => None,
         }
     }
 
     pub(crate) fn into_reply(self) -> Option<MsgReplyInfo> {
         match self {
             Self::Replied(reply) | Self::Deferred(reply) => Some(reply),
-            Self::Expired => None,
+            Self::Expired
+            | Self::RetentionElapsed
+            | Self::RecipientGone
+            | Self::Refused(_)
+            | Self::Undeliverable(_) => None,
         }
     }
 }
@@ -84,23 +109,25 @@ fn answer_kind(reply_correlation_id: &str, reply: MsgReplyInfo) -> Answer {
 pub(crate) fn answer_in(event: &EventEnvelope, correlation_id: &str) -> Option<Answer> {
     match &event.data {
         EventData::MessageQueued {
+            message_key,
             correlation_id: reply_id,
             in_reply_to: Some(original),
             from_pane,
             from_agent,
             from_host,
             body,
+            to_pane,
             ..
         } if original == correlation_id => Some(answer_kind(
             reply_id,
             MsgReplyInfo {
                 correlation_id: reply_id.clone(),
                 kind: "reply".into(),
-                body: body.clone(),
+                body: crate::mesh::delivery::body(message_key.as_ref(), body)?,
                 from_agent: from_agent.clone(),
                 from_pane: from_pane.clone(),
                 from_host: from_host.clone(),
-                held: false,
+                held: to_pane.is_empty(),
             },
         )),
         EventData::MessageReplied {
@@ -172,14 +199,55 @@ fn delivery_state(event: &EventEnvelope, correlation_id: &str) -> Option<&'stati
 /// What a scan of the log knows about one message so far.
 #[derive(Debug, Default)]
 struct Watch {
-    state: Option<&'static str>,
+    state: Option<String>,
     answer: Option<Answer>,
 }
 
 impl Watch {
+    fn refresh_mesh(
+        &mut self,
+        reader: &mut crate::mesh::runtime_store::WaitReader,
+        origin: Option<&str>,
+        correlation: &str,
+        reference: Option<&crate::mesh::store::StatusReference>,
+    ) -> Result<(), String> {
+        if let Some(status) = reader.status(origin, correlation, reference)? {
+            let durable = status
+                .reply
+                .map(|reply| {
+                    if reply.kind == "deferral" {
+                        Answer::Deferred(reply)
+                    } else {
+                        Answer::Replied(reply)
+                    }
+                })
+                .or(match status.state.as_str() {
+                    "expired" => Some(Answer::Expired),
+                    "outcome_retention_elapsed" => Some(Answer::RetentionElapsed),
+                    "recipient_gone" => Some(Answer::RecipientGone),
+                    "refused" => Some(Answer::Refused(status.detail.clone())),
+                    "undeliverable" => Some(Answer::Undeliverable(status.detail.clone())),
+                    _ => None,
+                });
+            // Merge by rank, as `observe` does: a local answer the mesh
+            // writer could not record still beats a durable expiry.
+            if let Some(found) = durable {
+                if self
+                    .answer
+                    .as_ref()
+                    .is_none_or(|held| found.rank() > held.rank())
+                {
+                    self.answer = Some(found);
+                }
+            }
+            self.state = Some(status.state);
+        }
+        Ok(())
+    }
+
     fn observe(&mut self, event: &EventEnvelope, correlation_id: &str) {
         if let Some(state) = delivery_state(event, correlation_id) {
-            self.state = Some(state);
+            self.state = Some(state.into());
         }
         if let Some(found) = answer_in(event, correlation_id) {
             if self
@@ -204,7 +272,8 @@ fn awaited(
     correlation_id: String,
     outcome: &str,
     reply: Option<MsgReplyInfo>,
-    state: Option<&'static str>,
+    detail: Option<String>,
+    state: Option<&str>,
 ) -> String {
     encode(&SuccessResponse {
         id: request_id,
@@ -212,6 +281,7 @@ fn awaited(
             correlation_id,
             outcome: outcome.into(),
             reply,
+            detail,
             state: state.map(str::to_string),
         },
     })
@@ -226,6 +296,7 @@ fn awaited(
 pub(super) fn wait_for_reply(
     request_id: String,
     params: MsgWaitReplyParams,
+    origin: Option<&str>,
     stream: &mut UnixStream,
     event_hub: &EventHub,
     running: &Arc<AtomicBool>,
@@ -240,34 +311,73 @@ pub(super) fn wait_for_reply(
 
     let mut cursor = event_hub.current_sequence();
     let mut watch = Watch::default();
+    let mut reader = crate::mesh::runtime_store::WaitReader::default();
     // The in-memory ring only, as `msg.status` reads it, so the two never
     // disagree. NOT the durable log: `persisted_events_after` re-reads every
     // log file while holding the hub's lock, and every `emit_event` on the
     // app thread waits on that lock — a retried typo would stall the server.
-    for (_, event) in event_hub.events_after(0) {
+    for (_, event) in event_hub.ring_snapshot_after(0) {
         watch.observe(&event, &correlation_id);
+    }
+    if let Err(reason) = watch.refresh_mesh(
+        &mut reader,
+        origin,
+        &correlation_id,
+        params.reference.as_ref(),
+    ) {
+        if params.reference.is_some() {
+            return Ok(Some(encode(&ErrorResponse {
+                id: request_id,
+                error: ErrorBody {
+                    data: None,
+                    code: "mail_store_unavailable".into(),
+                    message: reason,
+                },
+            })));
+        }
+        // Without a durable reference the event ring still answers for
+        // pre-mesh and local messages, so a store outage degrades, not fails.
+        crate::logging::mesh_custody_failed("wait_reply", "mail_store_unavailable");
     }
     if watch.state.is_none() && watch.answer.is_none() {
         crate::logging::msg_wait_reply_completed(&request_id, &correlation_id, "not_found");
         return Ok(Some(encode(&ErrorResponse {
             id: request_id,
             error: ErrorBody {
+                data: None,
                 code: "message_not_found".into(),
                 message: format!("no message with correlation id {correlation_id}"),
             },
         })));
     }
 
+    let _waiting = event_hub.track_reply_wait(&correlation_id);
+    let mut last_read = Instant::now();
+    let mut event_woke = false;
     loop {
+        if event_woke || last_read.elapsed() >= Duration::from_secs(1) {
+            if let Err(reason) = watch.refresh_mesh(
+                &mut reader,
+                origin,
+                &correlation_id,
+                params.reference.as_ref(),
+            ) {
+                crate::logging::mesh_wait_read_unavailable(&reason);
+            }
+            last_read = Instant::now();
+            event_woke = false;
+        }
         if let Some(answer) = watch.answer.take() {
             let outcome = answer.outcome();
             crate::logging::msg_wait_reply_completed(&request_id, &correlation_id, outcome);
+            let detail = answer.detail();
             return Ok(Some(awaited(
                 request_id,
                 correlation_id,
                 outcome,
                 answer.into_reply(),
-                watch.state,
+                detail,
+                watch.state.as_deref(),
             )));
         }
         if Instant::now() >= deadline {
@@ -277,7 +387,8 @@ pub(super) fn wait_for_reply(
                 correlation_id,
                 "timeout",
                 None,
-                watch.state,
+                None,
+                watch.state.as_deref(),
             )));
         }
         if should_stop_connection(stream, running)? {
@@ -292,23 +403,37 @@ pub(super) fn wait_for_reply(
             .saturating_duration_since(Instant::now())
             .min(CONNECTION_POLL_INTERVAL);
         if event_hub.wait_after(cursor, slice) {
-            let fresh = event_hub.events_after(cursor);
-            // More than the ring holds arrived between two wakes: the events
-            // just past the cursor are gone. Re-read what the ring still has
-            // rather than miss an answer among them silently.
-            let gap = fresh
-                .first()
-                .is_some_and(|(sequence, _)| *sequence > cursor + 1);
-            let batch = if gap {
-                event_hub.events_after(0)
-            } else {
-                fresh
+            event_woke = true;
+            let batch = match reply_events(event_hub, cursor) {
+                Ok(events) => events,
+                Err(error) => {
+                    crate::logging::msg_wait_reply_completed(&request_id, &correlation_id, "error");
+                    return Ok(Some(encode(&ErrorResponse {
+                        id: request_id,
+                        error,
+                    })));
+                }
             };
             for (sequence, event) in batch {
                 cursor = cursor.max(sequence);
                 watch.observe(&event, &correlation_id);
             }
         }
+    }
+}
+
+// Shared continuation policy for the active socket wait.
+fn reply_events(hub: &EventHub, cursor: u64) -> Result<Vec<(u64, EventEnvelope)>, ErrorBody> {
+    #[cfg(test)]
+    tracing::info!(event = "test.reply_wait.poll", cursor);
+    match hub.events_after(cursor) {
+        Ok(events) => Ok(events),
+        // A reply wait folds retained facts into its existing message state.
+        // Losing unrelated events must not discard a retained or future reply.
+        Err(error) if error.code == super::error_code::ErrorCode::EventsLost.as_str() => {
+            Ok(hub.ring_snapshot_after(0))
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -321,6 +446,7 @@ mod tests {
         EventEnvelope {
             event: EventKind::MessageQueued,
             data: EventData::MessageQueued {
+                message_key: None,
                 correlation_id: id.into(),
                 from_pane: Some("w1:p1".into()),
                 from_agent: Some("agent_example_1".into()),
@@ -363,6 +489,204 @@ mod tests {
                 from_agent: None,
                 held: true,
             },
+        }
+    }
+
+    /// Existing outage diagnostics provide synchronous boundaries after history
+    /// capture and on continuation. No scheduler race decides where the gap lands.
+    struct ReplyLoopEvents {
+        hub: EventHub,
+        retained_reply: Option<bool>,
+        injected_gap: std::sync::atomic::AtomicBool,
+        injected_reply: std::sync::atomic::AtomicBool,
+        completed: Arc<std::sync::Mutex<Vec<String>>>,
+        cursors: Arc<std::sync::Mutex<Vec<u64>>>,
+    }
+
+    #[derive(Default)]
+    struct ReplyLoopFields {
+        event: String,
+        outcome: String,
+        cursor: u64,
+    }
+    impl tracing::field::Visit for ReplyLoopFields {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            match field.name() {
+                "event" => self.event = value.into(),
+                "outcome" => self.outcome = value.into(),
+                _ => {}
+            }
+        }
+        fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            if field.name() == "cursor" {
+                self.cursor = value;
+            }
+        }
+    }
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ReplyLoopEvents {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            use std::sync::atomic::Ordering;
+            let mut fields = ReplyLoopFields::default();
+            event.record(&mut fields);
+            match fields.event.as_str() {
+                "test.reply_wait.poll" => {
+                    self.cursors.lock().unwrap().push(fields.cursor);
+                }
+                "mesh.custody.failed"
+                    if self.retained_reply.is_some()
+                        && !self.injected_gap.swap(true, Ordering::SeqCst) =>
+                {
+                    for id in ["noise1", "noise2", "noise3"] {
+                        self.hub.push(queued(id, None, "noise"));
+                    }
+                    if self.retained_reply == Some(true) {
+                        self.hub.push(held("q", "answer", "body"));
+                    }
+                }
+                "mesh.wait.read_unavailable"
+                    if self.retained_reply == Some(false)
+                        && !self.injected_reply.swap(true, Ordering::SeqCst) =>
+                {
+                    self.hub.push(held("q", "answer", "body"));
+                }
+                "api.msg_wait_reply.complete" => {
+                    self.completed.lock().unwrap().push(fields.outcome);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn run_reply_loop(retained_reply: Option<bool>, timeout_ms: u64) -> serde_json::Value {
+        use std::sync::atomic::Ordering;
+        use tracing_subscriber::prelude::*;
+        struct Recovery;
+        impl Drop for Recovery {
+            fn drop(&mut self) {
+                crate::mesh::runtime_store::recovered();
+            }
+        }
+        crate::mesh::runtime_store::begin_recovery();
+        let _recovery = Recovery;
+        let hub = EventHub::default();
+        hub.set_ring_cap(2);
+        hub.push(queued("q", None, "question"));
+        let completed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let cursors = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(ReplyLoopEvents {
+            hub: hub.clone(),
+            retained_reply,
+            injected_gap: Default::default(),
+            injected_reply: Default::default(),
+            completed: completed.clone(),
+            cursors: cursors.clone(),
+        });
+        let running = Arc::new(AtomicBool::new(true));
+        let stop = running.clone();
+        let events = hub.clone();
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let owner = std::thread::spawn(move || {
+            let result = tracing::subscriber::with_default(subscriber, || {
+                wait_for_reply(
+                    "loop".into(),
+                    MsgWaitReplyParams {
+                        reference: None,
+                        correlation_id: "q".into(),
+                        timeout_ms: Some(timeout_ms),
+                    },
+                    None,
+                    &mut server,
+                    &events,
+                    &stop,
+                )
+            });
+            let _ = tx.send(result);
+        });
+        let result = rx.recv_timeout(Duration::from_secs(5));
+        running.store(false, Ordering::Relaxed);
+        let _ = client.shutdown(std::net::Shutdown::Both);
+        owner.join().expect("reply waiter panicked");
+        let response = result
+            .expect("reply loop exceeded its fail ceiling")
+            .expect("reply loop I/O")
+            .expect("client stayed connected");
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        let expected = if retained_reply.is_none() {
+            "timeout"
+        } else {
+            "replied"
+        };
+        assert_eq!(response["result"]["outcome"], expected, "{response}");
+        assert_eq!(*completed.lock().unwrap(), [expected]);
+        assert!(hub.reply_waits().is_empty(), "active-wait guard released");
+        if retained_reply.is_some() {
+            assert_eq!(hub.current_sequence(), 5);
+        }
+        let expected_cursors: &[u64] = match retained_reply {
+            Some(true) => &[1],
+            Some(false) => &[1, 4],
+            None => &[],
+        };
+        assert_eq!(
+            *cursors.lock().unwrap(),
+            expected_cursors,
+            "each poll must continue from the last sequence returned by the hub"
+        );
+        response
+    }
+
+    #[test]
+    fn reply_wait_loop_recovers_gap_and_continues_to_retained_or_next_reply() {
+        for retained in [true, false] {
+            let response = run_reply_loop(Some(retained), 10_000);
+            assert_eq!(response["result"]["correlation_id"], "q");
+            assert_eq!(response["result"]["reply"]["body"], "body");
+        }
+    }
+
+    #[test]
+    fn reply_wait_loop_expires_and_reports_the_last_state() {
+        for timeout_ms in [0, 250] {
+            let response = run_reply_loop(None, timeout_ms);
+            assert_eq!(response["result"]["state"], "queued");
+            assert!(response["result"]["reply"].is_null());
+        }
+    }
+
+    #[test]
+    fn reply_wait_recovers_a_gap_before_a_retained_or_later_reply() {
+        for retained in [true, false] {
+            let hub = EventHub::default();
+            hub.set_ring_cap(2);
+            let original = queued("q", None, "question");
+            hub.push(original.clone());
+            let mut watch = Watch::default();
+            watch.observe(&original, "q");
+            let mut cursor = hub.current_sequence();
+            for id in ["noise1", "noise2", "noise3"] {
+                hub.push(queued(id, None, "noise"));
+            }
+            if retained {
+                hub.push(held("q", "answer", "body"));
+            }
+            for (seq, event) in reply_events(&hub, cursor).expect("a gap keeps the wait alive") {
+                cursor = seq;
+                watch.observe(&event, "q");
+            }
+            if !retained {
+                assert!(watch.answer.is_none());
+                hub.push(held("q", "answer", "body"));
+                for (_, event) in reply_events(&hub, cursor).unwrap() {
+                    watch.observe(&event, "q");
+                }
+            }
+            assert_eq!(watch.answer.unwrap().into_reply().unwrap().body, "body");
         }
     }
 
@@ -463,7 +787,7 @@ mod tests {
         for event in [queued("q", None, "x"), delivered("q", true, "read")] {
             watch.observe(&event, "q");
         }
-        assert_eq!(watch.state, Some("read"));
+        assert_eq!(watch.state.as_deref(), Some("read"));
         assert!(watch.answer.is_none());
     }
 }

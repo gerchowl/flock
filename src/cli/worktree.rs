@@ -79,7 +79,7 @@ fn worktree_unquarantine(args: &[String]) -> std::io::Result<i32> {
 fn worktree_list(args: &[String]) -> std::io::Result<i32> {
     let mut workspace_id = None;
     let mut cwd = None;
-    let mut json = false;
+    let mut json = super::output::json();
     let mut scan = false;
 
     let mut index = 0;
@@ -132,8 +132,7 @@ fn worktree_list(args: &[String]) -> std::io::Result<i32> {
         return super::print_response(&response);
     }
     if response.get("error").is_some() {
-        eprintln!("{}", serde_json::to_string(&response).unwrap_or_default());
-        return Ok(1);
+        return Ok(super::output::error(&response, super::exit::FAILURE));
     }
     print_worktree_table(&response, scan);
     Ok(0)
@@ -305,6 +304,7 @@ fn worktree_create(args: &[String]) -> std::io::Result<i32> {
     let mut path = None;
     let mut label = None;
     let mut focus = false;
+    let mut dry_run = false;
 
     let mut index = 0;
     while index < args.len() {
@@ -357,6 +357,10 @@ fn worktree_create(args: &[String]) -> std::io::Result<i32> {
                 label = Some(value.clone());
                 index += 2;
             }
+            "--dry-run" => {
+                dry_run = true;
+                index += 1;
+            }
             "--focus" => {
                 focus = true;
                 index += 1;
@@ -374,14 +378,19 @@ fn worktree_create(args: &[String]) -> std::io::Result<i32> {
     }
     if workspace_id.is_some() && cwd.is_some() {
         eprintln!(
-            "usage: flk worktree create [--workspace ID | --cwd PATH] [--branch NAME] [--base REF] [--path PATH] [--label TEXT] [--focus] [--no-focus] [--json]"
+            "usage: flk worktree create [--workspace ID | --cwd PATH] [--branch NAME] [--base REF] [--path PATH] [--label TEXT] [--focus] [--no-focus] [--json] [--dry-run]"
         );
         return Ok(2);
     }
+    let base = match base {
+        Some(base) if !dry_run => Some(fresh_base(&workspace_id, &cwd, base)?),
+        base => base,
+    };
 
     super::print_response(&super::send_request(&Request {
         id: "cli:worktree:create".into(),
         method: Method::WorktreeCreate(WorktreeCreateParams {
+            dry_run,
             workspace_id,
             cwd,
             branch,
@@ -391,6 +400,41 @@ fn worktree_create(args: &[String]) -> std::io::Result<i32> {
             focus,
         }),
     })?)
+}
+
+/// Refresh `--base` from its remote before the server branches from it, as
+/// `delegate start` does (#938). The source checkout is the one the server
+/// itself would resolve, read from a dry run of the same request, and the
+/// fetch runs here so the server is never held on the network.
+fn fresh_base(
+    workspace_id: &Option<String>,
+    cwd: &Option<String>,
+    base: String,
+) -> std::io::Result<String> {
+    let plan = super::send_request(&Request {
+        id: "cli:worktree:create:plan".into(),
+        method: Method::WorktreeCreate(WorktreeCreateParams {
+            dry_run: true,
+            workspace_id: workspace_id.clone(),
+            cwd: cwd.clone(),
+            base: Some(base.clone()),
+            ..WorktreeCreateParams::default()
+        }),
+    })?;
+    let Some(source) = plan
+        .pointer("/result/plan/source_checkout_path")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Ok(base);
+    };
+    let fresh = crate::worktree::resolve_fresh_base(std::path::Path::new(source), &base);
+    if let Some(note) = &fresh.note {
+        eprintln!("worktree create: --base {base}: {note}");
+    }
+    if let Some(sha) = &fresh.sha {
+        eprintln!("worktree create: base {} ({sha})", fresh.base);
+    }
+    Ok(fresh.base)
 }
 
 fn worktree_open(args: &[String]) -> std::io::Result<i32> {
@@ -607,18 +651,14 @@ fn worktree_kill(args: &[String]) -> std::io::Result<i32> {
             // have their own cwd in the checkout when a kill is run from
             // inside it.
             caller_pid: Some(std::process::id()),
+            // CLI callers explicitly choose a real kill and need no MCP guard.
+            self_kill_confirmed: None,
         }),
     })?;
 
     if let Some(error) = response.get("error") {
         println!("{response}");
-        let code = error.get("code").and_then(|v| v.as_str()).unwrap_or("");
-        return Ok(match code {
-            "not_linked_worktree" | "workspace_not_found" => 2,
-            // 4 is the retryable class: the same call with --force clears it.
-            "dirty_worktree_requires_force" | "submodule_worktree_requires_force" => 4,
-            _ => 1,
-        });
+        return Ok(kill_error_exit_code(error));
     }
 
     let result = response.pointer("/result").cloned().unwrap_or_default();
@@ -633,9 +673,39 @@ fn worktree_kill(args: &[String]) -> std::io::Result<i32> {
         .unwrap_or(false);
     if dry_run {
         // Unchanged contract: 0 when the gate would pass, 3 when it would not.
-        return Ok(if merged { 0 } else { 3 });
+        return Ok(if merged {
+            super::exit::SUCCESS
+        } else {
+            super::exit::WORKTREE_GATE_WOULD_FAIL
+        });
     }
     Ok(0)
+}
+
+/// What a `worktree.kill` refusal means as a process exit code.
+///
+/// One function rather than a `match` at each call site, because there are now
+/// two callers and they must not disagree (#578 P5): `flk worktree kill` prints
+/// the response and maps the code, and `flk delegate reap` destroys what the
+/// registry recorded through the same method. A delegate that answered a refusal
+/// with a different code than `worktree kill` would send a script to a different
+/// remedy for the same refusal.
+pub(super) fn kill_error_exit_code(error: &serde_json::Value) -> i32 {
+    match error.get("code").and_then(|v| v.as_str()).unwrap_or("") {
+        "worktree_checkout_unreachable" => {
+            super::error_code_exit("worktree_checkout_unreachable", false)
+        }
+        "not_linked_worktree" | "workspace_not_found" => super::exit::WORKTREE_NOT_LINKED,
+        // The retryable class: the same call with --force clears it.
+        "dirty_worktree_requires_force" | "submodule_worktree_requires_force" => {
+            super::exit::WORKTREE_NEEDS_FORCE
+        }
+        // #1278: the branch heads an open PR, or gh could not say whether it
+        // does. Refused before anything moved, and --force does not clear it:
+        // the PR closing, gh answering, or --keep-branch does.
+        "worktree_open_pr" | "worktree_merge_unknown" => super::exit::REFUSED,
+        _ => super::exit::FAILURE,
+    }
 }
 
 /// How many pids one line names before it stops counting. The measured case
@@ -703,7 +773,7 @@ fn print_worktree_help() {
     eprintln!("flk worktree commands:");
     eprintln!("  flk worktree list [--workspace ID | --cwd PATH] [--scan] [--json]");
     eprintln!(
-        "  flk worktree create [--workspace ID | --cwd PATH] [--branch NAME] [--base REF] [--path PATH] [--label TEXT] [--focus] [--no-focus] [--json]"
+        "  flk worktree create [--workspace ID | --cwd PATH] [--branch NAME] [--base REF] [--path PATH] [--label TEXT] [--focus] [--no-focus] [--json] [--dry-run]"
     );
     eprintln!(
         "  flk worktree open [--workspace ID | --cwd PATH] (--path PATH | --branch NAME) [--label TEXT] [--focus] [--no-focus] [--json]"
@@ -716,14 +786,31 @@ fn print_worktree_help() {
     eprintln!("  flk worktree unquarantine <quarantined-path> <destination>");
 }
 
-fn normalize_path_arg(value: &str) -> std::io::Result<String> {
+/// A path flag, absolute against the caller's directory before it reaches the
+/// server, which would otherwise read it against its own (#898).
+pub(super) fn normalize_path_arg(value: &str) -> std::io::Result<String> {
     let path = crate::worktree::expand_tilde_path(value);
-    let absolute = if path.is_absolute() {
-        path
+    if path.is_absolute() {
+        return Ok(path.display().to_string());
+    }
+    Ok(resolve_path_arg(value, &std::env::current_dir()?))
+}
+
+/// `value` with a leading `~` expanded, joined onto `base` when relative.
+/// Symlinks are not followed: the path stays the one the caller wrote.
+pub(super) fn resolve_path_arg(value: &str, base: &std::path::Path) -> String {
+    let path = crate::worktree::expand_tilde_path(value);
+    if path.is_absolute() {
+        path.display().to_string()
     } else {
-        std::env::current_dir()?.join(path)
-    };
-    Ok(absolute.display().to_string())
+        // `components` drops the `.` segments, so `--repo .` names the
+        // directory itself rather than `<dir>/.`.
+        base.join(path)
+            .components()
+            .collect::<std::path::PathBuf>()
+            .display()
+            .to_string()
+    }
 }
 
 #[cfg(test)]
@@ -732,6 +819,18 @@ mod tests {
 
     fn row(json: serde_json::Value) -> WorktreeRow {
         WorktreeRow::from_json(&json)
+    }
+
+    #[test]
+    fn an_open_pr_refusal_exits_refused_not_needs_force() {
+        // #1278: --force does not clear it, so it must not share exit 4.
+        for code in ["worktree_open_pr", "worktree_merge_unknown"] {
+            let error = serde_json::json!({ "code": code });
+            assert_eq!(
+                super::kill_error_exit_code(&error),
+                crate::cli::exit::REFUSED
+            );
+        }
     }
 
     #[test]
@@ -806,5 +905,14 @@ mod tests {
             "is_linked_worktree": true,
         }));
         assert_eq!(row.branch, "(detached)");
+    }
+    #[test]
+    fn unreachable_checkout_kill_exit_requires_recovery_not_force() {
+        assert_eq!(
+            super::kill_error_exit_code(
+                &serde_json::json!({"code":"worktree_checkout_unreachable"})
+            ),
+            crate::cli::exit::REFUSED
+        );
     }
 }

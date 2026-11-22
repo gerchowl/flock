@@ -12,6 +12,45 @@
 
 use std::path::PathBuf;
 
+/// Locate the built CLI in this unit-test artifact's own build profile.
+///
+/// Recognize Cargo's `deps` and `build/<package>/<hash>/out` artifact directories,
+/// including extracted archives and custom profiles. An unknown layout or a
+/// missing companion refuses without searching other directories or PATH.
+pub(crate) fn flk_binary() -> PathBuf {
+    let artifact = std::env::current_exe().expect("current unit-test executable");
+    find_flk_binary(&artifact, Path::is_file).unwrap_or_else(|| match build_profile_dir(&artifact) {
+        Some(profile) => panic!(
+            "built flk executable missing from its own build profile {}; build the CLI before running unit tests",
+            profile.display()
+        ),
+        None => panic!("unrecognized unit-test artifact layout: {}", artifact.display()),
+    })
+}
+
+fn build_profile_dir(artifact: &Path) -> Option<&Path> {
+    let directory = artifact.parent()?;
+    if directory.file_name()? == "deps" {
+        return directory.parent();
+    }
+    if directory.file_name()? != "out" {
+        return None;
+    }
+    let hash = directory.parent()?;
+    let package = hash.parent()?;
+    let build = package.parent()?;
+    if build.file_name()? != "build" {
+        return None;
+    }
+    build.parent()
+}
+
+fn find_flk_binary(artifact: &Path, mut is_file: impl FnMut(&Path) -> bool) -> Option<PathBuf> {
+    let name = format!("flk{}", std::env::consts::EXE_SUFFIX);
+    let candidate = build_profile_dir(artifact)?.join(name);
+    is_file(&candidate).then_some(candidate)
+}
+
 /// Absolute path to `name`, found on `PATH`.
 ///
 /// Panics rather than returning an `Option`: every caller wants a program it
@@ -312,9 +351,261 @@ fn describe_event(event: &crate::events::AppEvent) -> String {
     text
 }
 
+/// Attach an owned live pane process for tests of caller ancestry and authority.
+/// Production spawn captures its birth; no authority-specific test override is used.
+pub(crate) fn attest_pane_caller(app: &mut crate::app::App, pane: crate::layout::PaneId) {
+    use std::sync::{atomic::AtomicBool, Arc};
+    let (_, state) = app.find_pane(pane).expect("fixture pane");
+    let terminal = state.attached_terminal_id.clone();
+    if let Some(pid) = app
+        .terminal_runtimes
+        .get(&terminal)
+        .and_then(|runtime| runtime.child_pid())
+    {
+        let runtime = app.terminal_runtimes.get(&terminal).expect("owned runtime");
+        assert_eq!(
+            crate::platform::process_start_time(pid),
+            runtime.child_birth(),
+            "owned caller is alive with its original birth"
+        );
+        app.current_api_peer_pid = Some(pid);
+        return;
+    }
+    let runtime = crate::terminal::TerminalRuntime::spawn_shell_command(
+        pane,
+        24,
+        80,
+        std::env::temp_dir(),
+        "while IFS= read -r line; do :; done",
+        &[],
+        4096,
+        Default::default(),
+        app.event_tx.clone(),
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(AtomicBool::new(false)),
+    )
+    .expect("owned fixture pane");
+    app.current_api_peer_pid = runtime.child_pid();
+    app.terminal_runtimes.insert(terminal, runtime);
+}
+
+/// Import a real owned pane with old or mismatched handoff birth metadata.
+pub(crate) fn adopt_unproven_pane_caller(
+    app: &mut crate::app::App,
+    pane: crate::layout::PaneId,
+    mismatch: bool,
+) {
+    use std::sync::{atomic::AtomicBool, Arc};
+    attest_pane_caller(app, pane);
+    let terminal = app.find_pane(pane).unwrap().1.attached_terminal_id.clone();
+    let runtime = app.terminal_runtimes.remove(&terminal).unwrap();
+    let birth = runtime.child_birth().unwrap();
+    let mut encoded = serde_json::to_value(runtime.handoff_runtime_state(pane.raw())).unwrap();
+    if mismatch {
+        encoded["child_birth"] = serde_json::json!(birth.wrapping_add(1));
+    } else {
+        encoded.as_object_mut().unwrap().remove("child_birth");
+    }
+    runtime
+        .start_handoff_pause(Duration::from_secs(2), false)
+        .unwrap()
+        .wait()
+        .unwrap();
+    let fd = runtime.duplicate_handoff_fd().unwrap();
+    runtime.preserve_for_handoff();
+    let mut adopted = crate::terminal::TerminalRuntime::from_handoff_fd(
+        crate::handoff_runtime::ImportedHandoffRuntime {
+            master_fd: fd,
+            state: serde_json::from_value(encoded).unwrap(),
+        },
+        4096,
+        Default::default(),
+        app.event_tx.clone(),
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(AtomicBool::new(false)),
+    )
+    .unwrap();
+    adopted.assume_handoff_ownership();
+    adopted.set_handoff_reader_paused(false);
+    app.terminal_runtimes.insert(terminal, adopted);
+    app.current_api_peer_birth = Some(Some(birth));
+}
+
+/// Owned fixture directory, removed even if the test unwinds.
+pub(crate) struct TempDir(crate::structured::launch::SessionConfigDir);
+impl TempDir {
+    /// Keep Unix socket paths below the macOS sockaddr_un limit.
+    pub(crate) fn socket() -> Self {
+        // guardrails-ok(hermetic): short socket fixture root, not an executed program.
+        Self(
+            crate::structured::launch::SessionConfigDir::create(std::path::Path::new("/tmp"))
+                .expect("owned short fixture directory"),
+        )
+    }
+    pub(crate) fn path(&self) -> &std::path::Path {
+        self.0.path()
+    }
+}
+
+/// An isolated, scripted NDJSON peer with bounded accept/read failure ceilings.
+pub(crate) struct ScriptedApi {
+    directory: TempDir,
+    worker: std::thread::JoinHandle<Vec<serde_json::Value>>,
+}
+impl ScriptedApi {
+    pub(crate) fn new(script: Vec<(&'static str, Option<serde_json::Value>)>) -> Self {
+        use std::io::{BufRead, Write};
+        use std::os::fd::AsRawFd;
+        let directory = TempDir::socket();
+        let listener =
+            std::os::unix::net::UnixListener::bind(directory.path().join("api.sock")).unwrap();
+        let worker = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for (method, response) in script {
+                let mut poll = libc::pollfd {
+                    fd: listener.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // SAFETY: poll owns one initialized descriptor for this call.
+                assert_eq!(
+                    unsafe { libc::poll(&mut poll, 1, 5000) },
+                    1,
+                    "request never arrived"
+                );
+                let (stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = std::io::BufReader::new(stream);
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).unwrap() > 0);
+                let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(request["method"], method);
+                if let Some(mut response) = response {
+                    if response.is_object() && response.get("id").is_none() {
+                        response["id"] = request["id"].clone();
+                    }
+                    writeln!(reader.get_mut(), "{response}").unwrap();
+                }
+                requests.push(request);
+            }
+            requests
+        });
+        Self { directory, worker }
+    }
+    pub(crate) fn path(&self) -> std::path::PathBuf {
+        self.directory.path().join("api.sock")
+    }
+    pub(crate) fn client(&self) -> crate::api::client::ApiClient {
+        crate::api::client::ApiClient::for_target(crate::api::client::ConnectionTarget::SocketPath(
+            self.path(),
+        ))
+    }
+    pub(crate) fn finish(self) -> Vec<serde_json::Value> {
+        self.worker.join().expect("scripted peer")
+    }
+}
+
+/// Fictional name payloads; failure reports use case ids rather than raw text.
+pub(crate) fn hostile_agent_names() -> Vec<(&'static str, String)> {
+    vec![
+        ("csi", "agent\u{1b}[2J".into()),
+        ("osc", "agent\u{1b}]52;c;Zml4dHVyZQ==\u{7}".into()),
+        ("newline", "agent\nnext".into()),
+        ("trimmed_control", "\tagent\r".into()),
+        ("c1", "agent\u{9b}2J".into()),
+        ("c1_osc", "agent\u{9d}52;c;Zml4dHVyZQ==\u{9c}".into()),
+        ("lrm", "agent\u{200e}".into()),
+        ("rlm", "agent\u{200f}".into()),
+        ("alm", "agent\u{061c}".into()),
+        ("line_separator", "agent\u{2028}next".into()),
+        ("zero_width", "reviewer\u{200b}".into()),
+        ("word_joiner", "reviewer\u{2060}".into()),
+        ("invisible_operator", "reviewer\u{2064}".into()),
+        ("bom", "reviewer\u{feff}".into()),
+        ("soft_hyphen", "reviewer\u{00ad}".into()),
+        ("deprecated_format", "reviewer\u{206f}".into()),
+        ("tag", "reviewer\u{e007f}".into()),
+        ("bidi", "agent\u{202e}other".into()),
+        ("isolate", "agent\u{2066}other\u{2069}".into()),
+        ("overlong", "界".repeat(65)),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn helper_cli_resolves_both_cargo_artifact_layouts() {
+        for label in ["debug", "release", "custom-profile"] {
+            let profile = Path::new("fixture-target").join(label);
+            let helper = profile.join(format!("flk{}", std::env::consts::EXE_SUFFIX));
+            for artifact in [
+                profile.join("deps/unit-test"),
+                profile.join("build/package/hash/out/unit-test"),
+            ] {
+                assert_eq!(
+                    find_flk_binary(&artifact, |candidate| candidate == helper),
+                    Some(helper.clone()),
+                    "artifact {}",
+                    artifact.display()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn helper_cli_refuses_a_missing_companion_instead_of_searching_path() {
+        assert_eq!(
+            find_flk_binary(
+                Path::new("fixture-profile/build/package/hash/out/unit-test"),
+                |_| false
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn helper_cli_rejects_helpers_outside_its_build_profile() {
+        let target = Path::new("fixture-target");
+        let name = format!("flk{}", std::env::consts::EXE_SUFFIX);
+        let profile = target.join("custom-profile");
+        for artifact in [
+            profile.join("deps/unit-test"),
+            profile.join("build/package/hash/out/unit-test"),
+        ] {
+            for outside in [target.join(&name), target.join("other-profile").join(&name)] {
+                assert_eq!(
+                    find_flk_binary(&artifact, |candidate| candidate == outside),
+                    None,
+                    "artifact {}, outside helper {}",
+                    artifact.display(),
+                    outside.display()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn helper_cli_rejects_unrecognized_artifact_layouts_without_discovery() {
+        for artifact in [
+            "fixture-target/custom-profile/unit-test",
+            "fixture-target/custom-profile/unknown/unit-test",
+            "fixture-target/custom-profile/build/package/out/unit-test",
+        ] {
+            assert_eq!(
+                find_flk_binary(Path::new(artifact), |_| {
+                    panic!("unrecognized artifact layout must not inspect helper candidates")
+                }),
+                None
+            );
+        }
+    }
 
     #[test]
     fn resolves_a_program_that_exists_on_path() {
@@ -340,3 +631,6 @@ mod tests {
         program_path("flock-definitely-not-a-real-program");
     }
 }
+
+#[cfg(feature = "web")]
+pub(crate) mod deadline;

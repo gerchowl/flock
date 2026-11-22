@@ -1,7 +1,7 @@
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
-use crate::api::schema::EventEnvelope;
+use crate::api::schema::{EventEnvelope, EventKind};
 
 /// One durable log line (#175 O1). Newline-delimited JSON so a torn tail
 /// from a crash mid-write is detectable: the last line either parses whole
@@ -13,30 +13,127 @@ struct PersistedEvent {
     envelope: EventEnvelope,
 }
 
+#[cfg(all(test, feature = "web"))]
+type PushHook = std::sync::Arc<std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>>;
+
 #[derive(Clone, Default)]
 pub struct EventHub {
+    reply_waiters: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>>,
     inner: std::sync::Arc<std::sync::Mutex<EventHubState>>,
+    #[cfg(all(test, feature = "web"))]
+    before_push: PushHook,
     /// The newest sequence pushed, behind its own lock so a waiter can sleep
     /// on it (#438). Kept apart from `inner` because a condvar pairs with ONE
     /// mutex, and `inner` is held across disk writes — a waiter must never
     /// queue behind an fsync just to learn that nothing new arrived.
     arrived: std::sync::Arc<(std::sync::Mutex<u64>, std::sync::Condvar)>,
+    read_max_wait_ms: ReadMaxWait,
+    /// How many times the active log file has rotated since this hub opened
+    /// (ADR-0031 §4). The one rotation counter: the `PersistentLog` holds a
+    /// clone and bumps it in `rotate()`, which runs inside `push()` with
+    /// `inner` held. So the rotation only counts, and the server loop
+    /// re-issues what must outlive it once the lock is released. A cold read
+    /// compares it before and after its disk pass.
+    rotations: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    #[cfg(test)]
+    cold_reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Runs once between a read's disk pass and its ring pass, so a test
+    /// can interleave a push or a rotation there deterministically.
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    pub(crate) disk_read_hook: std::sync::Arc<std::sync::Mutex<Option<Box<dyn FnMut() + Send>>>>,
+}
+
+#[derive(Clone)]
+struct ReadMaxWait(std::sync::Arc<std::sync::atomic::AtomicU64>);
+
+impl Default for ReadMaxWait {
+    fn default() -> Self {
+        Self(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+            crate::api::schema::EVENTS_READ_MAX_WAIT_MS,
+        )))
+    }
 }
 
 #[derive(Default)]
 struct EventHubState {
     next_sequence: u64,
+    /// The newest sequence of a persisted kind. A restart resumes numbering
+    /// from it, so a sequence above it may be handed out again and must
+    /// never become a reader's cursor.
+    durable_sequence: u64,
+    /// The newest durable sequence no longer in the ring. Every durable
+    /// event past it is in the ring, so only an older cursor reads disk.
+    evicted_durable: u64,
+    #[cfg(test)]
+    ring_cap: Option<usize>,
     events: Vec<(u64, EventEnvelope)>,
     log: Option<PersistentLog>,
+    audit_indeterminate: bool,
+}
+
+/// A required audit either aborted durably or has an uncertain disk outcome.
+#[derive(Debug)]
+pub(crate) struct RequiredAuditError {
+    indeterminate: bool,
+    cause: std::io::Error,
+}
+
+impl From<std::io::Error> for RequiredAuditError {
+    fn from(cause: std::io::Error) -> Self {
+        Self {
+            indeterminate: false,
+            cause,
+        }
+    }
+}
+
+impl RequiredAuditError {
+    pub(crate) fn code(
+        &self,
+        unavailable: crate::api::error_code::ErrorCode,
+    ) -> crate::api::error_code::ErrorCode {
+        if self.indeterminate {
+            crate::api::error_code::ErrorCode::AuditIndeterminate
+        } else {
+            unavailable
+        }
+    }
+}
+
+impl std::fmt::Display for RequiredAuditError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.indeterminate {
+            write!(f, "audit outcome indeterminate; the mutation may or may not take effect after restart; repair storage, restart and inspect journal-derived state before retrying: {}", self.cause)
+        } else {
+            write!(f, "audit unavailable; no mutation committed; repair audit storage and restart the server before retrying: {}", self.cause)
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AuditFault {
+    Append,
+    PartialWrite,
+    FileSync,
+    DirectorySync,
+    Rollback,
 }
 
 struct PersistentLog {
     path: PathBuf,
-    file: std::fs::File,
+    #[cfg(test)]
+    audit_fault: Option<AuditFault>,
+    /// Closing an unavailable writer must retain the path for history readers.
+    file: Option<std::fs::File>,
     /// Events written to the active file since open/rotation.
     active_events: u64,
     /// Bytes written to the active file since open/rotation.
     active_bytes: u64,
+    /// The hub's rotation counter (`EventHub::rotations`), shared so that
+    /// every rotation, however it is reached, counts exactly once.
+    rotations: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Rotation policy (ADR-0005): rotate the active file past either bound,
@@ -47,7 +144,10 @@ const MAX_ACTIVE_EVENTS: u64 = 100_000;
 const MAX_ROTATED: usize = 4;
 
 impl PersistentLog {
-    fn open(path: PathBuf) -> std::io::Result<Self> {
+    fn open(
+        path: PathBuf,
+        rotations: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ) -> std::io::Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -58,36 +158,119 @@ impl PersistentLog {
         let active_bytes = file.metadata().map(|meta| meta.len()).unwrap_or(0);
         Ok(Self {
             path,
-            file,
+            #[cfg(test)]
+            audit_fault: None,
+            file: Some(file),
             // Only used to bound the active file; recounting lines on open
             // is not worth it — the byte bound covers a restarted file.
             active_events: 0,
             active_bytes,
+            rotations,
         })
     }
 
     fn rotated_path(&self, index: usize) -> PathBuf {
-        let mut name = self
-            .path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .unwrap_or("event-log")
-            .to_string();
-        name.push_str(&format!(".{index}.jsonl"));
-        self.path.with_file_name(name)
+        rotated_path(&self.path, index)
     }
 
+    /// Append one line, rotating past either bound.
     fn append(&mut self, event: &PersistedEvent) -> std::io::Result<()> {
+        #[cfg(test)]
+        if self.audit_fault == Some(AuditFault::Append) {
+            return Err(std::io::Error::other("injected append failure"));
+        }
         let mut line = serde_json::to_vec(event)
             .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
         line.push(b'\n');
-        self.file.write_all(&line)?;
-        self.file.sync_data()?;
+        let file = self.file.as_mut().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "durable event writer unavailable",
+            )
+        })?;
+        file.write_all(&line)?;
+        file.sync_data()?;
         self.active_bytes += line.len() as u64;
         self.active_events += 1;
         if self.active_bytes >= MAX_ACTIVE_BYTES || self.active_events >= MAX_ACTIVE_EVENTS {
             self.rotate()?;
         }
+        Ok(())
+    }
+
+    /// Complete rotation before writing so rollback always targets this handle.
+    fn append_required(&mut self, event: &PersistedEvent) -> Result<(), RequiredAuditError> {
+        let mut line = serde_json::to_vec(event)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        line.push(b'\n');
+        let directory = self
+            .path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let directory = std::fs::File::open(directory)?;
+        if self.active_bytes.saturating_add(line.len() as u64) >= MAX_ACTIVE_BYTES
+            || self.active_events.saturating_add(1) >= MAX_ACTIVE_EVENTS
+        {
+            self.rotate()?;
+        }
+        directory.sync_all()?;
+        let file = self.file.as_mut().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "durable event writer unavailable",
+            )
+        })?;
+        let before = file.metadata()?.len();
+        #[cfg(test)]
+        let fault = self.audit_fault;
+        let result = (|| -> std::io::Result<()> {
+            #[cfg(test)]
+            if fault == Some(AuditFault::Append) {
+                return Err(std::io::Error::other("injected append failure"));
+            }
+            #[cfg(test)]
+            if fault == Some(AuditFault::PartialWrite) {
+                file.write_all(&line[..line.len() / 2])?;
+                return Err(std::io::Error::other("injected partial write"));
+            }
+            file.write_all(&line)?;
+            #[cfg(test)]
+            if fault == Some(AuditFault::FileSync) {
+                return Err(std::io::Error::other("injected file sync failure"));
+            }
+            file.sync_data()?;
+            #[cfg(test)]
+            if matches!(
+                fault,
+                Some(AuditFault::DirectorySync | AuditFault::Rollback)
+            ) {
+                return Err(std::io::Error::other("injected directory sync failure"));
+            }
+            directory.sync_all()
+        })();
+        if let Err(write_error) = result {
+            let rollback = (|| -> std::io::Result<()> {
+                #[cfg(test)]
+                if fault == Some(AuditFault::Rollback) {
+                    return Err(std::io::Error::other("injected rollback failure"));
+                }
+                file.set_len(before)?;
+                file.sync_all()?;
+                directory.sync_all()
+            })();
+            return Err(match rollback {
+                Ok(()) => write_error.into(),
+                Err(rollback_error) => RequiredAuditError {
+                    indeterminate: true,
+                    cause: std::io::Error::other(format!(
+                        "{write_error}; rollback: {rollback_error}"
+                    )),
+                },
+            });
+        }
+        self.active_bytes = before + line.len() as u64;
+        self.active_events += 1;
         Ok(())
     }
 
@@ -103,12 +286,16 @@ impl PersistentLog {
             }
         }
         std::fs::rename(&self.path, self.rotated_path(1))?;
-        self.file = std::fs::File::options()
-            .append(true)
-            .create(true)
-            .open(&self.path)?;
+        self.file = Some(
+            std::fs::File::options()
+                .append(true)
+                .create(true)
+                .open(&self.path)?,
+        );
         self.active_events = 0;
         self.active_bytes = 0;
+        self.rotations
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 }
@@ -165,14 +352,35 @@ fn highest_seq_best_effort(path: &Path) -> u64 {
     highest
 }
 
-fn read_log_file(path: &Path) -> Result<Vec<PersistedEvent>, String> {
+/// The sequence of a line that is a well-formed log entry this binary cannot
+/// type: a kind added by a newer release (#1020, ADR-0028 §3a). Such a line is
+/// skipped, never treated as corruption, so a downgrade or the old side of a
+/// live handoff keeps the log instead of quarantining it. A KNOWN kind that
+/// fails to parse is real corruption and is not skipped.
+fn unknown_kind_seq(line: &str) -> Option<u64> {
+    unknown_kind_seq_as::<EventKind>(line)
+}
+// The reader's vocabulary is explicit so compatibility witnesses use this fallback.
+fn unknown_kind_seq_as<K: serde::de::DeserializeOwned>(line: &str) -> Option<u64> {
+    let value = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    let kind = value.pointer("/envelope/event")?;
+    if !kind.is_string() || serde_json::from_value::<K>(kind.clone()).is_ok() {
+        return None;
+    }
+    value.get("seq")?.as_u64()
+}
+
+/// Events in one file, plus the highest sequence among skipped unknown-kind
+/// lines: those numbers are spent too, and must not be handed out again.
+fn read_log_file(path: &Path) -> Result<(Vec<PersistedEvent>, u64), String> {
     let file = match std::fs::File::open(path) {
         Ok(file) => file,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), 0)),
         Err(err) => return Err(format!("{}: {err}", path.display())),
     };
     let mut reader = std::io::BufReader::new(file);
     let mut events = Vec::new();
+    let mut skipped_seq = 0;
     let mut line = String::new();
     loop {
         line.clear();
@@ -184,23 +392,90 @@ fn read_log_file(path: &Path) -> Result<Vec<PersistedEvent>, String> {
         }
         let complete = line.ends_with('\n');
         match serde_json::from_str::<PersistedEvent>(line.trim_end()) {
-            Ok(event) => events.push(event),
+            Ok(event) => {
+                if matches!(&event.envelope.data, crate::api::schema::EventData::QueueItemState(fact) if !fact.known())
+                {
+                    tracing::warn!(seq = event.seq, "skipping unknown queue lifecycle state");
+                    skipped_seq = skipped_seq.max(event.seq);
+                } else {
+                    events.push(event);
+                }
+            }
             Err(err) if !complete => {
                 // Torn tail from a crash mid-write: drop it, keep the prefix.
                 crate::logging::event_log_torn_tail(&path.display().to_string());
                 let _ = err;
                 break;
             }
-            Err(err) => return Err(format!("{}: corrupt line: {err}", path.display())),
+            Err(err) => match unknown_kind_seq(line.trim_end()) {
+                Some(seq) => skipped_seq = skipped_seq.max(seq),
+                None => return Err(format!("{}: corrupt line: {err}", path.display())),
+            },
         }
         if !complete {
             break;
         }
     }
-    Ok(events)
+    Ok((events, skipped_seq))
+}
+
+#[derive(Default)]
+pub(crate) struct EventRead {
+    pub gap: Option<(u64, u64)>,
+    pub events: Vec<(u64, EventEnvelope)>,
+    /// The cursor to hand a reader: never past the newest durable event.
+    pub next_after: u64,
+    /// How far this read looked, for waiting on the hub.
+    pub scanned: u64,
+}
+
+fn rotated_path(path: &Path, index: usize) -> PathBuf {
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("event-log");
+    path.with_file_name(format!("{stem}.{index}.jsonl"))
+}
+
+pub(crate) struct ReplyWaitGuard {
+    hub: EventHub,
+    correlation: String,
+}
+impl Drop for ReplyWaitGuard {
+    fn drop(&mut self) {
+        if let Ok(mut waiters) = self.hub.reply_waiters.lock() {
+            if let Some(count) = waiters.get_mut(&self.correlation) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    waiters.remove(&self.correlation);
+                }
+            }
+        }
+    }
 }
 
 impl EventHub {
+    #[cfg(all(test, feature = "web"))]
+    pub(crate) fn before_push_for_test(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.before_push.lock().unwrap() = Some(Box::new(hook));
+    }
+    pub(crate) fn track_reply_wait(&self, correlation: &str) -> ReplyWaitGuard {
+        if let Ok(mut waiters) = self.reply_waiters.lock() {
+            *waiters.entry(correlation.into()).or_default() += 1;
+        }
+        ReplyWaitGuard {
+            hub: self.clone(),
+            correlation: correlation.into(),
+        }
+    }
+
+    pub(crate) fn reply_waits(&self) -> Vec<String> {
+        self.reply_waiters
+            .lock()
+            .map(|waiters| waiters.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
     // #175 phase 4: bumped 512 → 4096 so the check-runner's per-tick fan-out
     // (CheckRan / CheckFired / CheckErrored / ChecksHeartbeat) can't starve the
     // pane-lifecycle events that share the in-memory ring. Operator-approved.
@@ -218,6 +493,7 @@ impl EventHub {
             let Ok(mut state) = hub.inner.lock() else {
                 return hub;
             };
+            let mut highest_skipped_seq = 0;
             for index in (1..=MAX_ROTATED).rev() {
                 let mut name = path
                     .file_stem()
@@ -226,13 +502,19 @@ impl EventHub {
                     .to_string();
                 name.push_str(&format!(".{index}.jsonl"));
                 match read_log_file(&path.with_file_name(name)) {
-                    Ok(events) => restored.extend(events),
+                    Ok((events, skipped)) => {
+                        restored.extend(events);
+                        highest_skipped_seq = highest_skipped_seq.max(skipped);
+                    }
                     Err(err) => crate::logging::event_log_corrupt(&err),
                 }
             }
             let mut highest_quarantined_seq = 0;
             match read_log_file(&path) {
-                Ok(events) => restored.extend(events),
+                Ok((events, skipped)) => {
+                    restored.extend(events);
+                    highest_skipped_seq = highest_skipped_seq.max(skipped);
+                }
                 Err(err) => {
                     // The active file is append-target: a corrupt one would
                     // swallow every future event on the next load. Quarantine
@@ -262,7 +544,16 @@ impl EventHub {
                 .last()
                 .map(|event| event.seq)
                 .unwrap_or(0)
-                .max(highest_quarantined_seq);
+                .max(highest_quarantined_seq)
+                .max(highest_skipped_seq);
+            state.durable_sequence = state.next_sequence;
+            // Everything below the ring is on disk at best, including what a
+            // rotation already deleted, so an older cursor must check there.
+            let seeded = restored.len().saturating_sub(Self::MAX_EVENTS);
+            state.evicted_durable = restored
+                .get(seeded)
+                .map(|first| first.seq.saturating_sub(1))
+                .unwrap_or(state.next_sequence);
             state.events = restored
                 .iter()
                 .rev()
@@ -270,7 +561,7 @@ impl EventHub {
                 .rev()
                 .map(|event| (event.seq, event.envelope.clone()))
                 .collect();
-            match PersistentLog::open(path) {
+            match PersistentLog::open(path, hub.rotations.clone()) {
                 Ok(log) => state.log = Some(log),
                 Err(err) => crate::logging::event_log_open_failed(&err.to_string()),
             }
@@ -278,13 +569,87 @@ impl EventHub {
         hub
     }
 
+    #[cfg(test)]
+    pub(crate) fn fail_appends_for_test(&self) {
+        self.fail_audit_for_test(AuditFault::Append);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_audit_for_test(&self, fault: AuditFault) {
+        self.inner
+            .lock()
+            .unwrap()
+            .log
+            .as_mut()
+            .expect("persistent fixture log")
+            .audit_fault = Some(fault);
+    }
+
+    /// Commit rotation and sync its directory before appending, with no rotation
+    /// during the append. Publish only after the file and directory sync succeed.
+    /// On append/sync failure, truncate through the retained file handle and sync
+    /// both file and directory before returning a definite unavailable refusal.
+    /// If rollback fails, return `audit_indeterminate`: do not apply live state,
+    /// and refuse every later required audit with that code until restart. The
+    /// mutation may or may not replay then; the reopened journal is authoritative.
+    /// Both failures close the writer but retain the path for history reads.
+    /// Ordinary best-effort `push` behavior is unchanged.
+    pub(crate) fn try_push_durable(&self, event: EventEnvelope) -> Result<(), RequiredAuditError> {
+        use std::io::{Error, ErrorKind};
+        if !event.event.is_persisted() {
+            return Err(Error::new(ErrorKind::InvalidInput, "event kind is not durable").into());
+        }
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| Error::other("event hub unavailable"))?;
+        if state.audit_indeterminate {
+            return Err(RequiredAuditError {
+                indeterminate: true,
+                cause: Error::other("required audit writer disabled until restart"),
+            });
+        }
+        let sequence = state.next_sequence + 1;
+        let persisted = PersistedEvent {
+            seq: sequence,
+            ts_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_millis().min(u128::from(u64::MAX)) as u64)
+                .unwrap_or(0),
+            envelope: event.clone(),
+        };
+        let result = state
+            .log
+            .as_mut()
+            .filter(|log| log.file.is_some())
+            .ok_or_else(|| Error::new(ErrorKind::NotConnected, "durable event log unavailable"))?
+            .append_required(&persisted);
+        // An uncertain append may have written bytes; never reuse its sequence.
+        state.next_sequence = sequence;
+        if let Err(error) = result {
+            state.audit_indeterminate = error.indeterminate;
+            if let Some(log) = state.log.as_mut() {
+                log.file = None;
+            }
+            return Err(error);
+        }
+        state.durable_sequence = sequence;
+        self.publish_event(state, sequence, event);
+        Ok(())
+    }
+
     pub fn push(&self, event: EventEnvelope) {
+        #[cfg(all(test, feature = "web"))]
+        if let Some(hook) = self.before_push.lock().unwrap().take() {
+            hook();
+        }
         let Ok(mut state) = self.inner.lock() else {
             return;
         };
         state.next_sequence += 1;
         let sequence = state.next_sequence;
         if event.event.is_persisted() {
+            state.durable_sequence = sequence;
             if let Some(log) = state.log.as_mut() {
                 let persisted = PersistedEvent {
                     seq: sequence,
@@ -299,10 +664,31 @@ impl EventHub {
                 }
             }
         }
+        self.publish_event(state, sequence, event);
+    }
+
+    fn publish_event(
+        &self,
+        mut state: std::sync::MutexGuard<'_, EventHubState>,
+        sequence: u64,
+        event: EventEnvelope,
+    ) {
         state.events.push((sequence, event));
-        let overflow = state.events.len().saturating_sub(Self::MAX_EVENTS);
+        #[cfg(test)]
+        let cap = state.ring_cap.unwrap_or(Self::MAX_EVENTS);
+        #[cfg(not(test))]
+        let cap = Self::MAX_EVENTS;
+        let overflow = state.events.len().saturating_sub(cap);
         if overflow > 0 {
-            state.events.drain(0..overflow);
+            let evicted = state
+                .events
+                .drain(0..overflow)
+                .filter(|(_, event)| event.event.is_persisted())
+                .map(|(seq, _)| seq)
+                .max();
+            if let Some(evicted) = evicted {
+                state.evicted_durable = evicted;
+            }
         }
         drop(state);
         let (latest, condvar) = &*self.arrived;
@@ -333,7 +719,53 @@ impl EventHub {
         }
     }
 
-    pub fn events_after(&self, sequence: u64) -> Vec<(u64, EventEnvelope)> {
+    /// A complete continuation from the ring, or a typed refusal requiring resync.
+    /// Checking retention and capturing events share one lock.
+    pub fn events_after(
+        &self,
+        sequence: u64,
+    ) -> Result<Vec<(u64, EventEnvelope)>, super::schema::ErrorBody> {
+        use super::{
+            error_code::ErrorCode,
+            schema::{ErrorBody, ErrorData},
+        };
+        let state = self.inner.lock().map_err(|_| ErrorBody {
+            data: None,
+            code: ErrorCode::InternalError.as_str().into(),
+            message: "event ring is unavailable".into(),
+        })?;
+        let floor = state
+            .events
+            .first()
+            .map_or(state.next_sequence, |(seq, _)| seq.saturating_sub(1));
+        let oldest = floor.saturating_add(1);
+        if sequence < floor {
+            return Err(ErrorBody {
+                code: ErrorCode::EventsLost.as_str().into(),
+                message: "Events were lost. Resync with per-verb reads (workspace.list, pane.list, agent.list, msg.list); use events.read for retained durable history.".into(),
+                data: Some(Box::new(ErrorData {
+                    extra: [
+                        ("requested_sequence".into(), sequence.into()),
+                        ("oldest_available_sequence".into(), oldest.into()),
+                        ("current_sequence".into(), state.next_sequence.into()),
+                    ]
+                    .into_iter()
+                    .collect(),
+                    ..Default::default()
+                })),
+            });
+        }
+        Ok(state
+            .events
+            .iter()
+            .filter(|(seq, _)| *seq > sequence)
+            .cloned()
+            .collect())
+    }
+
+    /// A bounded state-fold snapshot, without a completeness guarantee.
+    /// Continuation/subscription readers must use [`Self::events_after`].
+    pub fn ring_snapshot_after(&self, sequence: u64) -> Vec<(u64, EventEnvelope)> {
         let Ok(state) = self.inner.lock() else {
             return Vec::new();
         };
@@ -345,11 +777,172 @@ impl EventHub {
             .collect()
     }
 
+    /// Make the next persisted push rotate the active file, the way a full
+    /// one does, so a test can drive rotations without writing 100k events.
+    #[cfg(test)]
+    pub(crate) fn rotate_on_next_push(&self) {
+        let mut state = self.inner.lock().unwrap();
+        if let Some(log) = state.log.as_mut() {
+            log.active_events = MAX_ACTIVE_EVENTS - 1;
+        }
+    }
+
+    /// The rotation count (see the `rotations` field). A caller compares it
+    /// with the value it last acted on.
+    pub(crate) fn rotations(&self) -> u64 {
+        self.rotations.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     pub fn current_sequence(&self) -> u64 {
         let Ok(state) = self.inner.lock() else {
             return 0;
         };
         state.next_sequence
+    }
+
+    /// `events.read` (ADR-0028 §3): durable events with `seq > after` that
+    /// `keep` accepts, at most `limit`, oldest first.
+    ///
+    /// The ring holds every durable event newer than `evicted_durable`, so
+    /// a reader at or past it never touches disk. An older cursor reads the
+    /// log files newest first WITHOUT the hub lock, so a slow disk never
+    /// stalls a push. A rotation racing that read can only cost the oldest
+    /// end, which then surfaces as a gap, never as a silent hole.
+    pub(crate) fn read(
+        &self,
+        after: u64,
+        limit: usize,
+        keep: impl Fn(&EventEnvelope) -> bool,
+    ) -> EventRead {
+        let (evicted, path) = {
+            let Ok(state) = self.inner.lock() else {
+                return EventRead::default();
+            };
+            let path = state.log.as_ref().map(|log| log.path.clone());
+            (state.evicted_durable, path)
+        };
+        let mut floor = None;
+        let mut disk: Vec<(u64, EventEnvelope)> = Vec::new();
+        if after < evicted {
+            #[cfg(test)]
+            self.cold_reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let mut dropped = false;
+            for index in 0..=MAX_ROTATED {
+                let Some(path) = path.as_ref() else { break };
+                let file = match index {
+                    0 => path.clone(),
+                    index => rotated_path(path, index),
+                };
+                dropped |= index == MAX_ROTATED && file.exists();
+                let Ok((events, _)) = read_log_file(&file) else {
+                    dropped = true;
+                    break;
+                };
+                let reaches = events.first().is_some_and(|event| event.seq <= after + 1);
+                disk.extend(events.into_iter().map(|event| (event.seq, event.envelope)));
+                if reaches {
+                    dropped = false;
+                    break;
+                }
+            }
+            disk.retain(|(seq, _)| *seq > after);
+            disk.sort_by_key(|(seq, _)| *seq);
+            disk.dedup_by_key(|(seq, _)| *seq);
+            // `evicted` is a durable event that was pushed before the files
+            // were read, so finding nothing past the cursor means it is gone.
+            floor = match disk.first() {
+                None => Some(evicted + 1),
+                Some((first, _)) => dropped.then_some(*first),
+            };
+            #[cfg(test)]
+            if let Some(mut hook) = self.disk_read_hook.lock().ok().and_then(|mut h| h.take()) {
+                hook();
+            }
+        }
+        let reached = disk
+            .last()
+            .map(|(seq, _)| *seq)
+            .into_iter()
+            .chain(floor.map(|floor| floor - 1))
+            .fold(after, u64::max);
+        let Ok(state) = self.inner.lock() else {
+            return EventRead::default();
+        };
+        // The ring continues the disk read only if it has not evicted a
+        // durable event past it meanwhile. If it has, that event is on disk
+        // for the next call.
+        let ring_joins = state.evicted_durable <= reached;
+        let mut scanned = reached;
+        if ring_joins {
+            // A rotation can delete a file whose events the ring still
+            // holds, so the ring can move the retention floor down.
+            let ring_floor = state
+                .events
+                .iter()
+                .find(|(seq, event)| *seq > after && event.event.is_persisted())
+                .map(|(seq, _)| *seq);
+            floor = floor.map(|floor| ring_floor.map_or(floor, |ring| floor.min(ring)));
+            disk.extend(state.events.iter().filter(|(seq, _)| *seq > after).cloned());
+            disk.sort_by_key(|(seq, _)| *seq);
+            disk.dedup_by_key(|(seq, _)| *seq);
+            scanned = scanned.max(state.next_sequence);
+        }
+        let durable = state.durable_sequence;
+        drop(state);
+        let gap = floor
+            .filter(|floor| *floor > after + 1)
+            .map(|floor| (after + 1, floor - 1));
+        let mut events = Vec::new();
+        for (seq, envelope) in disk {
+            if !envelope.event.is_persisted() || !keep(&envelope) {
+                continue;
+            }
+            if events.len() == limit {
+                scanned = events.last().map(|(seq, _)| *seq).unwrap_or(after);
+                break;
+            }
+            events.push((seq, envelope));
+        }
+        EventRead {
+            gap,
+            events,
+            next_after: scanned.min(durable),
+            scanned,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_ring_cap(&self, cap: usize) {
+        if let Ok(mut state) = self.inner.lock() {
+            state.ring_cap = Some(cap);
+        }
+    }
+
+    /// The newest durable sequence: the furthest cursor a reader may hold.
+    pub(crate) fn durable_sequence(&self) -> u64 {
+        self.inner
+            .lock()
+            .map(|state| state.durable_sequence)
+            .unwrap_or(0)
+    }
+
+    /// `[events] read_max_wait_ms`, applied at start and on config reload.
+    pub(crate) fn set_read_max_wait_ms(&self, ms: u64) {
+        self.read_max_wait_ms
+            .0
+            .store(ms, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn read_max_wait_ms(&self) -> u64 {
+        self.read_max_wait_ms
+            .0
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cold_read_count(&self) -> usize {
+        self.cold_reads.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Stream persisted history (rotated files + active) with `seq >
@@ -359,24 +952,45 @@ impl EventHub {
     /// walker; an unreadable file contributes nothing rather than failing
     /// the whole read.
     pub fn persisted_events_after(&self, sequence: u64) -> Vec<(u64, u64, EventEnvelope)> {
-        let Ok(state) = self.inner.lock() else {
-            return Vec::new();
-        };
-        let Some(log) = state.log.as_ref() else {
-            return Vec::new();
-        };
+        #[cfg(test)]
+        self.cold_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Parse outside `inner`: a cold read covers up to six files, and
+        // `push` on the App loop must not queue behind it. Only the file
+        // names and the rotation count are taken under the lock. A rotation
+        // during the read renames files under it, so the read is retried, and
+        // the last attempt holds the lock throughout.
         let mut restored: Vec<PersistedEvent> = Vec::new();
-        for index in (1..=MAX_ROTATED).rev() {
-            match read_log_file(&log.rotated_path(index)) {
-                Ok(events) => restored.extend(events),
-                Err(err) => crate::logging::event_log_corrupt(&err),
+        for attempt in 0..3 {
+            let Ok(state) = self.inner.lock() else {
+                return Vec::new();
+            };
+            let Some(log) = state.log.as_ref() else {
+                return Vec::new();
+            };
+            let before = self.rotations();
+            let mut paths: Vec<PathBuf> = (1..=MAX_ROTATED)
+                .rev()
+                .map(|index| log.rotated_path(index))
+                .collect();
+            paths.push(log.path.clone());
+            let held = (attempt == 2).then_some(state);
+            restored.clear();
+            for path in &paths {
+                match read_log_file(path) {
+                    Ok((events, _)) => restored.extend(events),
+                    Err(err) => crate::logging::event_log_corrupt(&err),
+                }
+            }
+            if held.is_some() {
+                break;
+            }
+            if self.rotations() == before {
+                break;
             }
         }
-        match read_log_file(&log.path) {
-            Ok(events) => restored.extend(events),
-            Err(err) => crate::logging::event_log_corrupt(&err),
-        }
         restored.sort_by_key(|event| event.seq);
+        restored.dedup_by_key(|event| event.seq);
         restored
             .into_iter()
             .filter(|event| event.seq > sequence)
@@ -386,11 +1000,15 @@ impl EventHub {
 }
 
 #[cfg(test)]
+mod goal_storage_bench;
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::schema::{EventData, EventKind};
+    use crate::api::schema::EventData;
+    use std::sync::{Arc, Mutex};
 
-    fn temp_log(name: &str) -> PathBuf {
+    pub(super) fn temp_log(name: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|elapsed| elapsed.as_nanos())
@@ -412,6 +1030,224 @@ mod tests {
         }
     }
 
+    #[test]
+    fn review_failed_audit_keeps_existing_history_readable() {
+        let path = temp_log("review-existing-history");
+        let hub = EventHub::with_persistence(path.clone());
+        hub.push(workspace_event("existing"));
+        assert_eq!(hub.persisted_events_after(0).len(), 1);
+        let before = std::fs::read(&path).unwrap();
+        hub.fail_appends_for_test();
+        assert!(hub.try_push_durable(workspace_event("rejected")).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let count = hub.persisted_events_after(0).len();
+        drop(hub);
+        cleanup(&path);
+        assert_eq!(
+            count, 1,
+            "failed audit must not hide intact prior journal history"
+        );
+    }
+
+    #[test]
+    fn best_effort_push_after_required_failure_matches_dev_append_failure() {
+        let dev_path = temp_log("dev-best-effort");
+        let path = temp_log("required-best-effort");
+        let dev = EventHub::with_persistence(dev_path.clone());
+        let hub = EventHub::with_persistence(path.clone());
+        for candidate in [&dev, &hub] {
+            candidate.push(workspace_event("existing"));
+            candidate.fail_appends_for_test();
+        }
+        assert!(hub.try_push_durable(workspace_event("rejected")).is_err());
+        let before = std::fs::read(&path).unwrap();
+        for event in [
+            workspace_event("later"),
+            output_event(),
+            workspace_event("last"),
+        ] {
+            for candidate in [&dev, &hub] {
+                let previous = candidate.current_sequence();
+                let previous_durable = candidate.durable_sequence();
+                let warnings = crate::logging::capture_logs(|| candidate.push(event.clone()));
+                assert_eq!(
+                    warnings.contains("event_log.write"),
+                    event.event.is_persisted()
+                );
+                assert_eq!(candidate.current_sequence(), previous + 1);
+                assert_eq!(
+                    candidate.durable_sequence(),
+                    if event.event.is_persisted() {
+                        previous + 1
+                    } else {
+                        previous_durable
+                    }
+                );
+                assert_eq!(
+                    candidate.events_after(previous).unwrap(),
+                    [(previous + 1, event.clone())]
+                );
+                assert!(candidate.wait_after(previous, std::time::Duration::ZERO));
+            }
+        }
+        assert_eq!(hub.persisted_events_after(0).len(), 1);
+        assert_eq!(dev.persisted_events_after(0).len(), 1);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        drop(dev);
+        drop(hub);
+        cleanup(&dev_path);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn failed_required_audit_preserves_rotated_and_cold_history_reads() {
+        let path = temp_log("required-cold-history");
+        let hub = EventHub::with_persistence(path.clone());
+        hub.set_ring_cap(1);
+        hub.push(workspace_event("first"));
+        hub.rotate_on_next_push();
+        hub.push(workspace_event("second"));
+        hub.push(workspace_event("third"));
+        hub.fail_appends_for_test();
+        assert!(hub.try_push_durable(workspace_event("rejected")).is_err());
+        let history = hub.persisted_events_after(0);
+        assert_eq!(
+            history.iter().map(|(seq, _, _)| *seq).collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+        let cold_before = hub.cold_read_count();
+        let read = hub.read(0, 10, |_| true);
+        assert_eq!(hub.cold_read_count(), cold_before + 1);
+        assert_eq!(
+            read.events.iter().map(|(seq, _)| *seq).collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+        assert_eq!(read.next_after, 3);
+        assert_eq!(read.gap, None);
+        assert!(hub
+            .try_push_durable(workspace_event("still-rejected"))
+            .is_err());
+        assert_eq!(hub.persisted_events_after(0).len(), 3);
+        drop(hub);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn required_audit_finishes_rotation_before_appending() {
+        let path = temp_log("required-rotation");
+        let hub = EventHub::with_persistence(path.clone());
+        hub.push(workspace_event("existing"));
+        hub.rotate_on_next_push();
+        hub.try_push_durable(workspace_event("committed")).unwrap();
+        assert_eq!(hub.rotations(), 1);
+        assert_eq!(read_log_file(&path).unwrap().0.len(), 1);
+        assert_eq!(
+            read_log_file(&path).unwrap().0[0].envelope,
+            workspace_event("committed")
+        );
+        let reopened = EventHub::with_persistence(path.clone());
+        assert_eq!(reopened.persisted_events_after(0).len(), 2);
+        drop(reopened);
+        drop(hub);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn required_audit_append_is_replayable_before_publication() {
+        let path = temp_log("required-success");
+        let hub = EventHub::with_persistence(path.clone());
+        hub.set_ring_cap(1);
+        hub.push(workspace_event("existing"));
+        hub.try_push_durable(workspace_event("required")).unwrap();
+        assert_eq!(hub.durable_sequence(), 2);
+        assert_eq!(hub.events_after(1).unwrap().len(), 1);
+        assert!(hub.wait_after(1, std::time::Duration::ZERO));
+        let reopened = EventHub::with_persistence(path.clone());
+        let persisted = reopened.persisted_events_after(0);
+        assert_eq!(persisted.len(), 2);
+        assert_eq!(persisted[1].2, workspace_event("required"));
+        drop(reopened);
+        drop(hub);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn required_audit_failure_never_publishes_or_advances_the_durable_cursor() {
+        let path = temp_log("required-failure");
+        let hub = EventHub::with_persistence(path.clone());
+        hub.push(workspace_event("existing"));
+        let before = std::fs::read(&path).unwrap();
+        hub.fail_appends_for_test();
+        assert!(hub.try_push_durable(workspace_event("rejected")).is_err());
+        assert_eq!(hub.durable_sequence(), 1);
+        assert_eq!(hub.current_sequence(), 2);
+        assert!(hub.events_after(1).unwrap().is_empty());
+        assert!(!hub.wait_after(1, std::time::Duration::ZERO));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(hub
+            .try_push_durable(workspace_event("still-rejected"))
+            .is_err());
+        assert_eq!(hub.current_sequence(), 2);
+        drop(hub);
+        let reopened = EventHub::with_persistence(path.clone());
+        reopened
+            .try_push_durable(workspace_event("recovered"))
+            .unwrap();
+        assert_eq!(reopened.persisted_events_after(0).len(), 2);
+        drop(reopened);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn required_audit_refuses_when_the_log_directory_cannot_be_synced() {
+        let path = temp_log("required-directory");
+        let hub = EventHub::with_persistence(path.clone());
+        let directory = path.parent().unwrap();
+        let relocated = directory.with_extension("relocated");
+        std::fs::rename(directory, &relocated).unwrap();
+        assert!(hub
+            .try_push_durable(workspace_event("unconfirmed"))
+            .is_err());
+        assert_eq!(hub.durable_sequence(), 0);
+        assert!(!hub.wait_after(0, std::time::Duration::ZERO));
+        assert!(hub.events_after(0).unwrap_or_default().is_empty());
+        drop(hub);
+        std::fs::remove_dir_all(relocated).unwrap();
+    }
+
+    #[test]
+    fn required_audits_reject_memory_only_hubs_and_non_durable_kinds() {
+        let hub = EventHub::default();
+        assert!(hub.try_push_durable(workspace_event("required")).is_err());
+        assert!(hub.try_push_durable(output_event()).is_err());
+        assert_eq!(hub.current_sequence(), 0);
+        hub.push(workspace_event("best-effort"));
+        assert_eq!(hub.events_after(0).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn ring_overflow_refuses_an_incomplete_event_read() {
+        let hub = EventHub::default();
+        hub.set_ring_cap(2);
+        for label in ["one", "two", "three"] {
+            hub.push(workspace_event(label));
+        }
+        let read = format!("{:?}", hub.events_after(0));
+        assert!(read.starts_with("Err("), "{read}");
+        let error = hub.events_after(0).unwrap_err();
+        assert_eq!(error.code, "events_lost");
+        assert_eq!(error.data.unwrap().extra["oldest_available_sequence"], 2);
+        assert_eq!(
+            hub.events_after(1)
+                .unwrap()
+                .iter()
+                .map(|(seq, _)| *seq)
+                .collect::<Vec<_>>(),
+            [2, 3]
+        );
+        assert!(hub.events_after(3).unwrap().is_empty());
+    }
+
     fn output_event() -> EventEnvelope {
         EventEnvelope {
             event: EventKind::PaneOutputChanged,
@@ -423,7 +1259,7 @@ mod tests {
         }
     }
 
-    fn cleanup(path: &Path) {
+    pub(super) fn cleanup(path: &Path) {
         if let Some(parent) = path.parent() {
             let _ = std::fs::remove_dir_all(parent);
         }
@@ -492,6 +1328,591 @@ mod tests {
     }
 
     #[test]
+    fn grant_revocation_is_persisted_and_a_newer_kind_is_skipped() {
+        use crate::api::schema::EventData;
+        let root = crate::test_support::TempDir::socket();
+        let path = root.path().join("events.jsonl");
+        let hub = EventHub::with_persistence(path.clone());
+        assert!(EventKind::StructuredGrantRevoked.is_persisted());
+        hub.push(EventEnvelope {
+            event: EventKind::StructuredGrantRevoked,
+            data: EventData::StructuredGrantRevoked {
+                agent_id: "fixture-agent".into(),
+                generation: 1,
+                request_id: "request-one".into(),
+                request_seq: 2,
+                principal: "operator:pid:1".into(),
+            },
+        });
+        drop(hub);
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(file, "{}", serde_json::json!({"seq":2,"ts_ms":1,"envelope":{"event":"future_grant_kind","data":{"type":"future_grant_kind"}}})).unwrap();
+        drop(file);
+        let restarted = EventHub::with_persistence(path);
+        let records = restarted.persisted_events_after(0);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].2.event, EventKind::StructuredGrantRevoked);
+    }
+
+    /// ADR-0028 §3a: a kind from a newer release is skipped, not read as
+    /// corruption, and its sequence stays spent.
+    #[test]
+    fn directory_change_is_durable_and_unknown_kinds_remain_skippable() {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum OldKind {
+            WorkspaceCreated,
+        }
+        assert!(serde_json::from_str::<OldKind>(r#""workspace_created""#).is_ok());
+        let path = temp_log("directory-change");
+        let hub = EventHub::with_persistence(path.clone());
+        hub.push(EventEnvelope {
+            event: EventKind::DirectoryChanged,
+            data: crate::api::schema::EventData::DirectoryChanged {},
+        });
+        let line = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(unknown_kind_seq_as::<OldKind>(&line), Some(1));
+        drop(hub);
+        let future = r#"{"seq":2,"ts_ms":1,"envelope":{"event":"future_directory_kind","data":{"type":"future_directory_kind"}}}"#;
+        writeln!(
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap(),
+            "{future}"
+        )
+        .unwrap();
+        let restarted = EventHub::with_persistence(path.clone());
+        assert_eq!(restarted.current_sequence(), 2);
+        let events = restarted.persisted_events_after(0);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].2.event, EventKind::DirectoryChanged);
+        assert!(std::fs::read_to_string(&path).unwrap().contains(future));
+        drop(restarted);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn an_unknown_kind_is_skipped_without_quarantining_the_log() {
+        let path = temp_log("unknown-kind");
+        let hub = EventHub::with_persistence(path.clone());
+        hub.push(workspace_event("w1"));
+        drop(hub);
+        {
+            use std::io::Write;
+            let mut file = std::fs::File::options().append(true).open(&path).unwrap();
+            file.write_all(
+                b"{\"seq\":2,\"ts_ms\":1,\"envelope\":{\"event\":\"pr.from_the_future\",\"data\":{\"type\":\"pr.from_the_future\"}}}\n",
+            )
+            .unwrap();
+        }
+        let restarted = EventHub::with_persistence(path.clone());
+        assert!(
+            !path.with_file_name("event-log.corrupt.jsonl").exists(),
+            "an unknown kind must not quarantine the log"
+        );
+        assert_eq!(restarted.persisted_events_after(0).len(), 1);
+        restarted.push(workspace_event("w2"));
+        let seqs: Vec<u64> = restarted
+            .persisted_events_after(0)
+            .into_iter()
+            .map(|(seq, _, _)| seq)
+            .collect();
+        assert_eq!(seqs, vec![1, 3], "seq 2 stays spent");
+        cleanup(&path);
+    }
+
+    /// #1031: `wait.expired` is new to v2.0.0, whose reader skips a line
+    /// with a numeric `seq` and an `envelope.event` it cannot type (#1058).
+    /// The line this build writes has that shape and reads back whole here.
+    #[test]
+    fn wait_expired_is_a_line_an_older_reader_skips() {
+        use crate::api::schema::EventData;
+        let path = temp_log("wait-expired");
+        let hub = EventHub::with_persistence(path.clone());
+        let expired = EventEnvelope {
+            event: EventKind::WaitExpired,
+            data: EventData::WaitExpired {
+                wait_id: "w_1_1".into(),
+                agent_id: "agent_a".into(),
+                predicate: "delegate:agent_b phase in [finished]".into(),
+                since: 1,
+                deadline: 2,
+            },
+        };
+        hub.push(expired.clone());
+        drop(hub);
+        let line = std::fs::read_to_string(&path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert!(value["seq"].is_u64(), "{line}");
+        assert_eq!(value["envelope"]["event"], "wait.expired");
+        let restarted = EventHub::with_persistence(path.clone());
+        let back: Vec<EventEnvelope> = restarted
+            .persisted_events_after(0)
+            .into_iter()
+            .map(|(_, _, envelope)| envelope)
+            .collect();
+        assert_eq!(back, [expired]);
+        cleanup(&path);
+    }
+
+    /// #1171: the hub's rotation count is the log's own, so every rotation
+    /// counts once, whether `push` fills the file or `rotate` runs directly.
+    #[test]
+    fn every_rotation_counts_once_on_the_hub() {
+        let path = temp_log("rotation-count");
+        let hub = EventHub::with_persistence(path.clone());
+        hub.rotate_on_next_push();
+        hub.push(workspace_event("w1"));
+        assert_eq!(hub.rotations(), 1);
+        hub.inner
+            .lock()
+            .unwrap()
+            .log
+            .as_mut()
+            .unwrap()
+            .rotate()
+            .unwrap();
+        assert_eq!(hub.rotations(), 2);
+        hub.push(workspace_event("w2"));
+        assert_eq!(
+            hub.rotations(),
+            2,
+            "a push below both bounds does not rotate"
+        );
+        cleanup(&path);
+    }
+
+    /// #1027: the derived agent kinds are new to v2.0.0, whose reader skips
+    /// a line when `envelope.event` is a string it cannot type and `seq` is a
+    /// number (#1058). Every line this build writes for them has that shape,
+    /// under a name v2.0.0 does not know, and reads back whole here.
+    #[test]
+    fn the_derived_agent_kinds_are_lines_an_older_reader_skips() {
+        use crate::api::agent_state::{AgentState, Phase};
+        use crate::api::schema::{AgentPhaseEvent, EventData};
+        let path = temp_log("derived-agent-kinds");
+        let hub = EventHub::with_persistence(path.clone());
+        let event = AgentPhaseEvent {
+            agent_id: "agent_a".into(),
+            pane: "w1:p1".into(),
+            from: Phase::Working,
+            to: Phase::NeedsHuman,
+            state: AgentState::unknown(),
+            held_ms: 20_000,
+        };
+        let kinds = [
+            (
+                EventKind::AgentPhaseChanged,
+                EventData::AgentPhaseChanged(event.clone()),
+            ),
+            (
+                EventKind::AgentNeedsHuman,
+                EventData::AgentNeedsHuman(event.clone()),
+            ),
+            (
+                EventKind::AgentLimitReached,
+                EventData::AgentLimitReached(event.clone()),
+            ),
+            (EventKind::AgentGone, EventData::AgentGone(event)),
+        ];
+        for (kind, data) in kinds.clone() {
+            hub.push(EventEnvelope { event: kind, data });
+        }
+        drop(hub);
+        let names: Vec<String> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                let value: serde_json::Value = serde_json::from_str(line).unwrap();
+                assert!(value["seq"].is_u64(), "{line}");
+                value["envelope"]["event"].as_str().unwrap().to_string()
+            })
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "agent.phase_changed",
+                "agent.needs_human",
+                "agent.limit_reached",
+                "agent.gone"
+            ]
+        );
+        // Kind names v2.0.0's `EventKind` has with the `agent_` prefix.
+        let known_to_v2_0_0 = [
+            "agent_forked",
+            "agent_delegated",
+            "agent_removed",
+            "agent_hibernated",
+            "agent_resumed_from_hibernation",
+            "agent_restart",
+        ];
+        assert!(names
+            .iter()
+            .all(|name| !known_to_v2_0_0.contains(&name.as_str())));
+        let restarted = EventHub::with_persistence(path.clone());
+        let back: Vec<EventEnvelope> = restarted
+            .persisted_events_after(0)
+            .into_iter()
+            .map(|(_, _, envelope)| envelope)
+            .collect();
+        let written: Vec<EventEnvelope> = kinds
+            .into_iter()
+            .map(|(event, data)| EventEnvelope { event, data })
+            .collect();
+        assert_eq!(back, written);
+        cleanup(&path);
+    }
+
+    /// ADR-0028 §3a for the goal kinds (ADR-0030 §1): a reader that predates
+    /// them must skip every `Goal*` line, not quarantine the log. This binary
+    /// knows the kinds, so the older reader's view is made by renaming each
+    /// goal line's kind to one no build knows, leaving its data as written.
+    #[test]
+    fn a_reader_without_the_goal_kinds_skips_their_lines() {
+        use crate::api::schema::{GoalDecision, GoalRecord, GoalSubtask, GoalVerdictRecord};
+        let path = temp_log("goal-kinds-old-reader");
+        let hub = EventHub::with_persistence(path.clone());
+        hub.push(workspace_event("w1"));
+        let agent_id = || "agent_a".to_string();
+        let goal_events = [
+            EventData::GoalArmed {
+                agent_id: agent_id(),
+                record: GoalRecord {
+                    goal: "g".into(),
+                    ..Default::default()
+                },
+                reissued: false,
+            },
+            EventData::GoalAmended {
+                agent_id: agent_id(),
+                goal: "g2".into(),
+                checks: vec![],
+            },
+            EventData::GoalStatusSet {
+                agent_id: agent_id(),
+                status: "s".into(),
+            },
+            EventData::GoalSubtaskChanged {
+                agent_id: agent_id(),
+                subtask: GoalSubtask {
+                    id: "1".into(),
+                    text: "t".into(),
+                    done: false,
+                    owner: None,
+                },
+            },
+            EventData::GoalVerdict {
+                agent_id: agent_id(),
+                verdict: GoalVerdictRecord {
+                    decision: GoalDecision::Allow,
+                    rung: 1,
+                    reason: None,
+                },
+            },
+            EventData::GoalMet {
+                agent_id: agent_id(),
+            },
+            EventData::GoalPaused {
+                agent_id: agent_id(),
+                until_ms: None,
+            },
+            EventData::GoalResumed {
+                agent_id: agent_id(),
+            },
+            EventData::GoalDisarmed {
+                agent_id: agent_id(),
+                reason: None,
+            },
+        ];
+        let kinds = [
+            EventKind::GoalArmed,
+            EventKind::GoalAmended,
+            EventKind::GoalStatusSet,
+            EventKind::GoalSubtaskChanged,
+            EventKind::GoalVerdict,
+            EventKind::GoalMet,
+            EventKind::GoalPaused,
+            EventKind::GoalResumed,
+            EventKind::GoalDisarmed,
+        ];
+        for (event, data) in kinds.into_iter().zip(goal_events) {
+            assert!(event.is_persisted(), "{event:?} must persist");
+            hub.push(EventEnvelope { event, data });
+        }
+        drop(hub);
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let mut renamed = String::new();
+        let mut renamed_kinds = std::collections::BTreeSet::new();
+        for line in content.lines() {
+            let mut value: serde_json::Value = serde_json::from_str(line).unwrap();
+            let kind = value.pointer_mut("/envelope/event").unwrap();
+            if kind.as_str().unwrap().starts_with("goal_") {
+                renamed_kinds.insert(kind.as_str().unwrap().to_string());
+                *kind = serde_json::Value::String(format!("unknown_{}", kind.as_str().unwrap()));
+            }
+            renamed.push_str(&value.to_string());
+            renamed.push('\n');
+        }
+        std::fs::write(&path, renamed).unwrap();
+        assert_eq!(renamed_kinds.len(), 9, "every goal kind is on disk");
+
+        let restarted = EventHub::with_persistence(path.clone());
+        assert!(
+            !path.with_file_name("event-log.corrupt.jsonl").exists(),
+            "goal lines must not quarantine an older reader's log"
+        );
+        assert_eq!(restarted.persisted_events_after(0).len(), 1);
+        assert_eq!(
+            restarted.current_sequence(),
+            10,
+            "skipped goal seqs stay spent"
+        );
+        cleanup(&path);
+    }
+
+    /// ADR-0028 §3a for the question kinds (#1038): they read back whole
+    /// here, and a reader that predates them (v2.0.0, #1058) skips their
+    /// lines without quarantining the log. The older view is made by renaming
+    /// each question line's kind to one no build knows.
+    #[test]
+    fn a_reader_without_the_question_kinds_skips_their_lines() {
+        use crate::api::question::{
+            Question, QuestionCloseReason, QuestionForm, QuestionSource, QuestionState,
+        };
+        let path = temp_log("question-kinds-old-reader");
+        let hub = EventHub::with_persistence(path.clone());
+        hub.push(workspace_event("w1"));
+        let question = Question {
+            question_id: "q_0123456789abcdef".into(),
+            source: QuestionSource::Screen,
+            harness: "claude".into(),
+            state: QuestionState::Open,
+            form: QuestionForm {
+                header: Some("Colour".into()),
+                prompt: "Which colour?".into(),
+                options: vec![],
+                multi_select: false,
+                allow_other: true,
+            },
+        };
+        let written = [
+            EventEnvelope {
+                event: EventKind::AgentQuestionOpened,
+                data: EventData::AgentQuestionOpened {
+                    agent_id: "agent_a".into(),
+                    pane: "w1:p1".into(),
+                    question_id: question.question_id.clone(),
+                    question: question.clone(),
+                },
+            },
+            EventEnvelope {
+                event: EventKind::AgentQuestionClosed,
+                data: EventData::AgentQuestionClosed {
+                    agent_id: "agent_a".into(),
+                    pane: "w1:p1".into(),
+                    question_id: question.question_id.clone(),
+                    reason: QuestionCloseReason::Withdrawn,
+                    question: Some(Question {
+                        state: QuestionState::Withdrawn,
+                        ..question.clone()
+                    }),
+                },
+            },
+        ];
+        for envelope in written.clone() {
+            assert!(envelope.event.is_persisted());
+            hub.push(envelope);
+        }
+        drop(hub);
+        let back: Vec<EventEnvelope> = EventHub::with_persistence(path.clone())
+            .persisted_events_after(0)
+            .into_iter()
+            .skip(1)
+            .map(|(_, _, envelope)| envelope)
+            .collect();
+        assert_eq!(back, written);
+        // A close without its question, or with one this build cannot read.
+        for question in [serde_json::Value::Null, serde_json::json!({"prompt": 7})] {
+            let mut line = serde_json::to_value(&written[1].data).unwrap();
+            line["question"] = question;
+            let data: EventData = serde_json::from_value(line).unwrap();
+            assert!(
+                matches!(data, EventData::AgentQuestionClosed { question: None, .. }),
+                "{data:?}"
+            );
+        }
+        let mut line = serde_json::to_value(&written[1].data).unwrap();
+        line.as_object_mut().unwrap().remove("question");
+        let data: EventData = serde_json::from_value(line).unwrap();
+        assert!(matches!(
+            data,
+            EventData::AgentQuestionClosed { question: None, .. }
+        ));
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let mut renamed = String::new();
+        for line in content.lines() {
+            let mut value: serde_json::Value = serde_json::from_str(line).unwrap();
+            let kind = value.pointer_mut("/envelope/event").unwrap();
+            let name = kind.as_str().unwrap().to_string();
+            if name.starts_with("agent.question_") {
+                *kind = serde_json::Value::String(format!("unknown.{name}"));
+            }
+            renamed.push_str(&value.to_string());
+            renamed.push('\n');
+        }
+        std::fs::write(&path, renamed).unwrap();
+        let older = EventHub::with_persistence(path.clone());
+        assert!(!path.with_file_name("event-log.corrupt.jsonl").exists());
+        assert_eq!(older.persisted_events_after(0).len(), 1);
+        assert_eq!(older.current_sequence(), 3, "skipped seqs stay spent");
+        cleanup(&path);
+    }
+
+    /// ADR-0028 §3a for the owner kinds (ADR-0035 §1), the way the goal
+    /// kinds are proved above: renamed to kinds no build knows, the
+    /// `owner_bound` and `owner_unbound` lines are skipped, not quarantined.
+    #[test]
+    fn a_reader_without_the_owner_kinds_skips_their_lines() {
+        use crate::api::schema::{OwnerBinding, OwnerHarness};
+        let path = temp_log("owner-kinds-old-reader");
+        let hub = EventHub::with_persistence(path.clone());
+        hub.push(workspace_event("w1"));
+        let binding = OwnerBinding {
+            repo: "example/widgets".into(),
+            node: "node-a".into(),
+            agent_id: "agent_a".into(),
+            checkout: "/srv/widgets".into(),
+            harness: OwnerHarness::Claude,
+            model: None,
+            profiles: vec!["main".into()],
+            since_ms: 1,
+        };
+        for (event, data) in [
+            (
+                EventKind::OwnerBound,
+                EventData::OwnerBound {
+                    binding,
+                    reissued: true,
+                },
+            ),
+            (
+                EventKind::OwnerUnbound,
+                EventData::OwnerUnbound {
+                    repo: "example/widgets".into(),
+                },
+            ),
+        ] {
+            assert!(event.is_persisted(), "{event:?} must persist");
+            hub.push(EventEnvelope { event, data });
+        }
+        drop(hub);
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let mut renamed = String::new();
+        let mut owner_lines = 0;
+        for line in content.lines() {
+            let mut value: serde_json::Value = serde_json::from_str(line).unwrap();
+            let kind = value.pointer_mut("/envelope/event").unwrap();
+            if kind.as_str().unwrap().starts_with("owner_") {
+                owner_lines += 1;
+                *kind = serde_json::Value::String(format!("unknown_{}", kind.as_str().unwrap()));
+            }
+            renamed.push_str(&value.to_string());
+            renamed.push('\n');
+        }
+        assert_eq!(owner_lines, 2);
+        std::fs::write(&path, renamed).unwrap();
+
+        let restarted = EventHub::with_persistence(path.clone());
+        assert!(
+            !path.with_file_name("event-log.corrupt.jsonl").exists(),
+            "owner lines must not quarantine an older reader's log"
+        );
+        assert_eq!(restarted.persisted_events_after(0).len(), 1);
+        assert_eq!(
+            restarted.current_sequence(),
+            3,
+            "skipped owner seqs stay spent"
+        );
+        cleanup(&path);
+    }
+
+    /// ADR-0028 §3a for `owner_policy_adopted` (ADR-0035 §6.2): a reader
+    /// that predates the kind skips its lines instead of quarantining the
+    /// log. The older reader's view is made by renaming the kind.
+    #[test]
+    fn a_reader_without_the_owner_policy_kind_skips_its_lines() {
+        let path = temp_log("owner-policy-kind-old-reader");
+        let hub = EventHub::with_persistence(path.clone());
+        hub.push(workspace_event("w1"));
+        assert!(EventKind::OwnerPolicyAdopted.is_persisted());
+        hub.push(EventEnvelope {
+            event: EventKind::OwnerPolicyAdopted,
+            data: EventData::OwnerPolicyAdopted {
+                repo: "/repo/.git".into(),
+                policy_version: Some("0123abcd".into()),
+                reissued: false,
+            },
+        });
+        hub.push(workspace_event("w2"));
+        drop(hub);
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("\"owner_policy_adopted\""), "{content}");
+        std::fs::write(
+            &path,
+            content.replace(
+                "\"owner_policy_adopted\"",
+                "\"unknown_owner_policy_adopted\"",
+            ),
+        )
+        .unwrap();
+
+        let restarted = EventHub::with_persistence(path.clone());
+        assert!(
+            !path.with_file_name("event-log.corrupt.jsonl").exists(),
+            "an owner policy line must not quarantine an older reader's log"
+        );
+        assert_eq!(restarted.persisted_events_after(0).len(), 2);
+        assert_eq!(
+            restarted.current_sequence(),
+            3,
+            "the skipped seq stays spent"
+        );
+        cleanup(&path);
+    }
+
+    /// Skipping is for kinds this binary does not know. A known kind with
+    /// malformed data is corruption, and must still be caught.
+    #[test]
+    fn a_known_kind_with_malformed_data_is_still_corrupt() {
+        let path = temp_log("known-kind-malformed");
+        let hub = EventHub::with_persistence(path.clone());
+        hub.push(workspace_event("w1"));
+        drop(hub);
+        {
+            use std::io::Write;
+            let mut file = std::fs::File::options().append(true).open(&path).unwrap();
+            file.write_all(
+                b"{\"seq\":2,\"ts_ms\":1,\"envelope\":{\"event\":\"workspace_closed\",\"data\":{\"type\":\"workspace_closed\"}}}\n",
+            )
+            .unwrap();
+        }
+        let _restarted = EventHub::with_persistence(path.clone());
+        assert!(
+            path.with_file_name("event-log.corrupt.jsonl").exists(),
+            "a known kind that fails to parse must be quarantined, not skipped"
+        );
+        cleanup(&path);
+    }
+
+    #[test]
     fn torn_tail_is_dropped_and_sequencing_continues() {
         // #175 §8.4: kill mid-write ⇒ the torn line vanishes, the prefix
         // survives, and the next push continues the sequence.
@@ -513,7 +1934,7 @@ mod tests {
         );
         assert_eq!(restarted.current_sequence(), 2, "torn tail dropped");
         assert_eq!(
-            restarted.events_after(0).len(),
+            restarted.ring_snapshot_after(0).len(),
             2,
             "ring is seeded from disk at boot"
         );
@@ -632,10 +2053,219 @@ mod tests {
         let hub = EventHub::with_persistence(path.clone());
         hub.push(output_event());
         hub.push(workspace_event("w1"));
-        assert_eq!(hub.events_after(0).len(), 2, "ring sees both");
+        assert_eq!(hub.ring_snapshot_after(0).len(), 2, "ring sees both");
         let persisted = hub.persisted_events_after(0);
         assert_eq!(persisted.len(), 1, "disk sees only the persisted kind");
         assert_eq!(persisted[0].0, 2, "persisted event keeps its ring seq");
+        cleanup(&path);
+    }
+
+    /// Drain `read` from `after` to the head the way a consumer would:
+    /// every seq seen, plus every range a gap reported.
+    fn drain(hub: &EventHub, mut after: u64, limit: usize) -> (Vec<u64>, Vec<(u64, u64)>, u64) {
+        let (mut seen, mut gaps) = (Vec::new(), Vec::new());
+        loop {
+            let read = hub.read(after, limit, |_| true);
+            gaps.extend(read.gap);
+            seen.extend(read.events.iter().map(|(seq, _)| *seq));
+            if read.events.is_empty() && read.gap.is_none() {
+                return (seen, gaps, after);
+            }
+            assert!(read.next_after >= after, "a cursor never moves back");
+            after = read.next_after;
+        }
+    }
+
+    /// Arm a one-shot hook that runs inside the next disk read: `durable`
+    /// durable pushes, `churn` ephemeral ones, then a rotation if asked.
+    fn interleave(
+        hub: &EventHub,
+        pushed: &Arc<Mutex<Vec<u64>>>,
+        durable: u64,
+        churn: u64,
+        rotate: bool,
+    ) {
+        let (target, pushed) = (hub.clone(), pushed.clone());
+        *hub.disk_read_hook.lock().unwrap() = Some(Box::new(move || {
+            for _ in 0..durable {
+                target.push(workspace_event("raced"));
+                pushed.lock().unwrap().push(target.current_sequence());
+            }
+            for _ in 0..churn {
+                target.push(output_event());
+            }
+            if rotate {
+                let mut state = target.inner.lock().unwrap();
+                state.log.as_mut().unwrap().rotate().unwrap();
+            }
+        }));
+    }
+
+    /// Review of #1056: a durable event pushed and evicted from the ring
+    /// while a reader is on disk must reach that reader on a later call.
+    #[test]
+    fn a_durable_event_evicted_during_the_disk_read_is_not_skipped() {
+        let path = temp_log("read-race");
+        let hub = EventHub::with_persistence(path.clone());
+        hub.inner.lock().unwrap().ring_cap = Some(2);
+        for index in 0..5 {
+            hub.push(workspace_event(&format!("w{index}")));
+        }
+        let pushed = Arc::new(Mutex::new(Vec::new()));
+        interleave(&hub, &pushed, 1, 3, false);
+        let (seen, gaps, _) = drain(&hub, 0, 10);
+        assert_eq!(seen, [1, 2, 3, 4, 5, 6]);
+        assert!(gaps.is_empty(), "{gaps:?}");
+        cleanup(&path);
+    }
+
+    /// Review of #1056: a reader at the durable head stays off the disk
+    /// however much ephemeral output pushes the ring along.
+    #[test]
+    fn an_idle_reader_at_the_head_never_reads_disk() {
+        let path = temp_log("read-idle");
+        let hub = EventHub::with_persistence(path.clone());
+        hub.inner.lock().unwrap().ring_cap = Some(2);
+        hub.push(workspace_event("w"));
+        for _ in 0..10 {
+            hub.push(output_event());
+            let read = hub.read(1, 10, |_| true);
+            assert!(read.events.is_empty() && read.gap.is_none());
+            assert_eq!(read.next_after, 1);
+        }
+        assert_eq!(hub.cold_read_count(), 0);
+        cleanup(&path);
+    }
+
+    /// #1028 / ADR-0028 §3: across random rotations, restarts, ephemeral
+    /// kinds, and pushes or rotations landing in the middle of a disk read,
+    /// a reader resuming from any cursor sees every durable event or a gap
+    /// that names it. Silent loss fails the test.
+    #[test]
+    fn read_is_at_least_once_or_an_explicit_gap_across_rotations_and_restarts() {
+        // Seeds run in parallel: the per-push fsync dominates the runtime.
+        std::thread::scope(|scope| {
+            for seed in 1..=32u64 {
+                scope.spawn(move || {
+                    let path = temp_log(&format!("read-{seed}"));
+                    let mut rng = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+                    let mut next = |bound: u64| {
+                        rng ^= rng << 13;
+                        rng ^= rng >> 7;
+                        rng ^= rng << 17;
+                        rng % bound
+                    };
+                    let ring_cap = Some(2 + next(8) as usize);
+                    let mut hub = EventHub::with_persistence(path.clone());
+                    hub.inner.lock().unwrap().ring_cap = ring_cap;
+                    let durable = Arc::new(Mutex::new(Vec::new()));
+                    let (mut cursor, mut seen, mut gaps) = (0, Vec::new(), Vec::new());
+                    for step in 0..120 {
+                        match next(20) {
+                            0..=10 => {
+                                hub.push(workspace_event(&format!("w{step}")));
+                                durable.lock().unwrap().push(hub.current_sequence());
+                            }
+                            11..=13 => hub.push(output_event()),
+                            14..=15 => {
+                                let mut state = hub.inner.lock().unwrap();
+                                state.log.as_mut().unwrap().rotate().unwrap();
+                            }
+                            16 => {
+                                drop(hub);
+                                hub = EventHub::with_persistence(path.clone());
+                                hub.inner.lock().unwrap().ring_cap = ring_cap;
+                            }
+                            raced => {
+                                if raced == 19 {
+                                    interleave(&hub, &durable, next(3), next(12), next(2) == 0);
+                                }
+                                let (got, gap, resumed) = drain(&hub, cursor, 1 + next(4) as usize);
+                                *hub.disk_read_hook.lock().unwrap() = None;
+                                seen.extend(got);
+                                gaps.extend(gap);
+                                cursor = resumed;
+                            }
+                        }
+                    }
+                    let (got, gap, _) = drain(&hub, cursor, 3);
+                    seen.extend(got);
+                    gaps.extend(gap);
+                    let covered = |seq: u64, seen: &[u64], gaps: &[(u64, u64)]| {
+                        seen.contains(&seq)
+                            || gaps.iter().any(|(from, to)| (*from..=*to).contains(&seq))
+                    };
+                    let durable = durable.lock().unwrap().clone();
+                    for seq in &durable {
+                        assert!(
+                            covered(*seq, &seen, &gaps),
+                            "seed {seed}: {seq} lost silently"
+                        );
+                    }
+
+                    // Retained is the disk plus the ring: back-to-back rotations can
+                    // delete a file whose events the ring still holds.
+                    let mut retained: Vec<u64> = hub
+                        .persisted_events_after(0)
+                        .iter()
+                        .map(|(seq, _, _)| *seq)
+                        .chain(
+                            hub.ring_snapshot_after(0)
+                                .iter()
+                                .filter(|(_, e)| e.event.is_persisted())
+                                .map(|(seq, _)| *seq),
+                        )
+                        .collect();
+                    retained.sort_unstable();
+                    retained.dedup();
+                    for start in 0..=hub.current_sequence() {
+                        let (got, gap, _) = drain(&hub, start, 8 + next(64) as usize);
+                        let later: Vec<u64> =
+                            durable.iter().copied().filter(|s| *s > start).collect();
+                        for seq in &later {
+                            assert!(
+                                covered(*seq, &got, &gap),
+                                "seed {seed} from {start}: {seq} lost"
+                            );
+                        }
+                        if later.iter().any(|seq| !retained.contains(seq)) {
+                            assert!(!gap.is_empty(), "seed {seed} from {start}: past retention");
+                        }
+                        if retained.first().is_none_or(|first| start + 1 >= *first) {
+                            assert!(gap.is_empty(), "seed {seed} from {start}: inside retention");
+                        }
+                        for seq in &retained {
+                            assert!(
+                                !gap.iter().any(|(from, to)| (*from..=*to).contains(seq)),
+                                "seed {seed} from {start}: a gap hides retained {seq}"
+                            );
+                        }
+                    }
+                    cleanup(&path);
+                });
+            }
+        });
+    }
+
+    /// A restart resumes numbering from the newest durable event, so the
+    /// sequence of an ephemeral event after it is handed out again. A cursor
+    /// that pointed at it would skip the durable event that reuses it.
+    #[test]
+    fn read_cursor_never_lands_on_a_sequence_a_restart_reuses() {
+        let path = temp_log("read-reuse");
+        let hub = EventHub::with_persistence(path.clone());
+        hub.push(workspace_event("w1"));
+        hub.push(output_event());
+        let cursor = hub.read(0, 10, |_| true).next_after;
+        assert_eq!(cursor, 1);
+        drop(hub);
+        let hub = EventHub::with_persistence(path.clone());
+        hub.push(workspace_event("w2"));
+        let read = hub.read(cursor, 10, |_| true);
+        assert_eq!(
+            read.events.iter().map(|(seq, _)| *seq).collect::<Vec<_>>(),
+            [2]
+        );
         cleanup(&path);
     }
 
@@ -667,5 +2297,82 @@ mod tests {
         let restarted = EventHub::with_persistence(path.clone());
         assert_eq!(restarted.current_sequence(), 4);
         cleanup(&path);
+    }
+}
+
+#[cfg(test)]
+mod queue_state_tests {
+    use super::*;
+    use crate::api::schema::EventData;
+    use serde_json::json;
+    fn event(to: &str) -> EventEnvelope {
+        serde_json::from_value(json!({"event":"queue_item_state", "data":{
+            "type":"queue_item_state", "agent":"queue-fixture", "item_id":"item-fixture",
+            "producer":"human", "from":"queued", "to":to,
+            "stream":"queue/queue-fixture", "stream_seq":7
+        }}))
+        .unwrap()
+    }
+    #[test]
+    fn queue_global_fact_has_the_shape_an_old_reader_skips() {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum OldKind {
+            WorkspaceCreated,
+        }
+        let fact = event("delivered");
+        assert!(fact.event.is_persisted());
+        let line = serde_json::to_string(&PersistedEvent {
+            seq: 11,
+            ts_ms: 1,
+            envelope: fact.clone(),
+        })
+        .unwrap();
+        assert_eq!(unknown_kind_seq_as::<OldKind>(&line), Some(11));
+        assert_eq!(unknown_kind_seq(&line), None);
+        assert_eq!(
+            serde_json::from_str::<PersistedEvent>(&line)
+                .unwrap()
+                .envelope,
+            fact
+        );
+    }
+    #[test]
+    fn queue_global_unknown_state_is_skipped_without_losing_cursors_or_other_events() {
+        let path = super::tests::temp_log("queue-unknown-state");
+        let hub = EventHub::with_persistence(path.clone());
+        hub.push(event("delivered"));
+        drop(hub);
+        let mut line = serde_json::to_value(PersistedEvent {
+            seq: 2,
+            ts_ms: 1,
+            envelope: event("done"),
+        })
+        .unwrap();
+        line["envelope"]["data"]["to"] = json!("future_state");
+        writeln!(
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap(),
+            "{line}"
+        )
+        .unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let hub = EventHub::with_persistence(path.clone());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        hub.push(event("done"));
+        let events = hub.persisted_events_after(0);
+        assert_eq!(
+            events.iter().map(|(seq, _, _)| *seq).collect::<Vec<_>>(),
+            [1, 3]
+        );
+        assert!(events
+            .iter()
+            .all(|(_, _, e)| matches!(&e.data, EventData::QueueItemState(f) if f.known())));
+        hub.push(event("held"));
+        assert_eq!(hub.current_sequence(), 4);
+        assert!(!path.with_file_name("event-log.corrupt.jsonl").exists());
+        super::tests::cleanup(&path);
     }
 }

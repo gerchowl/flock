@@ -1,5 +1,3 @@
-use bytes::Bytes;
-
 use crate::api::schema::{
     AgentHistoryParams, AgentHistoryResult, AgentRenameParams, AgentResultInfo, AgentResultParams,
     AgentSendParams, AgentStartParams, AgentTarget, ErrorBody, HistoryTurnInfo, PaneReadResult,
@@ -8,7 +6,7 @@ use crate::api::schema::{
 };
 use crate::app::App;
 
-use super::responses::{encode_error, encode_error_body, encode_success};
+use super::responses::{encode_error, encode_error_body, encode_error_with_data, encode_success};
 
 /// opencode messages `agent.result` reads to find the newest reply: a turn
 /// is a user message plus one assistant message per step, so this reaches
@@ -21,6 +19,10 @@ enum ConversationStore {
         session_id: String,
         path: std::path::PathBuf,
     },
+    Codex {
+        session_id: String,
+        path: std::path::PathBuf,
+    },
     Opencode {
         session_id: String,
         db: std::path::PathBuf,
@@ -30,7 +32,9 @@ enum ConversationStore {
 impl ConversationStore {
     fn session_id(&self) -> &str {
         match self {
-            Self::Claude { session_id, .. } | Self::Opencode { session_id, .. } => session_id,
+            Self::Claude { session_id, .. }
+            | Self::Opencode { session_id, .. }
+            | Self::Codex { session_id, .. } => session_id,
         }
     }
 
@@ -38,6 +42,7 @@ impl ConversationStore {
         match self {
             Self::Claude { .. } => "claude",
             Self::Opencode { .. } => "opencode",
+            Self::Codex { .. } => "codex",
         }
     }
 
@@ -116,19 +121,63 @@ fn opencode_history(
 
 impl App {
     pub(super) fn handle_agent_list(&mut self, id: String) -> String {
+        self.handle_agent_list_with_clock(id, std::time::Instant::now)
+    }
+
+    /// Sample the monotonic clock once for local state ages. The fleet view
+    /// reuses those records, so one response cannot disagree with itself.
+    pub(in crate::app) fn handle_agent_list_with_clock(
+        &mut self,
+        id: String,
+        mut clock: impl FnMut() -> std::time::Instant,
+    ) -> String {
+        let agents = self.collect_agent_infos_at(clock());
+        let fleet = self.collect_fleet_agents(&agents);
+        let structured_agents = match self.structured_infos() {
+            Ok(agents) => agents,
+            Err(code) => return encode_error(id, code.as_str(), "structured metadata unavailable"),
+        };
         encode_success(
             id,
             ResponseResult::AgentList {
-                agents: self.collect_agent_infos(),
+                agents,
+                structured_agents,
                 // #320: the same call answers "who is here" and "who can I
                 // reach". A separate fleet verb would have been a second
                 // listing to keep in step with this one.
-                fleet: self.collect_fleet_agents(),
+                fleet,
             },
         )
     }
 
     pub(super) fn handle_agent_get(&mut self, id: String, target: AgentTarget) -> String {
+        match self.structured_target(&target.target) {
+            Ok(Some((agent_id, _))) => {
+                return match self.structured_info(&agent_id) {
+                    Ok(agent) => encode_success(id, ResponseResult::StructuredAgentInfo { agent }),
+                    Err(code) => encode_error(id, code.as_str(), "structured metadata unavailable"),
+                };
+            }
+            Err(code) => {
+                return encode_error(
+                    id,
+                    code.as_str(),
+                    "target is ambiguous across runtimes; use an agent id",
+                )
+            }
+            Ok(None) => {}
+        }
+        // This read supplies conservative bulk self-exclusion (#1010), not
+        // authority: even an unproven pane must not hibernate itself mid-loop.
+        if target.target == "self" {
+            let agent = self
+                .caller_pane_candidate()
+                .and_then(|(ws_idx, pane_id)| self.agent_info(ws_idx, pane_id));
+            return match agent {
+                Some(agent) => encode_success(id, ResponseResult::AgentInfo { agent }),
+                None => agent_not_found(id, "self"),
+            };
+        }
         let agent = match self.agent_info_for_target(&target.target) {
             Ok(agent) => agent,
             Err(err) => return encode_error_body(id, self.agent_target_error_body(err)),
@@ -138,6 +187,34 @@ impl App {
     }
 
     pub(super) fn handle_agent_focus(&mut self, id: String, target: AgentTarget) -> String {
+        match self.structured_target(&target.target) {
+            Ok(Some((agent_id, generation))) => {
+                let result = self
+                    .native_destination(Some(&agent_id))
+                    .and_then(|destination| {
+                        self.place_structured_view(
+                            crate::structured::view::Target {
+                                agent_id: agent_id.clone(),
+                                generation,
+                            },
+                            destination,
+                        )
+                    })
+                    .and_then(|()| self.structured_info(&agent_id));
+                return match result {
+                    Ok(agent) => encode_success(id, ResponseResult::StructuredAgentInfo { agent }),
+                    Err(code) => encode_error(id, code.as_str(), "structured focus refused"),
+                };
+            }
+            Err(code) => {
+                return encode_error(
+                    id,
+                    code.as_str(),
+                    "target is ambiguous across runtimes; use an agent id",
+                )
+            }
+            Ok(None) => (),
+        }
         let agent = match self.focus_agent_target(&target.target) {
             Ok(agent) => agent,
             Err(err) => return encode_error_body(id, self.agent_target_error_body(err)),
@@ -163,12 +240,36 @@ impl App {
         // answer to the same question, which is the drift #124 / #197 /
         // #199-#210 are.
         let caller = self.spawn_caller();
-        let (agent, argv) = match self.start_agent(params, &caller) {
+        // #1179: decided before anything is placed, so a refusal costs nothing.
+        let questions = match Self::admit_questions(&caller, params.questions, params.unattended) {
+            Ok(questions) => questions,
+            Err(refused) => {
+                return encode_error(
+                    id,
+                    crate::app::questions::WideningRefused::CODE,
+                    refused.message(),
+                )
+            }
+        };
+        if params.runtime == crate::api::schema::AgentRuntime::Structured {
+            return match self.start_structured(params, &caller) {
+                Ok(result) => encode_success(id, result),
+                Err(code) => encode_error(id, code.as_str(), "structured start refused"),
+            };
+        }
+        if params.model.is_some() {
+            return encode_error(
+                id,
+                "runtime_unsupported",
+                "--model requires structured runtime",
+            );
+        }
+        let result = match self.start_agent(params, &caller, questions) {
             Ok(started) => started,
             Err(err) => return encode_error_body(id, self.agent_start_error_body(err)),
         };
 
-        encode_success(id, ResponseResult::AgentStarted { agent, argv })
+        encode_success(id, result)
     }
 
     pub(super) fn handle_agent_read(
@@ -185,16 +286,28 @@ impl App {
             return agent_not_found(id, &params.target);
         };
         let requested_lines = params.lines.unwrap_or(80).min(1000) as usize;
+        let mut unfaint = None;
         let text = match params.format {
             ReadFormat::Text => match params.source {
                 ReadSource::Visible => pane.visible_text(),
                 ReadSource::Recent => pane.recent_text(requested_lines),
                 ReadSource::RecentUnwrapped => pane.recent_unwrapped_text(requested_lines),
+                ReadSource::Detection => pane.detection_text(),
+                ReadSource::DetectionUnfaint => {
+                    let (text, blanked) = pane.detection_text_and_unfaint();
+                    unfaint = Some(blanked);
+                    text
+                }
             },
             ReadFormat::Ansi => match params.source {
                 ReadSource::Visible => pane.visible_ansi(),
                 ReadSource::Recent => pane.recent_ansi(requested_lines),
                 ReadSource::RecentUnwrapped => pane.recent_unwrapped_ansi(requested_lines),
+                ReadSource::Detection => pane.detection_ansi(),
+                ReadSource::DetectionUnfaint => {
+                    unfaint = Some(pane.detection_text_and_unfaint().1);
+                    pane.detection_ansi()
+                }
             },
         };
 
@@ -212,6 +325,7 @@ impl App {
                     source: params.source,
                     format: params.format,
                     text,
+                    unfaint,
                     revision: 0,
                     truncated: false,
                 },
@@ -252,6 +366,13 @@ impl App {
         let page = match &store {
             ConversationStore::Claude { path, .. } => {
                 crate::agent_transcript::read_history(path, params.detail, params.cursor, limit)
+            }
+            ConversationStore::Codex { .. } => {
+                return encode_error(
+                    id,
+                    "unsupported_for_agent",
+                    "Codex supports agent.result, but agent.history is not supported",
+                );
             }
             ConversationStore::Opencode { db, session_id } => {
                 opencode_history(db, session_id, params.detail, params.cursor, limit)
@@ -320,10 +441,17 @@ impl App {
                 .map(|terminal| terminal.state),
             Some(crate::detect::AgentState::Working | crate::detect::AgentState::Blocked)
         );
+        // Claude's record also says when an open turn began (#1257): a waiting
+        // supervisor reads that as "this round is still running", which a
+        // screen that reads idle mid-turn cannot overrule.
+        let mut turn_open_at_ms = None;
         let read = match &store {
+            ConversationStore::Codex { path, .. } => crate::codex_transcript::read_tail(path),
             ConversationStore::Claude { path, .. } => {
                 crate::agent_transcript::read_tail(path).map(|read| {
-                    let over = crate::agent_transcript::finished(&read.events);
+                    let over = crate::agent_transcript::turn_over(&read.events);
+                    turn_open_at_ms =
+                        crate::agent_transcript::open_turn_at(&read.events).and_then(unix_ms);
                     (read.events, over)
                 })
             }
@@ -353,13 +481,21 @@ impl App {
             Err(err) => return store.unreadable(id, &err),
         };
         let Some(reply) = reply else {
-            return encode_error(
-                id,
-                "no_result",
-                format!("session {} has no assistant reply yet", store.session_id()),
-            );
+            let message = format!("session {} has no assistant reply yet", store.session_id());
+            return match turn_open_at_ms {
+                Some(at_ms) => encode_error_with_data(
+                    id,
+                    "no_result",
+                    message,
+                    serde_json::json!({ "turn_open_at_ms": at_ms }),
+                ),
+                None => encode_error(id, "no_result", message),
+            };
         };
         let (status, status_text) = crate::agent_transcript::sentinel(&reply.text).unzip();
+        let settled_with_background_shells = self
+            .agent_info(resolved.ws_idx, resolved.pane_id)
+            .is_some_and(|agent| agent.settled_with_background_shells);
         let max_chars = params
             .max_chars
             .unwrap_or(AGENT_RESULT_DEFAULT_CHARS)
@@ -372,6 +508,7 @@ impl App {
             id,
             ResponseResult::AgentResult {
                 result: AgentResultInfo {
+                    terminal_id: Some(resolved.terminal_id.clone()),
                     pane_id: self
                         .public_pane_id(resolved.ws_idx, resolved.pane_id)
                         .unwrap_or_else(|| params.target.clone()),
@@ -379,6 +516,7 @@ impl App {
                     agent: store.agent().to_string(),
                     session_id: store.session_id().to_string(),
                     finished,
+                    settled_with_background_shells,
                     status,
                     status_text,
                     text,
@@ -386,6 +524,7 @@ impl App {
                     total_chars: u32::try_from(total).unwrap_or(u32::MAX),
                     next_offset: (end < total).then(|| u32::try_from(end).unwrap_or(u32::MAX)),
                     at_ms: reply.at.and_then(unix_ms),
+                    turn_open_at_ms,
                 },
             },
         )
@@ -411,6 +550,7 @@ impl App {
             .resolve_terminal_target(target)
             .map_err(|err| self.agent_target_error_body(err))?;
         let refuse = |code: &str, message: String| ErrorBody {
+            data: None,
             code: code.into(),
             message,
         };
@@ -455,14 +595,58 @@ impl App {
             };
             return Ok((resolved, ConversationStore::Opencode { session_id, db }));
         }
-        // A pane with a session flock cannot read is a different answer from
-        // a pane with no session at all: telling a codex operator to check
-        // their hooks would send them after the wrong thing.
         if let Some(info) = terminal.and_then(super::super::creation::terminal_agent_session_info) {
+            if info.agent == "codex" && info.source == "flock:codex" {
+                let codex_home = std::env::var_os("CODEX_HOME")
+                    .map(std::path::PathBuf::from)
+                    .or_else(|| home.map(|home| home.join(".codex")));
+                let path = codex_home
+                    .map(|home| crate::codex_transcript::rollout_path(&home, &info.value))
+                    .transpose()
+                    .map_err(|_| {
+                        refuse(
+                            "transcript_unreadable",
+                            format!(
+                                "Codex rollouts for session {} could not be read",
+                                info.value
+                            ),
+                        )
+                    })?
+                    .flatten();
+                let Some(path) = path else {
+                    return Err(refuse(
+                        "transcript_not_found",
+                        format!("no Codex rollout on disk for session {}", info.value),
+                    ));
+                };
+                return Ok((
+                    resolved,
+                    ConversationStore::Codex {
+                        session_id: info.value,
+                        path,
+                    },
+                ));
+            }
+            // A claude or opencode session flock restored but no hook from the
+            // running agent has named since. The transcript is readable once it
+            // is confirmed, so "flock cannot read this agent" is false (#977).
+            if info.source == crate::agent_resume::CLAUDE_HOOK_SOURCE
+                || info.source == crate::agent_resume::OPENCODE_HOOK_SOURCE
+            {
+                return Err(refuse(
+                    "session_unconfirmed",
+                    format!(
+                        "{} session {} was restored by flock and no hook from the running agent \
+                         has confirmed it since, so its conversation is not read yet: retry after \
+                         the agent's next turn",
+                        info.agent, info.value
+                    ),
+                ));
+            }
             return Err(refuse(
                 "unsupported_for_agent",
                 format!(
-                    "{} ({}) has no conversation flock can read: only claude's transcript \
+                    "{} ({}) has no conversation flock can read: only claude and codex transcripts \
                      and opencode's session database are read",
                     info.agent, info.source
                 ),
@@ -477,6 +661,25 @@ impl App {
     /// `agent.hibernate` (#175 C3): park a pane. Refuses with a typed code
     /// when the agent has no resumable session (data loss guard) or the pane
     /// is already hibernated. Emits `AgentHibernated` on success.
+    pub(super) fn handle_agent_restart(
+        &mut self,
+        id: String,
+        params: crate::api::schema::AgentRestartParams,
+    ) -> String {
+        match self.queue_agent_restart(params, std::time::Instant::now()) {
+            Ok((pane_id, session, stop_only, dropped_flags)) => encode_success(
+                id,
+                ResponseResult::AgentRestartQueued {
+                    pane_id,
+                    session,
+                    stop_only,
+                    dropped_flags,
+                },
+            ),
+            Err(err) => encode_error_body(id, err),
+        }
+    }
+
     pub(super) fn handle_agent_hibernate(&mut self, id: String, target: AgentTarget) -> String {
         let resolved = match self.resolve_terminal_target(&target.target) {
             Ok(resolved) => resolved,
@@ -492,6 +695,7 @@ impl App {
             Err(err) => encode_error_body(
                 id,
                 ErrorBody {
+                    data: None,
                     code: err.code().to_string(),
                     message: err.message(),
                 },
@@ -506,6 +710,17 @@ impl App {
             Ok(resolved) => resolved,
             Err(err) => return encode_error_body(id, self.agent_target_error_body(err)),
         };
+        if let Some(terminal) = self
+            .state
+            .terminals
+            .values_mut()
+            .find(|t| t.id.to_string() == resolved.terminal_id)
+        {
+            if terminal.restart_stopped {
+                terminal.restart_stopped = false;
+                terminal.restart_in_progress = false;
+            }
+        }
         match self.resume_hibernated_pane(resolved.ws_idx, resolved.pane_id) {
             Ok(_) => {
                 let agent = self
@@ -516,6 +731,7 @@ impl App {
             Err(err) => encode_error_body(
                 id,
                 ErrorBody {
+                    data: None,
                     code: err.code().to_string(),
                     message: err.message(),
                 },
@@ -524,18 +740,65 @@ impl App {
     }
 
     pub(super) fn handle_agent_send(&mut self, id: String, params: AgentSendParams) -> String {
+        match self.structured_send_target(&params.target) {
+            Ok(Some(_)) => return self.handle_structured_send(id, params),
+            Err(code) => return encode_error(id, code.as_str(), "agent target is ambiguous"),
+            Ok(None) => (),
+        }
+        if params.submit && params.write_timeout_ms.is_some() {
+            return encode_error(
+                id,
+                "invalid_params",
+                "write_timeout_ms is for non-submit agent.send; submission uses its guarded budget",
+            );
+        }
+        let Some(deadline) = crate::app::input_writes::deadline(params.write_timeout_ms.as_ref())
+        else {
+            return encode_error(
+                id,
+                "invalid_params",
+                "write_timeout_ms must be an integer in 1..=30000",
+            );
+        };
         let resolved = match self.resolve_terminal_target(&params.target) {
             Ok(resolved) => resolved,
             Err(err) => return encode_error_body(id, self.agent_target_error_body(err)),
         };
-        let Some(runtime) = self.lookup_runtime_sender(resolved.ws_idx, resolved.pane_id) else {
-            return agent_not_found(id, &params.target);
-        };
-        if let Err(err) = runtime.try_send_bytes(Bytes::from(params.text)) {
-            return encode_error(id, "agent_send_failed", err.to_string());
+        if params.submit {
+            let Some(pane) = self.public_pane_id(resolved.ws_idx, resolved.pane_id) else {
+                return agent_not_found(id, &params.target);
+            };
+            // An operator's draft in the pane moves aside for the sentence
+            // and comes back after it (#850).
+            return self.handle_guarded_submit(
+                id,
+                crate::api::schema::PaneSubmitParams {
+                    self_submit_confirmed: None,
+                    pane_id: pane,
+                    text: params.text,
+                    if_session: None,
+                    min_age_secs: 0,
+                },
+                true,
+            );
         }
-
-        encode_success(id, ResponseResult::Ok {})
+        if let Some(reason) = (!params.raw)
+            .then(|| self.raw_text_refusal(resolved.ws_idx, resolved.pane_id))
+            .flatten()
+        {
+            return self.raw_text_refusal_response(id, resolved.ws_idx, resolved.pane_id, reason);
+        }
+        self.begin_paste(
+            id,
+            resolved.ws_idx,
+            resolved.pane_id,
+            params.text,
+            (
+                "agent_not_found",
+                format!("agent target {} not found", params.target),
+            ),
+            deadline,
+        )
     }
 }
 
@@ -558,7 +821,8 @@ fn unix_ms(at: std::time::SystemTime) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use crate::api::schema::{
-        AgentHistoryParams, ErrorResponse, Method, Request, ResponseResult, SuccessResponse,
+        AgentHistoryParams, AgentResultParams, ErrorResponse, Method, Request, ResponseResult,
+        SuccessResponse,
     };
     use crate::app::App;
 
@@ -576,6 +840,21 @@ mod tests {
         app.state.active = Some(0);
         app.state.selected = 0;
         app
+    }
+
+    #[test]
+    #[should_panic(expected = "deferred agent submit must be consumed by respond_or_park")]
+    fn agent_send_submit_cannot_be_silently_cleared_by_the_next_request() {
+        let mut app = test_app();
+        app.pending_agent_submit = Some((
+            "send".into(),
+            "1:p1".into(),
+            crate::app::guarded_submit::Attempt::test_new(),
+        ));
+        app.handle_api_request(Request {
+            id: "next".into(),
+            method: Method::Ping(crate::api::schema::PingParams {}),
+        });
     }
 
     fn focused_terminal_id(app: &App) -> crate::terminal::TerminalId {
@@ -612,7 +891,11 @@ mod tests {
             std::env::temp_dir().join(format!("flock-history-home-{}-{name}", std::process::id()));
         let project = home.join(".claude/projects/-repo");
         std::fs::create_dir_all(&project).expect("fixture project dir");
-        std::fs::write(project.join(format!("{session_id}.jsonl")), body).expect("transcript");
+        std::fs::write(
+            project.join(format!("{session_id}.jsonl")),
+            format!("{}\n{body}", serde_json::json!({"sessionId":session_id})),
+        )
+        .expect("transcript");
         std::env::set_var("HOME", &home);
         home
     }
@@ -795,17 +1078,233 @@ mod tests {
     #[test]
     fn agent_history_refuses_an_agent_with_no_transcript_flock_can_read() {
         let mut app = test_app();
-        let target = stamp_session(&mut app, "flock:codex", "codex", "sess-codex");
+        let target = stamp_session(&mut app, "flock:kimi", "kimi", "sess-kimi");
 
         let response = history(&mut app, params(&target));
 
         let error: ErrorResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(error.error.code, "unsupported_for_agent");
         assert!(
-            error.error.message.contains("codex"),
+            error.error.message.contains("kimi"),
             "{}",
             error.error.message
         );
+    }
+
+    #[test]
+    fn agent_history_says_a_restored_claude_session_is_unconfirmed_not_unreadable() {
+        // #977: a snapshot-restored claude session is deliberately not a
+        // licence to read (#328). The refusal used to claim flock cannot read
+        // claude at all, which sent operators chasing the wrong problem.
+        let mut app = test_app();
+        let terminal_id = focused_terminal_id(&app);
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .expect("test terminal")
+            .set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+                source: "flock:claude".into(),
+                agent: "claude".into(),
+                session_ref: crate::agent_resume::AgentSessionRef::id("sess-restored")
+                    .expect("session ref"),
+            });
+
+        let response = history(&mut app, params(&terminal_id.to_string()));
+
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            error.error.code, "session_unconfirmed",
+            "{}",
+            error.error.message
+        );
+        assert!(
+            error.error.message.contains("sess-restored"),
+            "{}",
+            error.error.message
+        );
+    }
+
+    #[test]
+    fn codex_rebound_session_reads_real_turn_and_rejects_wrong_identity() {
+        let mut app = test_app();
+        app.current_api_peer_pid = Some(std::process::id());
+        let root = crate::test_support::TempDir::socket();
+        std::env::set_var("CODEX_HOME", root.path());
+        let session_id = "00000000-0000-4000-8000-000000000613";
+        let sessions = root.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(
+            sessions.join(format!("rollout-fixture-{session_id}.jsonl")),
+            include_str!("../../../tests/fixtures/codex/finished.jsonl"),
+        )
+        .unwrap();
+        let terminal = focused_terminal_id(&app);
+        let agent_id = app.state.terminals[&terminal].agent_id.to_string();
+        app.state
+            .terminals
+            .get_mut(&terminal)
+            .unwrap()
+            .set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+                source: "flock:codex".into(),
+                agent: "codex".into(),
+                session_ref: crate::agent_resume::AgentSessionRef::id(session_id).unwrap(),
+            });
+        let pane = app
+            .public_pane_id(0, app.state.workspaces[0].focused_pane_id().unwrap())
+            .unwrap();
+        let mut params = crate::api::schema::PaneReportAgentSessionParams {
+            pane_id: pane,
+            source: "flock:codex".into(),
+            agent: "codex".into(),
+            seq: None,
+            agent_session_id: Some(session_id.into()),
+            agent_session_path: None,
+            session_start_source: None,
+            rebind_agent_id: Some("different-agent".into()),
+        };
+        assert!(Method::PaneReportAgentSession(params.clone()).needs_current_protocol());
+        let mut ordinary_hook = params.clone();
+        ordinary_hook.rebind_agent_id = None;
+        assert!(!Method::PaneReportAgentSession(ordinary_hook).needs_current_protocol());
+        let wrong: serde_json::Value = serde_json::from_str(
+            &app.handle_pane_report_agent_session("wrong".into(), params.clone()),
+        )
+        .unwrap();
+        assert_eq!(wrong["error"]["code"], "session_unbound");
+        params.rebind_agent_id = Some(agent_id.clone());
+        let response = app.handle_pane_report_agent_session("bind".into(), params);
+        assert!(!response.contains("\"error\""), "{response}");
+        let reply: serde_json::Value = serde_json::from_str(&app.handle_agent_result(
+            "reply".into(),
+            AgentResultParams {
+                target: agent_id,
+                max_chars: None,
+                offset: None,
+            },
+        ))
+        .unwrap();
+        assert_eq!(
+            reply["result"]["result"]["text"],
+            "The fixture is sound.\nDONE: checked"
+        );
+        std::env::remove_var("CODEX_HOME");
+    }
+
+    #[test]
+    fn cached_claude_session_is_confirmed_by_exact_recovery_and_replay_is_safe() {
+        let root = crate::test_support::TempDir::socket();
+        std::env::set_var("HOME", root.path());
+        std::env::set_var("XDG_STATE_HOME", root.path().join("state"));
+        let project = root.path().join(".claude/projects/fixture");
+        std::fs::create_dir_all(&project).unwrap();
+        let body = format!(
+            "{}\n{}",
+            serde_json::json!({"type":"user","sessionId":"claude-rebind",
+            "message":{"role":"user","content":"continue"}}),
+            assistant_line("DONE: recovered")
+        );
+        std::fs::write(project.join("claude-rebind.jsonl"), body).unwrap();
+        let mut app = test_app();
+        let terminal_id = focused_terminal_id(&app);
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "flock:claude".into(),
+            agent: "claude".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::id("claude-rebind").unwrap(),
+        });
+        let agent_id = terminal.agent_id.to_string();
+        app.current_api_peer_pid = Some(std::process::id());
+        let before: serde_json::Value =
+            serde_json::from_str(&result(&mut app, &agent_id, None, None)).unwrap();
+        assert_eq!(before["error"]["code"], "session_unconfirmed");
+        let params = crate::api::schema::PaneReportAgentSessionParams {
+            pane_id: app
+                .public_pane_id(0, app.state.workspaces[0].focused_pane_id().unwrap())
+                .unwrap(),
+            rebind_agent_id: Some(agent_id.clone()),
+            source: "flock:claude".into(),
+            agent: "claude".into(),
+            seq: None,
+            agent_session_id: Some("claude-rebind".into()),
+            agent_session_path: None,
+            session_start_source: None,
+        };
+        for _ in 0..2 {
+            let response = app.handle_pane_report_agent_session("bind".into(), params.clone());
+            assert!(!response.contains("\"error\""), "{response}");
+        }
+        assert_eq!(
+            result_info(&result(&mut app, &agent_id, None, None)).text,
+            "DONE: recovered"
+        );
+    }
+
+    #[test]
+    fn codex_result_reports_not_yet_codes_and_reads_the_reported_session() {
+        let mut app = test_app();
+        let home = std::env::temp_dir().join(format!("flock-codex-api-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("CODEX_HOME", &home);
+        let target = focused_terminal_id(&app).to_string();
+        let read = |app: &mut App| {
+            app.handle_agent_result(
+                "req".into(),
+                AgentResultParams {
+                    target: target.clone(),
+                    max_chars: None,
+                    offset: None,
+                },
+            )
+        };
+        let error: ErrorResponse = serde_json::from_str(&read(&mut app)).unwrap();
+        assert_eq!(error.error.code, "no_agent_session");
+        stamp_session(&mut app, "flock:codex", "codex", "sess-codex");
+        let error: ErrorResponse = serde_json::from_str(&read(&mut app)).unwrap();
+        assert_eq!(error.error.code, "transcript_not_found");
+        let dir = home.join("sessions/2026/01/01");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rollout-2026-01-01T00-00-00-sess-codex.jsonl");
+        std::fs::write(&path, "invalid JSON\n").unwrap();
+        let error: ErrorResponse = serde_json::from_str(&read(&mut app)).unwrap();
+        assert_eq!(error.error.code, "transcript_unreadable");
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n{}",
+                serde_json::json!({"type":"session_meta","payload":{"id":"sess-codex"}}),
+                include_str!("../../../tests/fixtures/codex/in-progress.jsonl")
+            ),
+        )
+        .unwrap();
+        let error: ErrorResponse = serde_json::from_str(&read(&mut app)).unwrap();
+        assert_eq!(error.error.code, "no_result");
+        std::fs::write(
+            &path,
+            include_str!("../../../tests/fixtures/codex/finished.jsonl")
+                .replace("00000000-0000-4000-8000-000000000613", "sess-codex"),
+        )
+        .unwrap();
+        let response: serde_json::Value = serde_json::from_str(&read(&mut app)).unwrap();
+        let result = &response["result"]["result"];
+        assert_eq!(result["agent"], "codex", "{response}");
+        assert_eq!(result["text"], "The fixture is sound.\nDONE: checked");
+        assert_eq!(result["finished"], true);
+        assert_eq!(result["at_ms"], 1_767_225_603_125_u64);
+        std::fs::write(
+            &path,
+            format!(
+                "{}{}",
+                include_str!("../../../tests/fixtures/codex/finished.jsonl"),
+                include_str!("../../../tests/fixtures/codex/in-progress.jsonl")
+            )
+            .replace("00000000-0000-4000-8000-000000000613", "sess-codex"),
+        )
+        .unwrap();
+        let response: serde_json::Value = serde_json::from_str(&read(&mut app)).unwrap();
+        assert_eq!(response["result"]["result"]["finished"], false);
+        assert_eq!(response["result"]["result"]["at_ms"], 1_767_225_603_125_u64);
+        std::env::remove_var("CODEX_HOME");
+        std::fs::remove_dir_all(home).unwrap();
     }
 
     #[test]
@@ -879,6 +1378,7 @@ mod tests {
 
         let info = result_info(&result(&mut app, &target, None, None));
         assert_eq!(info.agent, "claude");
+        assert_eq!(info.terminal_id.as_deref(), Some(target.as_str()));
         assert!(info.finished);
         assert_eq!(info.status.as_deref(), Some("done"));
         assert_eq!(info.status_text.as_deref(), Some("PR #12 merged"));
@@ -923,6 +1423,144 @@ mod tests {
         let _ = std::fs::remove_dir_all(home);
     }
 
+    /// #922: the server's own detector sees a Claude turn that ended with a
+    /// shell still running, and `agent.get` and `agent.result` both say so. It
+    /// starts from a real screen through the shared detector and the
+    /// `StateChanged` event the detection task publishes, so the field is
+    /// produced the way a live pane produces it, not set by hand.
+    #[test]
+    fn settled_with_background_shells_reaches_agent_get_and_agent_result() {
+        use crate::api::agent_state::SETTLE_MS;
+        use crate::detect::{Agent, AgentState};
+        use crate::events::AppEvent;
+
+        let settled = concat!(
+            "\u{25cf} DONE: recovered\n\n",
+            "\u{273b} Crunched for 7m 41s \u{b7} done 4:32 PM \u{b7} 1 shell still running\n",
+            "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n",
+            "\u{276f} \n",
+            "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n",
+            "  \u{23f5}\u{23f5} bypass permissions on \u{b7} 1 shell \u{b7} \u{2190} for agents\n",
+        );
+        let body = user_line("recover it") + &assistant_line("DONE: recovered");
+        let home = claude_home_with("settled-shells", "sess-shells", &body);
+        let mut app = test_app();
+        let target = stamp_session(&mut app, "flock:claude", "claude", "sess-shells");
+        let pane_id = app.state.workspaces[0]
+            .focused_pane_id()
+            .expect("focused pane");
+        let publish = |app: &mut App, screen: &str| {
+            let detection = crate::detect::detect_agent(Some(Agent::Claude), screen);
+            app.state.handle_app_event(AppEvent::StateChanged {
+                pane_id,
+                agent: Some(Agent::Claude),
+                state: detection.state,
+                activity: detection.activity,
+                provider_limit: detection.provider_limit,
+                visible_blocker: detection.visible_blocker,
+                visible_idle: detection.visible_idle,
+                visible_working: detection.visible_working,
+                background_tasks: detection.background_tasks,
+                needs_human: detection.needs_human,
+                question: detection.question,
+                settled_with_background_shells: detection.settled_with_background_shells,
+                process_exited: false,
+                observed_at: std::time::Instant::now(),
+            });
+            detection.state
+        };
+        let get = |app: &mut App| -> serde_json::Value {
+            let response = app.handle_api_request_after_internal_events_drained(Request {
+                id: "req".into(),
+                method: Method::AgentGet(crate::api::schema::AgentTarget {
+                    target: target.clone(),
+                }),
+            });
+            serde_json::from_str(&response).expect("agent.get json")
+        };
+        let read_result = |app: &mut App| -> serde_json::Value {
+            serde_json::from_str(&result(app, &target, None, None)).expect("agent.result json")
+        };
+
+        // #1022: the same screen fills the `background` axis, and once the
+        // idle turn has held past the settle window the phase says so.
+        let settle = |app: &mut App| {
+            let terminal_id = focused_terminal_id(app);
+            let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+            terminal.state_changed_at = std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_millis(SETTLE_MS + 1_000));
+        };
+        let axis = |agent: &serde_json::Value| {
+            let state = &agent["result"]["agent"]["state"];
+            (
+                state["turn"].clone(),
+                state["background"].clone(),
+                state["source"]["background"].clone(),
+                state["phase"].clone(),
+            )
+        };
+        assert_eq!(publish(&mut app, settled), AgentState::Idle);
+        settle(&mut app);
+        let agent = get(&mut app);
+        assert_eq!(
+            agent["result"]["agent"]["settled_with_background_shells"], true,
+            "{agent}"
+        );
+        assert_eq!(
+            axis(&agent),
+            (
+                "idle".into(),
+                serde_json::json!({"running": {"count": 1}}),
+                "screen".into(),
+                "finished_with_background".into()
+            ),
+            "{agent}"
+        );
+        let reply = read_result(&mut app);
+        assert_eq!(
+            reply["result"]["result"]["settled_with_background_shells"], true,
+            "{reply}"
+        );
+
+        // A plain settle with nothing left running omits the field, as does
+        // an older server, so a client reads absent as false.
+        let plain = concat!(
+            "\u{25cf} DONE: recovered\n\n",
+            "\u{273b} Crunched for 7m 41s \u{b7} done 4:32 PM\n",
+            "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n",
+            "\u{276f} \n",
+            "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n",
+            "  \u{23f5}\u{23f5} bypass permissions on\n",
+        );
+        assert_eq!(publish(&mut app, plain), AgentState::Idle);
+        settle(&mut app);
+        let agent = get(&mut app);
+        assert_eq!(
+            axis(&agent),
+            (
+                "idle".into(),
+                "none".into(),
+                "screen".into(),
+                "finished".into()
+            ),
+            "{agent}"
+        );
+        assert!(
+            agent["result"]["agent"]
+                .get("settled_with_background_shells")
+                .is_none(),
+            "{agent}"
+        );
+        let reply = read_result(&mut app);
+        assert!(
+            reply["result"]["result"]
+                .get("settled_with_background_shells")
+                .is_none(),
+            "{reply}"
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
     #[test]
     fn agent_result_with_no_reply_yet_is_refused_as_no_result() {
         let home = claude_home_with("no-result", "sess-empty", &user_line("hello?"));
@@ -931,6 +1569,88 @@ mod tests {
         let error: crate::api::schema::ErrorResponse =
             serde_json::from_str(&result(&mut app, &target, None, None)).unwrap();
         assert_eq!(error.error.code, "no_result");
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// #1257: a turn the transcript still records as running is reported with
+    /// the time it began, on the `no_result` refusal of a first round and on
+    /// the earlier reply a later round still shows.
+    #[test]
+    fn agent_result_reports_when_an_open_turn_began() {
+        let line = |value: serde_json::Value| format!("{value}\n");
+        let prompt = |text: &str, at: &str| {
+            line(serde_json::json!({"type": "user", "timestamp": at,
+                "message": {"role": "user", "content": text}}))
+        };
+        let tool = line(serde_json::json!({"type": "assistant",
+            "message": {"role": "assistant", "content": [{"type": "tool_use", "name": "Bash"}]}}));
+        let first = prompt("brief", "2026-10-13T01:06:15.939Z") + &tool;
+        let home = claude_home_with("open-first", "sess-open-first", &first);
+        let mut app = test_app();
+        let target = stamp_session(&mut app, "flock:claude", "claude", "sess-open-first");
+        let error: serde_json::Value =
+            serde_json::from_str(&result(&mut app, &target, None, None)).unwrap();
+        assert_eq!(error["error"]["code"], "no_result", "{error}");
+        assert_eq!(
+            error["error"]["data"]["turn_open_at_ms"],
+            1_791_853_575_939_u64
+        );
+        let _ = std::fs::remove_dir_all(home);
+
+        let second = prompt("round 1", "2026-10-13T01:00:00.000Z")
+            + &assistant_line("DONE: one")
+            + &line(serde_json::json!({"type": "system", "subtype": "turn_duration"}))
+            + &prompt("round 2", "2026-10-13T01:06:15.939Z")
+            + &tool
+            + &assistant_line("Reading the brief next.");
+        let home = claude_home_with("open-second", "sess-open-second", &second);
+        let mut app = test_app();
+        let target = stamp_session(&mut app, "flock:claude", "claude", "sess-open-second");
+        let info = result_info(&result(&mut app, &target, None, None));
+        assert!(!info.finished);
+        assert_eq!(info.status.as_deref(), Some("done"));
+        assert_eq!(info.turn_open_at_ms, Some(1_791_853_575_939));
+        let _ = std::fs::remove_dir_all(home);
+
+        let ended =
+            second + &line(serde_json::json!({"type": "system", "subtype": "turn_duration"}));
+        let home = claude_home_with("open-ended", "sess-open-ended", &ended);
+        let mut app = test_app();
+        let target = stamp_session(&mut app, "flock:claude", "claude", "sess-open-ended");
+        let info = result_info(&result(&mut app, &target, None, None));
+        assert!(info.finished);
+        assert_eq!(info.turn_open_at_ms, None);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// #1257: a resumed session (#582) ends its round on the harness's own
+    /// `No response requested.` with no `turn_duration` record. That round is
+    /// over, so a waiting supervisor reads a finished reply and never an open
+    /// turn it would wait on forever.
+    #[test]
+    fn agent_result_reads_a_resumed_round_as_finished() {
+        let line = |value: serde_json::Value| format!("{value}\n");
+        let body = line(
+            serde_json::json!({"type": "user", "timestamp": "2026-10-13T01:00:00.000Z",
+                "message": {"role": "user", "content": "round 1"}}),
+        ) + &assistant_line("DONE: one")
+            + &line(serde_json::json!({"type": "system", "subtype": "turn_duration"}))
+            + &line(
+                serde_json::json!({"type": "user", "timestamp": "2026-10-13T01:06:15.939Z",
+                "message": {"role": "user", "content": "round 2"}}),
+            )
+            + &line(serde_json::json!({"type": "user", "isMeta": true,
+                "message": {"role": "user", "content": [
+                    {"type": "text", "text": "Continue from where you left off."}]}}))
+            + &assistant_line("No response requested.");
+        let home = claude_home_with("resumed", "sess-resumed", &body);
+        let mut app = test_app();
+        let target = stamp_session(&mut app, "flock:claude", "claude", "sess-resumed");
+        let info = result_info(&result(&mut app, &target, None, None));
+        assert!(info.finished);
+        assert_eq!(info.turn_open_at_ms, None);
+        assert_eq!(info.text, "No response requested.");
+        assert_eq!(info.status, None);
         let _ = std::fs::remove_dir_all(home);
     }
 

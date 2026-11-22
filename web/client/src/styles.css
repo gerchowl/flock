@@ -1,0 +1,232 @@
+/* Colours, fonts and other values come from tokens.css (web/DESIGN.md). */
+:root {
+  color-scheme: light dark;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  background: var(--color-legacy-bg);
+  color: var(--color-legacy-fg);
+  font: 14px/1.5 var(--font-family-system);
+  overflow-wrap: anywhere;
+}
+
+/* 13 px body text on desktop (HIG Typography; #2903). The root stays 14 px:
+   it is the rem the legacy spacing is written in, until #2913 replaces it
+   with tokens. */
+body {
+  font-size: var(--font-size-13);
+}
+
+/* A shortcut label (the palette's ⌘K) is in the system font, like a menu's. */
+kbd {
+  font-family: inherit;
+}
+
+/* One visible focus ring for every control, keyboard focus only. */
+:focus-visible {
+  outline: 2px solid var(--color-legacy-working);
+  outline-offset: 2px;
+}
+
+/* ADR-0038 §2a: 15 px body text below the phone breakpoint. */
+@media (max-width: 767.98px) {
+  html,
+  body {
+    font-size: var(--font-size-15);
+  }
+}
+
+.replay-badge {
+  position: sticky;
+  top: 0;
+  z-index: var(--layer-sticky);
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.25rem 0.75rem;
+  min-height: 44px;
+  padding: 0.5rem 1rem;
+  background: var(--color-legacy-badge-bg);
+  color: var(--color-legacy-badge-fg);
+}
+
+.replay-badge__source {
+  font: 0.8125rem/1.4 var(--font-family-mono);
+  opacity: 0.9;
+  min-width: 0;
+}
+
+.app-main {
+  max-width: 60rem;
+  margin: 0 auto;
+  padding: 1rem;
+}
+
+.state-error {
+  max-width: 40rem;
+  margin: 2rem auto;
+  padding: 1rem;
+  color: var(--color-legacy-error);
+}
+
+.transcript {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.event {
+  min-width: 0;
+  padding: 0.75rem 1rem;
+  border: var(--border-width-thin) solid var(--color-legacy-border);
+  border-radius: var(--radius-medium);
+  background: var(--color-legacy-surface);
+}
+
+.event--assistant {
+  background: var(--color-legacy-bg);
+}
+
+.event__label {
+  margin: 0 0 0.25rem;
+  font-size: 0.8125rem;
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-legacy-muted);
+}
+
+.text {
+  margin: 0.25rem 0;
+  white-space: pre-wrap;
+}
+
+/* Collapsed blocks: the summary is a regular control (44 px on a phone, workbench.css). */
+details > summary {
+  display: flex;
+  align-items: center;
+  min-height: var(--size-control);
+  cursor: pointer;
+  list-style: none;
+}
+
+details > summary::before {
+  content: "▸";
+  margin-right: 0.5rem;
+}
+
+details[open] > summary::before {
+  content: "▾";
+}
+
+details > summary::-webkit-details-marker {
+  display: none;
+}
+
+.event--unknown > summary {
+  font-family: var(--font-family-mono);
+  font-size: 0.875rem;
+}
+
+/* Code and JSON scroll inside their own block, never the page. */
+.code {
+  max-width: 100%;
+  margin: 0.25rem 0 0;
+  padding: 0.5rem 0.75rem;
+  overflow-x: auto;
+  border-radius: var(--radius-small);
+  background: var(--color-legacy-bg);
+  font: 0.8125rem/1.45 var(--font-family-mono);
+  white-space: pre;
+  overflow-wrap: normal;
+}
+
+.transcript__status {
+  margin: 0.5rem 0 2rem;
+  color: var(--color-legacy-muted);
+  font-size: 0.875rem;
+}
+
+/* A history gap (ADR-0038 §3): fixed text, never implying a complete transcript. */
+.transcript__gap {
+  margin: 0.75rem 0;
+  padding: 0.5rem 0.75rem;
+  border: var(--border-width-thin) dashed var(--color-legacy-border);
+  border-radius: var(--radius-small);
+  color: var(--color-legacy-muted);
+  font-size: 0.875rem;
+}
+
+/* Turns and tool runs (ADR-0038 §2a). */
+.turn {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.turn + .turn {
+  padding-top: 0.75rem;
+  border-top: var(--border-width-thin) solid var(--color-legacy-border);
+}
+
+.transcript__fold {
+  min-height: var(--size-control);
+  border: var(--border-width-thin) dashed var(--color-legacy-border);
+  border-radius: var(--radius-small);
+  background: none;
+  color: var(--color-legacy-muted);
+  font: inherit;
+  cursor: pointer;
+}
+
+.tool-run > summary {
+  gap: 0.5rem;
+  min-width: 0;
+}
+
+.tool-run__name {
+  font-weight: var(--font-weight-semibold);
+}
+
+.tool-run__command {
+  min-width: 0;
+  overflow: hidden;
+  font-family: var(--font-family-mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tool-run__outcome {
+  margin-left: auto;
+  color: var(--color-legacy-muted);
+}
+
+.tool-run__outcome--error {
+  color: var(--color-legacy-error);
+}
+
+/* A failed sign-in link while a session works on (ADR-0038 §3): a dismissible notice over the workbench. */
+.notice {
+  position: fixed;
+  inset-inline: 16px;
+  bottom: 16px;
+  z-index: var(--layer-overlay);
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: 10px 14px;
+  background: var(--color-legacy-surface);
+  color: var(--color-legacy-fg);
+  border: var(--border-width-thin) solid var(--color-legacy-border);
+  border-radius: var(--radius-medium);
+}
+
+.notice span {
+  flex: 1;
+}

@@ -149,6 +149,22 @@ pub fn process_parent_id(pid: u32) -> Option<u32> {
     u32::try_from(ppid).ok()
 }
 
+/// One kernel snapshot of a living process; unknown/dead states fail closed.
+pub fn live_process_facts(pid: u32) -> Option<(u32, u64)> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let fields: Vec<_> = stat
+        .get(stat.rfind(')')? + 2..)?
+        .split_whitespace()
+        .collect();
+    if !matches!(
+        *fields.first()?,
+        "R" | "S" | "D" | "T" | "t" | "W" | "I" | "K" | "P"
+    ) {
+        return None;
+    }
+    Some((fields.get(1)?.parse().ok()?, fields.get(19)?.parse().ok()?))
+}
+
 /// Every live process id, from the numeric entries under `/proc`.
 pub fn all_process_ids() -> Vec<u32> {
     let mut pids = Vec::new();
@@ -181,7 +197,7 @@ fn process_argv(pid: u32) -> Option<Vec<String>> {
 }
 
 /// Get the current working directory of a process.
-/// Uses /proc/<pid>/cwd symlink.
+/// Uses `/proc/<pid>/cwd` symlink.
 pub fn process_cwd(pid: u32) -> Option<PathBuf> {
     if pid == 0 {
         return None;
@@ -238,7 +254,9 @@ pub fn write_clipboard(bytes: &[u8]) -> bool {
     false
 }
 
-pub fn open_url(url: &str) -> std::io::Result<()> {
+// xdg-open 1.2.1 rejects `--` as an unexpected option. The shared
+// HTTP(S) validator guarantees that this sole argument cannot be an option.
+pub(super) fn open_validated_url(url: &str) -> std::io::Result<()> {
     crate::process::TracedCommand::new("xdg-open", "platform")
         .arg(url)
         .stdin(Stdio::null())
@@ -449,7 +467,8 @@ fn run_clipboard_command(command: &ClipboardCommand, bytes: &[u8]) -> bool {
     child.wait().map(|status| status.success()).unwrap_or(false)
 }
 
-fn process_session_id(pid: u32) -> Option<i32> {
+/// The session a process belongs to, or `None` once it is gone.
+pub fn process_session_id(pid: u32) -> Option<i32> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let rest = stat.get(stat.rfind(')')? + 2..)?;
     let fields: Vec<&str> = rest.split_whitespace().collect();
@@ -461,6 +480,14 @@ fn process_session_id(pid: u32) -> Option<i32> {
 /// (#418).
 pub(crate) fn ssh_agent_rescan_roots() -> &'static [&'static str] {
     &[]
+}
+
+/// OS installation identity, independent of hostname and flock's state dir.
+pub(crate) fn machine_identity() -> std::io::Result<String> {
+    super::machine_id::read_machine_id(
+        std::path::Path::new("/etc/machine-id"),
+        sysinfo::System::boot_time().map_err(std::io::Error::other)?,
+    )
 }
 
 #[cfg(test)]

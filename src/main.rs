@@ -23,6 +23,7 @@ const NESTED_FLOCK_MESSAGES: [&str; 6] = [
     "recursion detected. base case not found. aborting.",
 ];
 
+mod agent_restart;
 mod agent_resume;
 mod agent_self_compact;
 mod agent_symbols;
@@ -30,12 +31,30 @@ mod agent_transcript;
 mod api;
 mod app;
 mod build_info;
+mod channels;
 mod checks;
 mod checksum;
 mod cli;
 mod client;
+mod client_open;
+// Pure rollout foundation; runtime consumers follow in #1662–#1664.
+#[allow(dead_code)]
+mod codex_rollout;
+// Binding foundation, connected to the reader and authority in #1663/#1664.
+#[allow(dead_code)]
+mod codex_binding;
+// File/cursor foundation; segment admission and supervision follow in #1856/#1857.
+#[allow(dead_code)]
+mod codex_reader;
+mod codex_transcript;
+mod session_evidence;
+// Version eligibility foundation; binding and runtime consumers follow in #1662/#1664.
+#[allow(dead_code)]
+mod codex_version;
 mod config;
 mod opencode_transcript;
+#[cfg(all(test, feature = "ts"))]
+mod ts;
 // #348 / ADR-0014 §4: one definition of "terminal control sequence",
 // shared by the handler that strips them and the one that refuses them.
 mod control_bytes;
@@ -50,6 +69,9 @@ mod events;
 mod ghostty;
 mod github;
 mod handoff_runtime;
+#[cfg(test)]
+#[path = "../tests/support/socket_dir.rs"]
+mod test_socket_dir;
 // #295: source-scoped health primitive for periodic in-process pollers.
 mod health;
 mod input;
@@ -59,7 +81,12 @@ mod kitty_graphics;
 mod layout;
 mod logging;
 mod mcp;
+// Slice 1-B provides custody primitives ahead of runtime integration.
+#[allow(dead_code)]
+mod mesh;
+mod owner_policy;
 mod pane;
+mod peer_name;
 mod peer_stream;
 mod peers;
 mod persist;
@@ -74,6 +101,11 @@ mod release_notes;
 mod remote;
 mod render_prof;
 mod report;
+#[cfg(any(test, feature = "web"))]
+mod structured_wire;
+#[cfg(not(any(test, feature = "web")))]
+#[path = "structured_wire/production.rs"]
+mod structured_wire;
 #[cfg(test)]
 mod test_support;
 // #175 phase 5 / S3 commit 4 (ops): `flk revert-run` trailer-scan.
@@ -84,6 +116,9 @@ mod server_icons;
 mod session;
 mod sound;
 mod spawn;
+// ADR-0036 S1 supplies event types before runtime integration (#1379).
+#[allow(dead_code)]
+mod structured;
 mod switch_progress;
 mod system_stats;
 mod terminal;
@@ -95,6 +130,26 @@ mod update;
 mod web;
 mod workspace;
 mod worktree;
+
+/// Whether this invocation warns about removed config keys on stderr before it
+/// runs. `config check` and the full `status` report them in their own output
+/// (`status server` and `status client` do not), and hooks and the MCP server
+/// run on every agent turn and tool call, where the warning is noise and the
+/// config scan is wasted work (#860).
+///
+/// It reads argv after the global output flags come off (ADR-0029 §3), so
+/// `flk --format json status` is the full status, as `flk status --json` is.
+fn prints_removed_config_warnings(args: &[String]) -> bool {
+    let Ok((args, _)) = cli::output::take_global(args) else {
+        return true;
+    };
+    match args.get(1).map(String::as_str) {
+        Some("hook" | "mcp") => false,
+        Some("status") => args.len() > 2,
+        Some("config") => args.get(2).map(String::as_str) != Some("check"),
+        _ => true,
+    }
+}
 
 fn init_logging() {
     crate::logging::init_file_logging("flock.log");
@@ -141,7 +196,7 @@ fn exit_if_nested_disabled(config: &config::Config) {
         eprintln!("see configuration if you want to enable it.");
         eprintln!();
         eprintln!("\x1b[2m\"{}\"\x1b[0m", random_nested_message());
-        std::process::exit(1);
+        std::process::exit(cli::exit::FAILURE);
     }
 }
 
@@ -409,14 +464,35 @@ fn switch_failure_reason(err: &io::Error) -> String {
     peers::failure_text(&err.to_string())
 }
 
-fn main() -> io::Result<()> {
-    let raw_args: Vec<String> = std::env::args().collect();
+fn main() {
+    if let Err(error) = run() {
+        eprintln!("Error: {error}");
+        let exit = if error
+            .get_ref()
+            .is_some_and(|inner| inner.is::<cli::argv::InvalidUtf8Argument>())
+        {
+            cli::exit::USAGE
+        } else {
+            cli::io_error_exit(&error)
+        };
+        std::process::exit(exit);
+    }
+}
+
+fn run() -> io::Result<()> {
+    let raw_args: Vec<_> = std::env::args_os().collect();
+    if raw_args.len() == 2
+        && (raw_args[1] == platform::client_token_lock::WORKER_ARG
+            || raw_args[1] == platform::client_token_lock::SHARED_WORKER_ARG)
+    {
+        return platform::client_token_lock::worker();
+    }
     let args = match session::configure_from_args(&raw_args) {
         Ok(args) => args,
         Err(err) => {
             eprintln!("error: {err}");
             eprintln!("run 'flk --help' for usage");
-            std::process::exit(2);
+            std::process::exit(cli::exit::USAGE);
         }
     };
     let (args, remote_launch) = match remote::extract_remote_args(&args) {
@@ -424,9 +500,16 @@ fn main() -> io::Result<()> {
         Err(err) => {
             eprintln!("error: {err}");
             eprintln!("run 'flk --help' for usage");
-            std::process::exit(2);
+            std::process::exit(cli::exit::USAGE);
         }
     };
+
+    // Decode only after global stripping: the importer must see this same argv,
+    // with its socket kept native and all remaining command text checked as UTF-8.
+    let cli::argv::Arguments {
+        text: args,
+        handoff_socket,
+    } = cli::argv::collect(args.into_iter())?;
 
     if remote_launch.is_some()
         && args.get(1).is_some()
@@ -439,7 +522,13 @@ fn main() -> io::Result<()> {
     {
         eprintln!("error: --remote can only be used with the default launch command");
         eprintln!("run 'flk --help' for usage");
-        std::process::exit(2);
+        std::process::exit(cli::exit::USAGE);
+    }
+
+    if prints_removed_config_warnings(&args) {
+        for warning in config::removed_config_warnings() {
+            eprintln!("warning: {warning}");
+        }
     }
 
     if let cli::CommandOutcome::Handled(code) = cli::maybe_run(&args)? {
@@ -454,7 +543,7 @@ fn main() -> io::Result<()> {
     }
 
     if args.get(1).map(|s| s.as_str()) == Some("server") {
-        return server::headless::run_server();
+        return server::headless::run_server(&args[2..], handoff_socket);
     }
 
     // Hidden client mode: connect to an existing server's client socket.
@@ -469,23 +558,23 @@ fn main() -> io::Result<()> {
             Ok(options) => options,
             Err(err) if err.starts_with("usage:") => {
                 eprintln!("{err}");
-                std::process::exit(0);
+                std::process::exit(cli::exit::SUCCESS);
             }
             Err(err) => {
                 eprintln!("{err}");
                 eprintln!("usage: flk update [--handoff]");
-                std::process::exit(2);
+                std::process::exit(cli::exit::USAGE);
             }
         };
         match update::self_update(options) {
             Ok(_) => return Ok(()),
             Err(e) => {
-                if e.starts_with("self-update is disabled") {
+                if e.message().starts_with("self-update is disabled") {
                     eprintln!("{e}");
                 } else {
                     eprintln!("update failed: {e}");
                 }
-                std::process::exit(1);
+                std::process::exit(e.exit());
             }
         }
     }
@@ -502,15 +591,23 @@ fn main() -> io::Result<()> {
         println!("       flk server stop");
         println!("       flk server reload-config");
         println!("       flk config <subcommand> ...");
+        println!("       flk structured grants <list|revoke> ...");
+        println!("       flk profile enable --plan <id> --expect <digest>");
         println!("       flk channel <subcommand> ...");
         println!("       flk workspace <subcommand> ...");
         println!("       flk worktree <subcommand> ...");
         println!("       flk tab <subcommand> ...");
         println!("       flk notification <subcommand> ...");
         println!("       flk agent <subcommand> ...");
+        println!("       flk delegate <subcommand> ...");
         println!("       flk pane <subcommand> ...");
         println!("       flk wait <subcommand> ...");
+        println!("       flk events <read|wait> ...");
+        println!("       flk adapter hello <binding> ...");
+        println!("       flk client <token|open> ...");
+        println!("       flk owner policy <show|adopt> ...");
         println!("       flk session <subcommand> ...");
+        println!("       flk doctor [--json]");
         println!("       flk integration <subcommand> ...");
         println!("       flk report bug [--file <path>] [--open]");
         println!("       flk web [--bind <addr>] (requires the `web` feature)");
@@ -521,6 +618,10 @@ fn main() -> io::Result<()> {
             (
                 "flk status [server|client]",
                 "Show local client and running server status",
+            ),
+            (
+                "flk doctor [--json]",
+                "Inspect retained structured records (operator)",
             ),
             ("flk update", "Download and install the latest version"),
             (
@@ -565,6 +666,10 @@ fn main() -> io::Result<()> {
                 "Agent/terminal helpers over the socket API",
             ),
             (
+                "flk delegate <subcommand>",
+                "Hand a task to an agent: start, send, wait, result, status, reap",
+            ),
+            (
                 "flk pane <subcommand>",
                 "Pane control helpers over the socket API",
             ),
@@ -575,6 +680,22 @@ fn main() -> io::Result<()> {
             (
                 "flk wait <subcommand>",
                 "Blocking wait helpers over the socket API",
+            ),
+            (
+                "flk events <read|wait>",
+                "Read or wait on the durable event log from a cursor",
+            ),
+            (
+                "flk adapter hello <binding>",
+                "Check a channel adapter's binding token before it starts",
+            ),
+            (
+                "flk client <token|open>",
+                "Manage GUI credentials or open the GUI",
+            ),
+            (
+                "flk owner policy <show|adopt>",
+                "Show a repo's committed owner policy, or adopt it (operator)",
             ),
             (
                 "flk session <subcommand>",
@@ -602,6 +723,7 @@ fn main() -> io::Result<()> {
         println!("  --version, -V       Print version and exit");
         println!("  --help, -h          Show this help");
         println!();
+        println!("{}", cli::exit::help_section());
         println!("Config: {}", config::config_path().display());
         println!("Logs:   {}", logging::help_log_paths_summary());
         println!("Env:    FLOCK_CONFIG_PATH overrides config file path");
@@ -636,7 +758,7 @@ fn main() -> io::Result<()> {
         if arg.starts_with('-') && !known_flags.contains(&arg_name) {
             eprintln!("unknown option: {arg}");
             eprintln!("run 'flk --help' for usage");
-            std::process::exit(1);
+            std::process::exit(cli::exit::FAILURE);
         }
         if !arg.starts_with('-')
             && ![
@@ -658,29 +780,28 @@ fn main() -> io::Result<()> {
         {
             eprintln!("unknown command: {arg}");
             eprintln!("run 'flk --help' for usage");
-            std::process::exit(1);
+            std::process::exit(cli::exit::FAILURE);
         }
     }
 
     if let Some(remote_launch) = remote_launch {
         if let Err(err) = run_attach_legs(AttachLeg::Remote(remote_launch)) {
             report_attach_chain_error(&err);
-            std::process::exit(1);
+            std::process::exit(cli::io_error_exit(&err));
         }
         return Ok(());
     }
 
+    let no_session = args.iter().any(|a| a == "--no-session");
     let loaded_config = config::Config::load();
     exit_if_nested_disabled(&loaded_config.config);
-
-    let no_session = args.iter().any(|a| a == "--no-session");
 
     // Auto-detect launch: when --no-session is NOT set, use server/client mode.
     // Check if a server is running, spawn one if needed, then attach as client.
     if !no_session {
         if let Err(err) = run_attach_legs(AttachLeg::Local) {
             report_attach_chain_error(&err);
-            std::process::exit(1);
+            std::process::exit(cli::io_error_exit(&err));
         }
         return Ok(());
     }
@@ -693,12 +814,18 @@ fn main() -> io::Result<()> {
     let (api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
     let event_hub =
         api::EventHub::with_persistence(crate::session::data_dir().join("event-log.jsonl"));
-    let _api_server = match api::start_server_with_capabilities(api_tx, event_hub.clone(), None) {
+    let runtime_config = app::AppRuntimeConfig::for_config(&loaded_config.config);
+    let _api_server = match api::start_server_for_mode(
+        api_tx,
+        event_hub.clone(),
+        false,
+        runtime_config.uid_policy.clone(),
+    ) {
         Ok(server) => server,
         Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
             eprintln!("error: flk is already running");
             eprintln!("socket: {}", api::socket_path().display());
-            std::process::exit(1);
+            std::process::exit(cli::exit::FAILURE);
         }
         Err(err) => return Err(err),
     };
@@ -766,14 +893,18 @@ fn main() -> io::Result<()> {
             std::io::stdout().flush()?;
         }
 
-        let mut app = app::App::new(
+        let mut app = app::App::new_with_runtime_config(
             config,
             true, // no_session — monolithic mode never saves/restores sessions
             config_diagnostic,
             api_rx,
             event_hub,
+            runtime_config,
         );
-        let result = app.run(&mut terminal).await;
+        let result = match app.initialize_mesh_mail(Some(&_api_server)) {
+            Ok(()) => app.run(&mut terminal).await,
+            Err(reason) => Err(std::io::Error::other(reason)),
+        };
 
         // Hand the host window title back (#361) — only if this session ever
         // took it. `[title] enabled = false` publishes nothing, so there is
@@ -819,6 +950,34 @@ fn main() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn removed_config_warnings_skip_commands_that_report_or_run_per_turn() {
+        let args = |line: &str| -> Vec<String> { line.split(' ').map(String::from).collect() };
+        for quiet in [
+            "flk status",
+            "flk status --json",
+            "flk status --format json",
+            "flk --format=json status",
+            "flk --json config check",
+            "flk hook stop",
+            "flk mcp",
+            "flk config check",
+        ] {
+            assert!(!prints_removed_config_warnings(&args(quiet)), "{quiet}");
+        }
+        for loud in [
+            "flk",
+            "flk --version",
+            "flk config edit",
+            "flk pane list",
+            "flk status server",
+            "flk status client --json",
+            "flk --format json status server",
+        ] {
+            assert!(prints_removed_config_warnings(&args(loud)), "{loud}");
+        }
+    }
 
     #[test]
     fn default_config_output_parses_back_to_default_config() {

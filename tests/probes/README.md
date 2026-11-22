@@ -9,12 +9,18 @@ harness that can drive a pty (this fork's agents use the `tui-probe` skill;
 any tmux driver works). Treat them as reproductions you can re-run against
 two builds, not as CI.
 
+The whole-Welcome acceptance driver runs without tmux:
+`python3 tests/probes/attach_welcome.py --bin target/debug/flk`. It owns isolated
+fake peers and PTYs, checks silent/trickled replies against the real five-second
+deadline, and bounds each client observation to eight seconds. The
+`attach_welcome` nextest integration binary runs this driver in CI as well.
+
 ## Running one
 
 ```sh
 PROBE=~/.claude/skills/tui-probe/tui-probe
-$PROBE run tests/probes/<name>.toml --artifacts /tmp/out \
-  --var bin=target/debug/flk --var home=<sandbox> --var xdg=/tmp/<short>
+python3 tests/probes/run.py --bin target/debug/flk \
+  --runbook tests/probes/<name>.toml --artifacts /tmp/probe-out --driver "$PROBE"
 ```
 
 Every runbook takes `bin`, so the same script runs against two builds. That
@@ -39,6 +45,138 @@ that describe the bug — is the point of the format.
 - **Seed the config.** `onboarding = false` skips the welcome dialogs, and
   binding what you need to a plain key (`toggle_prompt_expand = ["f8"]`)
   avoids driving prefix-mode chords.
-- **Kill the server the probe leaves behind.** Stopping the probe stops the
-  client; flk's server daemonises and survives. Match on the sandbox binary
-  path so you can never signal the user's real server.
+- **Use the wrapper for either build.** It copies the selected binary inside a
+  private `/tmp/flock-autodetect-test-<owner-pid>-<random>` sandbox, seeds config,
+  removes inherited `FLOCK_*` variables, and records its server before invoking
+  the driver. Normal completion stops that owned child and removes the copy.
+  Optional `--artifacts` keeps driver artifacts separately; binary copies and
+  state always stay disposable. Never leave an unfixed binary copy outside this
+  lifecycle.
+
+## Crash recovery and identity
+
+Before starting a server, the auto-detect test suite sweeps the same sandbox
+namespace. Live owner PIDs are kept. For dead owners, durable `.server-*.json`
+records must prove the recorded native birth time, exact launch argv, sandbox
+HOME and state directory, and the executable file identity captured before spawn.
+The file identity consists of device, inode, size and nanosecond modification
+time. These cheap metadata checks detect replacement, unlinking and ordinary
+edits without hashing a large test executable. They are not a cryptographic
+signature against deliberate metadata manipulation in these private fixtures.
+Neither a path nor Linux's deleted-executable marker authorizes a signal.
+A record whose PID belongs to a process outside that sandbox is refused,
+even if that process has the expected argv and birth time. Older or incomplete
+records without the required proof are retained and logged.
+
+The argv must be the fixture's exact server invocation, rather than a client
+command containing the word `server`. Direct spawns record the known launch
+invocation, since a freshly forked child can still expose inherited argv before
+exec. Detached discovery excludes the declared client PID and records only an
+exact server invocation while the test owns the sandbox. The Python wrapper
+records native birth time at spawn, using Linux process facts or Darwin's public
+`proc_bsdinfo` ABI; the Rust tests check parity with the native Rust reading.
+
+Identity is rechecked before SIGTERM and again before SIGKILL. SIGTERM gets the
+shared `TERM_GRACE` constant (two seconds) to close owned PTYs; escalation has the
+existing five-second exit ceiling. Kernel exit notifications bound both waits.
+Linux signals through the same pidfd registered before verification. Darwin
+kqueue tracks exit but does not provide an atomic signal handle: exit, reaping
+and PID reassignment would all have to happen between the final birth check and
+`kill`, with no userspace wait in that syscall-sized gap. This residual reuse
+window is negligible for the private fixtures, but is not a pidfd guarantee.
+Unproven identities, incomplete records, unavailable inspection and timeouts are
+logged and retain the sandbox. There are no pattern-based signals in this sweep.
+Concurrent sweepers use a nonblocking per-sandbox lock. Copied binaries disappear
+only with their recovered sandbox. Live owner PIDs, including dead owners whose
+PID has been reassigned to a live process, are retained.
+
+The copied probe server is recorded by the wrapper; direct and detached
+auto-detect servers are recorded by shared test support. Before spawning, the
+auto-detect launcher resolves and atomically records its canonical binary path
+and file identity, then executes the requested launch path, preserving symlink
+aliases. PID recording copies both facts into the durable server record rather
+than using live `argv[0]` as binary identity.
+The Python wrapper captures the same metadata before spawning its copied binary.
+Every match checks the current regular file against that immutable identity.
+Missing launch facts, missing file identity in older records, unavailable files
+and changed metadata are logged and remain unproven. A replaced or unlinked
+binary therefore retains its sandbox and server, even when argv and birth still
+match. Restore the original file at its recorded path to permit recovery, or
+inspect and stop the owned fixture manually. Rebuilding at the same path does
+not renew an existing server's proof.
+Rust tests in `tests/sandbox_sweep.rs` exercise the actual wrapper, replacement
+binaries, legacy records, identity refusals, graceful termination and escalation
+with real owned processes.
+The stage reader rejects EOF and unexpected output and fails within 30 seconds
+if a producer remains alive but silent, including after a partial line.
+
+## Python in CI
+
+Both supported CI legs (`ubuntu-latest` and `macos-15`) use
+[ci-leg.yml](../../.github/workflows/ci-leg.yml). Its test job runs
+`python3 scripts/nextest_version.py` before installing nextest, then uses Python
+again for shard selection and reports. Python is therefore a prerequisite before
+any Rust shard can run. This includes the `SignalChild` signal/escalation
+fixtures in `sandbox_sweep.rs`, not just the Python probe wrapper. The shared
+`test` job in
+[ci-leg.yml](../../.github/workflows/ci-leg.yml) runs `Read nextest version`
+(`python3 scripts/nextest_version.py`) before `Install Rust tools` and `Run shard`.
+Both the Ubuntu and macOS legs select this workflow in
+[ci.yml](../../.github/workflows/ci.yml), so no interpreter-availability skip is
+needed. Local checks likewise require Python. A missing interpreter is
+an explicit setup failure rather than an unnoticed loss of the Rust crash proof.
+
+## Socket-driven measurement scripts
+
+`fork_resume_messaging.py --bin <binary> --mode fork|resume` drives an owned fake
+Claude harness through an isolated server. The fork case uses `agent.fork` with
+a fixture transcript; the resume case launches `claude --resume` through
+`agent.start`. Both inject a stale pane environment into real Stop-hook and
+inbox-read CLI processes, verify wake/read ownership agrees, and exercise send
+and reply without model calls. The `fork_resume_messaging` nextest binary runs
+both cases. All sockets use a short sandbox, inherited `FLOCK_*` variables are
+cleared, and every producer wait has a failure ceiling.
+
+`agent_wake.py` is not a TUI runbook: it drives an isolated flk over its socket
+to time wakes (idle, mid-turn, with a harness background task), and it reads an
+`event-log.jsonl` or a System One endpoint for the volume and judge-latency
+figures in ADR-0028 and ADR-0030. It refuses to run the pane probes without
+`--sandbox`. `python3 -I tests/probes/agent_wake.py --help` lists the setup.
+
+`fork_cache.py` is the runbook behind ADR-0033's fork-cost figures: its
+docstring is the setup (an isolated flk, a warm throwaway Claude session, a
+fork through `agent.fork` or in place), and `usage <session id>` prints the
+cache read and creation tokens of every turn from the Claude transcript.
+
+`harness_question_hooks.py` re-measures the harness facts ADR-0034 rests on.
+For Claude these are: a `PreToolUse` hook answering `AskUserQuestion` and
+approving `ExitPlanMode`, `--disallowedTools`, failures falling open by
+default and `onFailure: "block"` closing them, and mid-turn
+`additionalContext`. For Codex they are: a deny, `request_user_input` reaching
+`PreToolUse`, mid-turn `additionalContext`, and a crashing, garbled, missing
+or slow hook failing open. It talks to no flk at all: it unsets every
+`FLOCK_*` variable, runs Claude in a private `tmux -L` server with no MCP
+servers and a minimal `--tools` list, and runs Codex against a throwaway
+`CODEX_HOME` (a copy of `auth.json`, deleted on exit) under
+`workspace-write`. `--cwd` must be a folder Claude already trusts. Re-run it
+on every harness version the fleet pins.
+
+`question_hook_claude.py` is #1180's live acceptance (ADR-0034 §3, §4): a real
+Claude Code session behind flk's question hook. In an isolated flk, a Claude
+delegate started from a root pane calls `AskUserQuestion`: no dialog is drawn,
+the hook returns `deny` with the server's reason, and a following `Read` starts
+no hook process. With the server stopped, a root's dialog draws and its hook
+takes under 500 ms, and a `route`-hinted delegate is refused with the fallback
+sentence. The hook entry is the one `flk integration install claude` writes
+into a sandbox `CLAUDE_CONFIG_DIR`, passed to Claude with `--settings`, so the
+operator's profile is never written. Run it once per build, `--flk` naming a
+build with the change and then one without, for the A/B. Pass `--app-dir` explicitly:
+`flock-dev` when the binary has debug assertions, `flock` otherwise. Rust callers
+use `support::paths::app_dir_name()`; neither a renamed binary nor a custom target
+directory is evidence of its compiled namespace.
+
+`worktree-checkout-unreachable.py --flk <binary>` drives a real isolated server
+and PTY client against an owned checkout with its gitfile removed. It confirms
+the kill dialog displays the full remount/no-prune recovery, then checks the
+same typed API refusal and preserved checkout. It clears inherited environment,
+uses short socket paths and bounds every producer wait without sleeps.

@@ -50,8 +50,6 @@ pub struct PaneDetail {
     pub state_labels: HashMap<String, String>,
     /// Session-promoted header fields (chips), non-expired, insertion order.
     pub header_fields: Vec<(String, String)>,
-    /// Live status-line activity while Working (e.g. "Implementing the parser").
-    pub live_activity: Option<String>,
     /// When the effective agent state last transitioned.
     pub state_changed_at: Option<std::time::Instant>,
 }
@@ -61,15 +59,15 @@ impl Tab {
         self.panes.values().any(|pane| {
             terminals
                 .get(&pane.attached_terminal_id)
-                .is_some_and(|terminal| terminal.state == AgentState::Working)
+                .is_some_and(|terminal| terminal.presentation_state(true).0 == AgentState::Working)
         })
     }
 
     /// (state, seen) for every pane in THIS tab with a live terminal — the
     /// per-tab counterpart of [`Workspace::pane_states`] (#394). The tab
     /// strip tints a tab by its own panes' join; deriving it here, over the
-    /// same `(terminal.state, pane.seen)` pair the workspace scope reads, is
-    /// what keeps the two strips from disagreeing about the same pane.
+    /// same lifecycle-projected pair the workspace scope reads, is what keeps
+    /// the two strips from disagreeing about the same pane.
     pub fn pane_states<'a>(
         &'a self,
         terminals: &'a HashMap<TerminalId, TerminalState>,
@@ -77,7 +75,7 @@ impl Tab {
         self.panes.values().filter_map(|pane| {
             terminals
                 .get(&pane.attached_terminal_id)
-                .map(|terminal| (terminal.state, pane.seen))
+                .map(|terminal| terminal.presentation_state(pane.seen))
         })
     }
 
@@ -100,14 +98,15 @@ impl Tab {
         terminals: &'a HashMap<TerminalId, TerminalState>,
     ) -> impl Iterator<Item = PaneSignal<'a>> + 'a {
         self.panes.values().filter_map(|pane| {
-            terminals
-                .get(&pane.attached_terminal_id)
-                .map(|terminal| PaneSignal {
-                    state: terminal.state,
-                    seen: pane.seen,
+            terminals.get(&pane.attached_terminal_id).map(|terminal| {
+                let (state, seen) = terminal.presentation_state(pane.seen);
+                PaneSignal {
+                    state,
+                    seen,
                     harness: terminal.effective_known_agent(),
                     label: terminal.display_agent_label(),
-                })
+                }
+            })
         })
     }
 
@@ -118,15 +117,12 @@ impl Tab {
             .filter_map(|id| {
                 let pane = self.panes.get(id)?;
                 let terminal = terminals.get(&pane.attached_terminal_id)?;
-                let fallback_agent_label = terminal
-                    .agent_name
-                    .as_deref()
-                    .or_else(|| terminal.effective_agent_label())?
-                    .to_string();
-                let agent_label = terminal
-                    .effective_display_agent()
-                    .unwrap_or_else(|| fallback_agent_label.clone());
+                terminal
+                    .agent_name()
+                    .or_else(|| terminal.effective_agent_label())?;
+                let agent_label = terminal.display_agent_label()?.into_owned();
                 let presentation = terminal.effective_presentation();
+                let (state, seen) = terminal.presentation_state(pane.seen);
                 Some(PaneDetail {
                     pane_id: *id,
                     tab_idx: self.number.saturating_sub(1),
@@ -134,14 +130,11 @@ impl Tab {
                     label: agent_label.clone(),
                     agent_label,
                     agent: terminal.effective_known_agent(),
-                    state: terminal.state,
-                    seen: pane.seen,
+                    state,
+                    seen,
                     custom_status: presentation.custom_status,
                     state_labels: presentation.state_labels,
                     header_fields: terminal.active_header_fields(),
-                    live_activity: (terminal.state == AgentState::Working)
-                        .then(|| terminal.live_activity.clone())
-                        .flatten(),
                     state_changed_at: terminal.state_changed_at,
                 })
             })
@@ -395,7 +388,7 @@ mod tests {
         let mut terminals = HashMap::new();
         let mut terminal = terminal_for_pane(&ws, root_pane);
         terminal.set_detected_state(Some(Agent::Pi), AgentState::Working);
-        terminal.set_agent_name("planner".into());
+        terminal.set_agent_name("planner".into()).unwrap();
         terminals.insert(terminal.id.clone(), terminal);
 
         let labels: Vec<_> = ws

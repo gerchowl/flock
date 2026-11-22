@@ -1,0 +1,45 @@
+
+ ▐▛███▛█   Claude Code v2.1.296
+▝▜██████▀  Haiku 5.5 · Claude Max
+ ▝▝   ▝▝   /fixture/questions-1038/repo
+
+
+❯ Call the AskUserQuestion tool exactly once with one question: question "Which
+  colour should the probe use?", header "Colour", multiSelect false, options
+  Red (description "A red probe") and Blue (description "A blue probe"). Do
+  nothing else.
+────────────────────────────────────────────────────────────────────────────────
+ ☐ Colour
+
+Which colour should the probe use?
+
+  1. Red
+     A red probe
+  2. Blue
+     A blue probe
+❯ 3. Type something.
+────────────────────────────────────────────────────────────────────────────────
+  4. Chat about this
+
+Enter to select · ↑/↓ to navigate · ctrl+g to edit in nano · Esc to cancel
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

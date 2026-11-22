@@ -50,26 +50,68 @@ pub(super) fn detect(agent: Agent, screen_content: &str) -> AgentDetection {
         return AgentDetection {
             state,
             activity: None,
+            provider_limit: None,
             skip_state_update: true,
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
+            settled_with_background_shells: false,
+            background_tasks: None,
+            needs_human: None,
+            question: None,
         };
     }
 
+    // Claude and Codex show a reset clock, never a duration (#1023).
+    let limit = |hit: bool| {
+        hit.then_some(super::provider_limit::ProviderLimit {
+            retry_after_ms: None,
+        })
+    };
+    let provider_limit = (state == AgentState::Blocked)
+        .then(|| match agent {
+            Agent::OpenCode => super::provider_limit::opencode(screen_content),
+            Agent::Claude => limit(claude_code::has_provider_limit(screen_content)),
+            Agent::Codex => limit(codex::has_provider_limit(screen_content)),
+            _ => None,
+        })
+        .flatten();
+    let needs_human = (state == AgentState::Blocked && provider_limit.is_none())
+        .then(|| match agent {
+            Agent::Claude => Some(claude_code::needs_human(screen_content)),
+            Agent::Codex => Some(codex::needs_human(screen_content)),
+            _ => None,
+        })
+        .flatten();
+    let question = (needs_human == Some(crate::api::agent_state::HumanReason::Question))
+        .then(|| match agent {
+            Agent::Claude => claude_code::question(screen_content),
+            Agent::Codex => codex::question(screen_content),
+            _ => None,
+        })
+        .flatten();
     let activity = if agent == Agent::Claude && state == AgentState::Working {
         claude_code::live_activity_text(screen_content)
     } else {
-        None
+        provider_limit.as_ref().map(|wait| wait.description())
     };
 
     AgentDetection {
         state,
         activity,
+        provider_limit,
         skip_state_update: false,
         visible_blocker: has_visible_blocker(agent, screen_content, state),
         visible_idle: has_visible_idle(agent, screen_content, state),
         visible_working: has_visible_working(agent, screen_content, state),
+        settled_with_background_shells: agent == Agent::Claude
+            && state == AgentState::Idle
+            && claude_code::settled_with_background_shells(screen_content),
+        background_tasks: (agent == Agent::Claude)
+            .then(|| claude_code::background_task_count(screen_content))
+            .flatten(),
+        needs_human,
+        question,
     }
 }
 
@@ -106,6 +148,7 @@ fn has_visible_blocker(agent: Agent, content: &str, state: AgentState) -> bool {
         Agent::Claude => claude_code::has_visible_blocker(content),
         Agent::Codex => codex::has_visible_blocker(content),
         Agent::Kimi => kimi::has_visible_blocker(content),
+        Agent::OpenCode => super::provider_limit::opencode(content).is_some(),
         _ => false,
     }
 }

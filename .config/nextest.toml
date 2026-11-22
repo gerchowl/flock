@@ -1,3 +1,6 @@
+# #1393: older runners can leak sibling capture pipes on Darwin (upstream #3553).
+nextest-version = "0.9.145"
+
 # nextest configuration.
 #
 # Why this exists: the integration suites in `tests/` each spawn several real
@@ -11,14 +14,72 @@
 # a runner-minutes problem.
 #
 # Fix: serialize the worst multi-process offenders so they never compete with
-# each other, and give every PTY-spawning integration binary a couple of
-# retries to absorb residual timing flakiness. Unit tests (lib/bin) stay fully
-# parallel and are not retried, so genuine logic failures still fail fast.
+# each other. Existing integration retry settings below are retained unchanged
+# by #1317. New flake fixes follow CONTRIBUTING.md: condition evidence and
+# producer liveness, with a measured termination ceiling only as a backstop.
+
+[profile.default]
+# #1317 backstop only: condition waits and producer liveness decide correctness.
+# docs/next/nextest-timings.md: all but mesh_delivery have p99 < 42s on both legs.
+slow-timeout = { period = "60s", terminate-after = 7 }
 
 [test-groups]
 # At most one of these heavy, multi-process tests runs at a time across the
 # whole nextest run.
 serial-pty = { max-threads = 1 }
+
+[[profile.default.overrides]]
+# #3102: scoped messaging must pass without masking authentication refusals.
+filter = 'binary(=mcp_native_reply)'
+retries = 0
+
+[[profile.default.overrides]]
+# #1894: mount.rs belongs to client_tokens; all optional web acceptance tests run once.
+filter = 'binary(=client_tokens) | binary(=gui_build) | (binary(=flk) & (test(web::) | test(server::headless::tests::fatal_client_accept_)))'
+retries = 0
+
+[[profile.default.overrides]]
+# #1894: foundation accept and descriptor safety must fail on their first attempt.
+filter = 'binary(=flk) & (test(api::client_listener::) | test(api::server::tests::ping_reports_only_) | test(web::listener_foundation::) | test(platform::client_listener::) | test(platform::received_fd::) | test(receiver_accumulates_150_fds_across_batches_in_order) | test(handoff_receive_passes_platform_flags_before_fcntl))'
+retries = 0
+
+[[profile.default.overrides]]
+# Hang ceiling only (#1317): condition waits decide correctness, while a
+# silent live producer must eventually produce a named test failure in CI.
+# Retain the stricter 180s backstop: each binary's measured p99 is below 18s
+# where observed (docs/next/nextest-timings.md).
+# mesh_step2 (#1349) uses the default 420s: p99 36.409s requires >= 364.09s.
+filter = 'binary(=delegate) | binary(=agent_settled) | binary(=api_ping) | binary(=cli_wrapper) | binary(=server_readiness) | binary(=live_handoff)'
+slow-timeout = { period = "60s", terminate-after = 3 }
+
+[[profile.default.overrides]]
+# Backstop restart fixture waits in #1051, including child startup and CLI teardown.
+# The earlier readiness rule already covers every live_handoff test at 180s.
+# Completion still depends on the worker reason or complete launch report.
+filter = 'binary(=flk) & test(=app::agent_restart::tests::restart_api_resumes_same_session_flags_env_and_delivers_continuation)'
+slow-timeout = { period = "60s", terminate-after = 3 }
+
+[[profile.default.overrides]]
+# Ubuntu mesh_delivery p99 = 63.390s, requiring >= 633.90s (#1317).
+# See docs/next/nextest-timings.md for runs and reproduction.
+filter = 'binary(=mesh_delivery)'
+slow-timeout = { period = "60s", terminate-after = 11 }
+
+[[profile.default.overrides]]
+# This end-to-end check intentionally observes the full 30-second startup grace.
+filter = 'binary(delegate_verdict) & test(delegate_idle_without_new_turn_reports_not_started_and_informs_s1)'
+slow-timeout = { period = "30s", terminate-after = 14 }
+
+[[profile.default.overrides]]
+# The lost-brief resubmit (#828) waits out the same 30-second startup window.
+filter = 'binary(delegate_codex) & test(codex_delegate_start_resubmits_a_brief_lost_at_startup)'
+slow-timeout = { period = "60s", terminate-after = 7 }
+
+[[profile.default.overrides]]
+# Acceptance must expose flakes even without a command-line retry override.
+filter = 'binary(mesh_step1) | binary(mesh_step2) | binary(mesh_forwarding)'
+test-group = 'serial-pty'
+retries = 0
 
 [[profile.default.overrides]]
 # The federation hub/spoke and detach/reattach suites stand up multiple servers
@@ -34,15 +95,46 @@ serial-pty = { max-threads = 1 }
 # is actually running. Under contention that handshake is the first thing to
 # miss its deadline, and it fails as "the MCP pane did not start" — a message
 # that reads like a product bug and is not one.
-filter = 'binary(peer_federation) | binary(cross_area) | binary(live_handoff) | binary(mcp_fleet_messaging)'
+# fleet_gossip also exercises multi-node restart and held-edge faults.
+# mesh_step1 includes live handoff and a two-second reverse-edge assertion.
+filter = 'binary(peer_federation) | binary(cross_area) | binary(live_handoff) | binary(mcp_fleet_messaging) | binary(fleet_gossip) | binary(mesh_enrollment) | binary(mesh_step1) | binary(mesh_routes)'
 test-group = 'serial-pty'
 retries = 2
 
 [[profile.default.overrides]]
+# #1490 proves the finite frozen-readiness request sequence and client EOF.
+filter = 'binary(=delegate_r4) & test(=a28_a_frozen_server_cannot_hold_start_in_readiness)'
+retries = 0
+
+[[profile.default.overrides]]
+# #2000: admission and helper lock-lifetime regressions must fail on first run.
+filter = 'binary(=flk) & (test(structured::permissions::auth::tokens::) | test(platform::client_token_lock::))'
+retries = 0
+
+[[profile.default.overrides]]
+# S10f owns an attached TUI and model/MCP processes; serialize without retries.
+filter = 'binary(=structured_tui)'
+test-group = 'serial-pty'
+retries = 0
+
+[[profile.default.overrides]]
 # The remaining integration binaries also spawn the real `flock` process; let
 # them run in parallel but retry to ride out timing hiccups under CI load.
-filter = 'kind(test)'
+# #1371's rollback handshake and receiver checks need no retry.
+filter = 'kind(test) & !(binary(=delegate) & (test(a11_) | test(rollback_fixture_)))'
 retries = 2
+
+[profile.ci]
+# Inherit the default 420s ceiling as well as every scoped ceiling (#1317).
+# CI's profile (#991). It inherits every `profile.default` override above —
+# the serial-pty group, the retries and the slow-timeouts — and only adds a
+# JUnit report, which `scripts/ci_shards.py summary` turns into the job
+# summary (slowest tests, per-binary totals, per-shard wall clock).
+# Written to target/nextest/ci/junit.xml.
+[profile.ci.junit]
+path = "junit.xml"
+store-success-output = false
+store-failure-output = true
 
 # NOTE: nextest IGNORES a top-level `[env]` table — it warns "ignoring unknown
 # configuration keys: env" and carries on, so pinning the test environment here

@@ -25,7 +25,7 @@ pub(super) fn run_digest_command(args: &[String]) -> std::io::Result<i32> {
         print!("{}", digest_help_text());
         return Ok(0);
     }
-    let mut json = false;
+    let mut json = super::output::json();
     let mut path: Option<String> = None;
     let mut since_secs: Option<u64> = None;
     let mut idx = 0;

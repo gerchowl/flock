@@ -4,6 +4,10 @@
 //! against known agent output patterns to determine state.
 
 mod agents;
+pub(crate) mod provider_limit;
+mod readiness;
+
+pub(crate) use readiness::readiness_text;
 
 /// The detected state of a terminal pane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,8 +27,9 @@ pub enum AgentState {
 pub struct AgentDetection {
     pub state: AgentState,
     /// Free-text activity from the agent's own status line (Claude's spinner
-    /// verb, e.g. "Implementing the parser"). Only set while Working.
+    /// verb, e.g. "Implementing the parser"). Also carries a provider-wait caption while Blocked.
     pub activity: Option<String>,
+    pub(crate) provider_limit: Option<provider_limit::ProviderLimit>,
     /// True when the current screen is an agent-owned viewer that shows
     /// transcript/history instead of the live prompt state.
     pub skip_state_update: bool,
@@ -40,6 +45,19 @@ pub struct AgentDetection {
     /// narrower than a fallback `Working` heuristic and may guard against stale
     /// hook idle reports.
     pub visible_working: bool,
+    /// True when a Claude turn visibly ended (`done <time>`) while background
+    /// shells or agents it started keep running (#911). Only ever set with
+    /// `state == Idle`.
+    pub settled_with_background_shells: bool,
+    /// Background tasks the agent's own screen counts (Claude's footer,
+    /// #1022), whatever the turn. `None` when this screen cannot say.
+    pub background_tasks: Option<u32>,
+    /// What a `Blocked` screen asks of a human (#1023), for harnesses whose
+    /// prompts the detector can name. `None` otherwise, and on a provider limit.
+    pub needs_human: Option<crate::api::agent_state::HumanReason>,
+    /// The structured question a `needs_human{question}` screen draws
+    /// (ADR-0028 §8a, #1038), when its harness's form can be read.
+    pub question: Option<crate::api::question::QuestionForm>,
 }
 
 /// Which agent we detected running in a pane.
@@ -259,6 +277,67 @@ pub fn identify_agent_in_job(job: &crate::platform::ForegroundJob) -> Option<(Ag
     best.map(|(_, agent, name)| (agent, name))
 }
 
+/// Transcript evidence with the detectors' recognized live status rows removed.
+/// A Claude spinner wrapped over several rows is removed whole (#1264).
+pub(crate) fn progress_text(screen: &str) -> String {
+    let lines: Vec<&str> = screen.lines().collect();
+    let spinners = agents::claude_code::spinner_rows(&lines);
+    lines
+        .iter()
+        .enumerate()
+        .filter(|(row, line)| {
+            !agents::codex::is_progress_chrome(line)
+                && !spinners.iter().any(|spinner| spinner.rows.contains(row))
+                && !agents::opencode::is_progress_chrome(line)
+        })
+        .map(|(_, line)| normalize_running_tool_counter(line))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Keep Claude's running-tool row and controls, ignoring only elapsed time.
+fn normalize_running_tool_counter(line: &str) -> String {
+    let Some(activity) = line.trim().strip_prefix('⎿') else {
+        return line.to_owned();
+    };
+    let activity = activity.trim_start();
+    let Some(suffix) = activity
+        .strip_prefix("Running…")
+        .or_else(|| activity.strip_prefix("Running..."))
+    else {
+        return line.to_owned();
+    };
+    if !suffix.trim_start().starts_with('(') {
+        return line.to_owned();
+    }
+    let Some((row, details)) = line.trim_end().rsplit_once('(') else {
+        return line.to_owned();
+    };
+    let Some(details) = details.strip_suffix(')') else {
+        return line.to_owned();
+    };
+    let (elapsed, controls) = details
+        .split_once('·')
+        .map_or((details, None), |(elapsed, controls)| {
+            (elapsed, Some(controls))
+        });
+    let parts: Vec<&str> = elapsed.split_whitespace().collect();
+    if parts.is_empty()
+        || !parts.iter().all(|part| {
+            let Some(digits) = part.strip_suffix(['h', 'm', 's']) else {
+                return false;
+            };
+            !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+        })
+    {
+        return line.to_owned();
+    }
+    match controls {
+        Some(controls) => format!("{}({})", row, controls.trim_start()),
+        None => row.trim_end().to_owned(),
+    }
+}
+
 /// Detect the state of an agent from the live terminal tail snapshot.
 /// If `agent` is `None`, returns `Unknown`.
 #[cfg(test)]
@@ -272,19 +351,27 @@ pub fn detect_agent(agent: Option<Agent>, screen_content: &str) -> AgentDetectio
         return AgentDetection {
             state: AgentState::Unknown,
             activity: None,
+            provider_limit: None,
             skip_state_update: false,
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
+            settled_with_background_shells: false,
+            background_tasks: None,
+            needs_human: None,
+            question: None,
         };
     };
-    agents::detect(agent, screen_content)
+    let screen_content = readiness_text(agent, screen_content);
+    agents::detect(agent, &screen_content)
 }
 
 /// Whether the agent's input box is on screen and EMPTY — `None` when this
 /// agent's box cannot be read at all (ADR-0018 §2). The idle wake types only
 /// into an empty box: text already there is somebody's unsent draft, and a
-/// sentence appended to it would be submitted along with it.
+/// sentence appended to it would be submitted along with it. Callers pass a
+/// read whose faint cells are blanked, which is what keeps Claude's dimmed
+/// prompt suggestion from reading as a draft (#892).
 pub fn agent_prompt_is_empty(agent: Agent, screen_content: &str) -> Option<bool> {
     match agent {
         Agent::Claude => {
@@ -292,6 +379,128 @@ pub fn agent_prompt_is_empty(agent: Agent, screen_content: &str) -> Option<bool>
         }
         _ => None,
     }
+}
+
+/// Whether a Claude turn ended with background shells or agents still running
+/// (#911): settled, not working, but not empty-handed either.
+pub(crate) fn settled_with_background_shells(screen: &str) -> bool {
+    agents::claude_code::settled_with_background_shells(screen)
+}
+
+/// Read the recognized Claude composer from the unscrolled detection snapshot.
+pub(crate) fn claude_composer(screen: &str) -> Option<String> {
+    agents::claude_code::prompt_input(screen)
+}
+
+/// Read the Codex prompt and footer bounds from the unscrolled snapshot.
+pub(crate) fn codex_composer_region(screen: &str) -> Option<(usize, usize)> {
+    let screen = readiness_text(Agent::Codex, screen);
+    agents::codex::composer_region(&screen)
+}
+
+/// Read Codex's composer with the terminal width needed to verify clipped controls.
+pub(crate) fn codex_composer_region_with_width(
+    screen: &str,
+    cols: Option<u16>,
+) -> Option<(usize, usize)> {
+    let screen = readiness_text(Agent::Codex, screen);
+    match cols {
+        Some(_) => agents::codex::composer_region_with_width(&screen, cols),
+        None => codex_composer_region(&screen),
+    }
+}
+
+/// A recognizable shortcut prefix, clipped precisely at the terminal edge.
+pub(crate) fn codex_clipped_shortcut_footer(line: &str, cols: u16) -> bool {
+    agents::codex::clipped_shortcut_footer(line, Some(cols))
+}
+
+/// A clipped model status is only a candidate boundary, never proof of an empty editor.
+pub(crate) fn codex_clipped_model_footer(line: &str, cols: u16) -> bool {
+    agents::codex::clipped_model_footer(line, Some(cols))
+}
+
+/// Whether this screen is Claude Code's folder-trust dialog and nothing else.
+/// This is the plain variant; permission pre-approval has its own named seam.
+///
+/// The public seam for the `delegate` readiness gate (#612): a caller that has
+/// read a pane's bottom buffer asks the DETECTOR rather than carrying its own
+/// copy of the pattern, because a second copy is a second rule to keep scoped
+/// to the live region and it would drift from this one the first time the
+/// dialog's wording moved. `false` for any other screen, including one where
+/// the dialog's text is quoted in scrollback.
+pub fn claude_waiting_on_folder_trust(screen_content: &str) -> bool {
+    agents::claude_code::has_folder_trust_dialog(screen_content)
+        && !agents::claude_code::has_folder_trust_with_permissions_dialog(screen_content)
+}
+
+/// Folder trust that also pre-approves tools: an operator must decide (#1116).
+pub fn claude_waiting_on_folder_trust_with_permissions(screen_content: &str) -> bool {
+    agents::claude_code::has_folder_trust_with_permissions_dialog(screen_content)
+}
+
+/// The live Codex conversation lock (#1667), shared with guarded resolution.
+pub fn codex_conversation_locked(screen_content: &str) -> bool {
+    agents::codex::has_codex_conversation_lock(screen_content)
+}
+
+/// The live Codex hook-review dialog, shared with delegate readiness.
+pub fn codex_waiting_on_hook_review(screen_content: &str) -> bool {
+    agents::codex::has_codex_hook_review(&screen_content.to_lowercase())
+}
+
+/// The live Codex folder-trust dialog (#828), shared with delegate readiness.
+pub fn codex_waiting_on_folder_trust(screen_content: &str) -> bool {
+    agents::codex::has_codex_folder_trust(&screen_content.to_lowercase())
+}
+
+/// Whether `screen` shows a live turn that follows `text`, echoed as the last
+/// prompt submitted above it (#870).
+///
+/// A guarded submit's own confirmation: the agent's history shows what was
+/// sent and its running-turn chrome sits below that, so the turn is ours even
+/// when the turn cursor has not moved yet and a provider notice (the weekly
+/// limit warning, an update notice) was printed between the echo and the
+/// composer. A Working row with a different or no echo above it proves nothing.
+pub(crate) fn live_turn_follows_submitted(agent: Agent, screen: &str, text: &str) -> bool {
+    let screen = readiness_text(agent, screen);
+    match agent {
+        Agent::Codex => agents::codex::live_turn_follows_echo(&screen, text),
+        Agent::Claude => agents::claude_code::live_turn_follows_echo(&screen, text),
+        _ => false,
+    }
+}
+
+/// Whether the prompt echoed at `lines[echo]` behind one of `markers` is
+/// exactly `text`, compared without whitespace so terminal wrapping does not
+/// matter. The echo must end at a row boundary before `end`, so a longer
+/// prompt that merely starts with `text` does not match.
+fn echo_matches(lines: &[&str], echo: usize, end: usize, markers: &[char], text: &str) -> bool {
+    let compact = |text: &str| {
+        text.chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>()
+    };
+    let target = compact(text);
+    let Some(first) = lines[echo].trim_start().strip_prefix(markers) else {
+        return false;
+    };
+    let mut echoed = compact(first);
+    let mut next = echo + 1;
+    while !target.is_empty() && target.starts_with(&echoed) {
+        if echoed == target {
+            // A continuation row is indented, so anything else starts a new block.
+            return next == end
+                || lines[next].trim().is_empty()
+                || !lines[next].starts_with(char::is_whitespace);
+        }
+        if next >= end {
+            return false;
+        }
+        echoed.push_str(&compact(lines[next]));
+        next += 1;
+    }
+    false
 }
 
 pub fn should_skip_state_update(agent: Option<Agent>, screen_content: &str) -> bool {
@@ -386,7 +595,7 @@ fn detect_kilo(content: &str) -> AgentState {
 // ---------------------------------------------------------------------------
 
 /// Check for action confirmations followed by "yes" or "❯".
-fn has_confirmation_prompt(lower_content: &str) -> bool {
+pub(crate) fn has_confirmation_prompt(lower_content: &str) -> bool {
     if let Some(pos) = lower_content
         .find("do you want to")
         .or_else(|| lower_content.find("would you like to"))
@@ -661,6 +870,15 @@ mod tests {
                 .as_nanos()
         );
         std::env::temp_dir().join(unique)
+    }
+
+    #[test]
+    fn detect_compaction_chrome_in_claude_and_opencode_is_working() {
+        assert_eq!(detect_claude("✶ Compacting conversation… (esc to interrupt)\n─────────────────────────\n❯ \n─────────────────────────"), AgentState::Working);
+        assert_eq!(
+            detect_opencode("Compacting conversation\n■■■■⬝⬝  esc interrupt  opencode"),
+            AgentState::Working
+        );
     }
 
     #[test]
@@ -1244,6 +1462,10 @@ mod tests {
 
         let wrapped = "─────────────\n❯ \n  continued draft\n─────────────";
         assert_eq!(agent_prompt_is_empty(Agent::Claude, wrapped), Some(false));
+
+        // Text alone cannot tell a suggestion from a draft, so it reads as typed (#892).
+        let typed = "─────────────\n❯ Try \"refactor check-ssot.sh\"\n─────────────";
+        assert_eq!(agent_prompt_is_empty(Agent::Claude, typed), Some(false));
 
         assert_eq!(agent_prompt_is_empty(Agent::Claude, "no box at all"), None);
         assert_eq!(agent_prompt_is_empty(Agent::Codex, empty), None);
@@ -1938,6 +2160,57 @@ mod tests {
     }
 
     // ---- OpenCode ----
+
+    #[test]
+    fn opencode_provider_limit_is_blocked_before_progress() {
+        for error in [
+            "Free usage exceeded, subscribe to Go",
+            "rate limit",
+            "usage limit reached",
+        ] {
+            let screen = format!("■■⬝⬝⬝⬝⬝⬝ {error} [retrying in 46m 15s attempt #1] esc interrupt");
+            let detection = detect_agent(Some(Agent::OpenCode), &screen);
+            assert_eq!(detection.state, AgentState::Blocked, "{error}");
+            assert!(detection.visible_blocker);
+        }
+    }
+
+    #[test]
+    fn opencode_provider_limit_wrapped_capture_retains_eta() {
+        let screen = "■■⬝⬝⬝⬝⬝⬝ Free usage exceeded, subscribe to Go [retry\ning in 46m 15s attempt #1]      esc interrupt";
+        assert_eq!(detect_opencode(screen), AgentState::Blocked);
+        assert_eq!(
+            provider_limit::opencode(screen).unwrap().retry_after_ms,
+            Some(2_775_000)
+        );
+    }
+
+    #[test]
+    fn opencode_provider_limit_requires_live_controls_on_same_row() {
+        for screen in [
+            "Free usage exceeded [retrying in 46m attempt #1]\n■■⬝⬝⬝⬝⬝⬝ esc interrupt",
+            "Free usage exceeded [retrying in 46m attempt #1]",
+            "■■⬝⬝⬝⬝⬝⬝ tool failed [retrying in 46m attempt #1] esc interrupt",
+            "■■⬝⬝⬝⬝⬝⬝ rate limit esc interrupt",
+            "A quoted status: ■■⬝⬝⬝⬝⬝⬝ rate limit [retrying in 46m attempt #1] esc interrupt",
+            "■■⬝⬝⬝⬝⬝⬝ esc interrupt\nrate limit [retrying in 46m attempt #1]",
+            "■■⬝⬝⬝⬝⬝⬝\n\nrate limit [retrying in 46m attempt #1] esc interrupt",
+            "■■⬝⬝⬝⬝⬝⬝ rate limit [retrying in 46m attempt #1] esc interrupt\n■■⬝⬝⬝⬝⬝⬝ esc interrupt",
+        ] {
+            assert_ne!(detect_opencode(screen), AgentState::Blocked, "{screen}");
+        }
+    }
+
+    #[test]
+    fn opencode_provider_limit_recovers_on_next_screen() {
+        let wait = "■■⬝⬝⬝⬝⬝⬝ rate limit [retrying in 2s attempt #1] esc interrupt";
+        assert_eq!(detect_opencode(wait), AgentState::Blocked);
+        assert_eq!(
+            detect_opencode("■■⬝⬝⬝⬝⬝⬝ esc interrupt"),
+            AgentState::Working
+        );
+        assert_eq!(detect_opencode("ctrl+p commands"), AgentState::Idle);
+    }
 
     #[test]
     fn opencode_waiting_permission() {
@@ -2763,6 +3036,17 @@ Which framework should we use?\n\
         assert!(has_spinner_activity("  ✶ Reading…")); // with leading whitespace
         assert!(has_spinner_activity("✻ Pouncing…"));
         assert!(has_spinner_activity("✽ Processing…"));
+    }
+
+    /// A ticking glyph on a wrapped spinner is not progress (#1264).
+    #[test]
+    fn progress_text_drops_a_wrapped_spinner_whole() {
+        let frame = |glyph: char| {
+            format!("⏺ Reading the brief\n\n{glyph} Investigating why every pane\n  reads idle…\n  ⎿  Tip: x\n")
+        };
+        let first = progress_text(&frame('✢'));
+        assert_eq!(first, progress_text(&frame('✶')));
+        assert_eq!(first, "⏺ Reading the brief\n\n  ⎿  Tip: x");
     }
 
     #[test]

@@ -64,7 +64,7 @@ impl StateClass {
             // #175 C3: hibernated is a settled state — rank it at the Idle
             // tier so a hibernated pane never pretends to be blocked/working.
             AgentStatus::Idle | AgentStatus::Hibernated => Self::Idle,
-            AgentStatus::Unknown => Self::None,
+            AgentStatus::Unknown | AgentStatus::Offline => Self::None,
         }
     }
 

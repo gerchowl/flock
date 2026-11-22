@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 
 use crate::agent_self_compact::{
-    ArmedSelfCompact, SelfCompactAbort, SelfCompactPhase, COMPACT_COMMAND, MAX_CONTINUATION_BYTES,
+    ArmedSelfCompact, SelfCompactAbort, SelfCompactPhase, MAX_CONTINUATION_BYTES,
 };
 use crate::app::App;
 
@@ -57,6 +57,7 @@ impl App {
         &mut self,
         pane: &str,
         continuation: String,
+        instructions: Option<String>,
         now: Instant,
     ) -> bool {
         let Some((ws_idx, pane_id)) = self.parse_pane_id(pane) else {
@@ -75,7 +76,8 @@ impl App {
         {
             return false;
         }
-        terminal.armed_self_compact = Some(ArmedSelfCompact::new(continuation));
+        terminal.armed_self_compact =
+            Some(ArmedSelfCompact::new(continuation).with_instructions(instructions));
         crate::logging::self_compact_armed(pane, terminal_continuation_len(terminal));
         true
     }
@@ -327,6 +329,9 @@ impl App {
         if !crate::agent_self_compact::agent_can_self_compact(terminal.effective_known_agent()) {
             return SelfCompactDecision::Suppressed("cannot_self_compact");
         }
+        if self.active_submissions.contains(pane) {
+            return SelfCompactDecision::Suppressed("guarded_submit_in_flight");
+        }
         if self.idle_wake.in_flight(pane) {
             return SelfCompactDecision::Suppressed("idle_wake_in_flight");
         }
@@ -351,9 +356,9 @@ impl App {
         // Quiet is not empty: a draft left in the box would be submitted with
         // this. Read the screen here, at the keystroke, never on an earlier tick.
         let agent = terminal.effective_known_agent();
-        match agent
-            .and_then(|agent| crate::detect::agent_prompt_is_empty(agent, &runtime.visible_text()))
-        {
+        match agent.and_then(|agent| {
+            crate::detect::agent_prompt_is_empty(agent, &runtime.detection_text_and_unfaint().1)
+        }) {
             Some(true) => {}
             Some(false) => return SelfCompactDecision::Suppressed("prompt_not_empty"),
             None => return SelfCompactDecision::Suppressed("no_prompt_box"),
@@ -363,7 +368,18 @@ impl App {
             return SelfCompactDecision::Abandoned(SelfCompactAbort::PaneGone);
         };
         let text = match write {
-            Write::CompactCommand => COMPACT_COMMAND.to_string(),
+            // The command and its instructions go out as ONE paste, so the
+            // Enter a gap later submits both or neither (#854).
+            Write::CompactCommand => {
+                let Some(line) = terminal
+                    .armed_self_compact
+                    .as_ref()
+                    .map(ArmedSelfCompact::compact_line)
+                else {
+                    return SelfCompactDecision::Suppressed("not_armed");
+                };
+                line
+            }
             Write::Continuation => {
                 let Some(continuation) = terminal
                     .armed_self_compact
@@ -498,6 +514,13 @@ impl App {
     /// agent can act on instead of leaving it waiting for a continuation that
     /// was never coming.
     pub(crate) fn self_compact_refusal(&self, pane: &str) -> Option<&'static str> {
+        if self
+            .parse_pane_id(pane)
+            .and_then(|(ws, id)| self.terminal_for_pane(ws, id))
+            .is_some_and(|terminal| terminal.restart_in_progress)
+        {
+            return Some("restart_pending");
+        }
         if !self.state.config.session.self_compact {
             return Some("disabled");
         }
@@ -510,6 +533,17 @@ impl App {
         } else {
             Some("agent_cannot_self_compact")
         }
+    }
+
+    /// Whether this pane's harness can take instructions with its compact
+    /// command (#854). Asked at the verb, after [`Self::self_compact_refusal`],
+    /// so an arming that would silently lose them is refused instead.
+    pub(crate) fn self_compact_takes_instructions(&self, pane: &str) -> bool {
+        let agent = self
+            .parse_pane_id(pane)
+            .and_then(|(ws_idx, pane_id)| self.terminal_for_pane(ws_idx, pane_id))
+            .and_then(|terminal| terminal.effective_known_agent());
+        crate::agent_self_compact::compact_takes_instructions(agent)
     }
 
     /// The terminal a pane's state lives on. Reached directly rather than

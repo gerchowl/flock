@@ -1,0 +1,83 @@
+/* The integrated composer (ADR-0038 §2a, #2903): one field with the send button inside it, and the agent's phase and the shortcut under it. Tokens only; layout comes from the primitives. */
+
+.composer {
+  padding-block: var(--space-2) var(--space-3);
+  padding-inline: var(--space-4);
+  border-top: var(--border-width-thin) solid var(--color-separator);
+}
+
+.composer__sent {
+  padding: 0;
+  list-style: none;
+}
+
+.sent__text {
+  min-inline-size: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sent__status {
+  color: var(--color-label-secondary);
+}
+
+.sent--failed .sent__status,
+.sent--uncertain .sent__status,
+.sent--unknown_outcome .sent__status {
+  color: var(--color-status-red);
+}
+
+/* The field: the text area and, at its trailing edge, the send button. */
+.composer__field {
+  padding-block: var(--space-1);
+  padding-inline: var(--space-3) var(--space-1);
+  border: var(--border-width-thin) solid var(--color-separator);
+  border-radius: var(--radius-large);
+  background: var(--color-background-window);
+}
+
+.composer__input {
+  min-block-size: var(--size-control);
+  padding-block: var(--space-1);
+  padding-inline: 0;
+  border: 0;
+  background: transparent;
+  color: var(--color-label-primary);
+  font: inherit;
+  resize: none;
+}
+
+.composer__send {
+  flex-grow: 0;
+  align-self: flex-end;
+}
+
+.composer__send:enabled {
+  background: var(--color-accent-fill);
+  color: var(--color-accent-on);
+}
+
+.composer__send:disabled {
+  color: var(--color-label-tertiary);
+  cursor: not-allowed;
+}
+
+.composer__mode,
+.composer__hint {
+  color: var(--color-label-secondary);
+  font-size: var(--font-size-11);
+}
+
+.composer__hint {
+  white-space: nowrap;
+}
+
+/* A keyboard shortcut means nothing on a touch screen; the phone keeps 44 px touch targets. */
+.phone .composer__hint {
+  display: none;
+}
+
+.phone .composer__input {
+  min-block-size: var(--size-touch);
+}

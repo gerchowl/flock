@@ -13,6 +13,8 @@ pub struct RuntimeStatus {
     /// older than this field, which is healthy by default rather than unknown —
     /// the same reading `#[serde(default)]` gives the wire.
     pub session_health: Option<crate::platform::SessionHealth>,
+    pub api_listener: Option<crate::api::schema::ApiListenerHealth>,
+    pub agent_account_diagnostic: Option<crate::api::schema::AgentAccountDiagnostic>,
 }
 
 pub fn read_runtime_status_at(
@@ -31,20 +33,20 @@ pub fn read_runtime_status_at(
         method: Method::Ping(crate::api::schema::PingParams::default()),
     };
     let response = client
-        .request_value_with_timeout(&request, timeout)
+        .with_class(crate::api::client::RequestClass::ReadOrIdempotent)
+        .request_value_retrying(&request, timeout, Some(std::time::Instant::now() + timeout))
         .and_then(crate::api::client::parse_response_value);
     let response = match response {
         Ok(response) => response,
         Err(crate::api::client::ApiClientError::Io(err))
             if matches!(
                 err.kind(),
-                io::ErrorKind::ConnectionRefused
-                    | io::ErrorKind::NotFound
-                    | io::ErrorKind::TimedOut
+                io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
             ) =>
         {
             return Ok(None);
         }
+        Err(crate::api::client::ApiClientError::Io(err)) => return Err(err),
         Err(err) => return Err(io::Error::other(err)),
     };
     match response.result {
@@ -53,11 +55,16 @@ pub fn read_runtime_status_at(
             protocol,
             capabilities,
             session_health,
+            api_listener,
+            agent_account_diagnostic,
+            ..
         } => Ok(Some(RuntimeStatus {
             version: Some(version),
             protocol: Some(protocol),
             capabilities,
             session_health,
+            api_listener,
+            agent_account_diagnostic,
         })),
         result => Err(io::Error::other(format!(
             "server status request returned unexpected result: {result:?}"

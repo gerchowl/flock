@@ -176,6 +176,7 @@ impl PeerPollTracker {
 /// Cached state of one configured peer, updated by the poll loop.
 #[derive(Debug, Clone)]
 pub struct PeerSummaryState {
+    pub node_id: Option<String>,
     /// Peer name from config (sidebar host badge).
     pub peer: String,
     /// SSH destination used for polling and switch-on-select attach.
@@ -190,6 +191,8 @@ pub struct PeerSummaryState {
     pub system: Option<crate::api::schema::PeerSystemSummary>,
     /// Round-trip latency of the last successful summary poll.
     pub latency_ms: Option<u64>,
+    /// Optional pane-free directory from JSON gossip, absent in legacy attach snapshots.
+    pub structured_agents: Vec<crate::api::schema::PeerStructuredAgentSummary>,
     pub workspaces: Vec<PeerWorkspaceSummary>,
     pub last_ok: Option<Instant>,
     /// Last poll error, cleared on success.
@@ -222,7 +225,7 @@ pub struct PeerSummaryState {
     /// polls only; a carried or relayed row has no dial of ours to judge.
     pub dial: PeerDialHealth,
     /// Why this peer has no held relay stream, when establishing one failed
-    /// (#418). Set even while polls succeed over the one-shot fallback.
+    /// (#418). Kept visible while mesh enrollment is refused.
     pub stream_error: Option<String>,
 }
 
@@ -317,8 +320,31 @@ impl PeerDialHealth {
 }
 
 impl PeerSummaryState {
+    /// Keep observations bound to one authenticated owner, including a pinned
+    /// expected owner whose first summary poll failed. Transport diagnostics
+    /// remain per configured path; owner facts never cross an identity change.
+    pub(crate) fn bind_node(&mut self, node: Option<String>) {
+        if self.node_id == node {
+            return;
+        }
+        self.node_id = node;
+        self.host = None;
+        self.version = None;
+        self.protocol = None;
+        self.system = None;
+        self.latency_ms = None;
+        self.last_ok = None;
+        self.icon = None;
+        self.origin_last_ok_secs = None;
+        self.ingested_at = None;
+        self.proxy_jump = None;
+        self.workspaces.clear();
+        self.structured_agents.clear();
+    }
     pub fn new(config: &PeerConfig) -> Self {
         Self {
+            structured_agents: Vec::new(),
+            node_id: None,
             peer: config.name.clone(),
             ssh_target: config.ssh_target().to_string(),
             host: None,
@@ -518,9 +544,9 @@ impl FleetSnapshotState {
     }
 
     /// Re-encode for the next leap, excluding the hop target itself (it
-    /// becomes the self row on the receiving end) and any entry matching the
-    /// origin — the home row owns that slot, so a hub that lists itself in
-    /// [[peers]] must not render twice. Ages are recomputed so time spent on
+    /// becomes the self row on the receiving end). Known self/home copies are
+    /// folded by node ID when received, never by their display names.
+    /// Ages are recomputed so time spent on
     /// this server keeps counting against freshness. Peer count is bounded:
     /// the snapshot rides an env var between attach legs, and an unbounded
     /// fleet could brush ARG_MAX and kill the leg spawn.
@@ -530,7 +556,7 @@ impl FleetSnapshotState {
             peers: self
                 .peers
                 .iter()
-                .filter(|peer| peer.ssh_target != exclude_ssh_target && peer.peer != self.origin)
+                .filter(|peer| peer.ssh_target != exclude_ssh_target)
                 .take(FLEET_SNAPSHOT_MAX_PEERS)
                 .map(peer_to_wire)
                 .collect(),
@@ -548,22 +574,25 @@ impl FleetSnapshotState {
     /// Drop pushed rows that claim to be this snapshot's ORIGIN (#424 review).
     ///
     /// The home row is refreshed only from the bound hub's own `hub_self`, see
-    /// [`Self::absorb_hub_self`]. Anything else naming the home machine is a
-    /// claim by whichever node the hub polled, keyed on a host it chose, so it
-    /// is neither absorbed into the home row nor stored as a second one.
+    /// [`Self::absorb_hub_self`]. Other claims to its known node ID are dropped.
+    /// Same-name nodes with other IDs and ID-less legacy observations remain
+    /// separate: a reported hostname never establishes home identity.
     pub fn without_origin_claims(
         &self,
         rows: Vec<crate::api::schema::RelayedFleetPeer>,
     ) -> Vec<crate::api::schema::RelayedFleetPeer> {
-        let origin_key = self.origin.to_ascii_lowercase();
+        let origin_node = self
+            .origin_summary
+            .as_ref()
+            .and_then(|peer| peer.node_id.as_deref());
         rows.into_iter()
-            .filter(|row| wire_row_identity(row) != origin_key)
+            .filter(|row| origin_node.is_none() || row.node_id.as_deref() != origin_node)
             .collect()
     }
 
     /// Refresh the carried origin from the hub's own row (#424). The caller has
-    /// already checked that the row names the hub bound to the relay AND that
-    /// this hub is the snapshot's origin.
+    /// already checked that the enrolled hub is the snapshot's origin by ID.
+    /// A home without a known identity cannot be refreshed by name alone.
     ///
     /// The origin summary is the only view a spoke has of the server the
     /// client came from, and it was stamped once, at switch time. A fresher
@@ -594,10 +623,10 @@ impl FleetSnapshotState {
     }
 }
 
-/// The identity a relayed row is stored under: its reported host, else its ssh
-/// target, lowercased. Exactly the relay cache key, so a row cannot match one
-/// machine here and be stored as another there. Unlike [`normalized_host_key`]
-/// nothing is stripped, because identity must not fold `a.lan` into `a.tailnet`.
+/// Legacy observation key: reported host, else SSH target, lowercased.
+/// Known nodes instead use their node ID in a disjoint private cache namespace.
+/// This key never binds a display name to a known node. Unlike
+/// [`normalized_host_key`], it preserves the complete domain spelling.
 pub fn wire_row_identity(row: &crate::api::schema::RelayedFleetPeer) -> String {
     row.host
         .as_deref()
@@ -645,6 +674,9 @@ pub struct RelayedEntry {
     /// message for one of its agents is handed to. Stamped at merge time, where
     /// the answering peer is known; `None` straight off the wire.
     pub via: Option<String>,
+    /// Immediate sender proven by the validated poll or enrolled inbound edge
+    /// at ingestion. A later alias binding cannot supply this proof.
+    pub source_node: Option<String>,
     /// A row a HUB pushed down to this spoke (#410), not one a peer we poll
     /// relayed up. Display-only: its ssh target and ProxyJump are never
     /// dialled. A spoke holds no key to anything, so a switch could not work
@@ -667,6 +699,13 @@ pub struct RelayedEntry {
 /// iterating the snapshot, so a bad row costs the fleet that row and no other.
 pub fn relayed_entry_from_wire(
     entry: crate::api::schema::RelayedFleetPeer,
+) -> Option<RelayedEntry> {
+    relayed_entry_from_wire_at(entry, Instant::now())
+}
+
+fn relayed_entry_from_wire_at(
+    entry: crate::api::schema::RelayedFleetPeer,
+    now: Instant,
 ) -> Option<RelayedEntry> {
     if !crate::remote::is_valid_ssh_destination(&entry.ssh_target) {
         crate::logging::peer_relay_entry_rejected(
@@ -701,6 +740,8 @@ pub fn relayed_entry_from_wire(
     let strip = |text: String| crate::control_bytes::strip(&text);
     Some(RelayedEntry {
         peer: PeerSummaryState {
+            structured_agents: entry.structured_agents,
+            node_id: entry.node_id,
             dial: Default::default(),
             stream_error: None,
             peer: strip(entry.name),
@@ -719,23 +760,28 @@ pub fn relayed_entry_from_wire(
                     ws.workspace = strip(ws.workspace);
                     ws.project_label = ws.project_label.map(strip);
                     ws.branch = ws.branch.map(strip);
-                    ws.agent = ws.agent.map(strip);
+                    ws.agent = crate::terminal::agent_name::received(ws.agent, "relay");
+                    for agent in &mut ws.agents {
+                        agent.agent =
+                            crate::terminal::agent_name::received(agent.agent.take(), "relay");
+                    }
                     ws
                 })
                 .collect(),
             last_ok: entry
                 .age_secs
-                .and_then(|secs| Instant::now().checked_sub(Duration::from_secs(secs))),
+                .and_then(|secs| now.checked_sub(Duration::from_secs(secs))),
             error: entry.error,
             // Prefer the explicit origin assertion; fall back to `age_secs` for
             // a v(N-1) hub that does not send one.
             origin_last_ok_secs: entry.origin_last_ok_secs.or(entry.age_secs),
             // Dwell starts now — this is when the reading entered this server.
-            ingested_at: Some(Instant::now()),
+            ingested_at: Some(now),
             proxy_jump: entry.proxy_jump,
             icon: entry.icon,
         },
         via: None,
+        source_node: None,
         hub_pushed: false,
     })
 }
@@ -747,10 +793,13 @@ pub fn relayed_entry_from_wire(
 /// it polls. Two copies of this loop would be two answers to "which reading of
 /// that host wins", and that drift is the defect the directory exists to stop.
 ///
-/// Loop prevention rides on the origin field: an entry whose origin is us (the
-/// one full cycle we could see — hub A polls hub B, B relayed A's own peers
-/// back) and an entry ABOUT us are both dropped. Freshest-wins across sources,
-/// on the LIVE age (origin's reading plus dwell here), so a source that has
+/// Legacy loop prevention uses the origin field and reported host. Known
+/// proven node copies are consolidated in AppState. Claims are cached per
+/// supplying edge, so an unproven claim cannot overwrite another source.
+/// `source_node` is the sender proven by ingress, never a relayed claim. Every
+/// row in a delivery uses its caller's observation instant `now`.
+/// Freshest-wins within each source on the LIVE age (origin's reading plus
+/// dwell here), so a source that has
 /// gone quiet cannot keep winning against one still polling. #392: a row whose
 /// ssh_target or proxy_jump this host refuses to dial is dropped and logged,
 /// and the rest still merges.
@@ -758,8 +807,10 @@ pub(crate) fn merge_relayed_fleet(
     cache: &mut std::collections::HashMap<String, RelayedEntry>,
     entries: Vec<crate::api::schema::RelayedFleetPeer>,
     via: &str,
+    source_node: Option<&str>,
+    now: Instant,
 ) {
-    merge_relayed_rows(cache, entries, via, false);
+    merge_relayed_rows(cache, entries, via, false, source_node, now);
 }
 
 /// The same merge for rows a hub pushed DOWN (#410): marked display-only, and
@@ -769,8 +820,10 @@ pub(crate) fn merge_hub_pushed_fleet(
     cache: &mut std::collections::HashMap<String, RelayedEntry>,
     entries: Vec<crate::api::schema::RelayedFleetPeer>,
     hub: &str,
+    source_node: Option<&str>,
+    now: Instant,
 ) {
-    merge_relayed_rows(cache, entries, hub, true);
+    merge_relayed_rows(cache, entries, hub, true, source_node, now);
 }
 
 fn merge_relayed_rows(
@@ -778,39 +831,51 @@ fn merge_relayed_rows(
     entries: Vec<crate::api::schema::RelayedFleetPeer>,
     via: &str,
     hub_pushed: bool,
+    source_node: Option<&str>,
+    now: Instant,
 ) {
+    cache.retain(|_, entry| {
+        entry.via.as_deref() != Some(via) || entry.source_node.as_deref() == source_node
+    });
     let self_host = crate::app::short_host_name();
     let self_host_lower = self_host.to_ascii_lowercase();
     for entry in entries {
-        if entry.origin.eq_ignore_ascii_case(&self_host) {
+        if entry.node_id.is_none() && entry.origin.eq_ignore_ascii_case(&self_host) {
             continue;
         }
-        let host_key = wire_row_identity(&entry);
-        // Identity is keyed before the row's names are cleaned, so a host
-        // carrying control bytes (`hopper\x07`) would slip past every exact
-        // comparison and then render as a second `hopper`. No real host has
-        // one: drop the row.
-        if host_key.chars().any(char::is_control) {
+        let legacy_key = wire_row_identity(&entry);
+        if legacy_key.chars().any(char::is_control)
+            || entry
+                .node_id
+                .as_deref()
+                .is_some_and(|id| id.chars().any(char::is_control))
+        {
             continue;
         }
-        if host_key == self_host_lower {
-            // Never store an entry about ourselves as a relayed row — the self
-            // row lives on the origin_summary path.
+        if entry.node_id.is_none() && legacy_key == self_host_lower {
             continue;
         }
-        let Some(mut materialised) = relayed_entry_from_wire(entry) else {
+        // NUL cannot occur in a validated legacy key, so the namespaces cannot
+        // collide even when an advertised hostname imitates a node-key prefix.
+        let host_key = entry
+            .node_id
+            .as_ref()
+            .map(|id| format!("\0node:{via}:{id}"))
+            .unwrap_or(legacy_key);
+        let Some(mut materialised) = relayed_entry_from_wire_at(entry, now) else {
             continue;
         };
         // #410: remember which edge told us, so a message for this row's
         // agents has a route instead of a refusal.
         materialised.via = Some(via.to_string());
+        materialised.source_node = source_node.map(str::to_owned);
         if hub_pushed {
             materialised.hub_pushed = true;
             materialised.peer.proxy_jump = Some(via.to_string());
         }
-        let challenger_age = materialised.peer.carried_age_secs();
+        let challenger_age = materialised.peer.carried_age_secs_at(now);
         let insert = match cache.get(&host_key) {
-            Some(existing) => match (existing.peer.carried_age_secs(), challenger_age) {
+            Some(existing) => match (existing.peer.carried_age_secs_at(now), challenger_age) {
                 (Some(cur), Some(new)) => new <= cur,
                 (None, Some(_)) => true,
                 (Some(_), None) => false,
@@ -842,6 +907,7 @@ pub fn peer_to_wire(peer: &PeerSummaryState) -> crate::protocol::FleetPeer {
 /// waiting for real seconds to pass.
 pub fn peer_to_wire_at(now: Instant, peer: &PeerSummaryState) -> crate::protocol::FleetPeer {
     crate::protocol::FleetPeer {
+        node_id: peer.node_id.clone(),
         name: peer.peer.clone(),
         ssh_target: peer.ssh_target.clone(),
         host: peer.host.clone(),
@@ -876,6 +942,8 @@ pub fn peer_to_wire_at(now: Instant, peer: &PeerSummaryState) -> crate::protocol
 /// receiver's dwell no longer cliffs a snapshot entry at `stale_after`.
 pub fn peer_from_wire(peer: crate::protocol::FleetPeer) -> PeerSummaryState {
     PeerSummaryState {
+        structured_agents: Vec::new(),
+        node_id: peer.node_id,
         dial: Default::default(),
         stream_error: None,
         peer: peer.name,
@@ -904,12 +972,16 @@ pub fn peer_from_wire(peer: crate::protocol::FleetPeer) -> PeerSummaryState {
 /// Parsed summary payload from one peer (everything its `peers.summary` carries).
 #[derive(Debug, Clone, PartialEq)]
 pub struct PeerSummaryPayload {
+    pub node_id: Option<String>,
+    pub outbound_pending: bool,
     pub host: String,
     pub version: Option<String>,
     pub protocol: Option<u32>,
     /// The peer's self-declared fleet icon name (#164), if any.
     pub icon: Option<String>,
     pub system: Option<crate::api::schema::PeerSystemSummary>,
+    /// Optional pane-free directory from JSON gossip, absent in legacy attach snapshots.
+    pub structured_agents: Vec<crate::api::schema::PeerStructuredAgentSummary>,
     pub workspaces: Vec<PeerWorkspaceSummary>,
     /// Round-trip wall time of the summary SSH call (free latency probe).
     pub latency_ms: u64,
@@ -917,6 +989,18 @@ pub struct PeerSummaryPayload {
     /// two-hop fleet visibility. Empty when the peer is v(N-1) — additive
     /// with a serde default keeps mixed-version fleets safe.
     pub relayed_fleet: Vec<crate::api::schema::RelayedFleetPeer>,
+}
+
+pub(crate) fn validated_summary_node(
+    claimed: Option<String>,
+    pinned: Option<&str>,
+) -> Option<String> {
+    if claimed.as_deref().is_some_and(|node| Some(node) != pinned) {
+        tracing::warn!("dropping summary node id that does not match enrolled pin");
+        None
+    } else {
+        claimed
+    }
 }
 
 /// Result of one poll of one peer, sent back as an AppEvent.
@@ -987,7 +1071,7 @@ pub struct PeerCheckoutOutcome {
 /// from the workspace id and acts on its own git; with `push` it pushes to
 /// origin so the hub can `git fetch origin <branch>` afterwards. `push == false`
 /// is a read-only probe feeding the hub's pre-action confirmation. Runs over the
-/// SAME SSH-invoked verb surface as `run_summary_command` — the hub never
+/// same peer SSH surface as the other `flk peers` verbs — the hub never
 /// touches the peer's `.git`, keeping the model hub-spoke. Blocking; run off the
 /// UI thread.
 pub fn run_checkout_prepare_command(
@@ -1006,7 +1090,7 @@ pub fn run_checkout_prepare_command(
     }
     let push_flag = if push { " --push" } else { "" };
     // The `flk` invocation is wrapped in a login shell so profile-managed PATHs
-    // (nix, brew) apply — same shape as the default summary_command and the
+    // (nix, brew) apply — same shape as the
     // prepare_peer_switch pre-focus call.
     let remote =
         format!("sh -lc 'flk peers checkout-prepare --workspace {workspace_id}{push_flag} --json'");
@@ -1050,28 +1134,11 @@ fn parse_checkout_prepare_response(stdout: &str) -> Result<PeerCheckoutOutcome, 
 }
 
 fn run_summary_command(peer: &PeerConfig) -> Result<String, String> {
-    // The held connection carries an API request; `summary_command` is a
-    // shell string. They only mean the same thing while the command is the
-    // shipped default, so a customized one keeps the one-shot path rather
-    // than being silently reinterpreted as `peers.summary`.
-    if peer.summary_command == crate::config::model::default_peer_summary_command() {
-        // A push already answered this poll — the peer told us the moment its
-        // state changed, so the round trip would only re-fetch what is
-        // already here.
-        if let Some(pushed) = crate::peer_stream::take_pushed_summary(peer) {
-            crate::logging::peer_push_consumed(&peer.name);
-            return Ok(pushed);
-        }
-        match crate::peer_stream::request(peer, "peers.summary", serde_json::json!({})) {
-            Ok(response) => return Ok(response),
-            // Every failure mode ends here — old `flk` without `peers relay`,
-            // asleep, wedged relay — and the answer is the same for all of
-            // them: take the path that already works.
-            Err(err) => crate::logging::peer_stream_fallback(&peer.name, &err),
-        }
+    if let Some(pushed) = crate::peer_stream::take_pushed_summary(peer) {
+        crate::logging::peer_push_consumed(&peer.name);
+        return Ok(pushed);
     }
-    run_peer_ssh_with(peer, &peer.summary_command, DialCadence::Poll)
-        .map_err(|failure| failure.detail)
+    crate::peer_stream::request(peer, "peers.summary", serde_json::json!({}))
 }
 
 /// Fetch the tail of a peer's session logs over SSH for the cross-host log view
@@ -1118,108 +1185,19 @@ fn parse_logs_response(stdout: &str) -> Result<Vec<crate::logging::LogLine>, Str
     Ok(lines)
 }
 
-/// Run one command on a peer over SSH (batch mode, short timeouts), returning
-/// stdout. Shared by the summary poll and the checkout-prepare invocation.
-/// Wrap a value as one POSIX single-quoted shell word.
-///
-/// `'` cannot appear inside single quotes, so each one closes the quote, emits
-/// an escaped quote, and reopens — the standard `'\''` idiom.
-fn shell_single_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
-}
-
-/// Hand a message to the peer that owns the recipient, for it to enqueue in
-/// its own mailbox (ADR-0008).
-///
-/// The same SSH-invoked verb surface `run_summary_command` and
-/// `run_checkout_prepare_command` use: we ask the owning server to act on its
-/// own state rather than reaching into it. That keeps ADR-0001 intact — the
-/// constraint there is that fleet *gossip* is pull, with no push/broadcast
-/// between servers; a directed, user-initiated verb call is neither, which is
-/// why cross-machine checkout-prepare already works this way.
-///
-/// The recipient's own flock does the queueing, the inbox and the wake, so
-/// there is exactly one delivery implementation no matter which host the
-/// sender was on.
-pub fn send_peer_message(
-    peer: &PeerConfig,
-    to_agent: &str,
-    from_agent: &str,
-    from_host: &str,
-    body: &str,
-    correlation_id: &str,
-    in_reply_to: Option<&str>,
-    intent: crate::api::schema::MsgIntent,
-) -> Result<(), PeerMessageFailure> {
-    // A command this host refuses to build never leaves the machine, so it is
-    // a refusal too — and a terminal one. Retrying an id that cannot be
-    // shell-quoted safely produces the same answer forever.
-    let attempt = |intent| {
-        let remote = peer_message_command(
-            to_agent,
-            from_agent,
-            from_host,
-            body,
-            correlation_id,
-            in_reply_to,
-            intent,
-        )
-        .map_err(PeerMessageFailure::Refused)?;
-        run_peer_ssh_status(peer, &remote)
-            .map(|_| ())
-            .map_err(classify_message_failure)
-    };
-    match attempt(intent) {
-        // ADR-0018 §1, the other direction of skew. A peer that predates
-        // `blocking` but has #380 refuses the tier by name; asking again as
-        // `needs_reply` keeps the message heard — it still nudges — and only
-        // loses the escalation that peer could not have performed anyway.
-        Err(PeerMessageFailure::Refused(detail))
-            if intent == crate::api::schema::MsgIntent::Blocking && refused_the_intent(&detail) =>
-        {
-            attempt(crate::api::schema::MsgIntent::NeedsReply)
-        }
-        outcome => outcome,
-    }
-}
-
-/// Whether a peer's refusal was about the intent VALUE — the one refusal a
-/// retry at a lower tier can answer. Matched on `unknown --intent`, the
-/// refusal every build since #280 prints for a tier it does not know; the bare
-/// flag name is not enough, because the unknown-option refusal lists every
-/// flag a build understands, `--intent` among them.
-fn refused_the_intent(detail: &str) -> bool {
-    detail.contains("unknown --intent")
-}
-
-/// Why a relayed message did not land on the peer that owns the recipient.
-///
-/// The split is #380's point. A message the far side never saw and one it read
-/// and rejected want different answers from the caller, and before this both
-/// arrived as "could not reach" — which is a lie about the second, and the
-/// wrong advice: an unreachable peer is worth retrying and a refused flag
-/// never will be. A refusal carries the remote CLI's own words, so a flag a
-/// peer's build does not understand comes back as data instead of being glued
-/// to the front of the message body. Same posture as [`crate::spawn::SpawnRefusal`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PeerMessageFailure {
     /// The hop itself failed: ssh transport, auth, timeout, or a peer with no
     /// `flk` on its PATH. Retry can succeed.
     Unreachable(String),
-    /// The peer's `flk msg send` ran and rejected the command — or this host
-    /// refused to build one. Terminal: the identical relay is refused again.
+    /// The peer rejected the envelope, or this host refused to build it.
+    /// Terminal: the identical relay is refused again.
     Refused(String),
+    /// Keep custody, but wait for a route change before trying another hop.
+    Reroute(String),
 }
 
 impl PeerMessageFailure {
-    /// The stable `error.code`.
-    pub fn code(&self) -> &'static str {
-        match self {
-            Self::Unreachable(_) => "peer_unreachable",
-            Self::Refused(_) => "peer_refused_message",
-        }
-    }
-
     /// Whether retrying the identical relay could ever succeed.
     pub fn retryable(&self) -> bool {
         matches!(self, Self::Unreachable(_))
@@ -1228,23 +1206,7 @@ impl PeerMessageFailure {
     /// The far side's own words, unedited.
     pub fn detail(&self) -> &str {
         match self {
-            Self::Unreachable(detail) | Self::Refused(detail) => detail,
-        }
-    }
-
-    /// The caller-facing message, naming the hop as a whole — which machine
-    /// failed to reach which, and how (#410). Once a message can cross a hub,
-    /// "could not reach node-b" no longer says enough: the reader needs to know it
-    /// was the HUB that could not, so it is not chasing the spoke's own network.
-    pub fn hop_message(&self, from: &str, host: &str, reason: SshFailureReason) -> String {
-        match self {
-            Self::Unreachable(detail) => {
-                format!(
-                    "{from} cannot reach {host} ({}): {detail}",
-                    reason.describe()
-                )
-            }
-            Self::Refused(detail) => format!("{host} refused the relay from {from}: {detail}"),
+            Self::Unreachable(detail) | Self::Refused(detail) | Self::Reroute(detail) => detail,
         }
     }
 }
@@ -1462,98 +1424,6 @@ impl std::fmt::Display for FleetFailureNotice {
     }
 }
 
-/// `flk`'s usage/refusal exit code, and the one thing separating a peer that
-/// refused from a peer that was never reached: ssh reports the remote
-/// command's own status and keeps 255 for its own transport failures, so a 2
-/// here is the far side's CLI answering rather than a network that never got
-/// there.
-const REMOTE_REFUSAL_EXIT: i32 = 2;
-
-fn classify_message_failure(failure: PeerSshFailure) -> PeerMessageFailure {
-    if failure.exit_code == Some(REMOTE_REFUSAL_EXIT) {
-        PeerMessageFailure::Refused(failure.detail)
-    } else {
-        PeerMessageFailure::Unreachable(failure.detail)
-    }
-}
-
-/// Build the `sh -lc …` the relay hands to the owning server.
-///
-/// Split out from [`send_peer_message`] so the quoting and the id guard — the
-/// two things here that have actually been wrong in production — can be
-/// asserted without an SSH round trip.
-fn peer_message_command(
-    to_agent: &str,
-    from_agent: &str,
-    from_host: &str,
-    body: &str,
-    correlation_id: &str,
-    in_reply_to: Option<&str>,
-    intent: crate::api::schema::MsgIntent,
-) -> Result<String, String> {
-    // Ids are server-minted and travel into a remote shell command; refuse
-    // anything that could escape it (same guard shape as checkout-prepare).
-    for (label, value) in [
-        ("agent id", to_agent),
-        ("sender id", from_agent),
-        ("sender host", from_host),
-        ("correlation id", correlation_id),
-    ]
-    .into_iter()
-    .chain(in_reply_to.map(|id| ("in-reply-to id", id)))
-    {
-        if value.is_empty()
-            || !value
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == ':')
-        {
-            return Err(format!("invalid {label}: {value:?}"));
-        }
-    }
-    // Threading has to survive the hop as well as the message does. Without
-    // `--reply-to` a cross-host answer arrived with `in_reply_to` empty, so an
-    // agent that had asked two questions could not tell which one it had just
-    // been answered — the reply routed home and still lost the one field that
-    // made it an answer.
-    let reply_to = in_reply_to
-        .map(|id| format!(" --reply-to {id}"))
-        .unwrap_or_default();
-    // Intent has to survive the hop too, or a cross-host question arrives
-    // stamped `fyi` — the exact mislabel #280 exists to remove, reintroduced
-    // by the one leg that rebuilds the send from scratch (#280).
-    //
-    // Appended only for `needs_reply`, the same shape `--reply-to` uses. That
-    // containment shipped with #377 because `flk msg send` swallowed unknown
-    // flags into the body; #380 fixed the swallowing, and this KEPT it anyway.
-    // The reason is that the fix lives on the RECEIVING side: a peer only
-    // refuses `--intent` once it runs a build that has #380 in it, and the
-    // hosts this protects are precisely the ones that do not. Dropping the
-    // containment now would trade a silent corruption for a loud one on every
-    // relay to an already-deployed peer, including the `fyi` majority that
-    // carries no new signal at all. It costs one match arm and buys the whole
-    // roll-forward window, so it stays until the fleet has crossed #380.
-    let intent_flag = match intent {
-        crate::api::schema::MsgIntent::Fyi => String::new(),
-        stamped => format!(" --intent {}", stamped.as_wire()),
-    };
-    // Quote ONCE, at the outside. The body is caller-supplied and cannot be
-    // validated like the ids, so it must never reach the remote shell as
-    // syntax — but quoting it *inside* an already single-quoted `sh -lc '...'`
-    // closes the outer quote and the shell then word-splits the message. A
-    // live cross-host send arrived as "cross-machine" instead of
-    // "cross-machine hello from atlas" for exactly that reason.
-    //
-    // So: build the inner command with the body quoted, then quote the whole
-    // inner command once more for `sh -lc`. Nesting handled by the same POSIX
-    // idiom at both levels rather than by hand at one.
-    let inner = format!(
-        "flk msg send --agent {to_agent} --from-agent {from_agent} --from-host {from_host} \
-         --correlation-id {correlation_id}{reply_to}{intent_flag} --json -- {}",
-        shell_single_quote(body)
-    );
-    Ok(format!("sh -lc {}", shell_single_quote(&inner)))
-}
-
 fn run_peer_ssh(peer: &PeerConfig, remote_command: &str) -> Result<String, String> {
     run_peer_ssh_status(peer, remote_command).map_err(|failure| failure.detail)
 }
@@ -1578,7 +1448,8 @@ fn run_peer_ssh(peer: &PeerConfig, remote_command: &str) -> Result<String, Strin
 /// operator's ssh config runs its own child ssh for the jump hop, which reads
 /// the config afresh and does NOT inherit `ControlMaster=no` — that hop can
 /// still ride a mux.
-pub(crate) const PEER_DIAL_SSH_OPTIONS: [&str; 12] = [
+pub(crate) const PEER_DIAL_SSH_OPTIONS: [&str; 13] = [
+    "-C",
     "-o",
     "BatchMode=yes",
     "-o",
@@ -1651,7 +1522,6 @@ enum DialCadence {
 struct PeerSshFailure {
     /// The remote command's exit status, or `None` when it was killed by a
     /// signal before producing one.
-    exit_code: Option<i32>,
     detail: String,
 }
 
@@ -1676,7 +1546,6 @@ fn run_peer_ssh_with(
     let output = command
         .output_traced_with_timeout(PEER_SSH_TIMEOUT)
         .map_err(|err| PeerSshFailure {
-            exit_code: None,
             // A dial that hung past the deadline was killed, not refused to
             // start: saying "spawn failed" would send the operator after the
             // local ssh binary instead of the link (#418).
@@ -1696,14 +1565,21 @@ fn run_peer_ssh_with(
             stderr.lines().next_back().unwrap_or(stderr).to_string()
         };
         return Err(PeerSshFailure {
-            exit_code: output.status.code(),
             detail: attribute_dial_failure(detail, &agent),
         });
     }
     String::from_utf8(output.stdout).map_err(|_| PeerSshFailure {
-        exit_code: output.status.code(),
         detail: "non-utf8 ssh output".to_string(),
     })
+}
+
+/// Test access to the same parser used by the real poll producer.
+#[cfg(test)]
+pub(crate) fn test_parse_summary_response(
+    stdout: &str,
+    latency_ms: u64,
+) -> Result<PeerSummaryPayload, String> {
+    parse_summary_response(stdout, latency_ms)
 }
 
 /// Parse the CLI's response envelope:
@@ -1777,6 +1653,19 @@ fn parse_summary_response(stdout: &str, latency_ms: u64) -> Result<PeerSummaryPa
             .map(crate::api::schema::PeerSystemSummary::sanitized);
     }
     Ok(PeerSummaryPayload {
+        structured_agents: result
+            .get("structured_agents")
+            .cloned()
+            .map(crate::api::peer_discovery::decode)
+            .unwrap_or_default(),
+        node_id: result
+            .get("node_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        outbound_pending: result
+            .get("outbound_pending")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
         host,
         version,
         protocol,
@@ -1799,6 +1688,8 @@ mod tests {
         proxy_jump: Option<&str>,
     ) -> crate::api::schema::RelayedFleetPeer {
         crate::api::schema::RelayedFleetPeer {
+            structured_agents: Vec::new(),
+            node_id: None,
             dial: None,
             name: "spoke2.invalid".into(),
             ssh_target: ssh_target.into(),
@@ -1815,6 +1706,51 @@ mod tests {
             proxy_jump: proxy_jump.map(Into::into),
             icon: None,
         }
+    }
+
+    #[test]
+    fn security_agent_name_typed_relay_rows_drop_bad_labels() {
+        for (case, name) in crate::test_support::hostile_agent_names() {
+            let mut row = wire_peer("spoke.invalid", None);
+            let mut ws: crate::api::schema::PeerWorkspaceSummary = serde_json::from_value(
+                serde_json::json!({"id":"fixture-workspace", "workspace":"fixture", "status":"idle"})
+            ).unwrap();
+            ws.agent = Some(name.clone());
+            ws.agents.push(crate::api::schema::PeerAgentSummary {
+                agent_id: "fixture-agent".into(),
+                pane_id: "fixture-pane".into(),
+                agent: Some(name),
+                status: crate::api::schema::AgentStatus::Idle,
+            });
+            row.workspaces.push(ws);
+            let accepted = relayed_entry_from_wire(row).unwrap();
+            assert!(
+                accepted.peer.workspaces[0].agent.is_none(),
+                "workspace name retained: {case}"
+            );
+            assert!(
+                accepted.peer.workspaces[0].agents[0].agent.is_none(),
+                "agent name retained: {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn security_agent_name_peer_json_drops_only_the_bad_name() {
+        let mut failures = Vec::new();
+        for (case, name) in crate::test_support::hostile_agent_names() {
+            let response = serde_json::json!({"id":"name-peer","result":{"host":"fixture.example","workspaces":[{"id":"workspace-fixture","workspace":"fixture","agent":name,"status":"idle","agents":[{"agent_id":"agent-fixture","pane_id":"pane-fixture","agent":name,"status":"idle"}]}]}}).to_string();
+            let payload = parse_summary_response(&response, 0).unwrap();
+            let ws = &payload.workspaces[0];
+            if ws.agent.is_some() || ws.agents[0].agent.is_some() {
+                failures.push(case);
+            }
+            assert_eq!(ws.agents[0].agent_id, "agent-fixture");
+        }
+        assert!(
+            failures.is_empty(),
+            "retained peer name cases: {failures:?}"
+        );
     }
 
     #[test]
@@ -1949,127 +1885,6 @@ mod tests {
         assert_eq!(kept, vec!["operator@spoke2.invalid".to_string()]);
     }
 
-    #[test]
-    fn shell_quoting_survives_spaces_and_quotes() {
-        // A live cross-host send arrived truncated at the first space, because
-        // the body was quoted INSIDE an already single-quoted `sh -lc '...'`:
-        // the inner quote closed the outer one and the remote shell then word-
-        // split the message. Quote once per level.
-        assert_eq!(super::shell_single_quote("hello world"), "'hello world'");
-        assert_eq!(super::shell_single_quote("it's fine"), r#"'it'\''s fine'"#);
-
-        // Nesting the way the relay does: inner command quoted, then the whole
-        // thing quoted again for `sh -lc`. The body must survive both.
-        let inner = format!("flk msg send -- {}", super::shell_single_quote("a b c"));
-        let outer = super::shell_single_quote(&inner);
-        assert!(outer.starts_with('\''), "{outer}");
-        assert!(outer.contains("a b c"), "body must survive: {outer}");
-    }
-
-    #[test]
-    fn a_relayed_message_carries_its_threading() {
-        // The reply routed home and arrived unthreaded: `relay_message_to_host`
-        // filled `in_reply_to`, and the relay command dropped it on the floor
-        // (#320). An answer that cannot be matched to its question is not an
-        // answer when an agent has more than one outstanding.
-        let command = super::peer_message_command(
-            "agent_atlas_1",
-            "agent_hopper_2",
-            "hopper",
-            "pong",
-            "c-reply",
-            Some("c-question"),
-            crate::api::schema::MsgIntent::Fyi,
-        )
-        .expect("valid ids");
-        assert!(
-            command.contains("--reply-to c-question"),
-            "threading must reach the owning server: {command}"
-        );
-
-        // A first message has nothing to thread to, and must not grow an
-        // empty flag the remote CLI would then reject.
-        let command = super::peer_message_command(
-            "agent_atlas_1",
-            "agent_hopper_2",
-            "hopper",
-            "ping",
-            "c-first",
-            None,
-            crate::api::schema::MsgIntent::Fyi,
-        )
-        .expect("valid ids");
-        assert!(!command.contains("--reply-to"), "{command}");
-    }
-
-    #[test]
-    fn a_needs_reply_relay_carries_its_stamp_and_a_fyi_one_is_unchanged() {
-        // #280. The relay is the one leg that REBUILDS the send from scratch,
-        // as a `flk msg send` on the owning server — so a stamp not passed
-        // here is a cross-host question arriving as a notice, which is the
-        // mislabel the field exists to remove.
-        let command = super::peer_message_command(
-            "agent_atlas_1",
-            "agent_hopper_2",
-            "hopper",
-            "re-derive both parameters and report back",
-            "c-question",
-            None,
-            crate::api::schema::MsgIntent::NeedsReply,
-        )
-        .expect("valid ids");
-        assert!(
-            command.contains("--intent needs_reply"),
-            "the stamp must reach the owning server: {command}"
-        );
-
-        // The default relays byte-identically to what shipped before the flag
-        // existed, so the far side needing a build that understands `--intent`
-        // is confined to the case that actually carries new signal.
-        let command = super::peer_message_command(
-            "agent_atlas_1",
-            "agent_hopper_2",
-            "hopper",
-            "landed the fix",
-            "c-notice",
-            None,
-            crate::api::schema::MsgIntent::Fyi,
-        )
-        .expect("valid ids");
-        assert!(!command.contains("--intent"), "{command}");
-    }
-
-    #[test]
-    fn a_blocking_relay_carries_its_tier_and_a_peer_refusing_it_is_recognised() {
-        // ADR-0018 §1: the tier rides the envelope across the hop, so the
-        // escalation happens on the recipient's own server.
-        let command = super::peer_message_command(
-            "agent_atlas_1",
-            "agent_hopper_2",
-            "hopper",
-            "I cannot merge until you rebase",
-            "c-blocking",
-            None,
-            crate::api::schema::MsgIntent::Blocking,
-        )
-        .expect("valid ids");
-        assert!(command.contains("--intent blocking"), "{command}");
-
-        // What a peer that has #380 but predates the tier prints: the refusal
-        // the relay retries at `needs_reply` rather than surfacing as a
-        // failure. Any other refusal is not the intent's fault.
-        assert!(super::refused_the_intent(
-            "unknown --intent \"blocking\": expected fyi or needs-reply"
-        ));
-        // The unknown-option refusal names `--intent` in its list of what
-        // the build understands; that must not trigger a second ssh hop.
-        assert!(!super::refused_the_intent(
-            "flk msg send: unknown option \"--from-host\" — this build understands --repo \
-             --intent --correlation-id --reply-to --agent --from-agent --json, and `--` ends \
-             flag parsing so a body may begin with dashes"
-        ));
-    }
-
     /// #418 with a REAL ssh: a dial that fails comes back classified from
     /// ssh's own words, and those words reach the `process.exec` record as
     /// its stderr tail. `.invalid` is reserved (RFC 2606) and never resolves,
@@ -2100,7 +1915,6 @@ mod tests {
             "{}",
             failure.detail
         );
-        assert_eq!(failure.exit_code, Some(255), "ssh's own failure status");
         assert!(logs.contains("stderr_tail="), "{logs}");
         assert!(
             logs.to_ascii_lowercase()
@@ -2109,6 +1923,10 @@ mod tests {
         );
         // flock's own dials never ride, or leave behind, a shared mux.
         assert!(logs.contains("ControlMaster=no") && logs.contains("ControlPath=none"));
+        assert!(
+            logs.contains("-C"),
+            "peer dial must enable compression: {logs}"
+        );
     }
 
     /// ssh cannot say its agent is gone — that is a debug-level message — so
@@ -2312,107 +2130,10 @@ mod tests {
     }
 
     #[test]
-    fn a_hop_failure_names_both_ends_and_the_reason() {
-        let failure = super::PeerMessageFailure::Unreachable(
-            "ssh: connect to host node-b port 22: Connection refused".into(),
-        );
-        let reason = super::SshFailureReason::classify(failure.detail());
-        let message = failure.hop_message("hopper", "node-b", reason);
-        assert!(
-            message.starts_with("hopper cannot reach node-b (connection refused)"),
-            "{message}"
-        );
-    }
-
-    #[test]
-    fn a_peer_that_refuses_is_not_a_peer_that_was_never_reached() {
-        // #380. Both used to arrive as "could not reach {host}", which is a
-        // lie about the second and the wrong advice about both: an unreachable
-        // peer is worth retrying and a rejected flag never will be.
-        //
-        // ssh reports the remote command's own exit status and keeps 255 for
-        // its own transport failures, so the status is the whole distinction.
-        let refused = super::classify_message_failure(super::PeerSshFailure {
-            exit_code: Some(super::REMOTE_REFUSAL_EXIT),
-            detail: "flk msg send: unknown option \"--intent\" — this build understands …"
-                .to_string(),
-        });
-        assert_eq!(refused.code(), "peer_refused_message");
-        assert!(!refused.retryable(), "the identical relay is refused again");
-        assert!(
-            refused
-                .hop_message("hopper", "atlas", super::SshFailureReason::Other)
-                .contains("--intent"),
-            "the peer's own words ARE the diagnosis and must survive the hop: {}",
-            refused.hop_message("hopper", "atlas", super::SshFailureReason::Other)
-        );
-
-        for (exit_code, what) in [
-            (Some(255), "ssh itself failed"),
-            (None, "killed by a signal"),
-        ] {
-            let failure = super::classify_message_failure(super::PeerSshFailure {
-                exit_code,
-                detail: "Connection timed out".to_string(),
-            });
-            assert_eq!(failure.code(), "peer_unreachable", "{what}");
-            assert!(failure.retryable(), "{what}");
-        }
-    }
-
-    #[test]
-    fn a_command_this_host_will_not_build_is_a_refusal_too() {
-        // An id that cannot be shell-quoted safely never leaves the machine,
-        // so it is terminal for the same reason a rejected flag is — and used
-        // to be reported as the host being unreachable, which it plainly was
-        // not.
-        // Never dials: the guard rejects shell-unsafe ids before ssh is spawned,
-        // which is what lets this drive the real entry point rather than
-        // hand-building the variant it is supposed to produce.
-        let peer = PeerConfig {
-            name: "atlas".into(),
-            ..Default::default()
-        };
-        let failure = super::send_peer_message(
-            &peer,
-            "agent_atlas_1",
-            "agent_hopper_2",
-            "hopper",
-            "pong",
-            "c-reply",
-            Some("c'; rm -rf /"),
-            crate::api::schema::MsgIntent::Fyi,
-        )
-        .expect_err("a shell-escaping id must be refused");
-        assert_eq!(failure.code(), "peer_refused_message");
-        assert!(!failure.retryable());
-        assert!(
-            failure.detail().contains("in-reply-to id"),
-            "the caller learns which id was rejected: {}",
-            failure.detail()
-        );
-    }
-
-    #[test]
-    fn a_threading_id_is_guarded_like_every_other_id() {
-        // Every id in this command is interpolated into a remote shell, so the
-        // new one is guarded by the same rule as the rest rather than trusted
-        // for being server-minted.
-        let err = super::peer_message_command(
-            "agent_atlas_1",
-            "agent_hopper_2",
-            "hopper",
-            "pong",
-            "c-reply",
-            Some("c'; rm -rf /"),
-            crate::api::schema::MsgIntent::Fyi,
-        )
-        .expect_err("a shell-escaping id must be refused");
-        assert!(err.contains("in-reply-to id"), "{err}");
-    }
-    #[test]
-    fn to_wire_dedups_origin_and_caps_peer_count() {
+    fn to_wire_preserves_legacy_names_excludes_destination_and_caps_count() {
         let mk = |name: &str| PeerSummaryState {
+            structured_agents: Vec::new(),
+            node_id: None,
             dial: Default::default(),
             stream_error: None,
             peer: name.to_string(),
@@ -2444,16 +2165,20 @@ mod tests {
         let wire = snapshot.to_wire("p0");
 
         assert!(
-            wire.peers.iter().all(|p| p.name != "hopper"),
-            "origin owns the home row"
-        );
-        assert!(
             wire.peers.iter().all(|p| p.name != "p0"),
             "hop target excluded"
         );
         assert!(
             wire.peers.len() <= FLEET_SNAPSHOT_MAX_PEERS,
             "env-var transport cap"
+        );
+        let mut names_only = snapshot;
+        names_only.peers = vec![mk("legacy-home.example")];
+        names_only.origin = "legacy-home.example".into();
+        assert_eq!(
+            names_only.to_wire("other.example").peers.len(),
+            1,
+            "a legacy display name cannot establish home identity"
         );
     }
 
@@ -2462,6 +2187,8 @@ mod tests {
 
     fn summary_state(name: &str, ssh_target: &str, age_secs: Option<u64>) -> PeerSummaryState {
         PeerSummaryState {
+            structured_agents: Vec::new(),
+            node_id: None,
             dial: Default::default(),
             stream_error: None,
             peer: name.to_string(),
@@ -2720,6 +2447,148 @@ mod tests {
         // A nested leap (pass-through) keeps the hub's own summary too.
         let nested = FleetSnapshotState::from_wire(back.to_wire("operator@kiln"));
         assert!(nested.origin_summary.is_some());
+    }
+
+    #[test]
+    fn peer_decoder_tolerates_idle_and_unknown_future_poller_values() {
+        for status in ["idle", "future_status"] {
+            let raw = serde_json::json!({"id":"summary", "result":{
+                "host":"fixture.example", "workspaces":[],
+                "pollers":{"git_refresh":{"status":status,"reason":"future_reason"}}
+            }});
+            let summary = parse_summary_response(&raw.to_string(), 7).unwrap();
+            assert_eq!(summary.host, "fixture.example");
+            assert_eq!(summary.latency_ms, 7);
+        }
+        assert_eq!(crate::mesh::hello::VERSION, 5);
+    }
+
+    #[test]
+    fn structured_discovery_unknown_enums_are_contained_to_their_row() {
+        for field in ["runtime", "status"] {
+            for unknown_in_relay in [false, true] {
+                let known = serde_json::json!({"agent_id":"known-native", "runtime":"structured", "status":"idle"});
+                let mut unknown = known.clone();
+                unknown["agent_id"] = serde_json::json!("future-native");
+                unknown[field] = serde_json::json!("future_value");
+                let mut last = known.clone();
+                last["agent_id"] = serde_json::json!("last-native");
+                let rows = serde_json::json!([known, unknown, last]);
+                let ordinary = serde_json::json!([known]);
+                let workspace = serde_json::json!({"workspace":"fixture", "status":"idle", "agents":[
+                    {"agent_id":"known-terminal", "pane_id":"", "status":"idle"}
+                ]});
+                let relay = serde_json::json!({"name":"fixture.example", "ssh_target":"fixture.example", "origin":"hub.example",
+                    "workspaces":[workspace], "structured_agents":if unknown_in_relay {&rows} else {&ordinary}});
+                let result = serde_json::json!({"type":"peers_summary", "host":"hub.example", "workspaces":[workspace],
+                    "structured_agents":if unknown_in_relay {&ordinary} else {&rows}, "relayed_fleet":[relay]});
+                let parsed =
+                    parse_summary_response(&serde_json::json!({"result":result}).to_string(), 0)
+                        .unwrap();
+                let ids = |rows: &[crate::api::schema::PeerStructuredAgentSummary]| {
+                    rows.iter()
+                        .map(|row| row.agent_id.clone())
+                        .collect::<Vec<_>>()
+                };
+                let expected = vec!["known-native".to_owned(), "last-native".to_owned()];
+                assert_eq!(
+                    ids(if unknown_in_relay {
+                        &parsed.relayed_fleet[0].structured_agents
+                    } else {
+                        &parsed.structured_agents
+                    }),
+                    expected
+                );
+                assert_eq!(parsed.workspaces[0].agents[0].agent_id, "known-terminal");
+                assert_eq!(
+                    parsed.relayed_fleet[0].workspaces[0].agents[0].agent_id,
+                    "known-terminal"
+                );
+                let typed: crate::api::schema::ResponseResult =
+                    serde_json::from_value(result).unwrap();
+                let crate::api::schema::ResponseResult::PeersSummary {
+                    structured_agents,
+                    relayed_fleet,
+                    ..
+                } = typed
+                else {
+                    panic!("wrong summary kind")
+                };
+                assert_eq!(structured_agents, parsed.structured_agents);
+                assert_eq!(
+                    relayed_fleet[0].structured_agents,
+                    parsed.relayed_fleet[0].structured_agents
+                );
+                let pushed: crate::api::schema::PeersHubFleetParams = serde_json::from_value(
+                    serde_json::json!({"hub":"hub.example", "fleet":[relay]}),
+                )
+                .unwrap();
+                assert_eq!(
+                    pushed.fleet[0].structured_agents,
+                    parsed.relayed_fleet[0].structured_agents
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_structured_list_does_not_discard_workspace_summary() {
+        for malformed in [
+            serde_json::Value::Null,
+            serde_json::json!({}),
+            serde_json::json!(7),
+        ] {
+            let result = serde_json::json!({"type":"peers_summary", "host":"fixture.example", "workspaces":[
+                {"workspace":"fixture", "status":"idle"}
+            ], "structured_agents":malformed});
+            let parsed =
+                parse_summary_response(&serde_json::json!({"result":result}).to_string(), 0)
+                    .unwrap();
+            assert!(parsed.structured_agents.is_empty());
+            assert_eq!(parsed.workspaces.len(), 1);
+            let decoded: crate::api::schema::ResponseResult =
+                serde_json::from_value(result).unwrap();
+            let crate::api::schema::ResponseResult::PeersSummary {
+                structured_agents,
+                workspaces,
+                ..
+            } = decoded
+            else {
+                panic!("wrong summary kind")
+            };
+            assert!(structured_agents.is_empty());
+            assert_eq!(workspaces.len(), 1);
+        }
+    }
+
+    #[test]
+    fn optional_structured_directory_decodes_and_survives_json_relay() {
+        let mut result = serde_json::json!({"host":"fixture.example", "workspaces":[]});
+        assert!(
+            parse_summary_response(&serde_json::json!({"result":result}).to_string(), 0)
+                .unwrap()
+                .structured_agents
+                .is_empty()
+        );
+        let agents = serde_json::json!([{"agent_id":"native-id", "agent":"claude", "status":"idle", "runtime":"structured"}]);
+        result["structured_agents"] = agents.clone();
+        let parsed =
+            parse_summary_response(&serde_json::json!({"result":result}).to_string(), 0).unwrap();
+        assert_eq!(parsed.structured_agents.len(), 1);
+        assert!(serde_json::to_value(&parsed.structured_agents[0])
+            .unwrap()
+            .get("pane_id")
+            .is_none());
+        assert_eq!(
+            parsed.structured_agents[0].runtime,
+            crate::structured::registry::StructuredRuntime::Structured
+        );
+        let relay = serde_json::json!({"name":"fixture.example", "ssh_target":"fixture.example", "origin":"hub.example", "structured_agents":agents});
+        let decoded: crate::api::schema::RelayedFleetPeer = serde_json::from_value(relay).unwrap();
+        let relay: crate::api::schema::RelayedFleetPeer =
+            serde_json::from_str(&serde_json::to_string(&decoded).unwrap()).unwrap();
+        let cached = relayed_entry_from_wire(relay).unwrap();
+        assert_eq!(cached.peer.structured_agents, parsed.structured_agents);
     }
 
     #[test]
@@ -3049,6 +2918,7 @@ Last login: banner noise
         // age_secs, so the origin-honest staleness path applies even for
         // entries from an older peer — the 60s cliff dies for those too.
         let wire = crate::protocol::FleetPeer {
+            node_id: None,
             name: "old".into(),
             ssh_target: "operator@old".into(),
             host: Some("old".into()),
@@ -3083,6 +2953,8 @@ Last login: banner noise
 
         // v(N) struct → JSON → v(N) struct: value preserved.
         let full = RelayedFleetPeer {
+            structured_agents: Vec::new(),
+            node_id: None,
             dial: None,
             name: "atlas".into(),
             ssh_target: "operator@atlas".into(),
@@ -3231,3 +3103,8 @@ Last login: banner noise
         assert_eq!(normalized_host_key("operator@::1"), "::1");
     }
 }
+
+#[cfg(test)]
+mod legacy_summary;
+
+mod direct_claims;

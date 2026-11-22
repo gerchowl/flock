@@ -34,6 +34,7 @@ pub(super) fn wait_for_output(
                     serde_json::to_string(&ErrorResponse {
                         id: request_id,
                         error: ErrorBody {
+                            data: None,
                             code: "invalid_regex".into(),
                             message: err.to_string(),
                         },
@@ -61,8 +62,12 @@ pub(super) fn wait_for_output(
                 strip_ansi: params.strip_ansi,
             }),
         };
-        let response =
-            dispatch_to_app_with_timeout(read_request, api_tx, Some(APP_RESPONSE_TIMEOUT), None);
+        let response = dispatch_to_app_with_timeout(
+            read_request,
+            api_tx,
+            Some(APP_RESPONSE_TIMEOUT),
+            Default::default(),
+        );
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&response) else {
             return Ok(Some(response));
         };
@@ -79,6 +84,7 @@ pub(super) fn wait_for_output(
                 serde_json::to_string(&ErrorResponse {
                     id: request_id,
                     error: ErrorBody {
+                        data: None,
                         code: "internal_error".into(),
                         message: "failed to decode pane read result".into(),
                     },
@@ -111,6 +117,7 @@ pub(super) fn wait_for_output(
                 serde_json::to_string(&ErrorResponse {
                     id: request_id,
                     error: ErrorBody {
+                        data: None,
                         code: "timeout".into(),
                         message: "timed out waiting for output match".into(),
                     },

@@ -27,6 +27,7 @@ pub(crate) mod sheep;
 mod sidebar;
 pub(crate) mod state_signal;
 pub(crate) mod status;
+pub(crate) mod structured;
 mod tabs;
 mod widgets;
 pub(crate) mod window_title;
@@ -273,6 +274,7 @@ fn compute_view_internal(
     resize_panes: bool,
     cell_size: crate::kitty_graphics::HostCellSize,
 ) {
+    app.refresh_terminal_runtime_presence(terminal_runtimes);
     if is_mobile_width(area, app.mobile_width_threshold) {
         compute_mobile_view(app, terminal_runtimes, area, resize_panes, cell_size);
         return;
@@ -424,12 +426,14 @@ fn compute_view_internal(
         config_diagnostic_lines: banner_lines,
         session_warning_lines,
         pane_infos,
+        structured: Default::default(),
         split_borders,
     };
 
     // After the view lands: pane geometry is now current, so the panel's
     // rows can be re-wrapped at the width they will actually render at (#254).
     refresh_prompt_layout(app);
+    app.view.structured = structured::prepare(app);
 }
 
 fn compute_mobile_view(
@@ -512,12 +516,14 @@ fn compute_mobile_view(
         config_diagnostic_lines: banner_lines,
         session_warning_lines,
         pane_infos,
+        structured: Default::default(),
         split_borders,
     };
 
     // After the view lands: pane geometry is now current, so the panel's
     // rows can be re-wrapped at the width they will actually render at (#254).
     refresh_prompt_layout(app);
+    app.view.structured = structured::prepare(app);
 }
 
 /// Render the UI — reads AppState but does not mutate it.
@@ -922,6 +928,29 @@ mod tests {
         assert_eq!(app.view.layout, ViewLayout::Mobile);
         assert_eq!(app.view.mobile_header_rect, Rect::new(0, 0, 80, 2));
         assert_eq!(app.view.terminal_area, Rect::new(0, 2, 80, 18));
+    }
+
+    /// #1126: a split active workspace must not decide how wide a pane in a new
+    /// background workspace is born. The first visible pane here is about 14
+    /// columns, while a lone pane gets the whole terminal area minus its frame.
+    #[test]
+    fn new_pane_size_ignores_the_active_workspace_split() {
+        let mut app = crate::app::state::AppState::test_new();
+        let mut ws = Workspace::test_new("split");
+        ws.test_split(ratatui::layout::Direction::Horizontal);
+        ws.test_split(ratatui::layout::Direction::Horizontal);
+        app.workspaces = vec![ws];
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = Mode::Terminal;
+
+        compute_view(&mut app, Rect::new(0, 0, 200, 50));
+        let first = app.view.pane_infos.first().expect("pane info").rect;
+        assert!(first.width < 100, "fixture must start split: {first:?}");
+
+        let area = app.view.terminal_area;
+        assert_eq!(app.estimate_pane_size(), (area.height - 2, area.width - 2));
+        assert!(area.width - 2 > 150);
     }
 
     /// A desktop app with one workspace and `diagnostic` showing. Returns the app
@@ -1596,6 +1625,10 @@ mod tests {
     #[test]
     fn servers_band_renders_self_row_in_place_with_two_line_peers() {
         let mut app = crate::app::state::AppState::test_new();
+        let narrow_width = app.sidebar_width;
+        // Keep this placement fixture's latency assertion visible beside the
+        // new route prefix. Also exercise the original width below.
+        app.sidebar_width += "direct ".len() as u16;
         app.workspaces = vec![Workspace::test_new("one")];
         app.active = Some(0);
         app.selected = 0;
@@ -1604,6 +1637,10 @@ mod tests {
             name: "kiln".into(),
             ..Default::default()
         });
+        let node = crate::mesh::identity::NodeIdentity::fixture([22; 32]).node_id();
+        peer.node_id = Some(node.clone());
+        app.server_nodes.insert("kiln".into(), node.clone());
+        app.server_paths.insert(node.clone(), node);
         peer.host = Some("kiln".into());
         peer.last_ok = Some(std::time::Instant::now());
         peer.latency_ms = Some(34);
@@ -1654,6 +1691,16 @@ mod tests {
         let peer_title = buffer_row_text(buffer, card.rect, card.rect.y);
         assert!(peer_title.contains("kiln"), "{peer_title}");
         assert!(peer_title.contains("34ms"), "{peer_title}");
+        assert!(peer_title.contains("direct"), "{peer_title}");
+
+        app.sidebar_width = narrow_width;
+        compute_view(&mut app, area);
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let card = &app.view.server_card_areas[0];
+        assert_eq!(card.rect.height, 2);
+        let title = buffer_row_text(terminal.backend().buffer(), card.rect, card.rect.y);
+        assert!(title.contains("kiln"), "{title}");
+        assert!(title.contains("direct"), "{title}");
     }
 
     #[test]

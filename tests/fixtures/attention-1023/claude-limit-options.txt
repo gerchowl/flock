@@ -1,0 +1,22 @@
+
+
+✻ Cogitated for 0s · done 2:24 AM
+
+⏺ Automatic continue cancelled ·
+  /rate-limit-options to re-arm
+
+❯ LIMIT again
+  ⎿  You've hit your session limit · resets 5:42am
+     (Europe/Zurich)
+
+⏺ Usage limit reached · continuing
+  automatically at 5:42am · esc to cancel
+
+✻ Churned for 0s · done 2:25 AM
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+   What do you want to do?
+
+   ❯ 1. Stop and wait for limit to reset
+     2. Don’t continue automatically
+
+   Enter to confirm · Esc to cancel

@@ -448,7 +448,7 @@ pub(super) fn render_tab_bar(app: &AppState, frame: &mut Frame, area: Rect) {
 /// pane-state join, or `None` when nothing in it carries a live agent signal.
 ///
 /// One derivation for both strips, over the shared severity ladder
-/// ([`join_states`] + [`StateClass::of`]) — the tabs strip and
+/// ([`super::state_signal::join_states`] + [`super::state_signal::StateClass::of`]) — the tabs strip and
 /// [`render_member_strip`] must never disagree about the same pane (#394).
 fn slot_state_tint(
     states: impl IntoIterator<Item = (crate::detect::AgentState, bool)>,

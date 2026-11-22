@@ -34,6 +34,8 @@ struct PaneRestoreStartup<'a> {
 }
 
 struct RestoreRuntimeContext<'a> {
+    registry: &'a crate::structured::registry::Registry,
+    native_seen: &'a std::cell::RefCell<HashSet<String>>,
     scrollback_limit_bytes: usize,
     shell_config: crate::pane::PaneShellConfig<'a>,
     resume_agents_on_restore: bool,
@@ -293,8 +295,11 @@ fn restore_with_imports_and_failures(
     let mut terminal_runtimes = HashMap::new();
     let mut resumed_agent_sessions = HashSet::new();
     let mut failed_imports = 0;
+    let native_seen = std::cell::RefCell::new(HashSet::new());
     for (idx, ws_snap) in snapshot.workspaces.iter().enumerate() {
         let runtime_context = RestoreRuntimeContext {
+            registry: &snapshot.structured_agents,
+            native_seen: &native_seen,
             scrollback_limit_bytes,
             shell_config,
             resume_agents_on_restore,
@@ -472,11 +477,22 @@ fn restore_tab(
     let pane_ids = collect_pane_ids(&node);
 
     let mut panes = HashMap::new();
+    let mut native_views = HashMap::new();
     let mut terminals = Vec::new();
     let mut terminal_runtimes = HashMap::new();
     let mut failed_imports = 0;
     for id in &pane_ids {
         let old_id = reverse_id_map.get(id);
+        if let Some(saved) = old_id.and_then(|id| snap.native_views.get(id)) {
+            native_views.insert(
+                *id,
+                saved.restore(
+                    runtime_context.registry,
+                    &mut runtime_context.native_seen.borrow_mut(),
+                ),
+            );
+            continue;
+        }
         let saved_pane = old_id.and_then(|old_id| snap.panes.get(old_id));
         let saved_cwd = saved_pane
             .map(|p| p.cwd.clone())
@@ -496,14 +512,19 @@ fn restore_tab(
             }
         };
 
-        let saved_label = saved_pane.and_then(|p| p.label.clone());
-        let saved_agent_name = saved_pane.and_then(|p| p.agent_name.clone());
+        let saved_name = saved_pane.and_then(|p| p.agent_name.clone());
+        let saved_label = crate::terminal::agent_name::received(
+            saved_pane.and_then(|p| p.label.clone()),
+            "manual_label_restore",
+        );
+        let saved_agent_name = crate::terminal::agent_name::received(saved_name, "session_restore");
         // #332: a restored agent keeps the run id it was spawned under. Its
         // commits keep their `Agent-Run:` trailers across a restart either
         // way, so an agent that forgot its own run id would strand them.
         let saved_run_id = saved_pane.and_then(|p| p.run_id.clone());
         let saved_spawn_depth = saved_pane.map_or(0, |p| p.spawn_depth);
         let saved_spawned_by = saved_pane.and_then(|p| p.spawned_by.clone());
+        let saved_questions = saved_pane.and_then(|p| p.questions).unwrap_or_default();
         let saved_launch_argv = saved_pane.and_then(|p| p.launch_argv.clone());
         let saved_last_prompt = saved_pane.and_then(|p| p.last_prompt.clone());
         let saved_header_reserved = saved_pane.is_some_and(|p| p.header_reserved);
@@ -515,11 +536,12 @@ fn restore_tab(
             .map(crate::terminal::AgentId::from_persisted)
             .unwrap_or_else(|| crate::terminal::AgentId::alloc(&crate::app::short_host_name()));
         let saved_agent_session = saved_pane.and_then(|p| p.agent_session.as_ref());
+        let unknown_runtime = saved_pane.and_then(|p| p.runtime.unknown());
         let saved_history =
             old_id.and_then(|old_id| history.and_then(|history| history.panes.get(old_id)));
         let startup = {
             let mut agent_restore = AgentRestoreState {
-                enabled: runtime_context.resume_agents_on_restore,
+                enabled: runtime_context.resume_agents_on_restore && unknown_runtime.is_none(),
                 resumed_sessions: resumed_agent_sessions,
             };
             pane_restore_startup(saved_agent_session, saved_history, &mut agent_restore)
@@ -532,30 +554,62 @@ fn restore_tab(
         let old_pane_id = reverse_id_map.get(id).copied();
         let imported_runtime = old_pane_id.and_then(|old_id| imported_panes.remove(&old_id));
         let was_imported = imported_runtime.is_some();
+        // #1010: a pane the operator hibernated comes back hibernated, whatever
+        // `resume_agents_on_restore` says. Parking it was a request to keep the
+        // agent resumable, and a cold start is exactly when that request has
+        // to hold: the old server's memory, where hibernation used to live, is
+        // gone.
+        let saved_hibernation = if was_imported {
+            None
+        } else {
+            saved_pane
+                .and_then(|p| p.hibernated.as_ref())
+                .and_then(super::snapshot::HibernatedPlanSnapshot::to_plan)
+        };
         let pending_native_agent_restore = if was_imported {
             None
         } else {
             startup.restore_plan.clone()
         };
-        if let Some(plan) = pending_native_agent_restore {
+        let runtime_less_restore = saved_hibernation
+            .map(|plan| (plan, true))
+            .or_else(|| pending_native_agent_restore.map(|plan| (plan, false)));
+        if let Some((plan, hibernated)) = runtime_less_restore {
+            // From the plan rather than `startup`, which is empty for a
+            // hibernated pane when resume-on-restore is off. A shell-launched
+            // agent has no name and no argv, so without this it would not
+            // even list as an agent.
+            let initial_restore_agent = crate::detect::parse_agent_label(&plan.agent);
             let terminal_id = TerminalId::alloc();
             let mut terminal = TerminalState::with_agent_id(
                 terminal_id.clone(),
                 restored_agent_id.clone(),
                 cwd.clone(),
-            )
-            .with_pending_agent_resume_plan(plan);
+            );
+            if hibernated {
+                terminal.set_hibernated_resume_plan(Some(plan));
+            } else {
+                terminal = terminal.with_pending_agent_resume_plan(plan);
+            }
+            terminal.launch_argv = saved_launch_argv.clone();
+            terminal.launch_env = saved_pane.map(|p| p.launch_env.clone()).unwrap_or_default();
+            terminal.persisted_runtime_tag = unknown_runtime.cloned();
             terminal.last_prompt = saved_last_prompt.clone();
             terminal.header_reserved = saved_header_reserved;
             if let Some(label) = saved_label {
-                terminal.set_manual_label(label);
+                if terminal.set_manual_label(label).is_err() {
+                    crate::logging::agent_name_dropped("manual_label_restore");
+                }
             }
             if let Some(agent_name) = saved_agent_name {
-                terminal.set_agent_name(agent_name);
+                if terminal.set_agent_name(agent_name).is_err() {
+                    crate::logging::agent_name_dropped("session_restore");
+                }
             }
             terminal.run_id = saved_run_id.clone();
             terminal.spawn_depth = saved_spawn_depth;
             terminal.spawned_by = saved_spawned_by.clone();
+            terminal.questions = saved_questions;
             if let Some(agent) = initial_restore_agent {
                 let _ = terminal.set_detected_state_with_screen_signals_at(
                     Some(agent),
@@ -578,6 +632,9 @@ fn restore_tab(
             continue;
         }
 
+        let imported_session_confirmed = imported_runtime
+            .as_ref()
+            .is_some_and(|imported| imported.state.agent_session_hook_confirmed);
         let runtime_result = if let Some(imported) = imported_runtime {
             TerminalRuntime::from_handoff_fd(
                 crate::handoff_runtime::ImportedHandoffRuntime {
@@ -614,6 +671,8 @@ fn restore_tab(
                     restored_agent_id.clone(),
                     cwd.clone(),
                 );
+                terminal.launch_env = saved_pane.map(|p| p.launch_env.clone()).unwrap_or_default();
+                terminal.persisted_runtime_tag = unknown_runtime.cloned();
                 terminal.last_prompt = saved_last_prompt.clone();
                 terminal.header_reserved = saved_header_reserved;
                 if was_imported {
@@ -622,14 +681,19 @@ fn restore_tab(
                     }
                 }
                 if let Some(label) = saved_label {
-                    terminal.set_manual_label(label);
+                    if terminal.set_manual_label(label).is_err() {
+                        crate::logging::agent_name_dropped("manual_label_restore");
+                    }
                 }
                 if let Some(agent_name) = saved_agent_name {
-                    terminal.set_agent_name(agent_name);
+                    if terminal.set_agent_name(agent_name).is_err() {
+                        crate::logging::agent_name_dropped("session_restore");
+                    }
                 }
                 terminal.run_id = saved_run_id.clone();
                 terminal.spawn_depth = saved_spawn_depth;
                 terminal.spawned_by = saved_spawned_by.clone();
+                terminal.questions = saved_questions;
                 if let Some(agent) = initial_restore_agent {
                     let _ = terminal.set_detected_state_with_screen_signals_at(
                         Some(agent),
@@ -646,6 +710,9 @@ fn restore_tab(
                     startup.duplicate_agent_session,
                 ) {
                     terminal.set_persisted_agent_session(session);
+                    if imported_session_confirmed {
+                        terminal.confirm_persisted_agent_session_after_handoff();
+                    }
                 }
                 panes.insert(*id, PaneState::new(terminal_id.clone()));
                 terminal_runtimes.insert(terminal_id, runtime);
@@ -669,12 +736,12 @@ fn restore_tab(
         }
     }
 
-    if panes.is_empty() {
+    if panes.is_empty() && native_views.is_empty() {
         crate::logging::session_restore_tab_no_panes(&format!("{:?}", snap.custom_name));
         return (None, failed_imports);
     }
 
-    let surviving: HashSet<PaneId> = panes.keys().copied().collect();
+    let surviving: HashSet<PaneId> = panes.keys().chain(native_views.keys()).copied().collect();
     let Some(node) = prune_restored_node(node, &surviving) else {
         crate::logging::session_restore_tab_pruned_empty(&format!("{:?}", snap.custom_name));
         return (None, failed_imports);
@@ -697,6 +764,7 @@ fn restore_tab(
                 root_pane,
                 layout,
                 panes,
+                native_views,
                 #[cfg(test)]
                 runtimes: HashMap::new(),
                 zoomed: snap.zoomed,
@@ -1126,6 +1194,8 @@ mod tests {
         // resolve, and nothing here asserts on which directory it is.
         let cwd = std::env::temp_dir();
         let snapshot = SessionSnapshot {
+            structured_agents: crate::structured::registry::Registry::default(),
+            structured_retention: serde_json::Value::Null,
             issue_draft: None,
             version: super::super::snapshot::SNAPSHOT_VERSION,
             workspaces: vec![WorkspaceSnapshot {
@@ -1138,11 +1208,13 @@ mod tests {
                 public_tab_numbers: Vec::new(),
                 next_public_tab_number: 0,
                 tabs: vec![TabSnapshot {
+                    native_views: HashMap::new(),
                     custom_name: None,
                     layout: LayoutSnapshot::Pane(0),
                     panes: HashMap::from([(
                         0,
                         super::super::snapshot::PaneSnapshot {
+                            runtime: crate::persist::snapshot::PtyRuntime::Pty,
                             agent_id: None,
                             cwd,
                             label: None,
@@ -1152,6 +1224,7 @@ mod tests {
                             run_id: None,
                             spawn_depth: 0,
                             spawned_by: None,
+                            questions: None,
                             agent_session: Some(super::super::snapshot::PaneAgentSessionSnapshot {
                                 source: "flock:opencode".into(),
                                 agent: "opencode".into(),
@@ -1159,6 +1232,8 @@ mod tests {
                                 value: "opencode-session".into(),
                             }),
                             launch_argv: None,
+                            launch_env: Vec::new(),
+                            hibernated: None,
                         },
                     )]),
                     zoomed: false,
@@ -1210,13 +1285,14 @@ mod tests {
         assert_eq!(session.session_ref.value, "opencode-session");
     }
 
-    #[tokio::test]
-    #[cfg(unix)]
-    async fn native_agent_restore_defers_runtime_launch() {
-        // Deterministic, existing directory: restore only needs the path to
-        // resolve, and nothing here asserts on which directory it is.
-        let cwd = std::env::temp_dir();
-        let snapshot = SessionSnapshot {
+    /// One codex agent pane with a resumable session.
+    fn codex_agent_snapshot(
+        cwd: PathBuf,
+        questions: Option<crate::api::schema::QuestionPolicy>,
+    ) -> SessionSnapshot {
+        SessionSnapshot {
+            structured_agents: crate::structured::registry::Registry::default(),
+            structured_retention: serde_json::Value::Null,
             issue_draft: None,
             version: super::super::snapshot::SNAPSHOT_VERSION,
             workspaces: vec![WorkspaceSnapshot {
@@ -1229,11 +1305,13 @@ mod tests {
                 public_tab_numbers: Vec::new(),
                 next_public_tab_number: 0,
                 tabs: vec![TabSnapshot {
+                    native_views: HashMap::new(),
                     custom_name: None,
                     layout: LayoutSnapshot::Pane(0),
                     panes: HashMap::from([(
                         0,
                         super::super::snapshot::PaneSnapshot {
+                            runtime: crate::persist::snapshot::PtyRuntime::Pty,
                             agent_id: None,
                             cwd,
                             label: None,
@@ -1243,6 +1321,7 @@ mod tests {
                             run_id: None,
                             spawn_depth: 0,
                             spawned_by: None,
+                            questions,
                             agent_session: Some(super::super::snapshot::PaneAgentSessionSnapshot {
                                 source: "flock:codex".into(),
                                 agent: "codex".into(),
@@ -1250,6 +1329,8 @@ mod tests {
                                 value: "codex-session".into(),
                             }),
                             launch_argv: None,
+                            launch_env: Vec::new(),
+                            hibernated: None,
                         },
                     )]),
                     zoomed: false,
@@ -1267,7 +1348,122 @@ mod tests {
             sidebar_section_split: None,
             collapsed_space_keys: Default::default(),
             pane_id_aliases: std::collections::HashMap::new(),
-        };
+        }
+    }
+
+    #[tokio::test]
+    async fn deferred_snapshot_reports_offline_through_agent_api() {
+        let saved = codex_agent_snapshot(std::env::temp_dir(), None);
+        let snapshot: SessionSnapshot =
+            serde_json::from_slice(&serde_json::to_vec(&saved).unwrap()).unwrap();
+        let (events, _event_rx) = mpsc::channel(4);
+        let (workspaces, terminals, runtimes) = restore(
+            &snapshot,
+            None,
+            24,
+            80,
+            0,
+            "/bin/sh",
+            crate::config::ShellModeConfig::NonLogin,
+            true,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert!(runtimes.is_empty());
+        let agent_id = terminals.values().next().unwrap().agent_id.to_string();
+        let (_, rx) = mpsc::unbounded_channel();
+        let mut app = crate::app::App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            rx,
+            crate::api::EventHub::default(),
+        );
+        app.state.workspaces = workspaces;
+        app.state.terminals = terminals;
+        app.terminal_runtimes = runtimes.into();
+        for (method, params, pointer) in [
+            (
+                "agent.get",
+                serde_json::json!({"target":agent_id}),
+                "/result/agent",
+            ),
+            ("agent.list", serde_json::json!({}), "/result/agents/0"),
+            ("pane.list", serde_json::json!({}), "/result/panes/0"),
+        ] {
+            let request = serde_json::from_value(
+                serde_json::json!({"id":"restore", "method":method, "params":params}),
+            )
+            .unwrap();
+            let response: serde_json::Value =
+                serde_json::from_str(&app.handle_api_request(request)).unwrap();
+            let record = response.pointer(pointer).unwrap();
+            assert_eq!(record["agent_status"], "offline", "{response}");
+            assert_eq!(record["agent_session"]["value"], "codex-session");
+            if method != "pane.list" {
+                assert_eq!(record["resumable"], true);
+                assert_eq!(record["state"]["lifecycle"], "offline");
+                assert_eq!(record["state"]["phase"], "offline");
+                assert_eq!(record["state"]["turn"], "unknown");
+            }
+        }
+        for (method, pointer) in [
+            ("tab.list", "/result/tabs/0/agent_status"),
+            ("workspace.list", "/result/workspaces/0/agent_status"),
+            ("peers.summary", "/result/workspaces/0/status"),
+            ("peers.summary", "/result/workspaces/0/agents/0/status"),
+        ] {
+            let request = serde_json::from_value(
+                serde_json::json!({"id":"projection", "method":method, "params":{}}),
+            )
+            .unwrap();
+            let response: serde_json::Value =
+                serde_json::from_str(&app.handle_api_request(request)).unwrap();
+            assert_eq!(response.pointer(pointer).unwrap(), "offline", "{response}");
+        }
+        assert_eq!(app.terminal_runtimes.len(), 0);
+        assert!(app
+            .state
+            .terminals
+            .values()
+            .next()
+            .unwrap()
+            .pending_agent_resume_plan
+            .is_some());
+        // #1644: an isolated restored instance must draw lifecycle, not saved idle.
+        app.state.mode = crate::app::Mode::Terminal;
+        app.state.active = Some(0);
+        let area = ratatui::layout::Rect::new(0, 0, 120, 36);
+        let (restored, _) = crate::server::render_stream::render_virtual_with_runtime_registry(
+            &mut app.state,
+            &app.terminal_runtimes,
+            area,
+            false,
+            Default::default(),
+        );
+        for terminal in app.state.terminals.values_mut() {
+            terminal.state = crate::detect::AgentState::Unknown;
+        }
+        let (offline, _) = crate::server::render_stream::render_virtual_with_runtime_registry(
+            &mut app.state,
+            &app.terminal_runtimes,
+            area,
+            false,
+            Default::default(),
+        );
+        assert_eq!(
+            restored, offline,
+            "cold restore must render as offline, not saved idle"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn native_agent_restore_defers_runtime_launch() {
+        // Deterministic, existing directory: restore only needs the path to
+        // resolve, and nothing here asserts on which directory it is.
+        let snapshot = codex_agent_snapshot(std::env::temp_dir(), None);
         let (events, _event_rx) = mpsc::channel(4);
 
         let (_workspaces, terminals, runtimes) = restore(
@@ -1324,6 +1520,45 @@ mod tests {
             handoff_runtimes.is_empty(),
             "handoff restore should not replace pending native agent resume with a shell runtime"
         );
+    }
+
+    /// #1179: a restored or handed-off agent keeps its question policy, and a
+    /// snapshot from before #1179 restores as `ask_human`.
+    #[tokio::test]
+    async fn a_restored_agent_keeps_its_question_policy() {
+        use crate::api::schema::QuestionPolicy;
+        for (saved, restored) in [
+            (Some(QuestionPolicy::Route), QuestionPolicy::Route),
+            (None, QuestionPolicy::AskHuman),
+        ] {
+            let snapshot = codex_agent_snapshot(std::env::temp_dir(), saved);
+            let (_workspaces, terminals, _runtimes) = restore(
+                &snapshot,
+                None,
+                24,
+                80,
+                0,
+                "/bin/sh",
+                crate::config::ShellModeConfig::NonLogin,
+                true,
+                mpsc::channel(4).0,
+                Arc::new(Notify::new()),
+                Arc::new(AtomicBool::new(false)),
+            );
+            assert_eq!(terminals.values().next().unwrap().questions, restored);
+            let (_workspaces, terminals, _runtimes) = restore_handoff(
+                &snapshot,
+                0,
+                "/bin/sh",
+                crate::config::ShellModeConfig::NonLogin,
+                &mut HashMap::new(),
+                mpsc::channel(4).0,
+                Arc::new(Notify::new()),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .expect("handoff restore");
+            assert_eq!(terminals.values().next().unwrap().questions, restored);
+        }
     }
 
     #[tokio::test]
@@ -1404,6 +1639,102 @@ mod tests {
         let _ = runtime.try_send_bytes(bytes::Bytes::from_static(b"exit\n"));
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn security_agent_name_restore_drops_names_in_shell_and_native_paths() {
+        let mut failures = Vec::new();
+        for native in [false, true] {
+            for (case, name) in crate::test_support::hostile_agent_names() {
+                let (mut snapshot, _) = snapshot_with_saved_pane_history();
+                let pane = snapshot.workspaces[0].tabs[0]
+                    .panes
+                    .values_mut()
+                    .next()
+                    .unwrap();
+                pane.agent_name = Some(name.clone());
+                pane.label = Some(name.clone());
+                if native {
+                    pane.agent_session = Some(super::super::snapshot::PaneAgentSessionSnapshot {
+                        source: "flock:codex".into(),
+                        agent: "codex".into(),
+                        kind: crate::agent_resume::AgentSessionRefKind::Id,
+                        value: "fixture-session".into(),
+                    });
+                }
+                let shell = crate::test_support::no_op_program();
+                let (events, _rx) = mpsc::channel(64);
+                let mut retained = false;
+                let logs = crate::logging::capture_logs(|| {
+                    let (_, terminals, mut runtimes) = restore(
+                        &snapshot,
+                        None,
+                        5,
+                        40,
+                        4096,
+                        &shell,
+                        crate::config::ShellModeConfig::NonLogin,
+                        true,
+                        events,
+                        Arc::new(Notify::new()),
+                        Arc::new(AtomicBool::new(false)),
+                    );
+                    retained = terminals.values().any(|terminal| {
+                        terminal.agent_name().is_some() || terminal.manual_label.is_some()
+                    });
+                    for (_, runtime) in runtimes.drain() {
+                        runtime.shutdown();
+                    }
+                });
+                if retained || !logs.contains("code=\"invalid_agent_name\"") {
+                    failures.push((native, case));
+                }
+                assert!(
+                    !logs.contains(&name),
+                    "rejected name must not reach logs: {case}"
+                );
+            }
+        }
+        assert!(failures.is_empty(), "unsafe restore cases: {failures:?}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn security_label_restore_drops_unmirrored_manual_label() {
+        for (case, label) in crate::test_support::hostile_agent_names() {
+            let (mut snapshot, _) = snapshot_with_saved_pane_history();
+            let pane = snapshot.workspaces[0].tabs[0]
+                .panes
+                .values_mut()
+                .next()
+                .unwrap();
+            pane.label = Some(label.clone());
+            assert!(pane.agent_name.is_none());
+            let (events, _rx) = mpsc::channel(64);
+            let shell = crate::test_support::no_op_program();
+            let mut retained = false;
+            let logs = crate::logging::capture_logs(|| {
+                let (_, terminals, mut runtimes) = restore(
+                    &snapshot,
+                    None,
+                    5,
+                    40,
+                    4096,
+                    &shell,
+                    crate::config::ShellModeConfig::NonLogin,
+                    false,
+                    events,
+                    Arc::new(Notify::new()),
+                    Arc::new(AtomicBool::new(false)),
+                );
+                retained = terminals.values().any(|t| t.manual_label.is_some());
+                for (_, runtime) in runtimes.drain() {
+                    runtime.shutdown();
+                }
+            });
+            assert!(!retained, "manual label retained: {case}");
+            assert!(logs.contains("invalid_agent_name"));
+            assert!(!logs.contains(&label));
+        }
+    }
+
     fn snapshot_with_saved_pane_history() -> (SessionSnapshot, SessionHistorySnapshot) {
         // Deterministic, existing directory (see above).
         let cwd = std::env::temp_dir();
@@ -1411,6 +1742,7 @@ mod tests {
         panes.insert(
             0,
             super::super::snapshot::PaneSnapshot {
+                runtime: crate::persist::snapshot::PtyRuntime::Pty,
                 agent_id: None,
                 cwd: cwd.clone(),
                 label: None,
@@ -1420,8 +1752,11 @@ mod tests {
                 run_id: None,
                 spawn_depth: 0,
                 spawned_by: None,
+                questions: None,
                 agent_session: None,
                 launch_argv: None,
+                launch_env: Vec::new(),
+                hibernated: None,
             },
         );
         let history = SessionHistorySnapshot {
@@ -1439,6 +1774,8 @@ mod tests {
             }],
         };
         let snapshot = SessionSnapshot {
+            structured_agents: crate::structured::registry::Registry::default(),
+            structured_retention: serde_json::Value::Null,
             issue_draft: None,
             version: super::super::snapshot::SNAPSHOT_VERSION,
             workspaces: vec![WorkspaceSnapshot {
@@ -1451,6 +1788,7 @@ mod tests {
                 public_tab_numbers: Vec::new(),
                 next_public_tab_number: 0,
                 tabs: vec![TabSnapshot {
+                    native_views: HashMap::new(),
                     custom_name: None,
                     layout: LayoutSnapshot::Pane(0),
                     panes,
@@ -1479,6 +1817,10 @@ mod tests {
         let registry = crate::terminal::TerminalRuntimeRegistry::new();
         // gen1 env id 5 was aliased to the gen2 id by the previous handoff.
         let snapshot = super::super::snapshot::capture(
+            crate::persist::RegistryCapture {
+                registry: &crate::structured::registry::Registry::default(),
+                now_ms: Some(42),
+            },
             &[ws_old],
             &std::collections::HashMap::new(),
             &registry,
@@ -1500,5 +1842,207 @@ mod tests {
         assert_eq!(aliases.get(&old_pane.raw()), Some(&new_pane));
         // The ancient gen1 id still resolves: 5 -> gen2 -> gen3.
         assert_eq!(aliases.get(&5), Some(&new_pane));
+    }
+}
+
+#[cfg(test)]
+mod native_tests {
+    use super::*;
+    use crate::app::state::PendingUiEvent::PaneClosed;
+    use crate::structured::view::{
+        placement::{UnavailableReason::*, View},
+        tests::fixture,
+    };
+
+    #[test]
+    fn native_roundtrip_unavailable_survives_and_close_removes() {
+        for (kind, schema, agent, reason) in [
+            ("structured", "1", "fixture-agent", None),
+            ("future", " 1", "x", Some(UnknownKind)),
+            ("structured", "2", "x", Some(UnsupportedSchema)),
+            ("structured", "1", "x", Some(MissingAgent)),
+            ("structured", "false", "x", Some(InvalidRecord)),
+        ] {
+            let (mut state, target) = fixture();
+            let raw = format!(r#"{{"kind":"{kind}","schema":{schema},"agent_id":"{agent}"}}"#);
+            let json = format!(
+                r#"{{"workspaces":[{{"identity_cwd":".","tabs":[{{"layout":{{"Pane":7}},"panes":{{}},"native_views":{{"7":{raw}}},"zoomed":false}}]}}]}}"#
+            );
+            let mut snap = super::super::snapshot::parse_snapshot(&json).unwrap();
+            snap.structured_agents = state.structured_agents.snapshot();
+            let (events, _) = mpsc::channel(8);
+            let (workspaces, terminals, runtimes) = restore(
+                &snap,
+                None,
+                24,
+                80,
+                0,
+                "/bin/sh",
+                crate::config::ShellModeConfig::NonLogin,
+                true,
+                events,
+                Arc::new(Notify::new()),
+                Arc::new(AtomicBool::new(false)),
+            );
+            assert_eq!(workspaces.len(), 1);
+            assert!(terminals.is_empty() && runtimes.is_empty());
+            let tab = &workspaces[0].tabs[0];
+            assert!(tab.membership_valid());
+            let id = tab.root_pane;
+            let view = &tab.native_views[&id];
+            assert_eq!(view.target(), reason.is_none().then_some(&target));
+            if let Some(reason) = reason {
+                assert!(
+                    matches!(view, View::Unavailable { reason: actual, .. } if *actual == reason)
+                );
+                let mut terminal =
+                    ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 4)).unwrap();
+                terminal
+                    .draw(|f| {
+                        assert!(view.render_unavailable(f, f.area()));
+                    })
+                    .unwrap();
+                let cells = terminal.backend().buffer().content();
+                let screen: String = cells.iter().map(|c| c.symbol()).collect();
+                assert!(screen.contains(&format!("Unavailable native view: {reason:?}")));
+            }
+            let saved = super::super::snapshot::capture_tab(tab, &terminals, &runtimes.into());
+            let record = &saved.native_views[&id.raw()];
+            assert_eq!(serde_json::to_string(record).unwrap(), raw.trim());
+            state.workspaces = workspaces;
+            state.active = Some(0);
+            state.close_pane();
+            assert!(state.workspaces.is_empty());
+            assert!(matches!(state.pending_ui_events[0], PaneClosed { .. }));
+        }
+    }
+
+    fn restore_native_fixture(
+        tabs: serde_json::Value,
+    ) -> (
+        Vec<Workspace>,
+        HashMap<TerminalId, TerminalState>,
+        HashMap<TerminalId, TerminalRuntime>,
+    ) {
+        let (state, _) = fixture();
+        let json =
+            serde_json::json!({"workspaces": [{"identity_cwd": ".", "tabs": tabs}]}).to_string();
+        let mut snap = super::super::snapshot::parse_snapshot(&json).unwrap();
+        snap.structured_agents = state.structured_agents.snapshot();
+        let (events, _) = mpsc::channel(8);
+        restore(
+            &snap,
+            None,
+            24,
+            80,
+            0,
+            &crate::test_support::no_op_program(),
+            crate::config::ShellModeConfig::NonLogin,
+            false,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
+
+    #[test]
+    fn duplicate_agent_retains_second_placement_without_target() {
+        let tab = serde_json::json!({
+            "layout": {"Pane": 7}, "panes": {}, "zoomed": false,
+            "native_views": {"7": {"kind": "structured", "schema": 1, "agent_id": "fixture-agent"}}
+        });
+        let (workspaces, terminals, runtimes) =
+            restore_native_fixture(serde_json::json!([tab, tab]));
+        assert!(terminals.is_empty() && runtimes.is_empty());
+        let tabs = &workspaces[0].tabs;
+        assert_eq!(tabs.len(), 2);
+        assert!(tabs[0].native_views[&tabs[0].root_pane].target().is_some());
+        assert!(matches!(
+            tabs[1].native_views[&tabs[1].root_pane],
+            View::Unavailable {
+                reason: DuplicateAgent,
+                ..
+            }
+        ));
+        let saved = super::super::snapshot::capture_tab(&tabs[1], &terminals, &runtimes.into());
+        assert_eq!(
+            serde_json::to_value(&saved.native_views[&tabs[1].root_pane.raw()]).unwrap(),
+            tab["native_views"]["7"]
+        );
+    }
+
+    #[test]
+    fn unknown_fields_remain_invalid_and_byte_equal_through_restore_save() {
+        let raw = r#"{ "agent_id":"fixture-agent", "future": { "nested": [1, true] }, "schema":1, "kind":"structured" }"#;
+        let json = format!(
+            r#"{{"workspaces":[{{"identity_cwd":".","tabs":[{{"layout":{{"Pane":7}},"panes":{{}},"native_views":{{"7":{raw}}},"zoomed":false}}]}}]}}"#
+        );
+        let (state, _) = fixture();
+        let mut snap = super::super::snapshot::parse_snapshot(&json).unwrap();
+        snap.structured_agents = state.structured_agents.snapshot();
+        let (events, _) = mpsc::channel(8);
+        let (workspaces, terminals, runtimes) = restore(
+            &snap,
+            None,
+            24,
+            80,
+            0,
+            "/bin/sh",
+            crate::config::ShellModeConfig::NonLogin,
+            false,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert!(terminals.is_empty() && runtimes.is_empty());
+        let tab = &workspaces[0].tabs[0];
+        assert!(matches!(
+            tab.native_views[&tab.root_pane],
+            View::Unavailable {
+                reason: InvalidRecord,
+                ..
+            }
+        ));
+        let saved = super::super::snapshot::capture_tab(tab, &terminals, &runtimes.into());
+        assert_eq!(
+            serde_json::to_string(&saved.native_views[&tab.root_pane.raw()]).unwrap(),
+            raw
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_terminal_and_unavailable_tab_survives_restore_save() {
+        let tab = serde_json::json!({
+            "layout": {"Split": {"direction": "Horizontal", "ratio": 0.5,
+                "first": {"Pane": 7}, "second": {"Pane": 8}}},
+            "panes": {"7": {"cwd": std::env::temp_dir()}}, "zoomed": false,
+            "root_pane": 8, "focused": 8,
+            "native_views": {"8": {"kind": "future", "schema": 1, "agent_id": "x"}}
+        });
+        let (workspaces, terminals, runtimes) = restore_native_fixture(serde_json::json!([tab]));
+        assert_eq!(workspaces.len(), 1);
+        let restored = &workspaces[0].tabs[0];
+        assert!(restored.membership_valid());
+        assert_eq!(restored.panes.len(), 1);
+        assert_eq!(terminals.len(), 1);
+        assert_eq!(runtimes.len(), 1);
+        assert!(matches!(
+            restored.native_views[&restored.root_pane],
+            View::Unavailable {
+                reason: UnknownKind,
+                ..
+            }
+        ));
+        let saved = super::super::snapshot::capture_tab(restored, &terminals, &runtimes.into());
+        assert_eq!(saved.panes.len(), 1);
+        assert_eq!(saved.native_views.len(), 1);
+        assert_eq!(
+            serde_json::to_value(&saved.native_views[&restored.root_pane.raw()]).unwrap(),
+            tab["native_views"]["8"]
+        );
+        assert_eq!(
+            serde_json::to_value(&saved.layout).unwrap()["Split"]["direction"],
+            "Horizontal"
+        );
     }
 }

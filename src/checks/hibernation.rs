@@ -129,6 +129,7 @@ impl HibernationFold {
                 // Blocked / Working / Unknown / Hibernated → skip.
                 AgentStatus::Blocked
                 | AgentStatus::Working
+                | AgentStatus::Offline
                 | AgentStatus::Unknown
                 | AgentStatus::Hibernated => continue,
             };

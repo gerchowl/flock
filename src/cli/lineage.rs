@@ -42,7 +42,7 @@ pub(super) fn run_lineage_command(args: &[String]) -> std::io::Result<i32> {
         print!("{}", lineage_help_text());
         return Ok(0);
     }
-    let mut json = false;
+    let mut json = super::output::json();
     for arg in &args[1..] {
         match arg.as_str() {
             "--json" => json = true,

@@ -27,10 +27,8 @@
 //! connection (the roaming-hopper case) and exits — which arrives here as EOF
 //! on the reader thread. No timer decides that.
 //!
-//! Every failure falls back to the one-shot spawn. That is what keeps this
-//! never-worse-than-today, and it is not only an error path: a peer whose
-//! `flk` predates `peers relay` can never hold a stream at all, so the
-//! fallback is also the compatibility path during a fleet rollout.
+//! Every held edge must complete mesh.hello before carrying requests. A peer
+//! that cannot authenticate is refused with its reason retained for status.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -48,11 +46,106 @@ use crate::config::PeerConfig;
 /// ServerAlive keeps answering while no response ever comes.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Refuse to re-spawn a connection that just died, so a peer that is asleep or
-/// running an old `flk` cannot turn into a reconnect storm. Polls continue via
-/// the one-shot fallback throughout, so data keeps flowing at today's cadence
-/// while this backoff runs.
+/// Authentication or compatibility refusals retry slowly. Status retains the
+/// refusal reason while this backoff runs.
 const RECONNECT_BACKOFF: Duration = Duration::from_secs(60);
+
+/// Names a peer whose flk predates mesh transport, e.g. v0.11.0.
+pub(crate) const PRE_MESH: &str = "(peer runs a pre-mesh flk)";
+
+fn pre_mesh_refusal(peer: &str) -> String {
+    format!("mesh handshake refused: upgrade flk on {peer} {PRE_MESH}")
+}
+
+/// A pre-mesh server rejects the hello method itself. v0.11.0 answers
+/// ``invalid request: unknown variant `mesh.hello`, expected one of ...``.
+fn pre_mesh_error(error: &serde_json::Value) -> bool {
+    matches!(
+        error["code"].as_str(),
+        Some("method_not_found" | "unknown_method")
+    ) || error["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("unknown variant `mesh.hello`"))
+}
+
+/// A flk without `peers relay` prints usage or an unknown-command error
+/// instead of a JSON response.
+fn pre_mesh_output(text: &str) -> bool {
+    let text = text.trim_start();
+    text.starts_with("usage: flk")
+        || [
+            "unrecognized subcommand",
+            "unknown command",
+            "unknown subcommand",
+        ]
+        .iter()
+        .any(|marker| text.contains(marker))
+}
+
+/// Only known identity and compatibility failures use the long refusal delay.
+struct EnrollmentError {
+    detail: String,
+    transient: bool,
+    /// Transport I/O needs SSH diagnostics; a decoded mesh refusal does not.
+    transport: bool,
+}
+
+impl From<String> for EnrollmentError {
+    fn from(detail: String) -> Self {
+        let permanent = [
+            "mesh version mismatch:",
+            "mesh_protocol_violation:",
+            "invalid mesh identity",
+            "invalid mesh signature",
+            "identity changed for ",
+            "impersonation of configured peer ",
+            "mesh handshake refused (local ",
+            "mesh handshake refused: ",
+        ]
+        .iter()
+        .any(|prefix| detail.starts_with(prefix))
+            || (detail.starts_with("node ") && detail.contains(" is enrolled as "));
+        Self {
+            detail,
+            transient: !permanent,
+            transport: false,
+        }
+    }
+}
+
+impl EnrollmentError {
+    fn transport(detail: String) -> Self {
+        Self {
+            detail,
+            transient: true,
+            transport: true,
+        }
+    }
+
+    fn response(error: &serde_json::Value, detail: String) -> Self {
+        let permanent = matches!(
+            error["code"].as_str(),
+            Some(
+                "mesh_version_mismatch"
+                    | "mesh_not_enrolled"
+                    | "identity_changed"
+                    | "invalid_request"
+                    | "invalid_mesh_identity"
+                    | "invalid_mesh_signature"
+                    | "identity_pin_conflict"
+                    | "impersonation"
+            )
+        ) || (error["code"] == "mesh_refused"
+            && error["message"]
+                .as_str()
+                .is_some_and(|message| !Self::from(message.to_owned()).transient));
+        Self {
+            detail,
+            transient: !permanent,
+            transport: false,
+        }
+    }
+}
 
 /// How long a failed stream waits for ssh's stderr to drain before it is
 /// explained. ssh writes its error and exits, and the stdout EOF that reports
@@ -71,6 +164,8 @@ struct PeerStream {
     stdin: ChildStdin,
     lines: Receiver<String>,
     next_id: u64,
+    /// Selected afresh by this stream's signed hello.
+    negotiated: Option<u32>,
     /// Latest unsolicited summary the peer pushed. One slot, not a queue:
     /// the payload is a snapshot, so an older push carries nothing the newer
     /// one does not already say and queueing them would only serve staleness.
@@ -83,7 +178,7 @@ struct PeerStream {
     latest_push: Arc<Mutex<Option<(std::time::Instant, String)>>>,
     /// The last few lines ssh wrote to stderr (#418). Before this the relay's
     /// stderr went to /dev/null, so a stream that could never be established
-    /// fell back to one-shot polling with no word about why.
+    /// failed without explaining why.
     stderr_tail: Arc<Mutex<std::collections::VecDeque<String>>>,
     /// Disconnects when ssh's stderr reaches EOF — ssh has exited.
     stderr_done: Receiver<()>,
@@ -113,15 +208,6 @@ fn line_is_push(line: &str) -> bool {
         .is_ok_and(|value| value.get("push").is_some_and(|push| !push.is_null()))
 }
 
-/// The push kind a spoke uses to hand a message up to its hub (#410).
-pub(crate) const UPLINK_PUSH: &str = "msg.uplink";
-
-/// Whether a push line is a message handed up rather than a summary. Parsed,
-/// like [`line_is_push`], never matched as text.
-fn push_is_uplink(line: &str) -> bool {
-    push_kind(line).as_deref() == Some(UPLINK_PUSH)
-}
-
 /// The push kind a summary push carries.
 const SUMMARY_PUSH: &str = "peers.summary";
 
@@ -133,17 +219,39 @@ fn push_kind(line: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Handed-up frames the hub will hold for one spoke before refusing more.
-///
-/// Bounds what a flooding (or compromised) spoke can cost the hub: frames past
-/// this are dropped and logged, and their senders time out with
-/// `taken_by_hub`, which is safe to retry. Far above any real message rate.
-const UPLINK_QUEUE_DEPTH: usize = 64;
+fn route_wake_registry() -> &'static Mutex<HashMap<String, std::sync::atomic::AtomicBool>> {
+    static WAKES: OnceLock<Mutex<HashMap<String, std::sync::atomic::AtomicBool>>> = OnceLock::new();
+    WAKES.get_or_init(Default::default)
+}
 
-/// Frames forwarded concurrently per spoke. More than one, so a slow next hop
-/// (a whole ssh timeout) does not hold every other message behind it; few, so
-/// a flood cannot spawn a thread per frame.
-const UPLINK_FORWARD_WORKERS: usize = 4;
+pub(crate) fn take_route_wake(peer: &PeerConfig) -> bool {
+    route_wake_registry()
+        .lock()
+        .ok()
+        .and_then(|wakes| {
+            wakes
+                .get(&peer.name)
+                .map(|wake| wake.swap(false, std::sync::atomic::Ordering::AcqRel))
+        })
+        .unwrap_or(false)
+}
+
+fn wake_registry() -> &'static Mutex<HashMap<String, std::sync::atomic::AtomicBool>> {
+    static WAKES: OnceLock<Mutex<HashMap<String, std::sync::atomic::AtomicBool>>> = OnceLock::new();
+    WAKES.get_or_init(Default::default)
+}
+
+pub(crate) fn take_wake(peer: &PeerConfig) -> bool {
+    wake_registry()
+        .lock()
+        .ok()
+        .and_then(|wakes| {
+            wakes
+                .get(&peer.name)
+                .map(|wake| wake.swap(false, std::sync::atomic::Ordering::AcqRel))
+        })
+        .unwrap_or(false)
+}
 
 /// Split the relay's inbound lines: pushes to the single-slot buffer, every
 /// other line to whoever is waiting on a response.
@@ -160,31 +268,32 @@ fn route_relay_lines<R: BufRead>(
     reader: R,
     responses: &std::sync::mpsc::Sender<String>,
     push_slot: &Arc<Mutex<Option<(std::time::Instant, String)>>>,
-    uplinks: &std::sync::mpsc::SyncSender<String>,
 ) {
     for line in reader.lines().map_while(Result::ok) {
-        // #410: a message a spoke handed up is a push too, but NOT a summary.
-        // It must never land in the one-slot summary buffer — a summary would
-        // overwrite it, or it would answer a poll as though it were one — and
-        // it is not coalesced: every frame is a message someone is waiting on.
-        // Checked first, so the summary path below keeps its at-most-one-per-
-        // window shape untouched.
-        if push_is_uplink(&line) {
-            if uplinks.try_send(line).is_err() {
-                crate::logging::uplink_result_undelivered(
-                    peer,
-                    "",
-                    "uplink queue full; frame dropped",
-                );
-            }
-            continue;
-        }
         // A push carries `push` where a response carries `id`, so routing
         // needs no guessing. Anything else is a response and belongs to
         // whoever is waiting on the channel — including a line that is not
         // JSON at all, which surfaces to the caller as a parse error rather
         // than disappearing into the push slot where nobody would see it.
         if line_is_push(&line) {
+            if push_kind(&line).as_deref() == Some("mesh.wake") {
+                if let Ok(mut wakes) = wake_registry().lock() {
+                    wakes
+                        .entry(peer.into())
+                        .or_default()
+                        .store(true, std::sync::atomic::Ordering::Release);
+                }
+                continue;
+            }
+            if push_kind(&line).as_deref() == Some("mesh.routes_changed") {
+                if let Ok(mut wakes) = route_wake_registry().lock() {
+                    wakes
+                        .entry(peer.into())
+                        .or_default()
+                        .store(true, std::sync::atomic::Ordering::Release);
+                }
+                continue;
+            }
             // A kind this build does not know is dropped, never fed to the
             // summary parser, where it would fail the poll it answered.
             if let Some(kind) = push_kind(&line).filter(|kind| kind != SUMMARY_PUSH) {
@@ -252,47 +361,127 @@ impl PeerStream {
         let (tx, lines) = std::sync::mpsc::channel();
         let latest_push = Arc::new(Mutex::new(None));
         let push_slot = Arc::clone(&latest_push);
-        let (uplink_tx, uplink_rx) = std::sync::mpsc::sync_channel::<String>(UPLINK_QUEUE_DEPTH);
         let reader_peer = peer.name.clone();
+        let epoch = register_reader(&reader_peer);
         std::thread::spawn(move || {
-            route_relay_lines(
-                &reader_peer,
-                BufReader::new(stdout),
-                &tx,
-                &push_slot,
-                &uplink_tx,
-            );
+            route_registered_lines(&reader_peer, epoch, BufReader::new(stdout), &tx, &push_slot);
         });
-        // A small pool, off the reader: forwarding runs the hub's own
-        // `msg.send`, which can spend a whole ssh timeout on the next hop, and
-        // the reader must keep delivering poll responses while it does. The
-        // workers end when the reader does, dropping the queue's sender.
-        let uplink_rx = Arc::new(Mutex::new(uplink_rx));
-        for _ in 0..UPLINK_FORWARD_WORKERS {
-            let spoke = peer.clone();
-            let queue = Arc::clone(&uplink_rx);
-            std::thread::spawn(move || loop {
-                let next = match queue.lock() {
-                    Ok(queue) => queue.recv(),
-                    Err(_) => return,
-                };
-                let Ok(line) = next else {
-                    return;
-                };
-                forward_uplinked_frame(&spoke, &line);
-            });
-        }
-
         Ok(Self {
             child,
             stdin,
             lines,
             next_id: 0,
+            negotiated: None,
             latest_push,
             stderr_tail,
             stderr_done,
             agent,
         })
+    }
+
+    fn enroll(&mut self, peer: &PeerConfig) -> Result<(String, u32), EnrollmentError> {
+        use crate::mesh::{
+            hello::{self, Challenge, Hello, Offer},
+            identity::NodeIdentity,
+        };
+        let identity = NodeIdentity::load().map_err(|e| e.to_string())?;
+        let dialer = Offer::new(&identity, crate::app::short_host_name())?;
+        let request = serde_json::to_value(Hello::Begin {
+            offer: dialer.clone(),
+        })
+        .map_err(|e| e.to_string())?;
+        let raw = self
+            .request("mesh.hello", request)
+            .map_err(EnrollmentError::transport)?;
+        let response: serde_json::Value = match serde_json::from_str(&raw) {
+            Ok(response) => response,
+            Err(_) if pre_mesh_output(&raw) => return Err(pre_mesh_refusal(&peer.name).into()),
+            Err(err) => return Err(err.to_string().into()),
+        };
+        if let Some(error) = response.get("error") {
+            if pre_mesh_error(error) {
+                return Err(pre_mesh_refusal(&peer.name).into());
+            }
+            if error["code"] == "mesh_version_mismatch" {
+                if let Some(remote) = error["data"]["mesh"]
+                    .as_u64()
+                    .and_then(|v| u32::try_from(v).ok())
+                {
+                    let min = error["data"]["mesh_min"]
+                        .as_u64()
+                        .and_then(|v| u32::try_from(v).ok())
+                        .unwrap_or(remote);
+                    if error["data"].get("mesh_min").is_none()
+                        && (hello::window().0..=hello::window().1).contains(&remote)
+                    {
+                        return Err(format!("mesh version mismatch: peer {} predates version negotiation; upgrade flk on {}", peer.name, peer.name).into());
+                    }
+                    return Err(hello::version_mismatch(
+                        hello::window(),
+                        (min, remote),
+                        &peer.name,
+                    )
+                    .into());
+                }
+            }
+            if matches!(
+                error["code"].as_str(),
+                Some("invalid_request" | "mesh_version_mismatch")
+            ) {
+                let remote = error["data"]["mesh"]
+                    .as_u64()
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "unsupported".into());
+                return Err(format!("mesh handshake refused (local {}, remote {remote}): {error}; upgrade flk on {}", hello::version(), peer.name).into());
+            }
+            return Err(EnrollmentError::response(
+                error,
+                format!("mesh handshake failed for {}: {error}", peer.name),
+            ));
+        }
+        let challenge: Challenge = serde_json::from_value(response["result"]["challenge"].clone())
+            .map_err(|e| {
+                format!(
+                    "unsupported mesh hello (local {}, remote unknown): {e}; upgrade flk on {}",
+                    hello::version(),
+                    peer.name
+                )
+            })?;
+        let negotiated = challenge.verify(&dialer, &peer.name)?;
+        challenge.offer.validate(&peer.name)?;
+        hello::check_pin(
+            &peer.name,
+            &challenge.offer,
+            crate::mesh::store::PinSource::Configured,
+            false,
+        )?;
+        let signature = hello::sign(&identity, &dialer, &challenge.offer, "dialer")?;
+        let finish =
+            serde_json::to_value(Hello::Finish { signature }).map_err(|e| e.to_string())?;
+        let raw = self
+            .request("mesh.hello", finish)
+            .map_err(EnrollmentError::transport)?;
+        let ack: serde_json::Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+        if let Some(error) = ack.get("error") {
+            return Err(EnrollmentError::response(
+                error,
+                format!("mesh enrollment failed: {error}"),
+            ));
+        }
+        if !ack.get("result").is_some_and(serde_json::Value::is_object) {
+            return Err("invalid mesh enrollment acknowledgement".to_string().into());
+        }
+        hello::check_pin(
+            &peer.name,
+            &challenge.offer,
+            crate::mesh::store::PinSource::Configured,
+            true,
+        )?;
+        if let Ok(mut push) = self.latest_push.lock() {
+            *push = None;
+        }
+        self.negotiated = Some(negotiated);
+        Ok((challenge.offer.node_id, negotiated))
     }
 
     /// Explain a failed request from what ssh said on the way out.
@@ -349,7 +538,24 @@ impl PeerStream {
             .map_err(|err| format!("flush failed: {err}"))?;
 
         match self.lines.recv_timeout(REQUEST_TIMEOUT) {
-            Ok(line) => Ok(line),
+            Ok(line) => {
+                if method != "mesh.hello" {
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
+                        if matches!(
+                            value["error"]["code"].as_str(),
+                            Some(
+                                "mesh_not_enrolled"
+                                    | "not_an_edge"
+                                    | "inbound_edges_full"
+                                    | "no_local_server"
+                            )
+                        ) {
+                            return Err("mesh edge lost enrollment; reconnect required".into());
+                        }
+                    }
+                }
+                Ok(line)
+            }
             Err(RecvTimeoutError::Timeout) => Err(format!(
                 "{WEDGED} in {}s — peer relay wedged",
                 REQUEST_TIMEOUT.as_secs()
@@ -366,86 +572,6 @@ const CONNECTION_CLOSED: &str = "connection closed";
 /// answered — the one failure where ssh has nothing on stderr to wait for.
 const WEDGED: &str = "no response";
 
-/// Where relay readers hand the frames their spokes push up: this hub's
-/// main loop (#410). Set by the poll dispatch, which already owns the sender.
-type UplinkSink = Mutex<Option<tokio::sync::mpsc::Sender<crate::events::AppEvent>>>;
-
-fn uplink_sink() -> &'static UplinkSink {
-    static SINK: OnceLock<UplinkSink> = OnceLock::new();
-    SINK.get_or_init(Default::default)
-}
-
-pub(crate) fn set_uplink_sink(sink: tokio::sync::mpsc::Sender<crate::events::AppEvent>) {
-    if let Ok(mut slot) = uplink_sink().lock() {
-        *slot = Some(sink);
-    }
-}
-
-/// How long a forward worker waits for the main loop's answer. Above the
-/// hub's own ssh timeout for the next hop, so a slow-but-successful delivery
-/// is not reported as lost; a property of that hop, not a preference.
-const UPLINK_FORWARD_ANSWER: Duration = Duration::from_secs(45);
-
-/// Hub side of #410: deliver a message `spoke` handed up, then send the
-/// outcome back down the same relay.
-///
-/// Handed to the main loop IN-PROCESS, as `AppEvent::UplinkForwarded`, never
-/// through this hub's socket: the spoke identity attached here comes from the
-/// `PeerConfig` of the edge this hub dialled, and a socket method would let
-/// any local process name a spoke instead. The main loop then runs the hub's
-/// ordinary `msg.send` — one delivery implementation, wherever the sender was.
-fn forward_uplinked_frame(spoke: &PeerConfig, line: &str) {
-    let Some(frame) = serde_json::from_str::<serde_json::Value>(line)
-        .ok()
-        .and_then(|value| value.get("frame").cloned())
-        .and_then(|frame| serde_json::from_value::<crate::api::schema::UplinkFrame>(frame).ok())
-    else {
-        crate::logging::uplink_result_undelivered(&spoke.name, "", "unparseable uplink frame");
-        return;
-    };
-    let uplink_id = frame.uplink_id.clone();
-    let sink = uplink_sink().lock().ok().and_then(|slot| slot.clone());
-    let (respond_to, answer) = std::sync::mpsc::channel();
-    let delivered = sink.is_some_and(|sink| {
-        sink.blocking_send(crate::events::AppEvent::UplinkForwarded {
-            spoke: spoke.name.clone(),
-            message: frame.message,
-            respond_to,
-        })
-        .is_ok()
-    });
-    let response = if delivered {
-        answer
-            .recv_timeout(UPLINK_FORWARD_ANSWER)
-            .ok()
-            .and_then(|line| serde_json::from_str::<serde_json::Value>(&line).ok())
-    } else {
-        None
-    }
-    .unwrap_or_else(|| {
-        serde_json::json!({
-            "id": "uplink-forward",
-            "error": {
-                "code": "hub_unavailable",
-                "message": "the hub's own server did not answer the forward",
-            },
-        })
-    });
-    crate::logging::uplink_frame_forwarded(
-        &spoke.name,
-        &uplink_id,
-        response.get("result").is_some(),
-    );
-    let result = serde_json::json!({
-        "uplink_id": uplink_id,
-        "hub": crate::app::short_host_name(),
-        "response": response,
-    });
-    if let Err(err) = request(spoke, "msg.uplink_result", result) {
-        crate::logging::uplink_result_undelivered(&spoke.name, &uplink_id, &err);
-    }
-}
-
 impl Drop for PeerStream {
     fn drop(&mut self) {
         // Closing stdin ends `peers relay` at its own read loop, so the remote
@@ -461,6 +587,7 @@ impl Drop for PeerStream {
 struct Slot {
     stream: Option<PeerStream>,
     retry_after: Option<std::time::Instant>,
+    transient_failures: u32,
     /// The ssh destination this connection was opened against, so a config
     /// reload can tell "this peer moved" from "some unrelated key changed".
     target: String,
@@ -470,6 +597,19 @@ struct Slot {
     failure: Option<StreamFailure>,
 }
 
+impl Slot {
+    fn transient_backoff(&mut self) -> Duration {
+        let ceiling_ms = (1_000_u64 << self.transient_failures.min(5)).min(30_000);
+        self.transient_failures = self.transient_failures.saturating_add(1);
+        let mut random = [0_u8; 8];
+        if getrandom::fill(&mut random).is_err() {
+            return Duration::from_millis(ceiling_ms);
+        }
+        // Equal jitter avoids synchronized retries without permitting a tight loop.
+        Duration::from_millis(ceiling_ms / 2 + u64::from_ne_bytes(random) % (ceiling_ms / 2 + 1))
+    }
+}
+
 type Registry = Mutex<HashMap<String, Arc<Mutex<Slot>>>>;
 
 fn registry() -> &'static Registry {
@@ -477,13 +617,168 @@ fn registry() -> &'static Registry {
     REGISTRY.get_or_init(Default::default)
 }
 
+type Enrollments = Mutex<HashMap<String, (crate::mesh::hello::Enrollment, u64)>>;
+
+fn enrollments() -> &'static Enrollments {
+    static STATUS: OnceLock<Enrollments> = OnceLock::new();
+    STATUS.get_or_init(Default::default)
+}
+
+fn reader_epochs() -> &'static Mutex<HashMap<String, u64>> {
+    static EPOCHS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+    EPOCHS.get_or_init(Default::default)
+}
+
+fn register_reader(peer: &str) -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let epoch = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if let Ok(mut readers) = reader_epochs().lock() {
+        readers.insert(peer.into(), epoch);
+    }
+    epoch
+}
+
+fn route_registered_lines<R: BufRead>(
+    peer: &str,
+    epoch: u64,
+    reader: R,
+    responses: &std::sync::mpsc::Sender<String>,
+    push_slot: &Arc<Mutex<Option<(std::time::Instant, String)>>>,
+) {
+    route_relay_lines(peer, reader, responses, push_slot);
+    // An old reader may finish after its replacement has already enrolled.
+    if let Ok(mut readers) = reader_epochs().lock() {
+        if readers.get(peer) == Some(&epoch) {
+            readers.remove(peer);
+            note_closed_edge(peer);
+        }
+    }
+}
+
+fn closed_edges() -> &'static Mutex<std::collections::BTreeSet<String>> {
+    static CLOSED: OnceLock<Mutex<std::collections::BTreeSet<String>>> = OnceLock::new();
+    CLOSED.get_or_init(Default::default)
+}
+
+fn note_closed_edge(peer: &str) {
+    if let Ok(mut closed) = closed_edges().lock() {
+        closed.insert(peer.into());
+    }
+    if let Ok(mut statuses) = enrollments().lock() {
+        if let Some((status, _)) = statuses.get_mut(peer) {
+            if status.state == "pinned" {
+                status.state = "retrying".into();
+                status.negotiated = None;
+            }
+        }
+    }
+}
+
+pub(crate) fn take_closed_edges() -> Vec<String> {
+    closed_edges()
+        .lock()
+        .map(|mut closed| std::mem::take(&mut *closed).into_iter().collect())
+        .unwrap_or_default()
+}
+
+static ENROLLMENT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn enrollment_generation() -> u64 {
+    ENROLLMENT_GENERATION.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(test)]
+pub(crate) fn test_enroll(peer: &PeerConfig, node: &str) {
+    set_enrollment(peer, Ok((node.into(), crate::mesh::hello::VERSION)));
+}
+
+fn set_enrollment(peer: &PeerConfig, result: Result<(String, u32), EnrollmentError>) {
+    let (node_id, negotiated, reason, state) = match result {
+        Ok((node, version)) => (Some(node), Some(version), None, "pinned"),
+        Err(error) => (
+            None,
+            None,
+            Some(error.detail),
+            if error.transient {
+                "retrying"
+            } else {
+                "refused"
+            },
+        ),
+    };
+    let enrolled = node_id.is_some();
+    if !enrolled {
+        note_closed_edge(&peer.name);
+    }
+    if let Ok(mut statuses) = enrollments().lock() {
+        let previous = statuses.get(&peer.name).and_then(|s| s.0.node_id.clone());
+        let generation = if enrolled {
+            enrollment_generation().saturating_add(1)
+        } else {
+            statuses.get(&peer.name).map(|s| s.1).unwrap_or(0)
+        };
+        statuses.insert(
+            peer.name.clone(),
+            (
+                crate::mesh::hello::Enrollment {
+                    negotiated,
+                    peer: peer.name.clone(),
+                    source: crate::mesh::store::PinSource::Configured,
+                    pin_origin: Default::default(),
+                    node_id: node_id.or(previous),
+                    state: state.into(),
+                    reason,
+                },
+                generation,
+            ),
+        );
+        // Publish the wake only after the enrolled status is visible.
+        if enrolled {
+            ENROLLMENT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+pub(crate) fn enrollment(peer: &PeerConfig) -> crate::mesh::hello::Enrollment {
+    enrollments()
+        .lock()
+        .ok()
+        .and_then(|s| s.get(&peer.name).map(|s| s.0.clone()))
+        .unwrap_or_else(|| crate::mesh::hello::Enrollment {
+            negotiated: None,
+            peer: peer.name.clone(),
+            source: crate::mesh::store::PinSource::Configured,
+            pin_origin: Default::default(),
+            node_id: None,
+            state: "pending".into(),
+            reason: None,
+        })
+}
+
+/// A successful reattachment remains observable even between app ticks.
+pub(crate) fn peer_enrollment_generation(peer: &PeerConfig) -> u64 {
+    enrollments()
+        .lock()
+        .ok()
+        .and_then(|s| s.get(&peer.name).map(|s| s.1))
+        .unwrap_or(0)
+}
+
+pub(crate) fn reset_enrollment(peer: &str) {
+    note_closed_edge(peer);
+    // Removing the registry entry avoids waiting on a worker that is itself
+    // waiting for an API response from this loop.
+    if let Ok(mut registry) = registry().lock() {
+        registry.remove(peer);
+    }
+    if let Ok(mut statuses) = enrollments().lock() {
+        statuses.remove(peer);
+    }
+}
+
 /// Send an API request to `peer` over its held connection.
 ///
-/// `Err` means the caller should fall back to the one-shot spawn — it covers
-/// a peer too old to have `peers relay`, one that is asleep, and one whose
-/// relay has wedged, deliberately without distinguishing them: the answer is
-/// the same in every case, and the fallback is a working path rather than a
-/// degraded one.
+/// Errors refuse this edge. There is no compatibility fallback.
 pub fn request(
     peer: &PeerConfig,
     method: &str,
@@ -524,6 +819,17 @@ fn request_over(
     params: serde_json::Value,
     spawn: bool,
 ) -> Result<String, String> {
+    request_over_with(peer, method, params, spawn, PeerStream::spawn)
+}
+
+/// Keep connection establishment injectable without changing the request path.
+fn request_over_with(
+    peer: &PeerConfig,
+    method: &str,
+    params: serde_json::Value,
+    spawn: bool,
+    connect: impl FnOnce(&PeerConfig) -> Result<PeerStream, String>,
+) -> Result<String, String> {
     // Outer lock is held only long enough to find the slot; the request itself
     // runs under the per-peer lock so one slow peer cannot stall the others.
     let slot = {
@@ -542,6 +848,7 @@ fn request_over(
         Ok(slot) => slot,
         Err(poisoned) => {
             let mut slot = poisoned.into_inner();
+            note_closed_edge(&peer.name);
             slot.stream = None;
             slot
         }
@@ -549,7 +856,11 @@ fn request_over(
 
     if let Some(retry_after) = slot.retry_after {
         if std::time::Instant::now() < retry_after {
-            return Err("connection backing off".into());
+            return Err(slot
+                .failure
+                .as_ref()
+                .map(|f| f.detail.clone())
+                .unwrap_or_else(|| "connection backing off".into()));
         }
     }
 
@@ -559,6 +870,7 @@ fn request_over(
     // held: without this, a still-reachable OLD target would keep answering
     // indefinitely because nothing forces the stream to be re-spawned.
     if slot.stream.is_some() && slot.target != peer.ssh_target() {
+        note_closed_edge(&peer.name);
         slot.stream = None;
     }
 
@@ -567,9 +879,54 @@ fn request_over(
         if !spawn {
             return Err("no held connection".into());
         }
-        match PeerStream::spawn(peer) {
-            Ok(stream) => slot.stream = Some(stream),
+        match connect(peer) {
+            Ok(mut stream) => match stream.enroll(peer) {
+                Ok(node_id) => {
+                    slot.transient_failures = 0;
+                    slot.retry_after = None;
+                    set_enrollment(peer, Ok(node_id));
+                    slot.stream = Some(stream);
+                }
+                Err(err) => {
+                    let mut transient = err.transient;
+                    let transport = err.transport;
+                    let err = err.detail;
+                    let (mut detail, tail) = if transport {
+                        stream.explain(&err)
+                    } else {
+                        (err, None)
+                    };
+                    // A relay that exits with a CLI error never answered hello.
+                    if transient && pre_mesh_output(&detail) {
+                        detail = pre_mesh_refusal(&peer.name);
+                        transient = false;
+                    }
+                    let backoff = if transient {
+                        slot.transient_backoff()
+                    } else {
+                        RECONNECT_BACKOFF
+                    };
+                    set_enrollment(
+                        peer,
+                        Err(EnrollmentError {
+                            detail: detail.clone(),
+                            transient,
+                            transport,
+                        }),
+                    );
+                    record_establish_failure(
+                        &mut slot,
+                        &peer.name,
+                        &detail,
+                        tail.as_deref(),
+                        backoff,
+                    );
+                    slot.retry_after = Some(std::time::Instant::now() + backoff);
+                    return Err(detail);
+                }
+            },
             Err(err) => {
+                set_enrollment(peer, Err(EnrollmentError::transport(err.clone())));
                 record_establish_failure(&mut slot, &peer.name, &err, None, Duration::ZERO);
                 return Err(err);
             }
@@ -580,7 +937,30 @@ fn request_over(
     let Some(stream) = slot.stream.as_mut() else {
         return Err("no connection".into());
     };
-    match stream.request(method, params) {
+    let version = stream.negotiated.unwrap_or(crate::mesh::hello::VERSION);
+    let mesh_payload = matches!(method, "mesh.deliver" | "mesh.collect");
+    if mesh_payload {
+        crate::mesh::version_gate::check_send(&params, version, &peer.name)?;
+    }
+    let result = stream.request(method, params).and_then(|response| {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&response) {
+            if mesh_payload {
+                if let Err(kind) = crate::mesh::version_gate::check(&value, version) {
+                    return Err(crate::mesh::version_gate::violation(
+                        &peer.name, version, &kind,
+                    ));
+                }
+            }
+            if value["error"]["code"] == "mesh_protocol_violation" {
+                return Err(format!(
+                    "mesh_protocol_violation: peer {} refused session VERSION {version}",
+                    peer.name
+                ));
+            }
+        }
+        Ok(response)
+    });
+    match result {
         Ok(response) => {
             if fresh {
                 let down_secs = slot
@@ -592,19 +972,29 @@ fn request_over(
             Ok(response)
         }
         Err(err) => {
-            let (detail, tail) = stream.explain(&err);
+            let (detail, tail) = if err.starts_with("mesh_protocol_violation:") {
+                (err, None)
+            } else {
+                stream.explain(&err)
+            };
+            let error = EnrollmentError::from(detail.clone());
+            let permanent = !error.transient;
+            set_enrollment(peer, Err(error));
             // Drop the stream rather than reuse it: after a timeout the pairing
             // between requests and responses is no longer known to hold.
+            note_closed_edge(&peer.name);
             slot.stream = None;
             // A best-effort extra (#410 down-gossip, `spawn: false`) must not
             // cost the poll its connection for a whole backoff: the next poll
             // reconnects at once, exactly as if this line had never been sent.
-            let backoff = if spawn {
+            let backoff = if permanent {
                 RECONNECT_BACKOFF
+            } else if spawn {
+                slot.transient_backoff()
             } else {
                 Duration::ZERO
             };
-            if spawn {
+            if spawn || permanent {
                 slot.retry_after = Some(std::time::Instant::now() + backoff);
             }
             if fresh {
@@ -663,9 +1053,9 @@ pub fn establish_failure(peer: &PeerConfig) -> Option<String> {
         Arc::clone(registry.get(&peer.name)?)
     };
     // A blocking lock, not `try_lock`: this runs on the poll's own worker
-    // thread, never the main loop, and a request in flight (an uplink answer,
-    // say) would otherwise read as "no failure" and blank the peer's row for
-    // a poll. Poison is recovered like `request_over` does.
+    // thread, never the main loop, and a request in flight (a mesh
+    // collection, say) would otherwise read as "no failure" and blank the
+    // peer's row for a poll. Poison is recovered like `request_over` does.
     let slot = match slot.lock() {
         Ok(slot) => slot,
         Err(poisoned) => poisoned.into_inner(),
@@ -711,6 +1101,9 @@ pub fn take_pushed_summary(peer: &PeerConfig) -> Option<String> {
         Arc::clone(registry.get(&peer.name)?)
     };
     let mut slot = slot.lock().ok()?;
+    if slot.target != peer.ssh_target() {
+        return None;
+    }
     let stream = slot.stream.as_mut()?;
     let mut push = stream.latest_push.lock().ok()?;
     let (arrived, payload) = push.take()?;
@@ -729,11 +1122,17 @@ pub fn take_pushed_summary(peer: &PeerConfig) -> Option<String> {
 /// its peer is gone from config, or when its ssh destination changed — the two
 /// cases where the held connection no longer points where the config says.
 pub fn retain_configured(peers: &[PeerConfig]) {
+    for registry in [route_wake_registry(), wake_registry()] {
+        if let Ok(mut wakes) = registry.lock() {
+            wakes.retain(|name, _| peers.iter().any(|peer| &peer.name == name));
+        }
+    }
     let Ok(mut registry) = registry().lock() else {
         return;
     };
     registry.retain(|name, slot| {
         let Some(peer) = peers.iter().find(|peer| &peer.name == name) else {
+            note_closed_edge(name);
             return false;
         };
         // A slot that never connected has an empty target and no stream to
@@ -746,11 +1145,15 @@ pub fn retain_configured(peers: &[PeerConfig]) {
         // re-checks `target` against config under the lock it already holds,
         // so a moved peer reconnects there rather than waiting for the old
         // stream to happen to die.
-        match slot.try_lock() {
+        let retain = match slot.try_lock() {
             Ok(slot) => slot.stream.is_none() || slot.target == peer.ssh_target(),
             Err(std::sync::TryLockError::WouldBlock) => true,
             Err(std::sync::TryLockError::Poisoned(_)) => false,
+        };
+        if !retain {
+            note_closed_edge(name);
         }
+        retain
     });
 }
 
@@ -758,10 +1161,227 @@ pub fn retain_configured(peers: &[PeerConfig]) {
 mod tests {
     use super::*;
 
+    struct RestoreStateHome(Option<std::ffi::OsString>);
+    impl Drop for RestoreStateHome {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(previous) => std::env::set_var("XDG_STATE_HOME", previous),
+                None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+        }
+    }
+
     fn peer(name: &str) -> PeerConfig {
         PeerConfig {
             name: name.to_string(),
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn pre_mesh_replies_are_permanent_upgrade_refusals() {
+        // Verbatim v0.11.0 answer to `mesh.hello` through its relay.
+        let v011 = serde_json::json!({"code":"invalid_request","message":"invalid request: unknown variant `mesh.hello`, expected one of `ping`, `server.stop`"});
+        assert!(pre_mesh_error(&v011));
+        assert!(!pre_mesh_error(&serde_json::json!({
+            "code":"invalid_request","message":"invalid request: missing field `offer`"
+        })));
+        assert!(pre_mesh_output(
+            "usage: flk peers [status] [--json]\n       flk peers summary [--json]"
+        ));
+        assert!(pre_mesh_output("error: unrecognized subcommand 'relay'"));
+        assert!(!pre_mesh_output(
+            "ssh: connect to host node port 22: Connection refused"
+        ));
+        let refusal = EnrollmentError::from(pre_mesh_refusal("nodeb"));
+        assert!(!refusal.transient);
+        assert_eq!(
+            refusal.detail,
+            "mesh handshake refused: upgrade flk on nodeb (peer runs a pre-mesh flk)"
+        );
+    }
+
+    #[test]
+    fn both_wake_kinds_interleaved_with_responses_remain_independent() {
+        let peer = crate::config::PeerConfig {
+            name: "wake.example".into(),
+            ..Default::default()
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let slot = Arc::new(Mutex::new(None));
+        let wire = concat!(
+            "{\"id\":\"one\"}\n",
+            "{\"push\":\"mesh.routes_changed\"}\n",
+            "{\"push\":\"mesh.wake\"}\n",
+            "{\"push\":\"unknown\"}\n",
+            "{\"id\":\"two\"}\n"
+        );
+        route_relay_lines(&peer.name, std::io::Cursor::new(wire), &tx, &slot);
+        assert_eq!(
+            rx.try_iter().collect::<Vec<_>>(),
+            vec![r#"{"id":"one"}"#, r#"{"id":"two"}"#]
+        );
+        assert!(take_route_wake(&peer));
+        assert!(!take_route_wake(&peer));
+        assert!(take_wake(&peer));
+        assert!(!take_wake(&peer));
+        assert!(slot.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn config_reload_retains_and_removes_both_wake_registries() {
+        let kept = peer("kept.example");
+        let removed = peer("removed.example");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let slot = Arc::new(Mutex::new(None));
+        let wire = "{\"push\":\"mesh.wake\"}\n{\"push\":\"mesh.routes_changed\"}\n";
+        for peer in [&kept, &removed] {
+            route_relay_lines(&peer.name, std::io::Cursor::new(wire), &tx, &slot);
+        }
+        retain_configured(std::slice::from_ref(&kept));
+        assert!(take_wake(&kept));
+        assert!(take_route_wake(&kept));
+        assert!(!take_wake(&removed));
+        assert!(!take_route_wake(&removed));
+        for registry in [wake_registry(), route_wake_registry()] {
+            assert!(registry.lock().unwrap().contains_key(&kept.name));
+            assert!(!registry.lock().unwrap().contains_key(&removed.name));
+        }
+    }
+
+    #[test]
+    fn eof_withdraws_a_quiet_enrolled_edge() {
+        let peer = peer("route-close.test");
+        set_enrollment(&peer, Ok(("node".into(), 5)));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        route_registered_lines(
+            &peer.name,
+            register_reader(&peer.name),
+            std::io::Cursor::new(""),
+            &tx,
+            &Arc::new(Mutex::new(None)),
+        );
+        assert_eq!(enrollment(&peer).state, "retrying");
+        assert!(take_closed_edges().contains(&peer.name));
+        assert!(take_closed_edges().is_empty());
+    }
+
+    #[test]
+    fn old_reader_eof_does_not_withdraw_replacement_edge() {
+        let peer = peer("route-replaced.test");
+        let old = register_reader(&peer.name);
+        register_reader(&peer.name);
+        set_enrollment(&peer, Ok(("node".into(), 5)));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        route_registered_lines(
+            &peer.name,
+            old,
+            std::io::Cursor::new(""),
+            &tx,
+            &Arc::new(Mutex::new(None)),
+        );
+        assert_eq!(enrollment(&peer).state, "pinned");
+        assert!(!take_closed_edges().contains(&peer.name));
+    }
+
+    #[test]
+    fn reset_and_refusal_queue_route_withdrawal() {
+        let peer = peer("route-reset.test");
+        set_enrollment(&peer, Ok(("node".into(), 5)));
+        reset_enrollment(&peer.name);
+        assert!(take_closed_edges().contains(&peer.name));
+        set_enrollment(&peer, Err("refused".to_string().into()));
+        assert!(take_closed_edges().contains(&peer.name));
+    }
+
+    #[test]
+    fn enrollment_backoff_classifies_missing_server_and_edge_capacity_as_transient() {
+        for code in [
+            "no_local_server",
+            "inbound_edges_full",
+            "future_unknown_error",
+            "mesh_version_mismatch",
+            "identity_changed",
+            "invalid_request",
+        ] {
+            let failure =
+                EnrollmentError::response(&serde_json::json!({"code": code}), code.into());
+            assert_eq!(
+                failure.transient,
+                matches!(
+                    code,
+                    "no_local_server" | "inbound_edges_full" | "future_unknown_error"
+                )
+            );
+            assert_eq!(failure.detail, code);
+            assert!(!failure.transport);
+        }
+        assert!(!EnrollmentError::from("identity changed for peer".to_string()).transient);
+        assert!(EnrollmentError::from("unparseable response".to_string()).transient);
+        assert!(
+            !EnrollmentError::response(
+                &serde_json::json!({"code":"mesh_refused", "message":"invalid mesh signature"}),
+                "identity refusal".into()
+            )
+            .transient
+        );
+        assert!(
+            EnrollmentError::response(
+                &serde_json::json!({"code":"mesh_refused", "message":"future transient failure"}),
+                "unknown".into()
+            )
+            .transient
+        );
+        assert!(EnrollmentError::response(&serde_json::json!({}), "unparseable".into()).transient);
+        assert!(EnrollmentError::transport(CONNECTION_CLOSED.into()).transient);
+        assert!(EnrollmentError::transport("write failed: Broken pipe".into()).transport);
+        assert!(!EnrollmentError::from("unparseable response".to_owned()).transport);
+    }
+
+    #[test]
+    fn enrollment_status_distinguishes_retrying_transport_from_handshake_refusal() {
+        let target = peer("enrollment-status.test");
+        set_enrollment(&target, Ok(("pinned-node".into(), 5)));
+        let generation = peer_enrollment_generation(&target);
+        for detail in [CONNECTION_CLOSED, "ConnectionReset", "peer relay wedged"] {
+            set_enrollment(&target, Err(EnrollmentError::transport(detail.into())));
+            let status = enrollment(&target);
+            assert_eq!(status.state, "retrying");
+            assert_eq!(status.reason.as_deref(), Some(detail));
+            assert_eq!(status.node_id.as_deref(), Some("pinned-node"));
+            assert_eq!(peer_enrollment_generation(&target), generation);
+        }
+        for (code, expected) in [
+            ("inbound_edges_full", "retrying"),
+            ("no_local_server", "retrying"),
+            ("mesh_version_mismatch", "refused"),
+            ("mesh_not_enrolled", "refused"),
+            ("mesh_refused", "retrying"),
+            ("identity_changed", "refused"),
+        ] {
+            set_enrollment(
+                &target,
+                Err(EnrollmentError::response(
+                    &serde_json::json!({"code":code}),
+                    code.into(),
+                )),
+            );
+            let status = enrollment(&target);
+            assert_eq!(status.state, expected);
+            assert_eq!(status.reason.as_deref(), Some(code));
+        }
+        set_enrollment(&target, Ok(("pinned-node".into(), 5)));
+        assert_eq!(enrollment(&target).state, "pinned");
+        assert!(enrollment(&target).reason.is_none());
+    }
+
+    #[test]
+    fn transient_backoff_grows_with_jitter_and_caps_at_thirty_seconds() {
+        let mut slot = Slot::default();
+        for ceiling in [1, 2, 4, 8, 16, 30, 30, 30] {
+            let delay = slot.transient_backoff();
+            assert!(delay >= Duration::from_millis(ceiling * 500));
+            assert!(delay <= Duration::from_secs(ceiling));
         }
     }
 
@@ -772,6 +1392,12 @@ mod tests {
     /// the error was a bare "connection closed".
     #[test]
     fn a_stream_that_cannot_be_established_says_why() {
+        let _lock = crate::config::test_config_env_lock().lock().unwrap();
+        let state = crate::test_support::TempDir::socket();
+        let _restore = RestoreStateHome(std::env::var_os("XDG_STATE_HOME"));
+        // Enrollment loads a node identity before observing the SSH failure.
+        // Keep that identity in this fixture, never the operator's state.
+        std::env::set_var("XDG_STATE_HOME", state.path());
         let target = PeerConfig {
             name: "flk418-stream".into(),
             ssh: "nobody@flk-418-no-such-host.invalid".into(),
@@ -800,6 +1426,74 @@ mod tests {
             "{logs}"
         );
         assert_eq!(establish_failure(&target).as_deref(), Some(err.as_str()));
+        assert_eq!(enrollment(&target).state, "retrying");
+        assert_eq!(enrollment(&target).reason.as_deref(), Some(err.as_str()));
+    }
+
+    #[test]
+    fn exited_ssh_is_classified_even_before_stdout_eof_is_observed() {
+        let _lock = crate::config::test_config_env_lock().lock().unwrap();
+        let state = crate::test_support::TempDir::socket();
+        let _restore = RestoreStateHome(std::env::var_os("XDG_STATE_HOME"));
+        std::env::set_var("XDG_STATE_HOME", state.path());
+        let target = peer("epipe.example");
+        let mut child = crate::process::TracedCommand::new("/bin/sh", "peers")
+            .args(["-c", "printf '%s\n' 'ssh: Could not resolve hostname missing.invalid: Name or service not known' >&2; exit 255"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn_traced()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let mut stderr = child.stderr.take().unwrap();
+        let (collected, diagnostic) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut text = String::new();
+            let result = std::io::Read::read_to_string(&mut stderr, &mut text).map(|_| text);
+            let _ = collected.send(result);
+        });
+        // Holding the sender models the stdout reader not having observed EOF.
+        // The exited child's stdin is already closed, so the write must fail.
+        let (_stdout_pending, lines) = std::sync::mpsc::channel();
+        let (stderr_finished, stderr_done) = std::sync::mpsc::channel();
+        drop(stderr_finished);
+        let mut stream = PeerStream {
+            child,
+            stdin,
+            lines,
+            next_id: 0,
+            negotiated: None,
+            latest_push: Arc::new(Mutex::new(None)),
+            stderr_tail: Arc::new(Mutex::new(Default::default())),
+            stderr_done,
+            agent: crate::platform::ssh_agent::AgentSocket::Unset,
+        };
+        // The stream owns cleanup if the child fails to close stderr in time.
+        let stderr = diagnostic
+            .recv_timeout(REQUEST_TIMEOUT)
+            .expect("child stderr EOF")
+            .unwrap();
+        assert_eq!(stream.child.wait().unwrap().code(), Some(255));
+        *stream.stderr_tail.lock().unwrap() = stderr.lines().map(str::to_owned).collect();
+        let logs = crate::logging::capture_logs(|| {
+            let err = request_over_with(
+                &target,
+                "peers.summary",
+                serde_json::json!({}),
+                true,
+                |_| Ok(stream),
+            )
+            .expect_err("the child exited before enrollment");
+            assert_eq!(
+                crate::peers::SshFailureReason::classify(&err),
+                crate::peers::SshFailureReason::UnknownHost,
+                "{err}"
+            );
+            assert!(err.contains("Could not resolve hostname"), "{err}");
+            assert_eq!(establish_failure(&target).as_deref(), Some(err.as_str()));
+            assert_eq!(enrollment(&target).reason.as_deref(), Some(err.as_str()));
+        });
+        assert!(logs.contains("reason=\"unknown_host\""), "{logs}");
     }
 
     /// The same establish failure on every backoff is one WARN, not one per
@@ -888,8 +1582,7 @@ mod tests {
             r#"{"id":"stream-2","result":{"host":"kiln"}}"#,
             "\n",
         );
-        let (uplink_tx, _uplinks) = std::sync::mpsc::sync_channel(UPLINK_QUEUE_DEPTH);
-        route_relay_lines("kiln", Cursor::new(wire), &tx, &push_slot, &uplink_tx);
+        route_relay_lines("kiln", Cursor::new(wire), &tx, &push_slot);
         drop(tx);
 
         let routed: Vec<String> = responses.iter().collect();
@@ -912,46 +1605,6 @@ mod tests {
             pushed.as_ref().map(|(_, line)| line.as_str()),
             Some(r#"{"push":"peers.summary","result":{"host":"kiln"}}"#),
             "the push is delivered exactly once, to the push slot"
-        );
-    }
-
-    /// #410 pitfall 4: a message a spoke hands up rides the same relay as its
-    /// summaries, and neither may starve or clobber the other. The frame must
-    /// reach the forwarder, never the one-slot summary buffer, and the summary
-    /// slot must still hold the summary.
-    #[test]
-    fn an_uplinked_message_is_not_mistaken_for_a_summary_push() {
-        use std::io::Cursor;
-
-        let (tx, responses) = std::sync::mpsc::channel();
-        let push_slot: Arc<Mutex<Option<(std::time::Instant, String)>>> =
-            Arc::new(Mutex::new(None));
-        let (uplink_tx, uplinks) = std::sync::mpsc::sync_channel(UPLINK_QUEUE_DEPTH);
-
-        let wire = concat!(
-            r#"{"push":"peers.summary","result":{"host":"atlas"}}"#,
-            "\n",
-            r#"{"push":"msg.uplink","frame":{"uplink_id":"u1"}}"#,
-            "\n",
-            r#"{"id":"stream-1","result":{"host":"atlas"}}"#,
-            "\n",
-            r#"{"push":"msg.uplink","frame":{"uplink_id":"u2"}}"#,
-            "\n",
-            r#"{"push":"some.future.kind","result":{"host":"not a summary"}}"#, // guardrails-ok(fixture): a prose fragment in a host field, asserting it is not a name
-            "\n",
-        );
-        route_relay_lines("atlas", Cursor::new(wire), &tx, &push_slot, &uplink_tx);
-        drop(tx);
-        drop(uplink_tx);
-
-        let frames: Vec<String> = uplinks.iter().collect();
-        assert_eq!(frames.len(), 2, "every frame is forwarded, none coalesced");
-        assert!(frames[0].contains("u1") && frames[1].contains("u2"));
-        assert_eq!(responses.iter().count(), 1, "the response still pairs");
-        let pushed = push_slot.lock().expect("push slot").take();
-        assert!(
-            pushed.is_some_and(|(_, line)| line.contains("peers.summary")),
-            "the summary slot holds the summary, not a message"
         );
     }
 
@@ -1000,13 +1653,11 @@ mod tests {
         let push_slot: Arc<Mutex<Option<(std::time::Instant, String)>>> =
             Arc::new(Mutex::new(None));
 
-        let (uplink_tx, _uplinks) = std::sync::mpsc::sync_channel(UPLINK_QUEUE_DEPTH);
         route_relay_lines(
             "kiln",
             Cursor::new("ssh: connect to host kiln port 22: \"push\"\n"),
             &tx,
             &push_slot,
-            &uplink_tx,
         );
         drop(tx);
 
@@ -1066,7 +1717,7 @@ mod tests {
         let second = request(&peer, "peers.summary", serde_json::json!({}));
         assert_eq!(
             second.unwrap_err(),
-            "connection backing off",
+            first.unwrap_err(),
             "the retry is refused locally rather than spawning ssh again"
         );
         retain_configured(&[]);
@@ -1116,13 +1767,242 @@ mod tests {
         // cleared the registry, a failing peer would retry on every reload and
         // the backoff would stop bounding anything.
         let peer = peer("retain-test-kept-host");
-        let _ = request(&peer, "peers.summary", serde_json::json!({}));
+        let first = request(&peer, "peers.summary", serde_json::json!({}));
         retain_configured(std::slice::from_ref(&peer));
         assert_eq!(
             request(&peer, "peers.summary", serde_json::json!({})).unwrap_err(),
-            "connection backing off",
+            first.unwrap_err(),
             "a still-configured peer keeps its slot, backoff included"
         );
         retain_configured(&[]);
+    }
+}
+
+#[cfg(test)]
+mod negotiation_tests {
+    use super::*;
+    use crate::mesh::{hello::legacy, runtime_store::TestStore};
+    use ed25519_dalek::SigningKey;
+    use serde_json::{json, Value};
+
+    #[test]
+    fn real_old_acceptor_enrolls_a_new_dialer_at_five_without_report() {
+        old_acceptor(false, None, None, None);
+    }
+
+    #[test]
+    fn old_acceptor_refusal_names_pre_negotiation_peer_and_is_permanent() {
+        old_acceptor(true, None, None, None);
+    }
+
+    #[test]
+    fn unknown_kind_refuses_whole_response_and_holds_edge_in_long_backoff() {
+        old_acceptor(false, Some("mesh.collect"), None, None);
+        old_acceptor(false, Some("peers.summary"), None, None);
+    }
+
+    #[test]
+    fn ranged_acceptor_reply_tampering_is_refused_permanently() {
+        for attack in ["minimum", "report", "disagreement"] {
+            old_acceptor(false, None, Some(attack), None);
+        }
+    }
+
+    #[test]
+    fn sequence_forms_reset_the_outbound_session_without_acknowledging() {
+        for (payload, deliver) in crate::mesh::version_gate::tests::noncanonical_payloads() {
+            if deliver {
+                old_acceptor(
+                    false,
+                    Some("mesh.collect"),
+                    None,
+                    Some(json!({"result":{"answers":[{"envelope":{}},payload]}})),
+                );
+            }
+        }
+        old_acceptor(
+            false,
+            Some("mesh.deliver"),
+            None,
+            Some(
+                json!({"error":{"code":"mesh_delivery_refused","data":{"receipt":crate::mesh::version_gate::tests::sequence_envelope()}}}),
+            ),
+        );
+    }
+
+    fn old_acceptor(
+        version_six: bool,
+        query: Option<&'static str>,
+        attack: Option<&'static str>,
+        response: Option<Value>,
+    ) {
+        let _guard = crate::config::test_config_env_guard();
+        let _store = TestStore::new();
+        reset_enrollment("old.test");
+        if version_six || attack.is_some_and(|a| a != "minimum") {
+            std::env::set_var("FLOCK_TEST_MESH_VERSION", "6");
+            std::env::set_var("FLOCK_TEST_MESH_MIN", "5");
+        }
+        let mut child = crate::process::TracedCommand::new("/bin/sh", "peers")
+            .args([
+                "-c",
+                "while IFS= read -r line; do printf '%s\n' \"$line\"; done",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn_traced()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (tx, lines) = std::sync::mpsc::channel();
+        let noncanonical = response.is_some();
+        let fixture = std::thread::spawn(move || {
+            let key = SigningKey::from_bytes(&[22; 32]);
+            let acceptor = legacy::offer(&key, "old.test");
+            let mut requests = BufReader::new(stdout).lines();
+            let begin: Value = serde_json::from_str(&requests.next().unwrap().unwrap()).unwrap();
+            let dialer: legacy::Offer =
+                serde_json::from_value(begin["params"]["offer"].clone()).unwrap();
+            if let Some(attack) = attack {
+                use crate::mesh::{
+                    hello::{self, Offer},
+                    identity::NodeIdentity,
+                };
+                let dialer: Offer =
+                    serde_json::from_value(begin["params"]["offer"].clone()).unwrap();
+                let mut offer: Offer = serde_json::from_value(json!(acceptor)).unwrap();
+                offer.mesh = 6;
+                offer.mesh_min = Some(5);
+                let signature = hello::sign(
+                    &NodeIdentity::fixture([22; 32]),
+                    &dialer,
+                    &offer,
+                    "acceptor",
+                )
+                .unwrap();
+                let mut challenge =
+                    json!({"offer":offer,"signature":signature,"negotiated":dialer.mesh.min(6)});
+                match attack {
+                    "minimum" => {
+                        challenge["offer"]
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("mesh_min");
+                    }
+                    "report" => {
+                        challenge.as_object_mut().unwrap().remove("negotiated");
+                    }
+                    "disagreement" => {
+                        challenge["negotiated"] = json!(5);
+                    }
+                    _ => panic!("unknown attack"),
+                }
+                tx.send(json!({"result":{"challenge":challenge}}).to_string())
+                    .unwrap();
+                return;
+            }
+            if let Err(reason) = legacy::validate(&dialer) {
+                tx.send(json!({"error":{"code":"mesh_version_mismatch", "message":reason, "data":{"mesh":5}}}).to_string()).unwrap();
+                return;
+            }
+            assert!(begin["params"]["offer"].get("mesh_min").is_none());
+            let signature = legacy::sign(&key, &dialer, &acceptor, "acceptor");
+            tx.send(
+                json!({"result":{"challenge":{"offer":acceptor,"signature":signature}}})
+                    .to_string(),
+            )
+            .unwrap();
+            let finish: Value = serde_json::from_str(&requests.next().unwrap().unwrap()).unwrap();
+            let signature: Vec<u8> =
+                serde_json::from_value(finish["params"]["signature"].clone()).unwrap();
+            legacy::verify(&dialer, &acceptor, "dialer", &signature);
+            tx.send(json!({"result":{"type":"ok"}}).to_string())
+                .unwrap();
+            if let Some(method) = query {
+                let query: Value =
+                    serde_json::from_str(&requests.next().unwrap().unwrap()).unwrap();
+                assert_eq!(query["method"], method);
+                let response = response.unwrap_or_else(|| json!({"result":{"answers":[{"envelope":{}}, {"envelope":{"kind":"future"}}]}}));
+                tx.send(response.to_string()).unwrap();
+            }
+        });
+        let (_done_tx, stderr_done) = std::sync::mpsc::channel();
+        let mut stream = PeerStream {
+            child,
+            stdin,
+            lines,
+            next_id: 0,
+            negotiated: None,
+            latest_push: Arc::new(Mutex::new(None)),
+            stderr_tail: Arc::new(Mutex::new(Default::default())),
+            stderr_done,
+            agent: crate::platform::ssh_agent::AgentSocket::Unset,
+        };
+        let peer = PeerConfig {
+            name: "old.test".into(),
+            ssh: "old.test".into(),
+            ..Default::default()
+        };
+        if let Some(method) = query {
+            let before = std::time::Instant::now();
+            let params = if method == "peers.summary" {
+                json!({"envelope":{"kind":"future"}})
+            } else {
+                json!({})
+            };
+            let result = request_over_with(&peer, method, params, true, |_| Ok(stream));
+            if method == "peers.summary" {
+                assert!(result.is_ok(), "non-mesh metadata: {result:?}");
+                assert_eq!(enrollment(&peer).state, "pinned");
+                reset_enrollment(&peer.name);
+                fixture.join().unwrap();
+                return;
+            }
+            let error = result.unwrap_err();
+            assert!(error.starts_with("mesh_protocol_violation:"), "{error}");
+            assert!(noncanonical || error.contains("future"), "{error}");
+            assert_eq!(enrollment(&peer).state, "refused");
+            assert_eq!(enrollment(&peer).negotiated, None);
+            let slots = registry().lock().unwrap();
+            let slot = slots[&peer.name].lock().unwrap();
+            assert!(slot.stream.is_none());
+            assert!(slot.retry_after.unwrap() >= before + RECONNECT_BACKOFF);
+            assert!(slot.retry_after.unwrap() <= std::time::Instant::now() + RECONNECT_BACKOFF);
+            drop(slot);
+            drop(slots);
+            assert_eq!(
+                request_over_with(&peer, "mesh.collect", json!({}), true, |_| panic!(
+                    "refused edge must back off"
+                ))
+                .unwrap_err(),
+                error
+            );
+        } else if let Some(attack) = attack {
+            let error = stream.enroll(&peer).expect_err("tampered reply refused");
+            assert!(!error.transient, "{}", error.detail);
+            if attack == "minimum" {
+                assert_eq!(error.detail, "invalid mesh signature");
+            } else {
+                assert!(
+                    error.detail.starts_with("mesh version mismatch:"),
+                    "{}",
+                    error.detail
+                );
+            }
+            drop(stream);
+        } else {
+            let result = stream.enroll(&peer);
+            if version_six {
+                let error = result.expect_err("pre-negotiation refusal");
+                assert_eq!(error.detail, "mesh version mismatch: peer old.test predates version negotiation; upgrade flk on old.test");
+                assert!(!error.transient);
+            } else {
+                let (_, version) = result.map_err(|e| e.detail).unwrap();
+                assert_eq!(version, 5);
+                assert_eq!(stream.negotiated, Some(5));
+            }
+            drop(stream);
+        }
+        fixture.join().unwrap();
     }
 }

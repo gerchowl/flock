@@ -18,17 +18,27 @@ export GIT_CONFIG_VALUE_0 := "main"
 
 # Run tests
 test:
-    cargo nextest run --locked --status-level fail --final-status-level fail --failure-output final --success-output never
-    python3 -m unittest scripts.test_changelog scripts.test_preview scripts.test_vendor_libghostty_vt scripts.test_hermetic_tests scripts.test_platform_test_gap scripts.test_export_issues_prs scripts.test_fixture_hosts scripts.test_ssh_hosts_gate scripts.test_exec_name_gate
+    cargo nextest run --locked --features ts --status-level fail --final-status-level fail --failure-output final --success-output never
+    just script-tests
+
+# Maintenance script tests plus the platform-coverage ratchet (#597).
+# One discovery-based entry point shared by `test`, `check` and CI, so a new
+# scripts/test_*.py can never be missing from a hand-written module list.
+script-tests:
+    python3 -m unittest discover -s scripts -p 'test_*.py' -t .
+    @python3 scripts/platform_test_gap.py
+
+# Isolated real-sccache devShell regression probe (never uses port 4226).
+test-sccache:
+    python3 scripts/probe_sccache.py
 
 # Run one nextest filter, e.g. `just test-one codex_stale_working`
 test-one filter:
-    cargo nextest run --locked "{{filter}}" --status-level fail --final-status-level fail --failure-output final --success-output never
+    cargo nextest run --locked --features ts "{{filter}}" --status-level fail --final-status-level fail --failure-output final --success-output never
 
 # Run every guardrails gate over the tree (same set `nix flake check` runs).
-# Standalone, NOT chained into `lint`: the host-bound CI runners (ci.yml) skip
-# the guardrails devShell, so prek isn't on their PATH — gate enforcement in CI
-# lives in nix.yml's `flake check` (checks.gates), locally in the git hooks.
+# Standalone, NOT chained into `lint`: CI gate enforcement lives in nix.yml's
+# `flake check` (checks.gates), locally in the git hooks.
 gates:
     prek run --all-files
 
@@ -41,18 +51,61 @@ log-budget seconds='60':
     guardrails-log-budget
 
 # Run fast local lint checks
-lint:
+lint: changelog-check journal-io-check ts-check client-lint
     cargo fmt --check
     cargo clippy --all-targets --locked -- -D warnings
+    cargo clippy --all-targets --locked --features ts -- -D warnings
+    cargo clippy --all-targets --locked --features {{ci_features}} -- -D warnings
+
+# Keep all journal I/O observable, including fully qualified filesystem paths.
+journal-io-check:
+    python3 scripts/journal_io_gate.py
+
+# Validate fragments with the same rules used to prepare a release.
+changelog-check:
+    python3 scripts/changelog.py check-fragments
+
+# Build internal API docs and reject broken links, markup and other warnings.
+doc-check:
+    RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --document-private-items
+
+# Shipped feature set shared by local CI and the archived shard inventory.
+ci_features := "web,ts"
 
 # Run PR CI checks
 ci filter='all()': lint
-    cargo nextest run --locked -E "{{filter}}" --status-level fail --final-status-level slow --failure-output final --success-output never
+    cargo nextest run --locked --features {{ci_features}} -E "{{filter}}" --status-level fail --final-status-level slow --failure-output final --success-output never
+
+# Build the real GUI before compiling the isolated browser fleet driver.
+gui-e2e-fleet:
+    cd web/client && bun install --frozen-lockfile && bun run build
+    FLOCK_GUI_DIST="{{justfile_directory()}}/web/client/dist" cargo build --locked --features web,ts --bin flk
+    FLOCK_GUI_DIST="{{justfile_directory()}}/web/client/dist" cargo nextest run --locked --features web,ts --test gui_e2e_fleet --test-threads 2 --retries 0
+
+# Build both feature variants with an explicit fixture input, proving GUI
+# embedding and exclusion without the independent frontend build (#1826).
+gui-check:
+    FLOCK_GUI_DIST="{{justfile_directory()}}/tests/fixtures/gui-dist" cargo nextest run --locked --features ts --test gui_build -E 'binary(=gui_build)' --retries 0
+    FLOCK_GUI_DIST="{{justfile_directory()}}/tests/fixtures/gui-dist" cargo nextest run --locked --features web,ts --bin flk --test gui_build -E 'test(web::gui::) | binary(=gui_build)' --retries 0
+
+# Build every test binary once into a nextest archive for CI's shard jobs, then
+# fail unless the shards in .config/ci-shards.toml partition `leg`'s tests
+# exactly (#991). Writes the shard matrix to $GITHUB_OUTPUT when set.
+ci-archive leg archive:
+    cargo nextest archive --locked --features {{ci_features}} --archive-file "{{archive}}"
+    python3 scripts/ci_shards.py verify --leg "{{leg}}" --archive-file "{{archive}}"
+
+# Run one CI shard inside the dev shell for its runtime tools, from a
+# web/ts archive made by `ci-archive`, with its feature set already compiled.
+# It is extracted into this checkout's target/
+# because the integration tests bake `env!("CARGO_BIN_EXE_flk")` in at compile
+# time, so the binary must sit where the build put it. JUnit lands in
+# target/nextest/ci/junit.xml.
+ci-shard leg shard archive:
+    cargo nextest run --profile ci --archive-file "{{archive}}" --workspace-remap . --extract-to . --extract-overwrite -E "$(python3 scripts/ci_shards.py filter --leg '{{leg}}' --shard '{{shard}}')" --status-level fail --final-status-level slow --failure-output final --success-output never
 
 # Check formatting + run unit tests + maintenance script tests
-check: ci
-    python3 -m unittest scripts.test_changelog scripts.test_preview scripts.test_vendor_libghostty_vt scripts.test_hermetic_tests scripts.test_platform_test_gap scripts.test_export_issues_prs scripts.test_fixture_hosts scripts.test_ssh_hosts_gate scripts.test_exec_name_gate
-    @python3 scripts/platform_test_gap.py
+check: ci script-tests
     @echo "docs reminder: if this changes user-facing behavior, make sure the relevant release docs are updated or called out before release."
 
 # Install the guardrails git hooks (gates + conventional-commit check) via prek.
@@ -69,6 +122,93 @@ build:
 # Build the website and documentation
 website-build:
     cd website && bun install --frozen-lockfile && bun run build
+
+# Check the web client (ADR-0038 G1) from its lockfile: the unit and DOM
+# tests, the fixture-preview screenshot test (needs `just client-browsers`;
+# writes web/client/artifacts/screenshots/), the strict type check, the design
+# rules (`client-lint`) and the Vite build. Each browser test file runs in a
+# process of its own: on Linux a Chromium launched by a later file of the same
+# `bun test` process lost its DevTools transport after an earlier file's
+# browser had run (#2931).
+client-check:
+    cd web/client && bun install --frozen-lockfile && bun test && for f in e2e/*.test.ts; do bun test "./$f" || exit 1; done && bun x tsc --noEmit -p tsconfig.json && bun run lint
+
+# Recompute nix/client-deps.json, the pinned hash of the client's
+# dependencies for `nix build .#flock-client` (#1731), after web/client/bun.lock
+# or Bun changes: it records the lock's sha256 and Bun version, fetches with an
+# empty hash and keeps the hash nix reports. Commit the file it writes. If the fetch fails for
+# any other reason (network, a lock bun refuses), the file is left as it was.
+# On failure or INT/TERM, restore before returning. A process-group signal can
+# arrive twice because just forwards it: each handler restores directly, and
+# restore ignores repeats and disarms EXIT before copying. A second signal
+# during EXIT must restore too, not exit past the active callback. SIGKILL
+# and host crashes cannot run cleanup and are outside this contract.
+client-deps-hash:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    backup=$(mktemp)
+    cp nix/client-deps.json "$backup"
+    restore() {
+      trap '' INT TERM
+      trap - EXIT
+      cp "$backup" nix/client-deps.json
+      rm -f "$backup"
+    }
+    trap restore EXIT
+    trap 'restore; exit 130' INT
+    trap 'restore; exit 143' TERM
+    lock=$(nix-hash --type sha256 --flat web/client/bun.lock)
+    printf '{\n  "lock": "%s",\n  "hash": ""\n}\n' "$lock" > nix/client-deps.json
+    bun=$(nix eval --raw .#flock-client.deps.bunVersion)
+    log=$(nix build .#flock-client.deps --no-link 2>&1 || true)
+    hash=$(printf '%s\n' "$log" | sed -n 's/^ *got: *//p' | tail -n 1)
+    if [ -z "$hash" ]; then
+      printf '%s\n' "$log" >&2
+      echo "client-deps-hash: the fetch failed before nix reported a hash (see above); nix/client-deps.json is unchanged" >&2
+      exit 1
+    fi
+    printf '{\n  "lock": "%s",\n  "bun": "%s",\n  "hash": "%s"\n}\n' "$lock" "$bun" "$hash" > nix/client-deps.json
+    if ! nix build .#flock-client.deps --no-link; then
+      echo "client-deps-hash: the fetch did not reproduce $hash; nix/client-deps.json is unchanged" >&2
+      exit 1
+    fi
+    trap - EXIT INT TERM
+    rm -f "$backup"
+    echo "nix/client-deps.json: $hash"
+
+# Install the Chromium build the client's screenshot test drives (CI, or once
+# per machine). --with-deps adds its system libraries on Linux.
+client-browsers:
+    cd web/client && bun install --frozen-lockfile && bun x playwright install --with-deps chromium
+
+# Refresh the desktop CLI's fixed-output hash after desktop/bun.lock or Bun changes.
+desktop-deps-hash:
+    python3 scripts/desktop_deps_hash.py
+
+# Build the client in fixture mode (a replay of the recorded session; no flk
+# server needed) and serve it with `vite preview` on the loopback address.
+# To try it from a phone on the local network, opt in explicitly:
+# `just client-preview --host`. The page in web/client/dist/index.html also
+# opens on its own, as a single self-contained file.
+client-preview *args:
+    cd web/client && bun install --frozen-lockfile && bun run build:fixture && bun x vite preview {{args}}
+
+# Run the Tauri desktop shell (desktop/, #1601) against the client's Vite dev
+# server. Server URL: FLOCK_DESKTOP_SERVER_URL or desktop/README.md's config file.
+desktop-dev:
+    cd desktop && bun install --frozen-lockfile && bun x tauri dev
+
+# The desktop shell's tests (CI, #2477). `generate_context!` embeds
+# web/client/dist at compile time, so build the client first.
+desktop-test:
+    cd web/client && bun install --frozen-lockfile && bun run build
+    cd desktop && cargo test --locked
+
+# Build the client into a release desktop shell. macOS: an ad-hoc signed
+# flock.app in desktop/target/release/bundle/ (identity signing and
+# notarisation are #1636). Elsewhere: only the binary, desktop/target/release/.
+desktop-build:
+    cd desktop && bun install --frozen-lockfile && bun x tauri build
 
 # Build the vendored libghostty-vt source dist
 build-libghostty-vt:
@@ -127,64 +267,54 @@ release-prepare version *flags:
         echo "error: tag v{{version}} already exists"; \
         exit 1; \
     fi
-    just release-docs-check
+    cp docs/next/README.md README.md
+    cp docs/next/CHANGELOG.md CHANGELOG.md
+    cp -R docs/next/website/src/content/docs/. website/src/content/docs/
     python3 scripts/changelog.py check-version --version {{version}} {{flags}}
-    python3 scripts/changelog.py prepare --version {{version}}
+    python3 scripts/changelog.py prepare --fragments docs/next/changes --version {{version}}
     cp CHANGELOG.md docs/next/CHANGELOG.md
+    just release-docs-check
     sed -i.bak 's/^version = ".*"/version = "{{version}}"/' Cargo.toml && rm -f Cargo.toml.bak
     cargo update -p flock-ai --offline
     just check
-    git add CHANGELOG.md docs/next/CHANGELOG.md Cargo.toml Cargo.lock
+    git add README.md CHANGELOG.md docs/next website/src/content/docs Cargo.toml Cargo.lock
     git diff --cached --quiet || git commit -m "release: v{{version}}"
-    @echo "v{{version}} release commit prepared. Review it, then run: just release-publish {{version}}"
+    @echo "v{{version}} release commit prepared locally as a dry run. Cut the real release with: just release {{version}}"
 
-# Tag and push an already-prepared release commit (usage: just release-publish 0.1.1)
-release-publish version:
-    @printf '%s\n' '{{version}}' | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || { \
-        echo "error: version must look like 1.0.0 without a v prefix"; \
-        exit 1; \
-    }
-    @if [ -n "$(git status --porcelain)" ]; then \
-        echo "error: working tree must be clean before publishing"; \
-        exit 1; \
+# Promote opens the `release: vX.Y.Z` PR into dev; once that merges and passes its checks,
+# release-follow-up.yml fast-forwards main to it and tags it. `main` moves no other way.
+# `just release-prepare` is the local dry run of the same commit.
+# Cut a release by dispatching the Promote workflow on dev (usage: just release, or just release 0.9.0)
+release version='':
+    @if [ -n '{{version}}' ]; then \
+        printf '%s\n' '{{version}}' | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || { \
+            echo "error: version must look like 1.0.0 without a v prefix"; \
+            exit 1; \
+        }; \
     fi
-    @branch="$(git branch --show-current)"; \
-    if [ "$branch" != "main" ]; then \
-        echo "error: release-publish must run from main, got $branch"; \
-        exit 1; \
-    fi
-    @git fetch origin main --tags
-    @if git rev-parse "v{{version}}" >/dev/null 2>&1; then \
-        echo "error: tag v{{version}} already exists"; \
-        exit 1; \
-    fi
-    @cargo_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"; \
-    if [ "$cargo_version" != "{{version}}" ]; then \
-        echo "error: Cargo.toml version $cargo_version does not match {{version}}"; \
-        exit 1; \
-    fi
-    just release-docs-check
-    python3 scripts/changelog.py extract --version {{version}} --output /tmp/flock-release-notes-check.md
-    rm -f /tmp/flock-release-notes-check.md
-    @local_head="$(git rev-parse HEAD)"; \
-    remote_head="$(git rev-parse origin/main)"; \
-    if ! git merge-base --is-ancestor "$remote_head" "$local_head"; then \
-        echo "error: origin/main is not an ancestor of HEAD; pull or rebase before publishing"; \
-        exit 1; \
-    fi; \
-    if [ "$local_head" != "$remote_head" ]; then \
-        echo "pushing release commit to origin/main"; \
-        git push origin HEAD:main; \
-    fi
-    git tag -a v{{version}} -m "v{{version}}"
-    git push origin v{{version}}
-    @echo "v{{version}} released — GitHub Actions building binaries and updating website/latest.json"
-
-# Prepare, verify, tag, push, and trigger the GitHub Release workflow (usage: just release 0.1.1)
-release version:
-    just release-prepare {{version}}
-    just release-publish {{version}}
+    just release-plan
+    gh workflow run promote.yml --ref dev{{if version != "" { " -f version=" + version } else { "" }}}
+    @echo "promote.yml dispatched; follow it with: gh run list --workflow promote.yml --limit 1"
 
 # Print default config
 default-config:
     cargo run --release --locked -- --default-config
+
+# Rewrite the Rust-derived client contracts (ADR-0036 §6).
+gen-ts:
+    cargo nextest run --locked --features ts --run-ignored ignored-only generate_wire_ts_types
+
+# Strict contract checks, including the Rust-classified recorded fixtures,
+# with the TypeScript compiler pinned in web/client/bun.lock.
+ts-check:
+    cd web/client && bun install --frozen-lockfile && bun x tsc --noEmit -p tsconfig.json
+
+# The client's design rules (#2895, web/DESIGN.md): the generated tokens are
+# current, source and shipped CSS use tokens and layout primitives (stylelint),
+# and runtime styles and type suppressions cannot bypass the gates (ESLint).
+client-lint:
+    cd web/client && bun install --frozen-lockfile && bun run lint
+
+# Non-gating real wire publication timings at near-global journal capacity.
+capacity-publication-probe:
+    cargo nextest run --locked --features web,ts --bin flk --test-threads 2 --retries 0 --run-ignored only -E 'test(near_global_capacity_publication_latency_report)' --success-output immediate

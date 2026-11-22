@@ -17,6 +17,9 @@ pub struct CompletionPending {
 /// Terminal identity, cwd, labels, and agent metadata live in TerminalState.
 pub struct PaneState {
     pub attached_terminal_id: TerminalId,
+    /// True only for a new tab root spawned with the configured default shell.
+    /// Custom argv commands and restored panes never receive this provenance.
+    pub(crate) created_as_root_shell: bool,
     /// Whether the user has seen this pane since its last state change to Idle.
     /// False = "Done" (agent finished while user was in another workspace).
     pub seen: bool,
@@ -32,6 +35,7 @@ impl PaneState {
     pub fn new(attached_terminal_id: TerminalId) -> Self {
         Self {
             attached_terminal_id,
+            created_as_root_shell: false,
             seen: true,
             completion_pending: None,
         }

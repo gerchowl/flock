@@ -44,10 +44,10 @@ Process:
      - formatting-only changes
      - comment-only/doc-only changes unless they materially affect users
 
-6. Audit `docs/next/CHANGELOG.md` and issue references.
+6. Audit next-release changelog entries and issue references.
    - Treat root `CHANGELOG.md` as the latest released changelog.
-   - Treat `docs/next/CHANGELOG.md` as the next-release changelog.
-   - Compare meaningful user-facing changes in the commit range against `docs/next/CHANGELOG.md`.
+   - Treat `docs/next/CHANGELOG.md` and `docs/next/changes/` as the next-release changelog.
+   - Compare meaningful user-facing changes in the commit range against `docs/next/CHANGELOG.md` and `docs/next/changes/`.
    - Flag missing entries for new features, bug fixes, removals, breaking changes, defaults, compatibility changes, user-visible command/config/API behavior, and security-relevant changes.
    - Do not require changelog entries solely for internal client/server protocol version bumps. Mention protocol only when the release intentionally changes user-facing compatibility guidance beyond the normal restart requirement.
    - Inspect commit bodies for issue reference lines in the form `refs #<issue-number>`.
@@ -80,8 +80,8 @@ Process:
 
 9. Apply changes only when asked.
    - Do not edit files during the audit unless the user explicitly asks you to apply fixes.
-   - When asked to apply audit fixes, update `docs/next/CHANGELOG.md`, `docs/next/README.md`, and any required staged website docs under `docs/next/website/src/content/docs/`.
-   - When asked to finalize release docs, copy approved next-release README and changelog into root, copy approved staged website docs into `website/src/content/docs/`, then run `just release-docs-check`.
+   - When asked to apply audit fixes, add missing changelog fragments under `docs/next/changes/`, update `docs/next/README.md`, and any required staged website docs under `docs/next/website/src/content/docs/`.
+   - When asked to finalize release docs, copy approved next-release README and changelog into root (release preparation folds and consumes fragments), copy approved staged website docs into `website/src/content/docs/`, then run `just release-docs-check`.
 
 Output format:
 

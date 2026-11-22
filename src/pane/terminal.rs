@@ -112,6 +112,8 @@ pub(crate) struct GhosttyPaneTerminal {
 
 pub(crate) struct GhosttyPaneCore {
     pub terminal: crate::ghostty::Terminal,
+    content_revision: u64,
+    pinned_selection: Option<(u64, crate::ghostty::TrackedSelection)>,
     pub render_state: crate::ghostty::RenderState,
     pub kitty_keyboard: KittyKeyboardTracker,
     pub initial_default_foreground: Option<crate::ghostty::RgbColor>,
@@ -195,6 +197,14 @@ impl PaneTerminal {
         self.ghostty.detection_text()
     }
 
+    pub fn detection_ansi(&self) -> String {
+        self.ghostty.detection_ansi()
+    }
+
+    pub fn detection_text_and_unfaint(&self) -> (String, String) {
+        self.ghostty.detection_text_and_unfaint()
+    }
+
     pub fn recent_text(&self, lines: usize) -> String {
         self.ghostty.recent_text(lines)
     }
@@ -209,6 +219,22 @@ impl PaneTerminal {
 
     pub fn recent_unwrapped_ansi(&self, lines: usize) -> String {
         self.ghostty.recent_unwrapped_ansi(lines)
+    }
+
+    /// Capture or extend content identity under the parser lock (ADR-0040 §1).
+    pub fn pin_selection(
+        &self,
+        selection: &mut crate::selection::Selection,
+        drag: Option<(u16, u16, Rect)>,
+    ) {
+        self.ghostty.pin_selection(selection, drag);
+    }
+    /// Resolve current endpoint coordinates, refusing discarded content.
+    pub fn resolve_selection(
+        &self,
+        selection: &crate::selection::Selection,
+    ) -> Option<crate::selection::Selection> {
+        self.ghostty.resolve_selection(selection)
     }
 
     pub fn extract_selection(&self, selection: &crate::selection::Selection) -> Option<String> {
@@ -345,6 +371,8 @@ impl GhosttyPaneTerminal {
         Ok(Self {
             core: Mutex::new(GhosttyPaneCore {
                 terminal,
+                content_revision: 0,
+                pinned_selection: None,
                 render_state,
                 kitty_keyboard: KittyKeyboardTracker::default(),
                 initial_default_foreground,
@@ -532,6 +560,7 @@ impl GhosttyPaneTerminal {
         xtgettcap_responses: Vec<XtgettcapResponse>,
         terminal_responses: &mut Vec<Bytes>,
     ) {
+        core.content_revision = core.content_revision.saturating_add(1);
         let mut events = Vec::with_capacity(default_color_events.len() + xtgettcap_responses.len());
         events.extend(
             default_color_events
@@ -1005,6 +1034,32 @@ impl GhosttyPaneTerminal {
             .unwrap_or_default()
     }
 
+    /// The detection text, and the same rows with every faint cell blanked.
+    /// Both come from one lock, so their rows line up one for one (#892).
+    pub fn detection_text_and_unfaint(&self) -> (String, String) {
+        self.core
+            .lock()
+            .ok()
+            .and_then(|core| ghostty_detection_text_and_unfaint(&core).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn detection_ansi(&self) -> String {
+        self.core
+            .lock()
+            .ok()
+            .and_then(|core| {
+                let rows = core
+                    .terminal
+                    .rows()
+                    .ok()
+                    .map(|rows| usize::from(rows).max(1))
+                    .unwrap_or(DEFAULT_DETECTION_ROWS);
+                ghostty_recent_ansi(&core, rows, false).ok()
+            })
+            .unwrap_or_default()
+    }
+
     pub fn recent_text(&self, lines: usize) -> String {
         self.core
             .lock()
@@ -1035,6 +1090,81 @@ impl GhosttyPaneTerminal {
             .ok()
             .and_then(|core| ghostty_recent_ansi(&core, lines, true).ok())
             .unwrap_or_default()
+    }
+
+    /// Capture or extend the runtime-owned content anchor (ADR-0040 §1).
+    pub fn pin_selection(
+        &self,
+        selection: &mut crate::selection::Selection,
+        drag: Option<(u16, u16, Rect)>,
+    ) {
+        let Ok(mut core) = self.core.lock() else {
+            selection.content_revision = Some(0);
+            return;
+        };
+        let core = &mut *core;
+        let Some(scrollbar) = core.terminal.scrollbar().ok() else {
+            selection.content_revision = Some(0);
+            return;
+        };
+        if let Some((col, row, rect)) = drag {
+            let Some(resolved) = resolve_content_selection(core, selection) else {
+                selection.content_revision = Some(0);
+                return;
+            };
+            *selection = resolved;
+            selection.drag(
+                col,
+                row,
+                rect,
+                Some(ScrollMetrics {
+                    offset_from_bottom: scrollbar
+                        .total
+                        .saturating_sub(scrollbar.offset + scrollbar.len),
+                    max_offset_from_bottom: scrollbar.total.saturating_sub(scrollbar.len),
+                    viewport_rows: scrollbar.len,
+                }),
+            );
+        } else {
+            selection.rebase_capture(scrollbar.offset as u32);
+        }
+        let revision = selection.content_revision.replace(0);
+        if let Some(revision) = revision {
+            if let Some((id, range)) = core
+                .pinned_selection
+                .as_mut()
+                .filter(|(id, _)| *id == revision)
+            {
+                let Some(current) = range.points(&core.terminal) else {
+                    return;
+                };
+                let mut points = selection.endpoints();
+                points[0].0 = current[0].0;
+                selection.set_endpoints(points);
+                if range.update(&core.terminal, points).is_some() {
+                    selection.content_revision = Some(*id);
+                }
+            }
+        } else if let Some(id) = core.content_revision.checked_add(1) {
+            // SAFETY: the pins stay in this core with the terminal. All access
+            // uses the parser mutex; core destruction has exclusive ownership.
+            if let Some(range) = unsafe {
+                crate::ghostty::TrackedSelection::new(&core.terminal, selection.endpoints())
+            } {
+                core.content_revision = id;
+                core.pinned_selection = Some((id, range));
+                selection.content_revision = Some(id);
+            }
+        }
+    }
+
+    /// Resolve current endpoint coordinates, refusing discarded content.
+    pub fn resolve_selection(
+        &self,
+        selection: &crate::selection::Selection,
+    ) -> Option<crate::selection::Selection> {
+        let core = self.core.lock().ok()?;
+        resolve_content_selection(&core, selection)
     }
 
     pub fn extract_selection(&self, selection: &crate::selection::Selection) -> Option<String> {
@@ -1444,6 +1574,45 @@ fn ghostty_detection_text(core: &GhosttyPaneCore) -> Result<String, crate::ghost
     ghostty_recent_text(core, lines)
 }
 
+/// `ghostty_detection_text`, paired with a copy whose faint cells read as
+/// blank. Claude paints its prompt suggestion faint in an empty composer and a
+/// typed draft is never faint, so the copy is what tells the two apart (#892).
+/// Trailing rows are trimmed by the plain text, so the copy keeps exactly its
+/// rows even where only faint text sits at the bottom.
+fn ghostty_detection_text_and_unfaint(
+    core: &GhosttyPaneCore,
+) -> Result<(String, String), crate::ghostty::Error> {
+    let lines = core
+        .terminal
+        .rows()
+        .ok()
+        .map(|rows| usize::from(rows).max(1))
+        .unwrap_or(DEFAULT_DETECTION_ROWS);
+    let total_rows = core.terminal.total_rows()?;
+    let cols = core.terminal.cols()?;
+    if total_rows == 0 || cols == 0 {
+        return Ok(Default::default());
+    }
+    let start = recent_window_start(core, total_rows, lines)?;
+    let mut plain = Vec::with_capacity(total_rows.saturating_sub(start));
+    let mut unfaint = Vec::with_capacity(total_rows.saturating_sub(start));
+    for y in start..total_rows {
+        let (row, row_unfaint) = ghostty_screen_row_and_unfaint(core, cols, y as u32)?;
+        plain.push(row);
+        unfaint.push(row_unfaint);
+    }
+    trim_trailing_blank_rows(&mut plain);
+    unfaint.truncate(plain.len());
+    let start = plain.len().saturating_sub(lines);
+    let join = |rows: &[String]| {
+        rows[start..]
+            .iter()
+            .map(|row| format!("{row}\n"))
+            .collect::<String>()
+    };
+    Ok((join(&plain), join(&unfaint)))
+}
+
 /// The bottom `lines` rows of the page list, extended upward over blank rows
 /// until it holds content (#456).
 ///
@@ -1629,10 +1798,27 @@ fn ghostty_restore_scroll_offset_from_bottom(
     }
 }
 
+fn resolve_content_selection(
+    core: &GhosttyPaneCore,
+    selection: &crate::selection::Selection,
+) -> Option<crate::selection::Selection> {
+    let mut resolved = selection.clone();
+    if let Some(revision) = selection.content_revision {
+        let (_, range) = core
+            .pinned_selection
+            .as_ref()
+            .filter(|(id, _)| *id == revision)?;
+        resolved.set_endpoints(range.points(&core.terminal)?);
+    }
+    Some(resolved)
+}
+
 fn ghostty_extract_selection(
     core: &mut GhosttyPaneCore,
     selection: &crate::selection::Selection,
 ) -> Result<String, crate::ghostty::Error> {
+    let selection = resolve_content_selection(core, selection)
+        .ok_or(crate::ghostty::Error::selection_unavailable())?;
     let ((start_row, start_col), (end_row, end_col)) = selection.ordered_cells();
     core.terminal
         .read_text_screen((start_col, start_row), (end_col, end_row), false)
@@ -1659,6 +1845,30 @@ fn ghostty_screen_row(
         }
     }
     Ok(line.trim_end().to_string())
+}
+
+fn ghostty_screen_row_and_unfaint(
+    core: &GhosttyPaneCore,
+    cols: u16,
+    y: u32,
+) -> Result<(String, String), crate::ghostty::Error> {
+    let mut line = String::new();
+    let mut unfaint = String::new();
+    for x in 0..cols {
+        let (graphemes, style) = core.terminal.screen_graphemes_and_style(x, y)?;
+        if graphemes.is_empty()
+            || graphemes.first().copied() == Some(crate::ghostty::KITTY_UNICODE_PLACEHOLDER)
+        {
+            line.push(' ');
+            unfaint.push(' ');
+        } else {
+            for ch in graphemes.into_iter().filter_map(char::from_u32) {
+                line.push(ch);
+                unfaint.push(if style.faint { ' ' } else { ch });
+            }
+        }
+    }
+    Ok((line.trim_end().to_string(), unfaint.trim_end().to_string()))
 }
 
 fn ghostty_line_from_cells(
@@ -2821,6 +3031,23 @@ mod tests {
         let after = pane.scroll_metrics().expect("scroll metrics after scroll");
         assert_eq!(after.offset_from_bottom, after.max_offset_from_bottom);
         assert!(pane.visible_text().contains("000000"));
+    }
+
+    #[test]
+    fn detection_unfaint_blanks_only_faint_cells_row_for_row() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(40, 6, 100).unwrap();
+        terminal.write(
+            b"\x1b[2Jtop\r\n\xe2\x9d\xaf \x1b[2mwatch CI\x1b[0m\r\n\xe2\x9d\xaf typed \x1b[2mtail\x1b[0m\r\n\x1b[2monly faint\x1b[0m",
+        );
+        let pane = GhosttyPaneTerminal::new(terminal, tx).unwrap();
+
+        let (plain, unfaint) = pane.detection_text_and_unfaint();
+        assert_eq!(plain, pane.detection_text());
+        assert_eq!(plain, "top\n❯ watch CI\n❯ typed tail\nonly faint\n");
+        // The faint bottom row stays as a blank row, so the two still line up.
+        assert_eq!(unfaint, "top\n❯\n❯ typed\n\n");
+        assert_eq!(plain.lines().count(), unfaint.lines().count());
     }
 
     #[test]

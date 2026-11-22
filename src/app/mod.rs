@@ -5,35 +5,67 @@
 //! - `input.rs` — key/mouse → action translation
 
 pub(crate) mod actions;
+mod agent_phases;
+mod agent_profile;
+pub(crate) mod agent_removal;
+pub(crate) mod agent_restart;
 mod agent_resume;
 mod agents;
 mod api;
+pub(crate) use api::mesh_mail::RecoveredMessage;
+pub(crate) use api::mesh_routes::Completion as MeshRoutesCompletion;
+pub(crate) use api::responses::encode_error_with_data;
+pub(crate) use api::structured_queue::SendParams as StructuredSendParams;
+pub(crate) use api::LocalOperator;
+mod local_operator;
+pub(crate) use local_operator::LocalPeer;
+#[cfg(feature = "web")]
+pub(crate) use local_operator::LocalPeerRefusal;
 pub(crate) mod fleet_pause;
+pub(crate) mod guarded_submit;
 pub(crate) mod hibernation;
 pub(crate) mod idle_wake;
+pub(crate) mod paste_confirm;
 pub(crate) mod self_compact;
 pub(crate) use api::peers::{configured_node_icon, short_host_name};
 pub(crate) use api::workspaces::WorkspaceFocusOutcome;
-mod api_helpers;
+pub(crate) mod api_helpers;
+mod background_jobs;
 pub(crate) mod config_io;
 mod creation;
+pub(crate) mod delegation;
+use crate::mesh::store::delivery_attempts;
 pub(crate) mod directory;
+pub(crate) mod draft_stash;
+pub(crate) mod edges;
 pub(crate) mod float;
+pub(crate) mod goals;
 pub(crate) mod handoffs;
 mod ids;
 mod input;
+mod input_writes;
 pub(crate) mod issue_drop;
 pub(crate) mod line_editor;
 pub(crate) mod mailboxes;
+pub(crate) mod message_relay;
+mod native_auth;
+mod native_submission;
 pub(crate) mod notification_panel;
 pub(crate) mod notifications;
+pub(crate) mod owners;
 mod peer_checkout;
+pub(crate) mod questions;
+pub(crate) mod queue_events;
 mod runtime;
 mod session;
 pub mod state;
+mod structured_actions;
+mod structured_controller;
+mod structured_placement;
+pub(crate) mod structured_view;
 mod terminal_targets;
 mod theme_sync;
-pub(crate) mod uplink;
+pub(crate) mod waits;
 mod worktrees;
 
 use std::collections::{HashMap, HashSet};
@@ -122,13 +154,88 @@ impl PaneClickState {
     }
 }
 
+/// Socket attribution preserved across recovery continuations.
+#[derive(Clone)]
+pub(crate) struct ApiCaller {
+    scope: Option<crate::api::scoped::Scope>,
+    pid: Option<u32>,
+    birth: Option<Option<u64>>,
+    uid: Option<Option<u32>>,
+}
+
+/// An API request held back until the mesh store finishes recovering.
+struct ParkedApiRequest {
+    request: crate::api::schema::Request,
+    caller: ApiCaller,
+    respond_to: std::sync::mpsc::Sender<String>,
+    deadline: Instant,
+}
+
+/// How long a mail request waits for post-handoff recovery before it is
+/// refused. Well below the CLI's client timeout, so a caller that gives up
+/// never has its request replayed behind its back, and a Stop-hook wake
+/// cannot stall a turn on a slow store reopen.
+pub(crate) const RECOVERY_PARK_LIMIT: Duration = Duration::from_secs(5);
+
+/// Process dependencies selected once when the app is constructed.
+///
+/// These are runtime configuration, not persisted user settings. Defaults
+/// preserve normal command lookup through the server's PATH.
+#[derive(Default)]
+pub(crate) struct AppRuntimeConfig {
+    /// Owning listener endpoint, never supplied by an API caller.
+    pub(crate) structured_mcp: Option<crate::structured::launch::SessionMcp>,
+    /// Command used by every app merge-evidence query, including workers.
+    pub(crate) merge_gate: crate::worktree::MergeGateContext,
+    /// Account lookup captured once, independent of caller-controlled requests.
+    pub(crate) uid_policy: crate::structured::identity::UidPolicy,
+}
+
+impl AppRuntimeConfig {
+    /// Capture one server's launch-time identity policy before starting listeners.
+    pub(crate) fn for_config(config: &Config) -> Self {
+        Self::for_config_with_uid_policy(config, Default::default())
+    }
+
+    /// Select account policy from injected dependencies before cloning for listeners.
+    pub(crate) fn for_config_with_uid_policy(
+        config: &Config,
+        mut uid_policy: crate::structured::identity::UidPolicy,
+    ) -> Self {
+        // Absence is explicit policy, never an inference from a pending lookup.
+        if config.security.agent_account == crate::config::model::AgentAccount::None {
+            uid_policy.dedicated = Ok(None).into();
+        }
+        Self {
+            structured_mcp: None,
+            merge_gate: Default::default(),
+            uid_policy,
+        }
+    }
+}
+
 pub struct App {
+    pub(crate) runtime_config: AppRuntimeConfig,
+    /// Shared, in-memory one-time browser handoffs, never persisted across restart.
+    pub(crate) client_codes: crate::client_open::Codes,
+    native_clients: native_auth::Clients,
+    native_input_client: Option<u64>,
+    pub(crate) client_auth: crate::structured::permissions::auth::tokens::server::Owner,
     pub state: AppState,
     pub(crate) terminal_runtimes: crate::terminal::TerminalRuntimeRegistry,
     pub event_tx: mpsc::Sender<AppEvent>,
     /// Peer PID of the API request currently being handled; lets pane
     /// reports resolve by process ancestry when env pane-ids are stale.
     pub(crate) current_api_peer_pid: Option<u32>,
+    /// Revocable scoped admission, preserved across queues and continuations.
+    pub(crate) current_api_scope: Option<crate::api::scoped::Scope>,
+    /// Internal call, captured socket birth, or captured-but-unavailable birth.
+    pub(crate) current_api_peer_birth: Option<Option<u64>>,
+    /// Internal call, captured UID, or captured-but-unavailable UID.
+    pub(crate) current_api_peer_uid: Option<Option<u32>>,
+    pub(crate) session_leases: crate::structured::lease::SessionLeases,
+    /// ADR-0052 operator binding switch, independent of agent-editable config.
+    pub(crate) structured_profiles: crate::structured::profiles::ProfileAdmission,
     /// Test-only override for pane child PIDs so ancestry reconciliation can
     /// be exercised without spawning real PTYs.
     #[cfg(test)]
@@ -136,19 +243,87 @@ pub struct App {
     pub(crate) event_rx: mpsc::Receiver<AppEvent>,
     pub(crate) api_rx: tokio::sync::mpsc::UnboundedReceiver<crate::api::ApiRequestMessage>,
     pub(crate) event_hub: crate::api::EventHub,
-    /// Pane-to-pane message queues (#175 M1), seeded from the durable
-    /// event log at construction.
+    delivery_attempt_registry: std::cell::RefCell<delivery_attempts::DeliveryAttempts>,
+    /// Installed from the API listener during server startup.
+    pub(crate) node_id: Option<String>,
+    pub(crate) mesh_collect_at: Option<Instant>,
+    pub(crate) mesh_outbound_cursor: usize,
+    pub(crate) mesh_outbound_polls: std::collections::HashMap<String, crate::mesh::collect::Poll>,
+    pub(crate) mesh_routes: api::mesh_routes::Routes,
+    pub(crate) collection_relays: message_relay::MessageRelays,
+    pub(crate) collection_peers: std::collections::HashMap<String, String>,
+    pub(crate) collection_generation: u64,
+    pub(crate) mesh_retry_at: Option<Instant>,
+    /// Store-clock ms up to which expired offer leases have woken their
+    /// collectors (#879).
+    pub(crate) mesh_offers_checked_ms: i64,
+    pub(crate) mesh_receipt_log_at: Option<Instant>,
+    pub(crate) pending_agent_removals: std::collections::VecDeque<agent_removal::Removal>,
+    /// #959: open architect -> delegate edges, folded from the durable log
+    /// once per server start by `reissue_open_records`.
+    pub(crate) delegations: delegation::DelegationIndex,
+    /// ADR-0030 §1: goals by `AgentId`, folded in the same start pass.
+    pub(crate) goals: goals::GoalIndex,
+    /// ADR-0035 §6.2: adopted owner policy versions by repo, folded in the
+    /// same start pass.
+    pub(crate) owner_policies: crate::owner_policy::OwnerPolicyIndex,
+    /// ADR-0035 §1: owner bindings by repo slug, folded in the same pass.
+    pub(crate) owners: owners::OwnerIndex,
+    /// The `EventHub::rotations` value the open goals, the adopted policies
+    /// and the owner bindings
+    /// were last re-issued at.
+    pub(crate) record_rotations_seen: u64,
+    mesh_store_retry_at: Option<Instant>,
+    mesh_store_recovering: bool,
+    /// Mail requests that arrived while the recovery worker was still
+    /// rebuilding the inbox projection after a handoff (#887). Answering them
+    /// then would read an empty projection, so they wait for the rebuild.
+    recovery_parked: Vec<ParkedApiRequest>,
+    /// Set by dispatch, taken by `respond_or_park`, which owns the responder.
+    pub(crate) pending_recovery_park: Option<(crate::api::schema::Request, ApiCaller)>,
+    pub(crate) mesh_enrollment_generation: u64,
+    pub(crate) mesh_forward_generation: Option<u64>,
+    pub(crate) mesh_forward_cursor: Option<(u64, crate::mesh::key::MessageKey)>,
+    /// Forwarded custody whose only onward route crosses a node the mail
+    /// already visited, with when this hub first saw it so (#928).
+    pub(crate) mesh_looped: std::collections::HashMap<crate::mesh::key::MessageKey, Instant>,
+    pub(crate) mesh_pause_seen: Option<bool>,
+    pub(crate) mesh_maintenance_at: Option<Instant>,
+    pub(crate) clone_detection_warning: Option<String>,
+    /// Mailbox projection, rebuilt from custody at server boot after staging
+    /// old log entries at construction for the one-time migration.
     pub(crate) mailboxes: crate::app::mailboxes::MailboxRegistry,
-    /// Messages this server is handing up to its hub, and the requests parked
-    /// on them (#410). In memory on purpose: a parked request dies with the
-    /// connection that made it, so there is nothing a restart could resume.
-    pub(crate) uplink: crate::app::uplink::Uplink,
+    /// Inbound SSH relay processes and their independent mesh handshakes.
+    pub(crate) inbound: crate::app::edges::InboundEdges,
+    pub(crate) message_relays: message_relay::MessageRelays,
+    /// Canonical pane ids reserved by a guarded client submission.
+    pub(crate) active_submissions: std::collections::HashSet<String>,
+    /// Operator drafts an injection could not type back (#850).
+    pub(crate) kept_drafts: std::cell::RefCell<draft_stash::KeptDrafts>,
+    /// Plain paste observation parked by `respond_or_park` after dispatch.
+    /// `integration.install`, answered from a worker thread by
+    /// `respond_or_park`, because installing Claude probes `claude --version`.
+    pub(crate) pending_integration_install: Option<api::integrations::PendingInstall>,
+    /// How the server learns the installed Claude Code's version, called only
+    /// on worker threads (it blocks up to 10 s). Replaceable so a test can
+    /// hold it and show the loop does not wait.
+    pub(crate) claude_version_probe: api::integrations::VersionProbe,
+    /// Deferred submit set by `handle_agent_send` and consumed by
+    /// `respond_or_park`, called from runtime.rs and headless.rs. Cleared per
+    /// request. A response path bypassing `respond_or_park` would reply ok
+    /// without pressing Enter, so dispatch asserts the previous slot was consumed.
+    pub(crate) pending_agent_submit: Option<(String, String, guarded_submit::Attempt)>,
     /// What the idle wake (ADR-0018 §2) has typed, and into which pane.
     pub(crate) idle_wake: crate::app::idle_wake::IdleWakeTracker,
+    /// Open registered waits per agent (ADR-0028 §5, #1031).
+    pub(crate) waits: waits::WaitRegistry,
+    /// Settled phase per local agent, for ADR-0028 §2's derived events.
+    pub(crate) agent_phases: agent_phases::AgentPhaseTracker,
     /// When the next armed self-compaction needs looking at (#540): the Enter
     /// of a typed write, a settle that lifts, or the timeout. `None` when
     /// nothing is armed anywhere, which is the state the loop is quiet in.
     pub(crate) self_compact_deadline: Option<Instant>,
+    pub(crate) restarts: agent_restart::RestartRuntime,
     pub(crate) last_focus: Option<(usize, crate::layout::PaneId)>,
     pub(crate) no_session: bool,
     pub(crate) input_rx: Option<mpsc::Receiver<crate::raw_input::RawInputEvent>>,
@@ -160,6 +335,8 @@ pub struct App {
     pub(crate) last_api_notification_at: Option<Instant>,
     pub(crate) last_git_remote_status_refresh: Instant,
     pub(crate) git_refresh_in_flight: bool,
+    /// Last dispatch gate; summaries read it without probing the filesystem.
+    pub(crate) git_refresh_idle: Option<crate::api::schema::PollerReason>,
     /// An issue-guard fetch is running off-loop (#302).
     pub(crate) issue_guard_fetch_in_flight: bool,
     pub(crate) git_refresh_due_after_in_flight: bool,
@@ -227,6 +404,13 @@ pub struct App {
     pub(crate) last_render_at: Option<Instant>,
     pub(crate) suppressed_repeat_keys:
         HashSet<(crossterm::event::KeyCode, crossterm::event::KeyModifiers)>,
+    pub(crate) input_writes: input_writes::InputWrites,
+    directory_snapshot: directory::DirectorySnapshot,
+    pub(crate) structured_workers: crate::structured::workers::Workers,
+    native_submissions: HashMap<String, native_submission::Submission>,
+    structured_views: HashMap<String, crate::structured::view::driver::Driver>,
+    queue_events: queue_events::QueueEvents,
+    pub(crate) structured_sends: api::structured_queue::Sends,
     pub render_notify: Arc<Notify>,
     pub render_dirty: Arc<AtomicBool>,
     pub(crate) full_redraw_pending: bool,
@@ -243,6 +427,8 @@ pub struct App {
     /// Source-scoped health for the batched PR poller (#294/#295). One row for
     /// one poller — see `PrPollHealth` for why this is not per-workspace.
     pub(crate) pr_poll_health: crate::pr_poll::PrPollHealth,
+    /// Which `pr.*` events are already in the log (#1020).
+    pub(crate) pr_events: crate::pr_poll::PrEventLedger,
     /// Source-scoped health for the periodic git-status refresh (#295). The
     /// refresh drives the sidebar's branch / dirty / ahead-behind numbers;
     /// without a row here "no update fired" is indistinguishable from "the
@@ -276,6 +462,7 @@ pub(crate) const APP_EVENT_DRAIN_LIMIT: usize = 64;
 
 pub(crate) enum LoopEvent {
     Timer,
+    InputWrites,
     Internal(AppEvent),
     Api(crate::api::ApiRequestMessage),
     RawInput(crate::raw_input::RawInputEvent),
@@ -392,13 +579,37 @@ impl App {
         api_rx: tokio::sync::mpsc::UnboundedReceiver<crate::api::ApiRequestMessage>,
         event_hub: crate::api::EventHub,
     ) -> Self {
+        Self::new_with_runtime_config(
+            config,
+            no_session,
+            config_diagnostic,
+            api_rx,
+            event_hub,
+            AppRuntimeConfig::for_config(config),
+        )
+    }
+
+    /// Construct an app with explicit process dependencies. Missing executables
+    /// retain the merge gate's normal failure classification, without fallback.
+    /// Select account policy with `AppRuntimeConfig::for_config` or its injected
+    /// variant before cloning it for the API listener; this preserves that cache.
+    pub(crate) fn new_with_runtime_config(
+        config: &Config,
+        no_session: bool,
+        config_diagnostic: Option<String>,
+        api_rx: tokio::sync::mpsc::UnboundedReceiver<crate::api::ApiRequestMessage>,
+        event_hub: crate::api::EventHub,
+        runtime_config: AppRuntimeConfig,
+    ) -> Self {
         let (prefix_code, prefix_mods) = config.prefix_key();
         crate::kitty_graphics::set_enabled(config.experimental.kitty_graphics);
+        crate::channels::issue_tokens(&config.channels, &short_host_name());
         let (event_tx, event_rx) = mpsc::channel::<AppEvent>(APP_EVENT_CHANNEL_CAPACITY);
         crate::system_stats::spawn_sampler(
             event_tx.clone(),
             config.ui.disk_path.clone(),
             config.thermal_command.clone(),
+            config.gpu_command.clone(),
         );
         {
             // Slow PR-state poll tick: the shared event handler collects the
@@ -446,6 +657,8 @@ impl App {
         let render_notify = Arc::new(Notify::new());
         let render_dirty = Arc::new(AtomicBool::new(false));
 
+        let mut structured_agents = crate::structured::registry::Registry::default();
+
         // Try to restore previous session
         let mut restored_terminals = std::collections::HashMap::new();
         let mut restored_terminal_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
@@ -488,6 +701,7 @@ impl App {
             );
             restored_terminals = terminals;
             restored_terminal_runtimes = terminal_runtimes.into();
+            structured_agents = snap.structured_agents;
             if ws.is_empty() {
                 crate::logging::session_restored(0, "empty");
                 (
@@ -578,6 +792,11 @@ impl App {
         };
 
         let mut state = AppState {
+            structured_agents,
+            native_control: None,
+            native_editors: HashMap::new(),
+            native_text_revision: 0,
+            native_frames: HashMap::new(),
             issue_drop: None,
             issue_repo_cache: None,
             terminals: std::collections::HashMap::new(),
@@ -615,6 +834,9 @@ impl App {
             adopt_external_worktrees: config.worktrees.adopt_external,
             branch_pivot_message: config.worktrees.branch_pivot_message.clone(),
             peers: config.peers.clone(),
+            server_nodes: Default::default(),
+            server_paths: Default::default(),
+            server_node: None,
             peer_summaries: config
                 .peers
                 .iter()
@@ -690,6 +912,7 @@ impl App {
                 config_diagnostic_lines: Vec::new(),
                 session_warning_lines: Vec::new(),
                 pane_infos: Vec::new(),
+                structured: HashMap::new(),
                 split_borders: Vec::new(),
             },
             drag: None,
@@ -727,6 +950,7 @@ impl App {
             server_label: config.ui.server_label,
             pane_header: config.ui.pane_header,
             status_line: config.ui.status_line,
+            agent_restarts: Default::default(),
             system_stats: None,
             system_stats_at: None,
             expanded_prompt_pane: None,
@@ -815,6 +1039,10 @@ impl App {
         });
 
         let mut this = Self {
+            runtime_config,
+            delivery_attempt_registry: std::cell::RefCell::new(
+                delivery_attempts::DeliveryAttempts::new(event_hub.current_sequence()),
+            ),
             config_diagnostic_deadline: None,
             action_notice_deadline: None,
             toast_deadline: None,
@@ -824,11 +1052,19 @@ impl App {
             terminal_runtimes: restored_terminal_runtimes,
             event_tx,
             current_api_peer_pid: None,
+            current_api_scope: None,
+            current_api_peer_birth: None,
+            current_api_peer_uid: None,
+            session_leases: Default::default(),
+            structured_profiles: crate::structured::profiles::ProfileAdmission::load(
+                &crate::session::data_dir().join("profile-bindings.json"),
+            ),
             #[cfg(test)]
             test_pane_child_pids: std::collections::HashMap::new(),
             event_rx,
             last_git_remote_status_refresh: Instant::now() - GIT_REMOTE_STATUS_REFRESH_INTERVAL,
             git_refresh_in_flight: false,
+            git_refresh_idle: None,
             issue_guard_fetch_in_flight: false,
             git_refresh_due_after_in_flight: false,
             git_status_cache: HashMap::new(),
@@ -892,14 +1128,62 @@ impl App {
                 mailboxes.seed_from_events(restored.iter().map(|(_, _, envelope)| envelope));
                 mailboxes
             },
-            uplink: Default::default(),
+            inbound: Default::default(),
+            message_relays: Default::default(),
+            pending_agent_submit: None,
+            pending_integration_install: None,
+            claude_version_probe: std::sync::Arc::new(crate::integration::probe_claude_version),
+            active_submissions: Default::default(),
+            kept_drafts: Default::default(),
             idle_wake: crate::app::idle_wake::IdleWakeTracker::default(),
+            waits: Default::default(),
+            agent_phases: Default::default(),
             self_compact_deadline: None,
+            restarts: Default::default(),
             event_hub,
+            node_id: None,
+            mesh_collect_at: None,
+            mesh_outbound_cursor: 0,
+            mesh_outbound_polls: Default::default(),
+            collection_relays: Default::default(),
+            mesh_routes: Default::default(),
+            collection_peers: Default::default(),
+            collection_generation: 0,
+            mesh_retry_at: None,
+            mesh_offers_checked_ms: 0,
+            mesh_receipt_log_at: None,
+            pending_agent_removals: Default::default(),
+            client_codes: Default::default(),
+            client_auth: Default::default(),
+            native_clients: Default::default(),
+            native_input_client: None,
+            delegations: Default::default(),
+            goals: Default::default(),
+            owner_policies: Default::default(),
+            owners: Default::default(),
+            record_rotations_seen: 0,
+            mesh_store_retry_at: None,
+            mesh_store_recovering: false,
+            recovery_parked: Vec::new(),
+            pending_recovery_park: None,
+            mesh_enrollment_generation: 0,
+            mesh_forward_generation: None,
+            mesh_forward_cursor: None,
+            mesh_looped: Default::default(),
+            mesh_pause_seen: None,
+            mesh_maintenance_at: None,
+            clone_detection_warning: None,
             last_focus,
             no_session,
             input_rx: None,
             last_terminal_size: terminal::size().ok(),
+            input_writes: input_writes::InputWrites::default(),
+            directory_snapshot: directory::DirectorySnapshot::default(),
+            structured_workers: crate::structured::workers::Workers::new(render_notify.clone()),
+            native_submissions: HashMap::new(),
+            structured_views: HashMap::new(),
+            queue_events: queue_events::QueueEvents::default(),
+            structured_sends: api::structured_queue::Sends::default(),
             render_notify,
             render_dirty,
             full_redraw_pending: false,
@@ -909,6 +1193,7 @@ impl App {
             gossip_poll_interval_secs,
             peer_poll_tracker: crate::peers::PeerPollTracker::new(),
             pr_poll_health: crate::pr_poll::PrPollHealth::default(),
+            pr_events: crate::pr_poll::PrEventLedger::default(),
             git_refresh_health: crate::health::PollerHealthCore::default(),
             checks_runner_health: crate::health::PollerHealthCore::default(),
             peer_poll_health: crate::health::PollerHealthCore::default(),
@@ -926,6 +1211,7 @@ impl App {
         // ADR-0018 §4: blocking mail restored from the log is still waiting on
         // its recipient, so the attention surface shows it from the first frame.
         this.sync_blocking_mail();
+        this.restore_delivery_attempts();
         // #372 / ADR-0016: rebuild the operator's notification list from the
         // durable log, the way the agent mailboxes above are. Surviving a
         // restart is most of what "durable" means here — the toast never did.
@@ -964,6 +1250,165 @@ impl App {
         };
     }
 
+    /// Reopen custody only after ownership commits, or the exporter rolls back.
+    pub(crate) fn resume_mesh_store(&mut self, minimum: u64) {
+        if self.mesh_store_recovering {
+            return;
+        }
+        let recover = self.mesh_recovery_work(minimum);
+        self.start_mesh_recovery(recover);
+    }
+
+    /// Capture the owned inputs for rebuilding custody and the inbox projection.
+    /// Keeping work separate from scheduling lets callers control its execution.
+    fn mesh_recovery_work(
+        &self,
+        minimum: u64,
+    ) -> impl FnOnce() -> Result<Vec<RecoveredMessage>, String> + Send + 'static {
+        let origin = self.node_id.clone();
+        let legacy = self.mailboxes.pending_messages();
+        let recipients = self.mesh_recovery_recipients();
+        let paused = self.fleet_pause.paused;
+        move || {
+            crate::mesh::runtime_store::resume(minimum).and_then(|()| match origin {
+                Some(origin) => api::mesh_mail::load_mesh_mail(origin, legacy, paused, recipients),
+                None => Ok(Vec::new()),
+            })
+        }
+    }
+
+    /// Schedule a custody rebuild, parking mail until its completion event.
+    /// A spawn failure finishes recovery immediately with the same error path.
+    fn start_mesh_recovery(
+        &mut self,
+        recover: impl FnOnce() -> Result<Vec<RecoveredMessage>, String> + Send + 'static,
+    ) {
+        if self.mesh_store_recovering {
+            return;
+        }
+        self.mesh_store_recovering = true;
+        crate::mesh::runtime_store::begin_recovery();
+        let tx = self.event_tx.clone();
+        let spawn = std::thread::Builder::new()
+            .name("mesh-recovery".into())
+            .spawn(move || {
+                let result = crate::mesh::runtime_store::recovery_work(recover);
+                if let Err(reason) = &result {
+                    crate::mesh::runtime_store::failed(reason.clone());
+                }
+                let _ = tx.blocking_send(AppEvent::MeshStoreRecovered(result));
+            });
+        if let Err(error) = spawn {
+            self.finish_mesh_recovery(Err(error.to_string()));
+        }
+    }
+
+    pub(crate) fn finish_mesh_recovery(&mut self, result: Result<Vec<RecoveredMessage>, String>) {
+        self.mesh_store_recovering = false;
+        match result {
+            Ok(records) => {
+                if self.node_id.is_some() {
+                    self.apply_mesh_mail(records);
+                }
+                crate::mesh::runtime_store::recovered();
+                // The reopened store's clock may restart below the old mark,
+                // which would hide every lease until it caught up (#879).
+                self.mesh_offers_checked_ms = 0;
+                self.mesh_retry_at = None;
+                self.mesh_maintenance_at = None;
+                self.mesh_store_retry_at = None;
+            }
+            Err(reason) => {
+                crate::logging::mesh_store_suspended(&reason);
+                crate::mesh::runtime_store::failed(reason);
+                self.mesh_store_retry_at = Some(Instant::now() + Duration::from_secs(5));
+            }
+        }
+        // After a failure too: the store's own error is then the honest answer.
+        self.replay_recovery_parked();
+    }
+
+    /// Whether a request reads the inbox projection or the custody store, both
+    /// of which a replacement server rebuilds asynchronously after handoff.
+    pub(crate) fn waits_for_mesh_recovery(&self, method: &crate::api::schema::Method) -> bool {
+        use crate::api::schema::Method;
+        self.mesh_store_recovering
+            && matches!(
+                method,
+                Method::MsgSend(_)
+                    | Method::MsgReply(_)
+                    | Method::MsgList(_)
+                    | Method::MsgRead(_)
+                    | Method::MsgOperatorList(_)
+                    | Method::MsgOperatorRead(_)
+                    | Method::MsgStatus(_)
+                    | Method::MsgWake(_)
+                    | Method::MsgMute(_)
+            )
+    }
+
+    pub(crate) fn park_until_mesh_recovered(
+        &mut self,
+        request: crate::api::schema::Request,
+        peer_pid: Option<u32>,
+        peer_birth: Option<Option<u64>>,
+        peer_uid: Option<Option<u32>>,
+        scope: Option<crate::api::scoped::Scope>,
+        respond_to: std::sync::mpsc::Sender<String>,
+    ) {
+        self.recovery_parked.push(ParkedApiRequest {
+            request,
+            caller: ApiCaller {
+                scope,
+                pid: peer_pid,
+                birth: peer_birth,
+                uid: peer_uid,
+            },
+            respond_to,
+            deadline: Instant::now() + RECOVERY_PARK_LIMIT,
+        });
+    }
+
+    /// Refuse parked requests whose wait ran out. They are dropped, never
+    /// replayed later: the caller already has its answer and may retry.
+    pub(crate) fn expire_recovery_parked(&mut self, now: Instant) {
+        let (expired, waiting) = std::mem::take(&mut self.recovery_parked)
+            .into_iter()
+            .partition(|parked| now >= parked.deadline);
+        self.recovery_parked = waiting;
+        for parked in expired {
+            let _ = parked.respond_to.send(api::responses::encode_error(
+                parked.request.id,
+                "mail_store_unavailable",
+                crate::mesh::runtime_store::RECOVERING_REASON,
+            ));
+        }
+    }
+
+    /// Answer parked mail requests in arrival order, each with its own caller.
+    fn replay_recovery_parked(&mut self) {
+        let caller = (
+            self.current_api_peer_pid,
+            self.current_api_peer_birth,
+            self.current_api_peer_uid,
+        );
+        let scope = self.current_api_scope.take();
+        for parked in std::mem::take(&mut self.recovery_parked) {
+            self.current_api_scope = parked.caller.scope;
+            self.current_api_peer_pid = parked.caller.pid;
+            self.current_api_peer_birth = parked.caller.birth;
+            self.current_api_peer_uid = parked.caller.uid;
+            let response = self.handle_api_request_after_internal_events_drained(parked.request);
+            self.respond_or_park(parked.respond_to, response);
+        }
+        (
+            self.current_api_peer_pid,
+            self.current_api_peer_birth,
+            self.current_api_peer_uid,
+        ) = caller;
+        self.current_api_scope = scope;
+    }
+
     #[cfg(unix)]
     pub fn new_from_handoff(
         config: &Config,
@@ -976,6 +1421,9 @@ impl App {
             crate::handoff_runtime::ImportedHandoffRuntime,
         >,
     ) -> io::Result<Self> {
+        let mut structured_agents = snapshot.structured_agents.snapshot();
+        structured_agents.restore_retained_stamps(&snapshot.structured_retention);
+        // Self::new restores attempt evidence once, including interrupted submissions.
         let mut app = Self::new(config, true, config_diagnostic, api_rx, event_hub);
         let (workspaces, terminals, runtimes) = crate::persist::restore_handoff(
             snapshot,
@@ -992,6 +1440,7 @@ impl App {
         app.no_session = false;
         app.state.detach_exits = false;
         app.state.pane_id_aliases = pane_id_aliases;
+        app.state.structured_agents = structured_agents;
         app.state.workspaces = workspaces;
         app.state.terminals = terminals;
         app.terminal_runtimes = runtimes.into();
@@ -1080,6 +1529,9 @@ impl App {
             self.input_rx = Some(crate::raw_input::spawn_input_reader());
         }
         self.query_host_terminal_theme();
+        // ADR-0028 §2: mirrored from the headless server's `run` (#25).
+        let restored = self.event_hub.persisted_events_after(0);
+        self.begin_agent_phases(&restored);
 
         let mut needs_render = true;
         let mut host_mouse_capture_active = self.state.mouse_capture;
@@ -1110,6 +1562,8 @@ impl App {
             if self.handle_scheduled_tasks(now, needs_render) {
                 needs_render = true;
             }
+
+            self.sync_directory_events();
 
             // #361: advertise flock's state to the host terminal. Monolithic
             // mode owns the terminal itself, so the write happens right here.
@@ -1224,6 +1678,7 @@ impl App {
             self.sync_host_mouse_capture(&mut host_mouse_capture_active)?;
 
             if needs_render && self.can_render_now(now) {
+                self.sync_structured_views();
                 self.render_dirty.swap(false, Ordering::AcqRel);
                 let _sync_output = SyncOutputGuard::begin()?;
                 let kitty_graphics_enabled = self.state.kitty_graphics_enabled;
@@ -1292,11 +1747,13 @@ impl App {
                         None => LoopEvent::InputClosed,
                     },
                     _ = sleep_until_or_pending(next_deadline) => LoopEvent::Timer,
+                    _ = self.input_writes.notify.notified() => LoopEvent::InputWrites,
                     _ = self.render_notify.notified() => LoopEvent::RenderRequested,
                 }
             };
 
             match event {
+                LoopEvent::InputWrites => self.service_input_writes(),
                 LoopEvent::Timer => {}
                 LoopEvent::Internal(ev) => {
                     self.handle_internal_event_with_prefix_sync(ev);
@@ -1316,6 +1773,7 @@ impl App {
                     self.input_rx = None;
                 }
                 LoopEvent::RenderRequested => {
+                    needs_render |= self.sync_structured_views();
                     if self.render_dirty.load(Ordering::Acquire) {
                         needs_render = true;
                     }
@@ -1323,12 +1781,9 @@ impl App {
             }
         }
 
-        // Save session on exit (skip in --no-session mode)
-        if !self.no_session {
-            self.save_session_now();
-        }
-
-        Ok(())
+        self.input_writes
+            .retire_all(crate::pty::write_receipt::WriteFailure::PaneGone);
+        self.finish_session().map_err(io::Error::other)
     }
 
     fn sync_host_mouse_capture(&self, active: &mut bool) -> io::Result<()> {
@@ -1445,20 +1900,31 @@ impl App {
             return;
         }
 
-        for target in targets {
-            let label = crate::integration::integration_target_label(target);
-            match crate::integration::install_target(target) {
-                Ok(_) => self
-                    .state
-                    .integration_install_messages
-                    .push(format!("installed {label}")),
-                Err(err) => self
-                    .state
-                    .integration_install_messages
-                    .push(format!("{label}: {err}")),
-            }
-        }
+        // Off the loop: installing Claude probes `claude --version`.
+        let human_tools = self.state.config.questions.human_tools.clone();
+        let probe = self.claude_version_probe.clone();
+        let event_tx = self.event_tx.clone();
+        std::thread::spawn(move || {
+            let messages = targets
+                .into_iter()
+                .map(|target| {
+                    let label = crate::integration::integration_target_label(target);
+                    let question = || {
+                        crate::integration::ClaudeQuestionHook::new(human_tools.clone(), probe())
+                    };
+                    match crate::integration::install_target(target, question) {
+                        Ok(_) => format!("installed {label}"),
+                        Err(err) => format!("{label}: {err}"),
+                    }
+                })
+                .collect();
+            let _ = event_tx.blocking_send(AppEvent::IntegrationsInstalled(messages));
+        });
+    }
 
+    /// The worker's report from [`Self::install_recommended_integrations`].
+    pub(crate) fn finish_recommended_integrations(&mut self, messages: Vec<String>) {
+        self.state.integration_install_messages = messages;
         self.state.integration_recommendations = crate::integration::integration_recommendations();
         self.state.mark_session_dirty();
     }
@@ -1512,6 +1978,24 @@ impl App {
         let invalid_section =
             |section: &str| invalid_sections.iter().any(|invalid| invalid == section);
 
+        if !invalid_section("security") && config.security != self.state.config.security {
+            diagnostics.push("security.agent_account changed: restart the server to apply socket account policy; keeping current policy".into());
+        }
+
+        if !invalid_section("sessions")
+            && config.sessions.queue_rewrite_bytes != self.state.config.sessions.queue_rewrite_bytes
+        {
+            diagnostics.push("sessions.queue_rewrite_bytes changed: restart required to apply the worker queue policy; keeping current threshold".into());
+        }
+
+        // ADR-0041 §5: server reload cannot renegotiate MCP sessions.
+        if !invalid_section("msg")
+            && crate::mcp::channel::ChannelOptions::from_config(&config.msg)
+                != crate::mcp::channel::ChannelOptions::from_config(&self.state.config.msg)
+        {
+            diagnostics.push("msg channel options changed: restart_required for existing MCP sessions; restart flk mcp serve to apply (server message policy applied live)".into());
+        }
+
         // Snapshot fields that need to detect a change relative to the
         // previous live config BEFORE any per-section replacement below.
         let previous_sound = self.state.config.ui.sound.clone();
@@ -1535,8 +2019,27 @@ impl App {
         if !invalid_section("worktrees") {
             self.state.config.worktrees = config.worktrees.clone();
         }
+        if !invalid_section("events") {
+            self.event_hub
+                .set_read_max_wait_ms(config.events.read_max_wait_ms);
+        }
         if !invalid_section("theme") {
             self.state.config.theme = config.theme.clone();
+        }
+        if !invalid_section("questions") {
+            self.state.config.questions = config.questions.clone();
+        }
+        if !invalid_section("channels") {
+            self.state.config.channels = config.channels.clone();
+            crate::channels::issue_tokens(&config.channels, &short_host_name());
+        }
+        // ADR-0041 §5: these server policies are read at use time.
+        // Existing admissions and process environment snapshots stay intact.
+        if !invalid_section("msg") {
+            self.state.config.msg = config.msg.clone();
+        }
+        if !invalid_section("spawn") {
+            self.state.config.spawn = config.spawn.clone();
         }
         // Sections without an explicit invalidation gate always follow the
         // incoming config.
@@ -1770,6 +2273,12 @@ impl App {
         apply_host_terminal_theme: bool,
     ) {
         for event in events {
+            // An earlier event in this batch can create or remove a runtime.
+            // Refresh before each event so navigation never reuses the previous
+            // event's or frame's presence snapshot. This is O(terminals), pure
+            // metadata publication, with no PTY reads.
+            self.state
+                .refresh_terminal_runtime_presence(&self.terminal_runtimes);
             let previous_mode = self.state.mode;
             match event {
                 crate::raw_input::RawInputEvent::Key(key) => {
@@ -1979,6 +2488,55 @@ mod tests {
         }
     }
 
+    #[test]
+    fn security2384_enum_env_reload_diagnostics_do_not_echo_values() {
+        let _guard = config_env_guard();
+        struct RestorePath(Option<std::ffi::OsString>);
+        impl Drop for RestorePath {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(value) => std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, value),
+                    None => std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR),
+                }
+            }
+        }
+        let _restore = RestorePath(std::env::var_os(crate::config::CONFIG_PATH_ENV_VAR));
+        let root =
+            crate::structured::launch::SessionConfigDir::create(&std::env::temp_dir()).unwrap();
+        std::env::set_var(
+            crate::config::CONFIG_PATH_ENV_VAR,
+            root.path().join("config.toml"),
+        );
+        let mut app = test_app();
+        let original_ui = app.state.config.ui.tab_mode;
+        let probe = "CONFIG2384_ENUM_PRIVATE_7c39_never_echo_this_value";
+        std::env::set_var("FLOCK_UI_TAB_MODE", probe);
+        let mut returned = Vec::new();
+        let logs = crate::logging::capture_logs(|| {
+            let loaded = crate::config::load_live_config().unwrap();
+            returned.extend(loaded.diagnostics.clone());
+            let report = app.apply_config_from_disk(false);
+            assert_eq!(report.status, crate::config::ConfigReloadStatus::Partial);
+            returned.extend(report.diagnostics);
+        });
+        assert_eq!(app.state.config.ui.tab_mode, original_ui);
+        assert!(returned.iter().any(|d| d.contains("ui.tab_mode")
+            && d.contains("environment")
+            && d.contains("expected")));
+        assert!(!returned.is_empty());
+        assert!(
+            !returned.join(" ").contains(probe),
+            "returned diagnostics leaked enum value"
+        );
+        assert!(!logs.contains(probe), "logs leaked enum value");
+        assert!(!app
+            .state
+            .config_diagnostic
+            .as_deref()
+            .unwrap_or_default()
+            .contains(probe));
+    }
+
     fn test_app() -> App {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         App::new(
@@ -1988,6 +2546,101 @@ mod tests {
             api_rx,
             crate::api::EventHub::default(),
         )
+    }
+
+    #[tokio::test]
+    async fn structured_worker_notifications_and_exact_deadlines_reach_the_scheduler() {
+        use crate::api::agent_state::{Lifecycle, Phase};
+        use crate::structured::workers::tests::{event, wait, Case};
+        let mut app = test_app();
+        let now = Instant::now();
+        let notify = app.render_notify.clone();
+        app.state.workspaces.clear();
+        app.state.config.checks.enable = false;
+        app.next_auto_update_check = None;
+        app.checks_heartbeat_deadline = None;
+        app.checks_next_deadline = None;
+        app.next_animation_tick = None;
+        app.session_save_deadline = None;
+        let (mut case, mut launch, factory) = Case::prepare(
+            &mut app.state.structured_agents,
+            11,
+            "state-reducer",
+            vec![event("command_lifecycle")],
+        );
+        // Choose an explicit fixture policy earlier than unrelated app deadlines.
+        launch.stall_after = Duration::from_millis(1);
+        case.generation = app
+            .structured_workers
+            .start(&mut app.state.structured_agents, launch, factory)
+            .unwrap();
+        wait(&notify, || {
+            app.handle_scheduled_tasks(now, false);
+            assert!(app
+                .structured_workers
+                .report(&case.id, case.generation)
+                .is_none());
+            app.state
+                .structured_agents
+                .get(&case.id)
+                .unwrap()
+                .1
+                .update
+                .state
+                .lifecycle
+                == Lifecycle::Live
+        })
+        .await;
+        case.submit(&app.structured_workers);
+        wait(&notify, || {
+            app.handle_scheduled_tasks(now, false);
+            assert!(app
+                .structured_workers
+                .report(&case.id, case.generation)
+                .is_none());
+            app.state
+                .structured_agents
+                .get(&case.id)
+                .unwrap()
+                .1
+                .update
+                .state
+                .phase
+                == Phase::Working
+        })
+        .await;
+        app.checks_next_deadline = None;
+        app.checks_heartbeat_deadline = None;
+        let due = app
+            .structured_workers
+            .next_deadline(&app.state.structured_agents)
+            .unwrap();
+        assert_eq!(
+            app.next_headless_loop_deadline_with_git_refresh(now, false, false),
+            Some(due)
+        );
+        let now = due;
+        app.handle_scheduled_tasks(now, false);
+        let update = &app.state.structured_agents.get(&case.id).unwrap().1.update;
+        assert_eq!(update.state.phase, Phase::Working);
+        assert!(update.stalled_since_ms.is_some());
+        case.finish(
+            &mut app.state.structured_agents,
+            &mut app.structured_workers,
+            &notify,
+            now,
+            Some(crate::structured::runtime::Outcome::Stopped),
+        )
+        .await;
+    }
+
+    #[test]
+    fn production_app_uses_plain_gh_for_merge_evidence() {
+        let app = test_app();
+        assert_eq!(
+            app.runtime_config.merge_gate.gh_program,
+            std::path::Path::new("gh")
+        );
     }
 
     #[derive(Clone, Default)]
@@ -2606,6 +3259,113 @@ mod tests {
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
+    fn assert_channel_reload_reports_mcp_restart(change: fn(&mut crate::config::model::MsgConfig)) {
+        let mut app = test_app();
+        let mut incoming = app.state.config.clone();
+        change(&mut incoming.msg);
+        let report = app.apply_live_config(&incoming, &[], &[], false);
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Partial);
+        assert!(report
+            .diagnostics
+            .iter()
+            .any(|message| message.contains("restart_required")
+                && message.contains("MCP")
+                && message.contains("flk mcp serve")));
+        assert_eq!(
+            crate::mcp::channel::ChannelOptions::from_config(&app.state.config.msg),
+            crate::mcp::channel::ChannelOptions::from_config(&incoming.msg)
+        );
+    }
+
+    #[test]
+    fn reload_channel_push_reports_mcp_restart_required() {
+        assert_channel_reload_reports_mcp_restart(|msg| msg.channel_push = true);
+    }
+
+    #[test]
+    fn reload_channel_body_limit_reports_mcp_restart_required() {
+        assert_channel_reload_reports_mcp_restart(|msg| msg.channel_push_body_max_bytes += 1);
+    }
+
+    #[test]
+    fn reload_channel_reconnect_reports_mcp_restart_required() {
+        assert_channel_reload_reports_mcp_restart(|msg| msg.channel_push_reconnect_secs += 1);
+    }
+
+    #[test]
+    fn reload_unrelated_msg_policy_does_not_require_mcp_restart() {
+        let mut app = test_app();
+        let mut incoming = app.state.config.clone();
+        incoming.msg.blocking_per_hour = 0;
+        incoming.msg.channel_push_idle_wake_grace_ms += 1;
+        let report = app.apply_live_config(&incoming, &[], &[], false);
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(app.state.config.msg.blocking_per_hour, 0);
+        assert_eq!(
+            app.state.config.msg.channel_push_idle_wake_grace_ms,
+            incoming.msg.channel_push_idle_wake_grace_ms
+        );
+    }
+
+    #[test]
+    fn reload_invalid_msg_does_not_report_unapplied_channel_changes() {
+        let mut app = test_app();
+        let mut incoming = app.state.config.clone();
+        incoming.msg.channel_push = true;
+        let report = app.apply_live_config(
+            &incoming,
+            &["invalid msg section".into()],
+            &["msg".into()],
+            false,
+        );
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Partial);
+        assert_eq!(report.diagnostics, ["invalid msg section"]);
+        assert!(!app.state.config.msg.channel_push);
+    }
+
+    #[test]
+    fn queue_threshold_reload_reports_restart_required_and_keeps_worker_policy() {
+        let mut app = test_app();
+        let old = app.state.config.sessions.queue_rewrite_bytes;
+        let mut incoming = app.state.config.clone();
+        incoming.sessions.queue_rewrite_bytes = std::num::NonZeroU64::new(old.get() + 1).unwrap();
+        let report = app.apply_live_config(&incoming, &[], &[], false);
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Partial);
+        assert!(report
+            .diagnostics
+            .iter()
+            .any(|message| message
+                .contains("sessions.queue_rewrite_bytes changed: restart required")));
+        assert_eq!(app.state.config.sessions.queue_rewrite_bytes, old);
+        assert_eq!(
+            app.state.config_diagnostic.as_deref(),
+            Some(report.diagnostics[0].as_str())
+        );
+        let same = app.state.config.clone();
+        assert_eq!(
+            app.apply_live_config(&same, &[], &[], false).status,
+            crate::config::ConfigReloadStatus::Applied
+        );
+    }
+
+    #[test]
+    fn account_policy_reload_keeps_active_policy_and_requires_restart() {
+        let mut app = test_app();
+        let mut incoming = app.state.config.clone();
+        incoming.security.agent_account = crate::config::model::AgentAccount::None;
+        let report = app.apply_live_config(&incoming, &[], &[], false);
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Partial);
+        assert!(report
+            .diagnostics
+            .iter()
+            .any(|message| message.contains("security.agent_account changed: restart")));
+        assert_eq!(
+            app.state.config.security.agent_account,
+            crate::config::model::AgentAccount::FlkAgent
+        );
+    }
+
     #[test]
     fn reload_config_updates_live_state() {
         let _guard = config_env_guard();
@@ -3185,6 +3945,66 @@ sidebar_pane_gap = 99
     }
 
     #[test]
+    fn removed_key_on_live_reload_applies_other_settings() {
+        let _guard = config_env_guard();
+        let path = temp_config_path("reload-removed-mesh-key");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+        let mut app = test_app();
+        let workspace_count = app.state.workspaces.len();
+        for removed in [
+            "[msg]\nuplink_timeout_secs=20",
+            "[msg]\nuplink_heartbeat_secs=3",
+            "[msg]\ndeferral_relay_concurrency=1",
+            "[[peers]]\nname='nodea'\nsummary_command='false'",
+        ] {
+            std::fs::write(&path, format!("name='changed'\n{removed}\n")).unwrap();
+            let report = app.reload_config();
+            assert_eq!(report.status, crate::config::ConfigReloadStatus::Partial);
+            assert_eq!(app.state.config.name, "changed");
+            assert_eq!(app.state.workspaces.len(), workspace_count);
+            assert!(app
+                .state
+                .config_diagnostic
+                .as_deref()
+                .unwrap()
+                .contains("was removed (mesh); delete this line"));
+        }
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn usability2384_fix1_unknown_keys_reach_startup_reload_and_banner() {
+        let _guard = config_env_guard();
+        let path = temp_config_path("unknown-key-location");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "[msg]\n  SECRET_UNKNOWN_2384 = true").unwrap();
+        let prior = std::env::var_os(crate::config::CONFIG_PATH_ENV_VAR);
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+        let startup = crate::config::Config::load();
+        let mut app = test_app();
+        let report = app.reload_config();
+        let banner = app.state.config_diagnostic.clone().unwrap_or_default();
+        match prior {
+            Some(v) => std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, v),
+            None => std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR),
+        }
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        for text in [
+            startup.diagnostics.join(" "),
+            report.diagnostics.join(" "),
+            banner,
+        ] {
+            assert!(!text.contains("SECRET_"));
+            assert!(
+                text.contains("key=msg;") && text.contains("at 2:3"),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
     fn reload_config_keeps_current_state_on_invalid_toml() {
         let _guard = config_env_guard();
         let path = temp_config_path("reload-config-invalid-toml");
@@ -3638,7 +4458,8 @@ sidebar_pane_gap = 99
             .terminals
             .get_mut(&attached_terminal_id)
             .unwrap()
-            .set_agent_name("reviewer".into());
+            .set_agent_name("reviewer".into())
+            .unwrap();
         app.state.active = Some(0);
         app.state.selected = 0;
 
@@ -3682,7 +4503,8 @@ sidebar_pane_gap = 99
             .terminals
             .get_mut(&first_terminal_id)
             .unwrap()
-            .set_agent_name("worker".into());
+            .set_agent_name("worker".into())
+            .unwrap();
         let second_terminal_id = app.state.workspaces[0]
             .pane_state(second)
             .unwrap()
@@ -3692,7 +4514,8 @@ sidebar_pane_gap = 99
             .terminals
             .get_mut(&second_terminal_id)
             .unwrap()
-            .set_agent_name("worker".into());
+            .set_agent_name("worker".into())
+            .unwrap();
         app.state.active = Some(0);
         app.state.selected = 0;
 
@@ -3753,6 +4576,7 @@ sidebar_pane_gap = 99
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req_pane_split_background_tab".into(),
             method: crate::api::schema::Method::PaneSplit(crate::api::schema::PaneSplitParams {
+                dry_run: false,
                 workspace_id: None,
                 target_pane_id,
                 direction: crate::api::schema::SplitDirection::Right,
@@ -3831,6 +4655,7 @@ sidebar_pane_gap = 99
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req_pane_split_focus_background_tab".into(),
             method: crate::api::schema::Method::PaneSplit(crate::api::schema::PaneSplitParams {
+                dry_run: false,
                 workspace_id: None,
                 target_pane_id,
                 direction: crate::api::schema::SplitDirection::Right,
@@ -3925,8 +4750,7 @@ sidebar_pane_gap = 99
         let pane_id = app.state.workspaces[ws_idx]
             .focused_pane_id()
             .expect("a pane to be sitting in");
-        app.test_pane_child_pids.insert(pane_id, std::process::id());
-        app.current_api_peer_pid = Some(std::process::id());
+        crate::test_support::attest_pane_caller(app, pane_id);
         assert_eq!(
             app.spawn_caller().own_workspace(),
             Some(ws_idx),
@@ -3952,6 +4776,10 @@ sidebar_pane_gap = 99
         crate::api::schema::Request {
             id: "req_agent_start_390".into(),
             method: crate::api::schema::Method::AgentStart(crate::api::schema::AgentStartParams {
+                runtime: Default::default(),
+                model: None,
+                label: None,
+                dry_run: false,
                 name: "worker".into(),
                 cwd,
                 workspace_id: None,
@@ -3961,6 +4789,8 @@ sidebar_pane_gap = 99
                 here: false,
                 focus: false,
                 argv: vec![crate::test_support::live_program()],
+                questions: None,
+                unattended: false,
             }),
         }
     }
@@ -4108,7 +4938,7 @@ sidebar_pane_gap = 99
     }
 
     #[tokio::test]
-    async fn an_explicit_workspace_target_still_splits_rather_than_defaulting() {
+    async fn an_explicit_workspace_target_gets_a_tab_rather_than_defaulting() {
         // #365's direction, and the override. `--workspace` is somebody
         // saying, so the cwd default must not reinterpret it.
         let checkout = cwd_fixture_dir("explicit");
@@ -4124,6 +4954,10 @@ sidebar_pane_gap = 99
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req_agent_start_390_explicit".into(),
             method: crate::api::schema::Method::AgentStart(crate::api::schema::AgentStartParams {
+                runtime: Default::default(),
+                model: None,
+                label: None,
+                dry_run: false,
                 name: "worker".into(),
                 cwd: Some(checkout.display().to_string()),
                 workspace_id: Some(workspace_id),
@@ -4133,14 +4967,21 @@ sidebar_pane_gap = 99
                 here: false,
                 focus: false,
                 argv: vec![crate::test_support::live_program()],
+                questions: None,
+                unattended: false,
             }),
         });
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
         assert_eq!(response["result"]["type"], "agent_started");
         let ws = &app.state.workspaces[0];
         assert_eq!(app.state.workspaces.len(), 1);
-        assert_eq!(ws.tabs.len(), 1, "--workspace splits its target, as before");
-        assert_eq!(ws.tabs[0].panes.len(), 2);
+        assert_eq!(
+            ws.tabs.len(),
+            2,
+            "unknown shell provenance requires a new tab"
+        );
+        assert_eq!(ws.tabs[0].panes.len(), 1);
+        assert_eq!(ws.tabs[1].panes.len(), 1);
         drain_test_runtimes(&mut app);
     }
 
@@ -4148,6 +4989,10 @@ sidebar_pane_gap = 99
         crate::api::schema::Request {
             id: "req_agent_start_390_split".into(),
             method: crate::api::schema::Method::AgentStart(crate::api::schema::AgentStartParams {
+                runtime: Default::default(),
+                model: None,
+                label: None,
+                dry_run: false,
                 name: "worker".into(),
                 cwd,
                 workspace_id: None,
@@ -4157,6 +5002,8 @@ sidebar_pane_gap = 99
                 here: false,
                 focus: false,
                 argv: vec![crate::test_support::live_program()],
+                questions: None,
+                unattended: false,
             }),
         }
     }
@@ -4169,6 +5016,10 @@ sidebar_pane_gap = 99
         crate::api::schema::Request {
             id: "req_agent_start_398_active".into(),
             method: crate::api::schema::Method::AgentStart(crate::api::schema::AgentStartParams {
+                runtime: Default::default(),
+                model: None,
+                label: None,
+                dry_run: false,
                 name: "worker".into(),
                 cwd: None,
                 workspace_id: None,
@@ -4178,6 +5029,8 @@ sidebar_pane_gap = 99
                 here: false,
                 focus: false,
                 argv: vec![crate::test_support::live_program()],
+                questions: None,
+                unattended: false,
             }),
         }
     }
@@ -4191,6 +5044,10 @@ sidebar_pane_gap = 99
         crate::api::schema::Request {
             id: "req_agent_start_398_here".into(),
             method: crate::api::schema::Method::AgentStart(crate::api::schema::AgentStartParams {
+                runtime: Default::default(),
+                model: None,
+                label: None,
+                dry_run: false,
                 name: "worker".into(),
                 cwd: None,
                 workspace_id: None,
@@ -4200,6 +5057,8 @@ sidebar_pane_gap = 99
                 here: true,
                 focus: false,
                 argv: vec![crate::test_support::live_program()],
+                questions: None,
+                unattended: false,
             }),
         }
     }
@@ -4282,6 +5141,10 @@ sidebar_pane_gap = 99
                 id: format!("req_agent_start_398_{index}"),
                 method: crate::api::schema::Method::AgentStart(
                     crate::api::schema::AgentStartParams {
+                        runtime: Default::default(),
+                        model: None,
+                        label: None,
+                        dry_run: false,
                         name: format!("worker-{index}"),
                         cwd: Some(checkout.display().to_string()),
                         workspace_id: None,
@@ -4291,6 +5154,8 @@ sidebar_pane_gap = 99
                         here: false,
                         focus: false,
                         argv: vec![crate::test_support::live_program()],
+                        questions: None,
+                        unattended: false,
                     },
                 ),
             });
@@ -4479,8 +5344,7 @@ sidebar_pane_gap = 99
                 .get_mut(&terminal_id)
                 .expect("terminal")
                 .launch_argv = Some(vec!["claude".into()]);
-            app.test_pane_child_pids.insert(pane_id, std::process::id());
-            app.current_api_peer_pid = Some(std::process::id());
+            crate::test_support::attest_pane_caller(&mut app, pane_id);
             app
         }
 
@@ -4748,6 +5612,10 @@ sidebar_pane_gap = 99
         };
 
         let base = || crate::api::schema::AgentStartParams {
+            runtime: Default::default(),
+            model: None,
+            label: None,
+            dry_run: false,
             name: "worker".into(),
             cwd: None,
             workspace_id: None,
@@ -4757,11 +5625,16 @@ sidebar_pane_gap = 99
             here: false,
             focus: false,
             argv: vec![crate::test_support::live_program()],
+            questions: None,
+            unattended: false,
         };
 
         // `--active`: names the focused space, so there is something to split.
         let response = attempt(&|_| {
             split_start(crate::api::schema::AgentStartParams {
+                runtime: Default::default(),
+                model: None,
+                dry_run: false,
                 active: true,
                 ..base()
             })
@@ -4772,6 +5645,9 @@ sidebar_pane_gap = 99
         let response = attempt(&|app: &App| {
             let workspace_id = app.public_workspace_id(0);
             split_start(crate::api::schema::AgentStartParams {
+                runtime: Default::default(),
+                model: None,
+                dry_run: false,
                 workspace_id: Some(workspace_id),
                 ..base()
             })
@@ -4782,6 +5658,9 @@ sidebar_pane_gap = 99
         let response = attempt(&|app: &App| {
             let tab_id = app.public_tab_id(0, 0).expect("a public tab id");
             split_start(crate::api::schema::AgentStartParams {
+                runtime: Default::default(),
+                model: None,
+                dry_run: false,
                 tab_id: Some(tab_id),
                 ..base()
             })
@@ -4791,6 +5670,9 @@ sidebar_pane_gap = 99
         // `--cwd` naming an OPEN checkout: resolves to a space, so it splits it.
         let response = attempt(&|_| {
             split_start(crate::api::schema::AgentStartParams {
+                runtime: Default::default(),
+                model: None,
+                dry_run: false,
                 cwd: Some(open_checkout.display().to_string()),
                 ..base()
             })
@@ -4804,6 +5686,9 @@ sidebar_pane_gap = 99
         // `a_headless_start_naming_an_unopened_checkout_still_gets_a_space_of_its_own`.
         let response = attempt(&|_| {
             split_start(crate::api::schema::AgentStartParams {
+                runtime: Default::default(),
+                model: None,
+                dry_run: false,
                 cwd: Some(unopened.display().to_string()),
                 ..base()
             })
@@ -4836,6 +5721,10 @@ sidebar_pane_gap = 99
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req_agent_start_398_precedence".into(),
             method: crate::api::schema::Method::AgentStart(crate::api::schema::AgentStartParams {
+                runtime: Default::default(),
+                model: None,
+                label: None,
+                dry_run: false,
                 name: "worker".into(),
                 cwd: Some(checkout.display().to_string()),
                 workspace_id: None,
@@ -4845,6 +5734,8 @@ sidebar_pane_gap = 99
                 here: false,
                 focus: false,
                 argv: vec![crate::test_support::live_program()],
+                questions: None,
+                unattended: false,
             }),
         });
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
@@ -5072,6 +5963,10 @@ sidebar_pane_gap = 99
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req_agent_start_own_space".into(),
             method: crate::api::schema::Method::AgentStart(crate::api::schema::AgentStartParams {
+                runtime: Default::default(),
+                model: None,
+                label: None,
+                dry_run: false,
                 name: "worker".into(),
                 cwd: None,
                 workspace_id: None,
@@ -5082,6 +5977,8 @@ sidebar_pane_gap = 99
                 here: false,
                 focus: false,
                 argv: vec![crate::test_support::live_program()],
+                questions: None,
+                unattended: false,
             }),
         });
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
@@ -5127,6 +6024,10 @@ sidebar_pane_gap = 99
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req_agent_start_focus".into(),
             method: crate::api::schema::Method::AgentStart(crate::api::schema::AgentStartParams {
+                runtime: Default::default(),
+                model: None,
+                label: None,
+                dry_run: false,
                 name: "worker".into(),
                 cwd: None,
                 workspace_id: None,
@@ -5136,6 +6037,8 @@ sidebar_pane_gap = 99
                 here: false,
                 focus: true,
                 argv: vec![crate::test_support::live_program()],
+                questions: None,
+                unattended: false,
             }),
         });
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
@@ -5317,7 +6220,7 @@ sidebar_pane_gap = 99
 
     fn workspace_closed_count(app: &App, workspace_id: &str) -> usize {
         app.event_hub
-            .events_after(0)
+            .ring_snapshot_after(0)
             .iter()
             .filter(|(_, event)| {
                 matches!(
@@ -5665,9 +6568,14 @@ sidebar_pane_gap = 99
             agent: Some(Agent::Pi),
             state: AgentState::Working,
             activity: None,
+            provider_limit: None,
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
+            settled_with_background_shells: false,
+            background_tasks: None,
+            needs_human: None,
+            question: None,
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });
@@ -5691,9 +6599,14 @@ sidebar_pane_gap = 99
             agent: Some(Agent::Pi),
             state: AgentState::Idle,
             activity: None,
+            provider_limit: None,
             visible_blocker: false,
             visible_idle: false,
             visible_working: false,
+            settled_with_background_shells: false,
+            background_tasks: None,
+            needs_human: None,
+            question: None,
             process_exited: false,
             observed_at: std::time::Instant::now(),
         });
