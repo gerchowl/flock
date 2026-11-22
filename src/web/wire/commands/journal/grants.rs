@@ -28,7 +28,7 @@ pub(in crate::web::wire) struct Consumption {
 /// `environment` runs under the generation lease immediately before evaluation.
 /// P3c will supply durable paired-clock evidence; M2 adds budget/enrollment checks.
 pub(in crate::web::wire) struct Claim {
-    pub store: Store,
+    pub store: std::sync::Arc<Store>,
     pub generation: u64,
     pub issuance: String,
     pub home: String,
@@ -46,7 +46,7 @@ impl Journal {
         if self.blocked {
             return Err(ErrorCode::SessionBusy);
         }
-        c.store.with_listing(|listing| {
+        c.store.with_accounting(|listing, fence| {
             if listing.generation != c.generation {
                 return Ok(Admission::Refused(Refusal::Revoked));
             }
@@ -68,6 +68,9 @@ impl Journal {
                     .get_mut(&use_.issuance)
                     .ok_or(ErrorCode::SessionUnconfirmed)?;
                 *total = total.checked_sub(1).ok_or(ErrorCode::SessionUnconfirmed)?;
+            }
+            if c.command.resume_only && existing.is_none() {
+                return Err(ErrorCode::SessionUnconfirmed);
             }
             let selected = existing
                 .and_then(|r| r.consumption.as_ref())
@@ -97,6 +100,14 @@ impl Journal {
                 Decision::Refused(reason) => return Ok(Admission::Refused(reason)),
                 Decision::Allowed { issuance_id, .. } => issuance_id,
             };
+            let counted = listing.entries.values().flatten().any(|g| {
+                g.lifecycle.as_ref().is_some_and(|p| {
+                    p.max_uses.is_some() && p.issuance.as_ref().is_some_and(|i| i.id == issuance)
+                })
+            });
+            if counted && !fence.check(&issuance, self.index.stamp(&issuance))? {
+                return Ok(Admission::Refused(Refusal::AccountingLost));
+            }
             let consumption = match existing {
                 Some(r) => r.consumption.clone().ok_or(ErrorCode::SessionUnconfirmed)?,
                 None => Consumption {
@@ -117,6 +128,7 @@ impl Journal {
                 &c.command,
                 c.now,
                 Some(consumption.clone()),
+                counted.then_some(fence),
             )?;
             Ok(Admission::Granted {
                 consumption,
@@ -125,15 +137,38 @@ impl Journal {
         })
     }
 }
-/// Rebuilt only from committed claims, never a second durable grants-file update.
-/// Compaction retains every grant claim and its first outcome, independent of the
-/// ordinary 24-hour replay window. This also preserves command bindings forever:
-/// pending recovery is uncertainty, never permission to redispatch or refund.
-/// No issuance is collected, including revoked/expired issuances, until a future
-/// collection rule can prove that its authority cannot recur. Retention is bounded
-/// by the shared J1 global/per-principal entry caps and active-file byte cap, with
-/// at most two bounded rows per key and one total per retained issuance. Capacity
-/// refuses new admission rather than evicting consumption or restoring uses.
-/// Outcomes still require current A1 authority before disclosure. P3c's clock
-/// evidence belongs at the existing environment seam under that same lease.
+/// Rebuilt from synced claims and compacted issuance checkpoints. Outcomes and
+/// command bindings have J1's 24-hour replay window. Beyond it, resume-only is
+/// uncertain and never dispatches. Compaction retains totals for live issuances
+/// and any issuance with a retained retry row, dropping revoked or provably
+/// expired issuances only once no retry row needs them. Incomparable clocks keep
+/// history. Grant commands and issuance checkpoints have separate 4096-entry
+/// budgets and a separate byte reserve; they never occupy local operator slots.
+/// Counted integrity watermarks live in A1 and survive deletion of all of J1.
+/// Missing/behind history requires operator revoke/re-add, never counter erasure.
 pub(in crate::web::wire) type Totals = BTreeMap<String, u64>;
+
+/// Conservative retirement snapshot. Unknown A1 rows or storage failure preserve
+/// history. A new issuance arriving after this snapshot is never discarded.
+pub(super) fn retired(data: &std::path::Path, known: &BTreeSet<String>) -> BTreeSet<String> {
+    let Ok(store) = Store::open(data) else {
+        return BTreeSet::new();
+    };
+    store
+        .with_listing(|listing| {
+            if listing.entries.values().any(Option::is_none) {
+                return Ok(BTreeSet::new());
+            }
+            let clock = gateway::lifecycle::retirement_clock();
+            let live: BTreeSet<_> = listing
+                .entries
+                .values()
+                .flatten()
+                .filter_map(|g| g.lifecycle.as_ref())
+                .filter(|p| !gateway::lifecycle::expired(p, clock.as_ref()))
+                .filter_map(|p| p.issuance.as_ref().map(|i| i.id.clone()))
+                .collect();
+            Ok(known.difference(&live).cloned().collect())
+        })
+        .unwrap_or_default()
+}

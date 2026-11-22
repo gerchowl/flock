@@ -28,6 +28,7 @@ pub(crate) enum Refusal {
     Expired,
     Exhausted,
     NoGrant,
+    AccountingLost,
 }
 /// Preflight only: an allowed decision does not consume or authorize dispatch.
 #[derive(Debug, PartialEq)]
@@ -203,4 +204,22 @@ pub(crate) fn target<'a>(verb: &str, id: &'a str) -> Target<'a> {
     } else {
         Target::Agent(id)
     }
+}
+
+/// Only comparable elapsed evidence can prove that timed authority cannot recur.
+pub(crate) fn expired(policy: &Lifecycle, now: Option<&ClockPair>) -> bool {
+    let Some(i) = &policy.issuance else {
+        return false;
+    };
+    let Some(now) = now else { return false };
+    i.issued
+        .as_ref()
+        .is_some_and(|issued| issued.domain == now.domain)
+        && i.expires_at_ms
+            .is_some_and(|deadline| now.wall_ms >= deadline)
+        && i.elapsed_deadline_ms
+            .is_some_and(|deadline| now.elapsed_ms >= deadline)
+}
+pub(crate) fn retirement_clock() -> Option<ClockPair> {
+    clock_pair()
 }

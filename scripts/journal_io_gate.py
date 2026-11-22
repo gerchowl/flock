@@ -195,6 +195,7 @@ EXISTING_GLOBS = {
     COMMANDS / 'journal/compact.rs': 'compaction shares journal types and counted adapters',
     COMMANDS / 'journal/tests.rs': 'journal fixture access to private journal state',
     COMMANDS / 'journal/tests/capacity.rs': 'capacity fixtures share journal test helpers',
+    COMMANDS / 'journal/tests/recovery.rs': 'recovery fixtures share counted journal helpers',
     COMMANDS / 'journal/tests/compaction.rs': 'compaction fixtures share journal test helpers',
     COMMANDS / 'ownership/tests.rs': 'ownership fixtures inspect private lifecycle state',
 }
@@ -553,6 +554,28 @@ def capability_findings(text, code, path, alias_names=()):
 CALL_EXCEPTIONS = {
     (COMMANDS / path, item, receiver, method): reason
     for path, item, receivers, methods, reason in [
+        ('journal/tests/recovery.rs', ('fn legacy_counted_policy_requires_explicit_reissuance',), ('filesystem::fs',), 'read write', 'simulate a pre-accounting A1 fixture without touching any running store'),
+        ('journal/tests/recovery.rs', ('fn legacy_counted_policy_requires_explicit_reissuance',), ('Journal',), 'open', 'replay isolated counted authority after an explicit migration refusal'),
+
+        ('journal/tests.rs', ('impl Stream',), ('<reference>',), 'Stream', 'test stream identity; all file access remains counted'),
+        ('journal/tests.rs', ('impl Stream', 'fn sync_data'), ('<definition>',), 'sync_data', 'test stream sync declaration, not an independent filesystem constructor'),
+        ('journal/tests.rs', ('impl Stream', 'fn sync_data'), ('self.file',), 'sync_data', 'real counted fsync remains the default for durability fixtures'),
+        ('journal/tests/recovery.rs', ('fn standing_history_is_bounded_over_two_months_without_operator_lockout',), ('gateway::Store',), 'open', 'reuse namespace identity while reacquiring current A1 leases for every simulated claim'),
+        ('journal/tests/recovery.rs', ('fn standing_history_is_bounded_over_two_months_without_operator_lockout',), ('journal.file',), 'sync_all', 'stress simulation syncs before every compaction and daily restart through the counted stream'),
+
+        ('journal/tests/recovery.rs', ('fn operator_reissuance_recovers_counted_authority_while_standing_stays_available',), ('Journal',), 'open', 'replay only the isolated counted fixture after loss or truncation'),
+        ('journal/tests/recovery.rs', ('fn operator_reissuance_recovers_counted_authority_while_standing_stays_available',), ('filesystem::fs',), 'remove_dir_all', 'fault injection changes only the isolated fixture storage through counted adapters'),
+        ('journal/tests/recovery.rs', ('fn a_surviving_prefix_behind_the_a1_watermark_cannot_restore_uses',), ('Journal',), 'open', 'replay only the isolated counted fixture after loss or truncation'),
+        ('journal/tests/recovery.rs', ('fn a_surviving_prefix_behind_the_a1_watermark_cannot_restore_uses',), ('filesystem::fs',), 'read write', 'fault injection changes only the isolated fixture storage through counted adapters'),
+
+        ('journal/compact.rs', ('impl Snapshot', 'fn emit_pending'), ('self.file',), 'write_all', 'checkpoint publication uses the counted compaction stream'),
+        ('journal/grants.rs', ('fn retired',), ('Store',), 'open', 'read A1 through its existing durable Namespace boundary, outside the wire directory'),
+        ('journal/tests/recovery.rs', ('fn deleting_the_wire_directory_cannot_restore_counted_authority',), ('Journal',), 'open', 'isolated counted replay for loss, recovery and bounded retention'),
+        ('journal/tests/recovery.rs', ('fn standing_history_is_bounded_over_two_months_without_operator_lockout',), ('Journal',), 'open', 'isolated counted replay for loss, recovery and bounded retention'),
+        ('journal/tests/recovery.rs', ('fn interrupted_first_start_does_not_lock_out_local_commands',), ('Journal',), 'open', 'isolated counted replay for loss, recovery and bounded retention'),
+        ('journal/tests/recovery.rs', ('fn deleting_the_wire_directory_cannot_restore_counted_authority',), ('filesystem::fs',), 'remove_dir_all', 'delete only the isolated fixture wire directory'),
+        ('journal/tests/recovery.rs', ('fn interrupted_first_start_does_not_lock_out_local_commands',), ('filesystem::fs',), 'remove_file', 'simulate interrupted initialization in the isolated fixture'),
+
         ('journal/tests/grants.rs', ('fn final_lifecycle_use_is_not_admitted_twice',), ('Writer',), 'spawn', 'existing journal worker with a bounded sync barrier, never a child process'),
         ('journal/tests/grants.rs', ('fn crash_before_append_spends_nothing_on_restart',), ('Journal',), 'open', 'isolated A1 fixtures and counted journal replay for transactional recovery assertions'),
         ('journal/tests/grants.rs', ('fn claim_holds_generation_lease_through_sync',), ('Journal', 'Store'), 'open', 'isolated A1 fixtures and counted journal replay for transactional recovery assertions'),
@@ -566,7 +589,7 @@ CALL_EXCEPTIONS = {
         ('journal/tests/grants.rs', ('fn crash_after_commit_before_publication_recovers_spent_pending_claim',), ('Journal',), 'open', 'replay isolated claims through the existing counted journal opener'),
         ('journal/tests/grants.rs', ('fn revoke_first_fences_claim_and_retry_without_spending',), ('Journal',), 'open', 'replay isolated claims through the existing counted journal opener'),
         ('journal/tests/grants.rs', ('fn compaction_retains_grant_totals_and_outcomes_beyond_replay_window',), ('Journal',), 'open', 'isolated replay through the counted journal boundary for retention and crash recovery'),
-        ('journal/tests/grants.rs', ('fn retained_grants_refuse_capacity_without_eviction_or_restored_uses',), ('Journal',), 'open', 'isolated replay through the counted journal boundary for retention and crash recovery'),
+        ('journal/tests/grants.rs', ('fn retained_grants_do_not_occupy_local_capacity',), ('Journal',), 'open', 'isolated replay through the counted journal boundary for retention and crash recovery'),
         ('journal/tests/grants.rs', ('fn crash_at_claim_dispatch_and_result_never_redispatches_after_recovery',), ('Journal',), 'open', 'isolated replay through the counted journal boundary for retention and crash recovery'),
         ('journal/tests/grants.rs', ('fn grant_crash_child',), ('Journal',), 'open', 'isolated child replays through the counted journal boundary'),
         ('journal/tests/grants.rs', ('fn grant_crash_child',), ('effect',), 'write_all sync_all', 'a counted private fixture stream models one durable external effect'),
@@ -721,8 +744,8 @@ CALL_EXCEPTIONS = {
         ('journal.rs', ('impl Writer', 'fn spawn'), ('admission',), 'lock', 'existing in-memory ownership/admission mutex, not a filesystem lock'),
         ('journal.rs', ('impl Writer', 'fn submit'), ('self.admission',), 'lock', 'existing in-memory ownership/admission mutex, not a filesystem lock'),
         ('journal.rs', ('impl Writer', 'fn shutdown'), ('self.admission',), 'lock', 'existing in-memory ownership/admission mutex, not a filesystem lock'),
-        ('journal.rs', ('fn private_created',), ('<namespace>',), 'files', 'existing use of reviewed counted stream/namespace alias; this use site reviewed separately'),
-        ('journal.rs', ('fn private_created',), ('file',), 'sync_all', 'existing counted File/Stream or its buffered writer; boundary retains I/O observation'),
+        ('journal.rs', ('fn private',), ('<namespace>',), 'files', 'existing use of reviewed counted stream/namespace alias; this use site reviewed separately'),
+        ('journal.rs', ('fn private',), ('file',), 'sync_all', 'existing counted File/Stream or its buffered writer; boundary retains I/O observation'),
         ('journal.rs', ('struct Journal',), ('<reference>',), 'Stream', 'existing use of reviewed counted stream/namespace alias; this use site reviewed separately'),
         ('journal.rs', ('impl Journal', 'fn open'), ('<definition>',), 'open', 'existing journal method declaration, not an expression permission'),
         ('journal.rs', ('impl Journal', 'fn lease'), ('<namespace>',), 'Stream files', 'existing use of reviewed counted stream/namespace alias; this use site reviewed separately'),

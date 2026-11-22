@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     io::{self, BufRead, Read, Write},
     path::{Path, PathBuf},
     sync::{
@@ -29,7 +29,11 @@ const PRINCIPAL_LIMIT: usize =
 const GLOBAL_LIMIT: usize =
     PRINCIPAL_LIMIT * super::super::CONNECTIONS as usize / super::super::CREDENTIAL_CONNECTIONS;
 const ENTRY_BYTES: usize = super::super::MAX_MESSAGE + 2048;
-const LOG_BYTES: u64 = (GLOBAL_LIMIT * ENTRY_BYTES * 2) as u64;
+// Grant retention has its own entry, issuance and byte reserve, never local capacity.
+const GRANT_LIMIT: usize = 4096;
+const ISSUANCE_LIMIT: usize = 4096;
+const LOG_BYTES: u64 =
+    ((GLOBAL_LIMIT * 2 + GRANT_LIMIT * 4 + ISSUANCE_LIMIT * 2) * ENTRY_BYTES) as u64;
 const QUEUED: usize = 32;
 type Key = (String, String, String);
 #[derive(Default)]
@@ -38,6 +42,8 @@ struct Index {
     counts: HashMap<(String, String), usize>,
     oldest_ms: Option<u64>,
     consumed: Totals,
+    proofs: BTreeMap<String, [u8; 32]>,
+    grant_records: usize,
 }
 #[cfg(not(test))]
 type Stream = File;
@@ -58,9 +64,43 @@ struct Record {
 }
 impl Record {
     fn decode(line: &[u8]) -> Option<Self> {
-        serde_json::from_slice::<Self>(line).ok().filter(|r| (r.version == 1 && r.consumption.is_none() || r.version == 2 && r.consumption.as_ref().is_some_and(|c| c.ordinal > 0 && c.issuance.len() == 32)) && r.outcome.as_ref().is_none_or(|v| {
-            matches!(serde_json::from_value::<ServerFrame>(v.clone()), Ok(ServerFrame::Ack {cmd_id, ..}) if cmd_id == r.cmd_id)
-        }))
+        let r: Self = serde_json::from_slice(line).ok()?;
+        let consumption = r
+            .consumption
+            .as_ref()
+            .is_some_and(|c| c.ordinal > 0 && c.issuance.len() == 32);
+        let version = match r.version {
+            1 => r.consumption.is_none(),
+            2 => consumption,
+            3 => {
+                consumption
+                    && r.namespace.is_empty()
+                    && r.principal.is_empty()
+                    && r.cmd_id.is_empty()
+                    && r.outcome.is_none()
+            }
+            _ => false,
+        };
+        (version && r.outcome.as_ref().is_none_or(|v| matches!(serde_json::from_value::<ServerFrame>(v.clone()), Ok(ServerFrame::Ack {cmd_id, ..}) if cmd_id == r.cmd_id))).then_some(r)
+    }
+    fn proof(&self) -> Option<[u8; 32]> {
+        if self.version == 3 {
+            return Some(self.digest);
+        }
+        Some(
+            Sha256::digest(serde_json::to_vec(&(self.key(), self.digest, &self.consumption)).ok()?)
+                .into(),
+        )
+    }
+    fn checkpoint(mut self, now: u64) -> Option<Self> {
+        self.digest = self.proof()?;
+        self.version = 3;
+        self.namespace.clear();
+        self.principal.clear();
+        self.cmd_id.clear();
+        self.admitted_ms = now;
+        self.outcome = None;
+        Some(self)
     }
     fn key(&self) -> Key {
         (
@@ -285,21 +325,17 @@ fn unavailable(error: &io::Error) {
     crate::logging::client_wire_unavailable("command_journal", Some(error.kind()));
 }
 fn private(path: &Path) -> io::Result<File> {
-    private_created(path).map(|(file, _)| file)
-}
-/// Open a private stream, also reporting whether this call created it.
-fn private_created(path: &Path) -> io::Result<(File, bool)> {
-    let created = match files::create_private_file(path) {
+    match files::create_private_file(path) {
         Ok(file) => {
             file.sync_all()?;
             filesystem::sync_directory(path.parent().ok_or(io::ErrorKind::InvalidInput)?)?;
-            true
         }
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => false,
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => (),
         Err(e) => return Err(e),
-    };
-    Ok((files::open_append_file(path)?, created))
+    }
+    files::open_append_file(path)
 }
+
 struct Journal {
     file: Stream,
     root: PathBuf,
@@ -309,6 +345,7 @@ struct Journal {
     next_compaction: u64,
     bytes: u64,
     blocked: bool,
+    rollback_uncertain: bool,
     principal_limit: usize,
     global_limit: usize,
     replay_progress: Option<ReplayProgress>,
@@ -338,16 +375,12 @@ impl Journal {
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => files::check_private_dir(&root)?,
             Err(e) => return Err(e),
         }
-        let (journal_lease_file, first_open) = private_created(&root.join("commands.lock"))?;
-        let lease = LockFile::new(journal_lease_file);
+        // Establish the durable log before the lock. Reopen only after acquiring
+        // the lease, so a concurrent old holder's rename cannot leave a stale fd.
+        drop(private(&root.join("commands.jsonl"))?);
+        let lease = LockFile::new(private(&root.join("commands.lock"))?);
         lease.try_lock().map_err(io::Error::other)?;
-        // An established journal must never recreate lost consumption as zero uses.
-        let path = root.join("commands.jsonl");
-        let file = if first_open {
-            private(&path)?
-        } else {
-            files::open_append_file(&path)?
-        };
+        let file = files::open_append_file(&root.join("commands.jsonl"))?;
         #[cfg(test)]
         let file = Stream::from(file);
         let bytes = file.metadata()?.len();
@@ -363,6 +396,7 @@ impl Journal {
             next_compaction: compact::THRESHOLD,
             bytes,
             blocked: false,
+            rollback_uncertain: false,
             principal_limit: PRINCIPAL_LIMIT,
             global_limit: GLOBAL_LIMIT,
             replay_progress: None,
@@ -534,6 +568,7 @@ impl Journal {
                 self.file.sync_all()
             })();
             if let Err(error) = rollback {
+                self.rollback_uncertain = true;
                 unavailable(&error);
             }
             return Err(ErrorCode::SessionBusy);
@@ -587,7 +622,7 @@ impl Journal {
         command: &Command,
         now: u64,
     ) -> Result<Admission, ErrorCode> {
-        self.claim_with(namespace, principal, command, now, None)
+        self.claim_with(namespace, principal, command, now, None, None)
     }
     fn claim_with(
         &mut self,
@@ -596,6 +631,9 @@ impl Journal {
         command: &Command,
         now: u64,
         consumption: Option<Consumption>,
+        mut fence: Option<
+            &mut crate::structured::permissions::auth::gateway::accounting::Fence<'_>,
+        >,
     ) -> Result<Admission, ErrorCode> {
         let key = (
             namespace.to_owned(),
@@ -604,9 +642,7 @@ impl Journal {
         );
         let digest = digest(command)?;
         if let Some(record) = self.index.records.get(&key) {
-            if record.consumption.is_none()
-                && now.saturating_sub(record.admitted_ms) >= super::super::IDEMPOTENCY_WINDOW_MS
-            {
+            if now.saturating_sub(record.admitted_ms) >= super::super::IDEMPOTENCY_WINDOW_MS {
                 return Err(if command.resume_only {
                     ErrorCode::SessionUnconfirmed
                 } else {
@@ -626,15 +662,21 @@ impl Journal {
         if command.resume_only {
             return Err(ErrorCode::SessionUnconfirmed);
         }
-        if self.index.records.len() >= self.global_limit
-            || self
-                .index
-                .counts
-                .get(&(key.0.clone(), key.1.clone()))
-                .copied()
-                .unwrap_or_default()
-                >= self.principal_limit
-        {
+        let full = if let Some(c) = &consumption {
+            self.index.grant_records >= GRANT_LIMIT
+                || (!self.index.consumed.contains_key(&c.issuance)
+                    && self.index.consumed.len() >= ISSUANCE_LIMIT)
+        } else {
+            self.index.records.len() - self.index.grant_records >= self.global_limit
+                || self
+                    .index
+                    .counts
+                    .get(&(key.0.clone(), key.1.clone()))
+                    .copied()
+                    .unwrap_or_default()
+                    >= self.principal_limit
+        };
+        if full {
             return Err(ErrorCode::SessionBusy);
         }
         let record = Record {
@@ -651,12 +693,35 @@ impl Journal {
         if let Some(hook) = &mut self.claim_checkpoint {
             hook(false);
         }
-        self.append(&record)?;
+        let issuance = record.consumption.as_ref().map(|c| c.issuance.clone());
+        let previous = issuance
+            .as_ref()
+            .map(|id| self.index.stamp(id))
+            .unwrap_or_default();
+        let next = crate::structured::permissions::auth::gateway::accounting::Stamp {
+            total: record.consumption.as_ref().map_or(0, |c| c.ordinal),
+            digest: record.proof().ok_or(ErrorCode::SerializationError)?,
+        };
+        if let (Some(f), Some(id)) = (fence.as_deref_mut(), &issuance) {
+            f.prepare(id, previous, next)?;
+        }
+        if let Err(error) = self.append(&record) {
+            if !self.rollback_uncertain {
+                if let (Some(f), Some(id)) = (fence.as_deref_mut(), &issuance) {
+                    f.commit(id, previous)?;
+                }
+            }
+            return Err(error);
+        }
         #[cfg(test)]
         if let Some(hook) = &mut self.claim_checkpoint {
             hook(true);
         }
         self.index.fold(record, self.global_limit);
+        if let (Some(f), Some(id)) = (fence, &issuance) {
+            f.commit(id, next)
+                .map_err(|_| ErrorCode::SessionUnconfirmed)?;
+        }
         Ok(Admission::Claimed(now))
     }
     fn finish(
@@ -693,7 +758,43 @@ impl Journal {
     }
 }
 impl Index {
+    fn stamp(&self, id: &str) -> crate::structured::permissions::auth::gateway::accounting::Stamp {
+        crate::structured::permissions::auth::gateway::accounting::Stamp {
+            total: self.consumed.get(id).copied().unwrap_or(0),
+            digest: self.proofs.get(id).copied().unwrap_or([0; 32]),
+        }
+    }
+    fn consume(&mut self, record: &Record) -> bool {
+        let Some(c) = &record.consumption else {
+            return false;
+        };
+        let Some(proof) = record.proof() else {
+            return false;
+        };
+        let used = self.consumed.get(&c.issuance).copied().unwrap_or(0);
+        if (!self.consumed.contains_key(&c.issuance) && self.consumed.len() >= ISSUANCE_LIMIT)
+            || (record.version != 3 && used.checked_add(1) != Some(c.ordinal))
+            || (record.version == 3
+                && (c.ordinal < used
+                    || (c.ordinal == used && self.proofs.get(&c.issuance) != Some(&proof))))
+        {
+            return false;
+        }
+        self.consumed.insert(c.issuance.clone(), c.ordinal);
+        self.proofs.insert(c.issuance.clone(), proof);
+        true
+    }
     fn fold(&mut self, record: Record, global_limit: usize) -> bool {
+        if record.version == 3 {
+            if !self.consume(&record) {
+                return false;
+            }
+            self.oldest_ms = Some(
+                self.oldest_ms
+                    .map_or(record.admitted_ms, |n| n.min(record.admitted_ms)),
+            );
+            return true;
+        }
         let key = record.key();
         if let Some(first) = self.records.get_mut(&key) {
             if first.consumption != record.consumption
@@ -706,26 +807,31 @@ impl Index {
             }
             first.outcome = record.outcome;
         } else {
-            if record.outcome.is_some() || self.records.len() == global_limit {
+            let grant = record.consumption.is_some();
+            if record.outcome.is_some()
+                || (if grant {
+                    self.grant_records >= GRANT_LIMIT
+                } else {
+                    self.records.len() - self.grant_records >= global_limit
+                })
+            {
                 return false;
             }
-            if let Some(c) = &record.consumption {
-                let used = self.consumed.get(&c.issuance).copied().unwrap_or(0);
-                if used.checked_add(1) != Some(c.ordinal) {
+            if grant {
+                if !self.consume(&record) {
                     return false;
                 }
-                self.consumed.insert(c.issuance.clone(), c.ordinal);
+                self.grant_records += 1;
+            } else {
+                *self
+                    .counts
+                    .entry((key.0.clone(), key.1.clone()))
+                    .or_default() += 1;
             }
-            *self
-                .counts
-                .entry((key.0.clone(), key.1.clone()))
-                .or_default() += 1;
-            if record.consumption.is_none() {
-                self.oldest_ms = Some(
-                    self.oldest_ms
-                        .map_or(record.admitted_ms, |oldest| oldest.min(record.admitted_ms)),
-                );
-            }
+            self.oldest_ms = Some(
+                self.oldest_ms
+                    .map_or(record.admitted_ms, |oldest| oldest.min(record.admitted_ms)),
+            );
             self.records.insert(key, record);
         }
         true

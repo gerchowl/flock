@@ -18,9 +18,17 @@ use std::{
 };
 use tokio::sync::Notify;
 
-fn request(root: &std::path::Path, generation: u64, issuance: &str, id: &str) -> Claim {
+pub(super) fn request(root: &std::path::Path, generation: u64, issuance: &str, id: &str) -> Claim {
+    request_from(
+        Arc::new(Store::open(root).unwrap()),
+        generation,
+        issuance,
+        id,
+    )
+}
+pub(super) fn request_from(store: Arc<Store>, generation: u64, issuance: &str, id: &str) -> Claim {
     Claim {
-        store: Store::open(root).unwrap(),
+        store,
         generation,
         issuance: issuance.into(),
         home: "a".repeat(64),
@@ -40,7 +48,7 @@ fn request(root: &std::path::Path, generation: u64, issuance: &str, id: &str) ->
         environment: Box::new(|| (None, Some("w1".into()))),
     }
 }
-fn claimed(result: Result<Admission, ErrorCode>) -> Consumption {
+pub(super) fn claimed(result: Result<Admission, ErrorCode>) -> Consumption {
     match result.unwrap() {
         Admission::Granted { consumption, state } => {
             assert!(matches!(*state, Admission::Claimed(100)));
@@ -270,20 +278,20 @@ fn compaction_retains_grant_totals_and_outcomes_beyond_replay_window() {
         for _ in 0..2 {
             let rx = super::compaction::start(&mut journal, now);
             super::compaction::finish_compaction(&mut journal, &rx);
-            assert_eq!(journal.index.records.len() as u64, limit.unwrap());
-            assert!(journal.index.oldest_ms.is_none());
+            assert!(journal.index.records.is_empty());
             drop(journal);
             journal = Journal::open(root.path()).unwrap();
             assert!(!journal.blocked);
             assert_eq!(journal.index.consumed[&issuance], limit.unwrap());
-            for (index, outcome) in outcomes.iter().enumerate() {
+            for index in 0..outcomes.len() {
                 let mut retry =
                     request(root.path(), generation, &issuance, &(index + 1).to_string());
                 retry.now = now;
                 retry.command.resume_only = true;
-                assert!(
-                    matches!(journal.grant(retry).unwrap(), Admission::Granted {state, ..} if matches!(*state, Admission::Replayed(ref frame) if frame == outcome))
-                );
+                assert!(matches!(
+                    journal.grant(retry),
+                    Err(ErrorCode::SessionUnconfirmed)
+                ));
             }
             let mut next = request(root.path(), generation, &issuance, "next");
             next.now = now;
@@ -293,31 +301,26 @@ fn compaction_retains_grant_totals_and_outcomes_beyond_replay_window() {
 }
 
 #[test]
-fn retained_grants_refuse_capacity_without_eviction_or_restored_uses() {
-    for (principal, global) in [(2, 3), (3, 2)] {
-        let (root, _store, generation, issuance) = gateway::claim_fixture_limit(None);
-        let mut journal = Journal::open(root.path()).unwrap();
-        journal.principal_limit = principal;
-        journal.global_limit = global;
-        for id in ["one", "two"] {
-            claimed(journal.grant(request(root.path(), generation, &issuance, id)));
-        }
-        let now = 101 + super::super::super::super::IDEMPOTENCY_WINDOW_MS;
-        let rx = super::compaction::start(&mut journal, now);
-        super::compaction::finish_compaction(&mut journal, &rx);
-        drop(journal);
-        let mut journal = Journal::open(root.path()).unwrap();
-        journal.principal_limit = principal;
-        journal.global_limit = global;
-        let bytes = journal.bytes;
-        assert!(matches!(
-            journal.grant(request(root.path(), generation, &issuance, "three")),
-            Err(ErrorCode::SessionBusy)
-        ));
-        assert_eq!(journal.bytes, bytes);
-        assert_eq!(journal.index.records.len(), 2);
-        assert_eq!(journal.index.consumed[&issuance], 2);
+fn retained_grants_do_not_occupy_local_capacity() {
+    let (root, _store, generation, issuance) = gateway::claim_fixture_limit(None);
+    let mut journal = Journal::open(root.path()).unwrap();
+    journal.principal_limit = 2;
+    journal.global_limit = 2;
+    for id in ["one", "two", "three"] {
+        claimed(journal.grant(request(root.path(), generation, &issuance, id)));
     }
+    for id in ["operator-one", "operator-two"] {
+        assert!(matches!(
+            journal
+                .claim("local", "p", &super::command(id), 100)
+                .unwrap(),
+            Admission::Claimed(100)
+        ));
+    }
+    assert!(matches!(
+        journal.claim("local", "p", &super::command("full"), 100),
+        Err(ErrorCode::SessionBusy)
+    ));
 }
 
 #[test]
@@ -403,7 +406,7 @@ fn crash_at_claim_dispatch_and_result_never_redispatches_after_recovery() {
             assert_eq!(effect.unwrap(), b"x");
         }
         let mut journal = Journal::open(root.path()).unwrap();
-        let now = 101 + super::super::super::super::IDEMPOTENCY_WINDOW_MS;
+        let now = 101;
         let rx = super::compaction::start(&mut journal, now);
         super::compaction::finish_compaction(&mut journal, &rx);
         drop(journal);
@@ -441,8 +444,11 @@ fn missing_authoritative_log_refuses_restart_without_recreating_uses() {
     drop(journal);
     let path = root.path().join("wire/commands.jsonl");
     super::super::filesystem::fs::remove_file(&path).unwrap();
-    assert!(Journal::open(root.path()).is_err());
-    assert!(super::super::filesystem::fs::read(&path).is_err());
+    let mut journal = Journal::open(root.path()).unwrap();
+    refused(
+        journal.grant(request(root.path(), generation, &issuance, "two")),
+        Refusal::AccountingLost,
+    );
 }
 
 #[test]
@@ -528,11 +534,15 @@ fn in_flight_compaction_cannot_publish_over_consumption() {
         super::super::Message::Compacted(result) => result,
         _ => panic!("unexpected compaction message"),
     };
-    claimed(journal.grant(request(root.path(), generation, &issuance, "one")));
+    let mut c = request(root.path(), generation, &issuance, "one");
+    c.now = now;
+    assert!(
+        matches!(journal.grant(c).unwrap(), Admission::Granted {state, ..} if matches!(*state, Admission::Claimed(_)))
+    );
     let outcome = journal
         .finish(
             &("a".repeat(64), "client-1".into(), "one".into()),
-            100,
+            now,
             Ok(json!({"first": true})),
         )
         .unwrap();

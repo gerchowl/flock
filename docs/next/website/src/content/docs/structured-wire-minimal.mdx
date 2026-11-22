@@ -385,6 +385,30 @@ returns its original acknowledgement. A recovered pending claim returns
 `session_unconfirmed` without executing again: inspect the subject's state to
 resolve that uncertainty instead of sending a new command ID to force execution.
 
+Counted lifecycle accounting also keeps an integrity watermark in the separate
+`gateway-grants` store. Deleting the whole `wire` directory cannot restore a
+once/count grant's uses: that counted issuance refuses if recovered history is
+missing or behind its watermark. Local operator commands and standing grants
+remain available. This is dormant lifecycle infrastructure; remote lifecycle
+commands remain refused and mesh VERSION remains 5.
+
+For an affected counted grant, inspect the agent's state and any already applied
+effect first. As the authenticated local operator, use `flk client grant revoke
+NAME`, then add the grant again with its intended policy through the same
+operator grant-management interface. Re-issuing assigns a new issuance and
+explicitly authorizes fresh uses. Do not erase `gateway-grants/grants.json`,
+copy the old issuance ID, or automatically resend an uncertain old command.
+Counted issuances from older data without integrity evidence also require this
+explicit re-issuance. Interrupted first initialization recovers on restart: the
+log is synced before the lease file is created.
+
+Grant command rows and outcomes expire after the same 24-hour replay window.
+Compaction keeps issuance totals/checkpoints while authority remains live or a
+retained retry needs them. It collects revoked issuances after that window, and
+expired issuances only with comparable paired-clock proof that both deadlines
+have passed. Incomparable evidence retains history. Grant accounting uses its
+own bounded budgets, so it cannot exhaust the local operator's command slots.
+
 Watch the server logs for `command journal replay`: `status=replaying` reports
 `replayed_bytes=N` / `total_bytes=M` at the start and roughly every tenth of the
 file; `status=ready` follows successful replay. Startup and importer readiness

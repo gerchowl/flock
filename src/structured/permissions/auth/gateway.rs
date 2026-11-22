@@ -258,12 +258,24 @@ impl Store {
                             );
                             issuance.issued = Some(clock);
                         }
+                        if p.max_uses.is_some() {
+                            accounting::initialize(&mut value, &issuance.id)?;
+                        }
                         p.issuance = Some(issuance);
                     }
                     value["entries"][&grant.name] =
                         serde_json::to_value(&grant).map_err(storage)?;
                 }
                 Change::Revoke(key) => {
+                    let id = value["entries"][&key]["lifecycle"]["issuance"]["id"]
+                        .as_str()
+                        .map(str::to_owned);
+                    if let (Some(id), Some(evidence)) = (
+                        id,
+                        value.get_mut("accounting").and_then(Value::as_object_mut),
+                    ) {
+                        evidence.remove(&id);
+                    }
                     value["entries"]
                         .as_object_mut()
                         .ok_or(E::InternalError)?
@@ -276,25 +288,28 @@ impl Store {
                 .and_then(|n| n.checked_add(1))
                 .ok_or(E::InternalError)?
                 .into();
-            let bytes = serde_json::to_vec(&value).map_err(storage)?;
-            if bytes.len() > 1_048_576 {
-                return Err(E::InvalidParams);
-            }
-            let mut nonce = [0; 16];
-            getrandom::fill(&mut nonce).map_err(storage)?;
-            let temporary = format!(".tmp-{:032x}", u128::from_ne_bytes(nonce));
-            let result = (|| {
-                let mut file = self.0.file(&temporary, true).map_err(storage)?;
-                file.write_all(&bytes).map_err(storage)?;
-                file.sync_all().map_err(storage)?;
-                self.0
-                    .publish(&temporary, "grants.json", true)
-                    .map_err(storage)
-            })();
-            let _ = self.0.remove(&temporary);
-            result?;
+            self.persist(&value)?;
         }
         Ok(Self::listing(&value))
+    }
+    fn persist(&self, value: &Value) -> Result<(), E> {
+        let bytes = serde_json::to_vec(value).map_err(storage)?;
+        if bytes.len() > 1_048_576 {
+            return Err(E::InvalidParams);
+        }
+        let mut nonce = [0; 16];
+        getrandom::fill(&mut nonce).map_err(storage)?;
+        let temporary = format!(".tmp-{:032x}", u128::from_ne_bytes(nonce));
+        let result = (|| {
+            let mut file = self.0.file(&temporary, true).map_err(storage)?;
+            file.write_all(&bytes).map_err(storage)?;
+            file.sync_all().map_err(storage)?;
+            self.0
+                .publish(&temporary, "grants.json", true)
+                .map_err(storage)
+        })();
+        let _ = self.0.remove(&temporary);
+        result
     }
     /// Evaluate again under the durable generation fence; claim cannot race revoke.
     /// `membership` MUST read destination state, never a workspace asserted for an agent.
@@ -348,6 +363,7 @@ mod tests;
 #[cfg(test)]
 mod lifecycle_tests;
 
+pub(crate) mod accounting;
 pub(crate) mod lifecycle;
 #[cfg(test)]
 use lifecycle::{Decision, Evaluation, PrincipalKind, Refusal};
@@ -407,4 +423,36 @@ pub(crate) fn claim_revoke(store: &Store) -> Result<Listing, E> {
         &tests::operator().client_token_authority().unwrap(),
         Some(Change::Revoke("tablet".into())),
     )
+}
+
+#[cfg(test)]
+pub(crate) fn claim_install(store: &Store, name: &str, max_uses: Option<u64>) -> (u64, String) {
+    let mut grant = tests::grant(&["*"]);
+    grant.name = name.into();
+    grant.lifecycle = Some(Box::new(Lifecycle {
+        subject: Subject::User,
+        destination_node_id: "b".repeat(64),
+        max_uses,
+        lifetime_ms: None,
+        issuance: None,
+    }));
+    let listing = store
+        .manage_issued(
+            &tests::operator().client_token_authority().unwrap(),
+            Some(Change::Add(grant)),
+            || Ok(("b".repeat(64), None)),
+        )
+        .unwrap();
+    let id = listing.entries[name]
+        .as_ref()
+        .unwrap()
+        .lifecycle
+        .as_ref()
+        .unwrap()
+        .issuance
+        .as_ref()
+        .unwrap()
+        .id
+        .clone();
+    (listing.generation, id)
 }

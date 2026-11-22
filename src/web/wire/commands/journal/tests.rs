@@ -210,7 +210,11 @@ fn absent_expired_and_lost_claims_fail_closed() {
         Err(ErrorCode::SessionUnconfirmed)
     ));
     drop(journal);
-    assert!(Journal::open(root.path()).is_err());
+    let mut journal = Journal::open(root.path()).unwrap();
+    assert_eq!(
+        journal.claim("local", "p", &cmd, 101).err(),
+        Some(ErrorCode::SessionUnconfirmed)
+    );
 }
 #[test]
 fn torn_tail_is_archived_before_truncation_and_append_remains_readable() {
@@ -542,10 +546,27 @@ fn public_writer_opens_and_wakes_only_after_durable_completion() {
 pub(super) struct Stream {
     file: File,
     written: u64,
+    coalesce_sync: bool,
 }
 impl From<File> for Stream {
     fn from(file: File) -> Self {
-        Self { file, written: 0 }
+        Self {
+            file,
+            written: 0,
+            coalesce_sync: false,
+        }
+    }
+}
+impl Stream {
+    /// Logical-time stress batches still write every claim through counted I/O,
+    /// syncing at daily restart boundaries. All durability/crash fixtures use
+    /// the default real per-claim sync, including failures before/after fsync.
+    pub(super) fn sync_data(&self) -> io::Result<()> {
+        if self.coalesce_sync {
+            Ok(())
+        } else {
+            self.file.sync_data()
+        }
     }
 }
 impl std::ops::Deref for Stream {
@@ -661,3 +682,5 @@ impl Writer {
 }
 
 mod grants;
+
+mod recovery;
