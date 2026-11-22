@@ -14,10 +14,14 @@ not infer receiver types, expand arbitrary macros, or model trait dispatch and
 generic instantiation. The independent method-name layer defends receiver-typed
 calls even when path resolution cannot identify their origin. References to
 associated capability functions are refused too, preventing an indirect call
-through a function value. Exact call-text
-exceptions trust the reviewed receiver bindings in those source files; they are
-not proof of Rust type identity. Alias collection covers the whole file and its
-lexical/inline-module scopes before uses are checked. Unsupported source and
+through a function value. Exceptions pin the file, lexical module/impl/function
+path, receiver tokens and method, trusting reviewed bindings rather than proving
+Rust type identity. Arguments and closure bodies remain independently scanned;
+receiver literals are retained in anchors. Duplicate calls matching the
+same anchor share its permission, but another item cannot consume a deleted pin.
+In-tree macro token trees cannot synthesize method/path positions from
+metavariables without an explicit, reasoned exception. Alias collection covers
+the whole file and its lexical/inline-module scopes before uses are checked. Unsupported source and
 namespace injection constructs fail closed as documented above.
 """
 from __future__ import annotations
@@ -34,11 +38,12 @@ RAW = re.compile(r'(?:b|c)?r(#+|)"')
 CHAR = re.compile(r"'(?:\\(?:u\{[0-9a-fA-F_]+\}|x[0-9a-fA-F]{2}|.)|[^'\\\n])'")
 
 
-def tokens(text: str) -> list[tuple[str, int]]:
-    """Rust code tokens with source offsets, excluding nested comments/literals."""
+def tokens(text: str, *, literals=False) -> list[tuple[str, int]]:
+    """Rust tokens and offsets, excluding comments and, by default, literals."""
     result = []
     i = 0
     while i < len(text):
+        start, literal = i, False
         if text[i].isspace():
             i += 1
         elif text.startswith("//", i):
@@ -57,9 +62,11 @@ def tokens(text: str) -> list[tuple[str, int]]:
                 else:
                     i += 1
         elif match := RAW.match(text, i):
+            literal = True
             end = text.find('"' + match[1], match.end())
             i = len(text) if end < 0 else end + 1 + len(match[1])
         elif text[i] == '"':
+            literal = True
             i += 1
             while i < len(text):
                 if text[i] == "\\":
@@ -70,6 +77,7 @@ def tokens(text: str) -> list[tuple[str, int]]:
                 else:
                     i += 1
         elif match := CHAR.match(text, i):
+            literal = True
             i = match.end()
         elif match := IDENT.match(text, i):
             result.append((match[0].removeprefix("r#"), i))
@@ -78,6 +86,8 @@ def tokens(text: str) -> list[tuple[str, int]]:
             token = "::" if text.startswith("::", i) else text[i]
             result.append((token, i))
             i += len(token)
+        if literals and literal:
+            result.append((text[start:i], start))
     return result
 
 
@@ -173,6 +183,8 @@ EXISTING_GLOBS = {
 # Keys are (definition source path, macro name), with a review reason as value.
 # No crate-defined macros currently need to cross into the journal.
 CRATE_MACRO_ALLOWLIST = {}
+# Same key shape, for reviewed in-tree macros synthesizing method/path positions.
+MACRO_POSITION_ALLOWLIST = {}
 
 # Independent of path/alias resolution: these std and Tokio names can perform
 # filesystem or process operations on a value whose type the scanner cannot infer.
@@ -193,10 +205,68 @@ CAPABILITY_METHODS = frozenset({
 })
 
 
-def call_span(code, index):
-    """Return the exact receiver/associated-call source span, including arguments."""
-    names = [name for name, _ in code]
-    if names[index - 1:index] not in (['.'], ['::']):
+def delimiter_pairs(names):
+    """Index balanced Rust token trees once for item and receiver boundaries."""
+    pairs, stack = {}, []
+    for i, name in enumerate(names):
+        if name in {'(', '[', '{'}:
+            stack.append(i)
+        elif name in {')', ']', '}'} and stack:
+            opening = stack.pop()
+            if names[opening] == {')': '(', ']': '[', '}': '{'}[name]:
+                pairs[opening], pairs[i] = i, opening
+    return pairs
+
+
+def item_paths(names, pairs):
+    """Lexical module/impl/function identities, independent of call order.
+
+    Closures and ordinary blocks inherit their enclosing item. Macro token trees
+    get their own identity so generated items cannot borrow a real item's pins.
+    Impl headers retain trait and generic tokens to distinguish implementations.
+    """
+    at, stack, path = [], [], ()
+    i = 0
+    while i < len(names):
+        name, identity = names[i], None
+        named = i + 1 + (names[i:i + 2] == ['static', 'mut'])
+        anonymous_const = names[i:i + 2] == ['const', '{']
+        if (name in {'impl', 'macro_rules'} or anonymous_const
+                or (name in {'fn', 'mod', 'trait', 'struct', 'enum', 'union', 'const', 'static'}
+                    and names[max(0, i - 1):i] != ["'"]
+                    and named < len(names) and IDENT.fullmatch(names[named])
+                    and names[named] != 'fn')):
+            end = i + 1
+            while end < len(names) and names[end] not in {'{', ';'}:
+                if names[end] in {'(', '['}:
+                    end = pairs.get(end, len(names))
+                end += 1
+            if end < len(names) and names[end] == '{':
+                if name == 'impl':
+                    identity = ' '.join(names[i:end])
+                elif name == 'macro_rules':
+                    identity = 'macro ' + ''.join(names[i + 2:end])
+                else:
+                    identity = name + ' ' + ('block' if anonymous_const else names[named])
+            at.extend([path] * (end - i))
+            i = end
+            if i >= len(names):
+                break
+            name = names[i]
+        at.append(path)
+        if name == '{':
+            stack.append(path)
+            if identity is not None:
+                path += (identity,)
+        elif name == '}' and stack:
+            path = stack.pop()
+        i += 1
+    return at
+
+
+def call_receiver(names, index, pairs):
+    """Token identity of a method/associated call's receiver, excluding arguments."""
+    if names[max(0, index - 1):index] not in (['.'], ['::']):
         return None
     opening = index + 1
     if names[opening:opening + 2] == ['::', '<']:
@@ -207,318 +277,136 @@ def call_span(code, index):
                 names[opening] == '>' and names[opening - 1] != '-')
             opening += 1
     if names[opening:opening + 1] != ['(']:
-        # A capability-bearing generic reference that cannot be resolved must
-        # not silently opt out of the independent call-name layer.
-        return (code[index][1], code[index][1] + len(names[index])) if opening > index + 1 else None
-
-    def matching(end):
-        pairs = {')': '(', ']': '[', '}': '{', '>': '<'}
-        left, depth = pairs[names[end]], 1
-        cursor = end - 1
-        while cursor >= 0:
-            depth += (names[cursor] == names[end]) - (names[cursor] == left)
-            if not depth:
-                return cursor
-            cursor -= 1
-        return 0
+        return None
 
     def receiver(end):
         if end < 0:
             return 0
         if names[end] == '?':
             return receiver(end - 1)
-        start = matching(end) if names[end] in {')', ']', '}', '>'} else end
+        start = pairs.get(end, end)
         if start and names[end] in {')', ']'} and (
-                IDENT.fullmatch(names[start - 1]) or names[start - 1] in {')', ']', '>'}):
+                IDENT.fullmatch(names[start - 1]) or names[start - 1] in {')', ']'}):
             start = receiver(start - 1)
         if start >= 2 and names[start - 1] in {'.', '::'}:
             start = receiver(start - 2)
         return start
 
-    start = receiver(index - 2)
-    stack = ['(']
-    end = opening + 1
-    pairs = {')': '(', ']': '[', '}': '{'}
-    while end < len(names) and stack:
-        if names[end] in {'(', '[', '{'}:
-            stack.append(names[end])
-        elif names[end] in pairs:
-            if stack[-1] != pairs[names[end]]:
-                return None
-            stack.pop()
-        end += 1
-    if stack:
-        return None
-    return code[start][1], code[end - 1][1] + 1
+    return receiver(index - 2), index - 1
 
 
 def method_findings(text, code, path):
     if path == BOUNDARY or test_source(path):
         return []
-    findings, seen = [], {}
+    names = [name for name, _ in code]
+    pairs = delimiter_pairs(names)
+    items = item_paths(names, pairs)
+    findings = []
     for i, (name, offset) in enumerate(code):
         if name not in CAPABILITY_METHODS:
             continue
-        span = call_span(code, i)
-        if span is None:
-            if i and code[i - 1][0] == '::':
-                findings.append((text.count('\n', 0, offset) + 1,
-                                 f'associated capability reference requires review: {name}'))
+        receiver = call_receiver(names, i, pairs)
+        if (receiver is None and names[max(0, i - 1):i] != ['::']
+                and names[i + 1:i + 3] != ['::', '<']):
             continue
-        key = (path, text[span[0]:span[1]])
-        seen[key] = seen.get(key, 0) + 1
-        exception = CALL_EXCEPTIONS.get(key)
-        if exception is None or seen[key] > exception[1]:
+        if receiver is not None:
+            start, end = receiver
+            receiver = ''.join(token for token, _ in tokens(
+                text[code[start][1]:code[end][1]], literals=True))
+        if receiver is None or (path, items[i], receiver, name) not in CALL_EXCEPTIONS:
             findings.append((text.count('\n', 0, offset) + 1,
-                             f'filesystem/process-capable call requires an exact exception: {name}'))
+                             f'filesystem/process capability requires an anchored exception: {name}'))
     return findings
 
-# Each key is the file plus the complete, literal call text (including arguments
-# and closure bodies). Values record the reason and maximum existing occurrences.
-# Receiver bindings are trusted only for these reviewed source expressions.
+
+# Keys pin (file, lexical item path, receiver expression tokens, method).
+# Arguments and closure bodies are scanned independently, not frozen. All current
+# receivers are counted adapters, in-memory locks or worker factories: none grants
+# access based on an argument's value, so no argument-specific pins are needed.
+# Receiver types/bindings remain a review responsibility, not a scanner proof.
 CALL_EXCEPTIONS = {
-    (COMMANDS / 'journal/compact.rs', r'''self.file.write_all(&line)'''): (
-        'existing counted File/Stream or its buffered writer; boundary retains I/O observation', 1),
-    (COMMANDS / 'journal/compact.rs', r'''self.file.try_clone()'''): (
-        'existing counted File/Stream or its buffered writer; boundary retains I/O observation', 1),
-    (COMMANDS / 'journal/compact.rs', r'''std::thread::Builder::new()
-            .name("wire-compact".into())
-            .spawn(move || {
-                let initial = (|| -> io::Result<Snapshot> {
-                    let path = root.join("commands.compact");
-                    match filesystem::remove_file(&path) {
-                        Ok(()) => (),
-                        Err(e) if e.kind() == io::ErrorKind::NotFound => (),
-                        Err(e) => return Err(e),
-                    }
-                    drop(files::create_private_file(&path)?);
-                    let mut snapshot = Snapshot {
-                        reader: io::BufReader::new(Positioned {
-                            file: source,
-                            offset: 0,
-                        }),
-                        file: files::open_append_file(&path)?,
-                        // Reserve on the copier so the bounded publication tail cannot rehash.
-                        index: Index {
-                            records: HashMap::with_capacity(limit),
-                            counts: HashMap::with_capacity(limit),
-                            oldest_ms: None,
-                        },
-                        offset: 0,
-                        bytes: 0,
-                        now,
-                        limit,
-                        #[cfg(test)]
-                        hook,
-                    };
-                    #[cfg(test)]
-                    snapshot.checkpoint("created");
-                    snapshot.copy_to(prefix)?;
-                    #[cfg(test)]
-                    snapshot.checkpoint("prefix_copied");
-                    Ok(snapshot)
-                })();
-                if tx.send(Message::Compacted(initial)).is_err() {
-                    return;
-                }
-                while let Ok(next) = control.recv() {
-                    match next {
-                        Continue::CatchUp(mut snapshot, target) => {
-                            let result = snapshot.copy_to(target).map(|()| snapshot);
-                            if tx.send(Message::Compacted(result)).is_err() {
-                                break;
-                            }
-                        }
-                        Continue::Retire(index) => {
-                            drop(index);
-                            break;
-                        }
-                    }
-                }
-            })'''): (
-        'existing journal worker thread, not a child process; body scanned independently', 1),
-    (COMMANDS / 'journal/compact.rs', r'''filesystem::remove_file(&path)'''): (
-        'existing counted filesystem boundary adapter', 1),
-    (COMMANDS / 'journal/compact.rs', r'''snapshot.file.sync_all()'''): (
-        'existing counted File/Stream or its buffered writer; boundary retains I/O observation', 1),
-    (COMMANDS / 'journal/compact.rs', r'''filesystem::rename(
-                self.root.join("commands.compact"),
-                self.root.join("commands.jsonl"),
-            )'''): (
-        'existing counted filesystem boundary adapter', 1),
-    (COMMANDS / 'journal/compact.rs', r'''snapshot.file.try_clone()'''): (
-        'existing counted File/Stream or its buffered writer; boundary retains I/O observation', 2),
-    (COMMANDS / 'journal.rs', r'''self.source.read(bytes)'''): (
-        'existing replay stream delegates to the counted File', 1),
-    (COMMANDS / 'journal.rs', r'''Self::spawn(
-            move || {
-                let mut journal = Journal::lease(&data)?;
-                journal.replay_progress = progress;
-                journal.replay_advanced(0);
-                if let Some(acquired) = acquired {
-                    let _ = acquired.send(());
-                }
-                #[cfg(test)]
-                tests::replay_barrier(&data)?;
-                journal.replay()?;
-                Ok(journal)
-            },
-            wake,
-        )'''): (
-        'existing journal Writer factory; closure uses the counted boundary', 1),
-    (COMMANDS / 'journal.rs', r'''std::thread::Builder::new()
-            .name("wire-journal".into())
-            .spawn(move || {
-                if let Ok(mut journal) = open().inspect_err(unavailable) {
-                    let _ = opened.send(Ok(()));
-                    while let Ok(message) = rx.recv() {
-                        match message {
-                            Message::Job((operation, reply)) => {
-                                let now = match &operation {
-                                    Operation::Claim { now, .. } => Some(*now),
-                                    _ => None,
-                                };
-                                let result = journal.apply(operation);
-                                // Counted I/O has no published completion yet.
-                                worker_pending.fetch_sub(1, Ordering::AcqRel);
-                                let _ = reply.send(result);
-                                if let Some(now) = now {
-                                    if let Some(admission) = weak.upgrade() {
-                                        let tx = admission.lock().as_ref().cloned();
-                                        if let Some(tx) = tx {
-                                            journal.start_compaction(now, tx);
-                                        }
-                                    }
-                                }
-                            }
-                            Message::Compacted(result) => journal.compacted(result),
-                        }
-                        wake.notify_one();
-                    }
-                    // The lease is released before shutdown completion becomes observable.
-                    drop(journal);
-                } else {
-                    let _ = opened.send(Err(ErrorCode::SessionBusy));
-                }
-                closed.send_replace(true);
-            })'''): (
-        'existing journal worker thread, not a child process; body scanned independently', 1),
-    (COMMANDS / 'journal.rs', r'''admission.lock()'''): (
-        'existing in-memory ownership/admission mutex, not a filesystem lock', 1),
-    (COMMANDS / 'journal.rs', r'''self
-            .admission
-            .lock()'''): (
-        'existing in-memory ownership/admission mutex, not a filesystem lock', 1),
-    (COMMANDS / 'journal.rs', r'''self.admission.lock()'''): (
-        'existing in-memory ownership/admission mutex, not a filesystem lock', 1),
-    (COMMANDS / 'journal.rs', r'''file.sync_all()'''): (
-        'existing counted File/Stream or its buffered writer; boundary retains I/O observation', 2),
-    (COMMANDS / 'journal.rs', r'''lease.try_lock()'''): (
-        'existing counted LockFile wrapper', 1),
-    (COMMANDS / 'journal.rs', r'''file.metadata()'''): (
-        'existing counted File/Stream or its buffered writer; boundary retains I/O observation', 2),
-    (COMMANDS / 'journal.rs', r'''self.file.try_clone()'''): (
-        'existing counted File/Stream or its buffered writer; boundary retains I/O observation', 3),
-    (COMMANDS / 'journal.rs', r'''file.write_all(b"\n")'''): (
-        'existing counted File/Stream or its buffered writer; boundary retains I/O observation', 3),
-    (COMMANDS / 'journal.rs', r'''file.flush()'''): (
-        'existing counted File/Stream or its buffered writer; boundary retains I/O observation', 1),
-    (COMMANDS / 'journal.rs', r'''file.get_ref().sync_all()'''): (
-        'existing counted File/Stream or its buffered writer; boundary retains I/O observation', 1),
-    (COMMANDS / 'journal.rs', r'''self.file.try_clone()?.seek(SeekFrom::Start(0))'''): (
-        'existing counted File/Stream or its buffered writer; boundary retains I/O observation', 1),
-    (COMMANDS / 'journal.rs', r'''self.file.metadata()'''): (
-        'existing counted File/Stream or its buffered writer; boundary retains I/O observation', 1),
-    (COMMANDS / 'journal.rs', r'''file.write_all(&archive)'''): (
-        'existing counted File/Stream or its buffered writer; boundary retains I/O observation', 1),
-    (COMMANDS / 'journal.rs', r'''self.file.set_len(good)'''): (
-        'existing counted File/Stream or its buffered writer; boundary retains I/O observation', 1),
-    (COMMANDS / 'journal.rs', r'''self.file.sync_all()'''): (
-        'existing counted File/Stream or its buffered writer; boundary retains I/O observation', 2),
-    (COMMANDS / 'journal.rs', r'''self.file.write_all(&line[..line.len() / 2])'''): (
-        'existing counted File/Stream or its buffered writer; boundary retains I/O observation', 1),
-    (COMMANDS / 'journal.rs', r'''self.file.write_all(&line)'''): (
-        'existing counted File/Stream or its buffered writer; boundary retains I/O observation', 1),
-    (COMMANDS / 'journal.rs', r'''self.file.sync_data()'''): (
-        'existing counted File/Stream or its buffered writer; boundary retains I/O observation', 1),
-    (COMMANDS / 'journal.rs', r'''self.file.set_len(before)'''): (
-        'existing counted File/Stream or its buffered writer; boundary retains I/O observation', 1),
-    (COMMANDS / 'ownership.rs', r'''self
-            .0
-            .writer
-            .try_lock()'''): (
-        'existing in-memory ownership/admission mutex, not a filesystem lock', 1),
-    (COMMANDS / 'ownership.rs', r'''self.0.pending.lock()'''): (
-        'existing in-memory ownership/admission mutex, not a filesystem lock', 2),
-    (COMMANDS / 'ownership.rs', r'''tokio::spawn(async move {
-            let mut send = Some(send);
-            let mut acquired = Some(acquired);
-            loop {
-                let (progress, mut advanced) = watch::channel((0, 0));
-                let stalled = Arc::new(AtomicBool::new(false));
-                let opening = owner.acquire_at(phase, acquired.take(), progress, stalled.clone());
-                tokio::pin!(opening);
-                let idle = tokio::time::sleep(REPLAY_STALL);
-                tokio::pin!(idle);
-                let mut observing = true;
-                let result = loop {
-                    tokio::select! {
-                        biased;
-                        result = &mut opening => break result,
-                        changed = advanced.changed(), if observing => {
-                            observing = changed.is_ok();
-                            if observing {
-                                idle.as_mut().reset(tokio::time::Instant::now() + REPLAY_STALL);
-                                #[cfg(test)]
-                                tests::replay_observed(&owner.0.data, *advanced.borrow());
-                            }
-                        }
-                        _ = &mut idle => {
-                            stalled.store(true, Ordering::Release);
-                            let (bytes, total) = *advanced.borrow();
-                            crate::logging::client_journal_replay("stalled", bytes, total);
-                            if let Some(send) = send.take() {
-                                let _ = send.send(Err(ErrorCode::SessionBusy));
-                            }
-                            owner.0.wake.notify_one();
-                            // Retain the worker and its lease until it stops. A
-                            // late completion must drain, never reopen admission.
-                            break opening.await;
-                        }
-                    }
-                };
-                let delivered = send.take().is_some_and(|send| send.send(result).is_ok());
-                // Synchronous startup already observes its reply. Only later
-                // recovery or rollback needs to wake the running owner loop.
-                if notify || !delivered {
-                    owner.0.wake.notify_one();
-                }
-                if result.is_ok() || !owner.current(phase) {
-                    break;
-                }
-                tokio::time::sleep(ACQUIRE_RETRY).await;
-            }
-        })'''): (
-        'existing ownership future task, not a child process; body scanned independently', 1),
-    (COMMANDS / 'ownership.rs', r'''self.0.writer.lock()'''): (
-        'existing in-memory ownership/admission mutex, not a filesystem lock', 1),
-    (COMMANDS / 'ownership.rs', r'''self.0.open_barrier.lock()'''): (
-        'existing in-memory ownership/admission mutex, not a filesystem lock', 1),
-    (COMMANDS / 'ownership.rs', r'''tokio::spawn(async move {
-            let mut slot = owner.0.writer.lock().await;
-            // An abandoned old drain must not close a newer recovered owner.
-            if slot.phase <= phase {
-                if let Some(writer) = slot.writer.take() {
-                    writer.shutdown().await?;
-                }
-            }
-            Ok::<_, ErrorCode>(())
-        })'''): (
-        'existing ownership future task, not a child process; body scanned independently', 1),
-    (COMMANDS / 'ownership.rs', r'''owner.0.writer.lock()'''): (
-        'existing in-memory ownership/admission mutex, not a filesystem lock', 1),
-    (COMMANDS / 'ownership.rs', r'''tokio::spawn(async move { owner.wait_open(reply).await })'''): (
-        'existing ownership future task, not a child process; body scanned independently', 1),
+    (COMMANDS / 'journal.rs', ('impl < R : Read > Read for ReplayReader < R >', 'fn read'),
+     'self.source', 'read'): 'existing replay stream delegates to the counted File',
+    (COMMANDS / 'journal.rs', ('impl Writer', 'fn open_signalled'),
+     'Self', 'spawn'): 'existing journal Writer factory; closure uses the counted boundary',
+    (COMMANDS / 'journal.rs', ('impl Writer', 'fn spawn'),
+     'std::thread::Builder::new().name("wire-journal".into())', 'spawn'): 'existing journal worker thread, not a child process; body scanned independently',
+    (COMMANDS / 'journal.rs', ('impl Writer', 'fn spawn'),
+     'admission', 'lock'): 'existing in-memory ownership/admission mutex, not a filesystem lock',
+    (COMMANDS / 'journal.rs', ('impl Writer', 'fn submit'),
+     'self.admission', 'lock'): 'existing in-memory ownership/admission mutex, not a filesystem lock',
+    (COMMANDS / 'journal.rs', ('impl Writer', 'fn shutdown'),
+     'self.admission', 'lock'): 'existing in-memory ownership/admission mutex, not a filesystem lock',
+    (COMMANDS / 'journal.rs', ('fn private',),
+     'file', 'sync_all'): 'existing counted File/Stream or its buffered writer; boundary retains I/O observation',
+    (COMMANDS / 'journal.rs', ('impl Journal', 'fn lease'),
+     'lease', 'try_lock'): 'existing counted LockFile wrapper',
+    (COMMANDS / 'journal.rs', ('impl Journal', 'fn lease'),
+     'file', 'metadata'): 'existing counted File/Stream or its buffered writer; boundary retains I/O observation',
+    (COMMANDS / 'journal.rs', ('impl Journal', 'fn seed_capacity_test'),
+     'self.file', 'try_clone'): 'existing counted File/Stream or its buffered writer; boundary retains I/O observation',
+    (COMMANDS / 'journal.rs', ('impl Journal', 'fn seed_capacity_test'),
+     'file', 'write_all'): 'existing counted File/Stream or its buffered writer; boundary retains I/O observation',
+    (COMMANDS / 'journal.rs', ('impl Journal', 'fn seed_capacity_test'),
+     'file', 'flush'): 'existing counted File/Stream or its buffered writer; boundary retains I/O observation',
+    (COMMANDS / 'journal.rs', ('impl Journal', 'fn seed_capacity_test'),
+     'file.get_ref()', 'sync_all'): 'existing counted File/Stream or its buffered writer; boundary retains I/O observation',
+    (COMMANDS / 'journal.rs', ('impl Journal', 'fn seed_capacity_test'),
+     'self.file.try_clone()?', 'seek'): 'existing counted File/Stream or its buffered writer; boundary retains I/O observation',
+    (COMMANDS / 'journal.rs', ('impl Journal', 'fn seed_capacity_test'),
+     'self.file', 'metadata'): 'existing counted File/Stream or its buffered writer; boundary retains I/O observation',
+    (COMMANDS / 'journal.rs', ('impl Journal', 'fn replay'),
+     'self.file', 'try_clone'): 'existing counted File/Stream or its buffered writer; boundary retains I/O observation',
+    (COMMANDS / 'journal.rs', ('impl Journal', 'fn replay'),
+     'file', 'metadata'): 'existing counted File/Stream or its buffered writer; boundary retains I/O observation',
+    (COMMANDS / 'journal.rs', ('impl Journal', 'fn replay'),
+     'file', 'write_all'): 'existing counted File/Stream or its buffered writer; boundary retains I/O observation',
+    (COMMANDS / 'journal.rs', ('impl Journal', 'fn replay'),
+     'file', 'sync_all'): 'existing counted File/Stream or its buffered writer; boundary retains I/O observation',
+    (COMMANDS / 'journal.rs', ('impl Journal', 'fn replay'),
+     'self.file', 'set_len'): 'existing counted File/Stream or its buffered writer; boundary retains I/O observation',
+    (COMMANDS / 'journal.rs', ('impl Journal', 'fn replay'),
+     'self.file', 'sync_all'): 'existing counted File/Stream or its buffered writer; boundary retains I/O observation',
+    (COMMANDS / 'journal.rs', ('impl Journal', 'fn append'),
+     'self.file', 'write_all'): 'existing counted File/Stream or its buffered writer; boundary retains I/O observation',
+    (COMMANDS / 'journal.rs', ('impl Journal', 'fn append'),
+     'self.file', 'sync_data'): 'existing counted File/Stream or its buffered writer; boundary retains I/O observation',
+    (COMMANDS / 'journal.rs', ('impl Journal', 'fn append'),
+     'self.file', 'set_len'): 'existing counted File/Stream or its buffered writer; boundary retains I/O observation',
+    (COMMANDS / 'journal.rs', ('impl Journal', 'fn append'),
+     'self.file', 'sync_all'): 'existing counted File/Stream or its buffered writer; boundary retains I/O observation',
+    (COMMANDS / 'journal/compact.rs', ('impl Snapshot', 'fn copy_to'),
+     'self.file', 'write_all'): 'existing counted File/Stream or its buffered writer; boundary retains I/O observation',
+    (COMMANDS / 'journal/compact.rs', ('impl Journal', 'fn start_compaction'),
+     'self.file', 'try_clone'): 'existing counted File/Stream or its buffered writer; boundary retains I/O observation',
+    (COMMANDS / 'journal/compact.rs', ('impl Journal', 'fn start_compaction'),
+     'std::thread::Builder::new().name("wire-compact".into())', 'spawn'): 'existing journal worker thread, not a child process; body scanned independently',
+    (COMMANDS / 'journal/compact.rs', ('impl Journal', 'fn start_compaction'),
+     'filesystem', 'remove_file'): 'existing counted filesystem boundary adapter',
+    (COMMANDS / 'journal/compact.rs', ('impl Journal', 'fn compacted'),
+     'snapshot.file', 'sync_all'): 'existing counted File/Stream or its buffered writer; boundary retains I/O observation',
+    (COMMANDS / 'journal/compact.rs', ('impl Journal', 'fn compacted'),
+     'filesystem', 'rename'): 'existing counted filesystem boundary adapter',
+    (COMMANDS / 'journal/compact.rs', ('impl Journal', 'fn compacted'),
+     'snapshot.file', 'try_clone'): 'existing counted File/Stream or its buffered writer; boundary retains I/O observation',
+    (COMMANDS / 'ownership.rs', ('impl Ownership', 'fn submit'),
+     'self.0.writer', 'try_lock'): 'existing in-memory ownership/admission mutex, not a filesystem lock',
+    (COMMANDS / 'ownership.rs', ('impl Ownership', 'fn abandoned'),
+     'self.0.pending', 'lock'): 'existing in-memory ownership/admission mutex, not a filesystem lock',
+    (COMMANDS / 'ownership.rs', ('impl Ownership', 'fn recover'),
+     'tokio', 'spawn'): 'existing ownership future task, not a child process; body scanned independently',
+    (COMMANDS / 'ownership.rs', ('impl Ownership', 'fn acquire_at'),
+     'self.0.writer', 'lock'): 'existing in-memory ownership/admission mutex, not a filesystem lock',
+    (COMMANDS / 'ownership.rs', ('impl Ownership', 'fn acquire_at'),
+     'self.0.open_barrier', 'lock'): 'existing in-memory ownership/admission mutex, not a filesystem lock',
+    (COMMANDS / 'ownership.rs', ('impl Ownership', 'fn acquire_at'),
+     'self.0.pending', 'lock'): 'existing in-memory ownership/admission mutex, not a filesystem lock',
+    (COMMANDS / 'ownership.rs', ('impl Ownership', 'fn freeze'),
+     'tokio', 'spawn'): 'existing ownership future task, not a child process; body scanned independently',
+    (COMMANDS / 'ownership.rs', ('impl Ownership', 'fn freeze'),
+     'owner.0.writer', 'lock'): 'existing in-memory ownership/admission mutex, not a filesystem lock',
+    (COMMANDS / 'ownership.rs', ('impl Ownership', 'fn reopen'),
+     'tokio', 'spawn'): 'existing ownership future task, not a child process; body scanned independently',
 }
 
 
@@ -690,10 +578,7 @@ def import_findings(code, path, local_macros):
     names = [name for name, _ in code]
     findings = []
     base = module_path(path)
-    module = base
     aliases = AliasIndex(names, base)
-    scope = 0
-    imported = aliases.visible(scope)
     i = 0
     seen_globs = set()
     allowed_items = ALLOWLIST | (TEST_ONLY_ALLOWLIST if test_source(path) else {})
@@ -832,6 +717,40 @@ def boundary_path(names: list[str], index: int) -> bool:
                 and all(part == "super" for part in parts[:-1])))
 
 
+def macro_position_findings(code, path):
+    """Refuse uninspectable method/path substitutions in local macro bodies."""
+    names = [name for name, _ in code]
+    pairs = delimiter_pairs(names)
+    findings = []
+    for i in range(len(names) - 3):
+        if names[i:i + 2] != ['macro_rules', '!']:
+            continue
+        if (path, names[i + 2]) in MACRO_POSITION_ALLOWLIST:
+            continue
+        opening = i + 3
+        end = pairs.get(opening, opening)
+        for j in range(opening + 1, end):
+            if names[j] != '$':
+                continue
+            method = names[j - 1] == '.'
+            qualified = (names[j - 1] == '::'
+                         or names[j + 2:j + 3] == ['::'])
+            if qualified and names[j + 1] == 'crate' and names[j - 1] != '::':
+                # Static crate-relative paths are visible, but must not hide a
+                # capability behind macro hygiene or a generated receiver.
+                k = j + 3
+                qualified = False
+                while k < end and IDENT.fullmatch(names[k]):
+                    qualified |= names[k] in CAPABILITY_METHODS
+                    if names[k + 1:k + 2] != ['::']:
+                        break
+                    k += 2
+            if method or qualified:
+                findings.append((code[j][1],
+                                 'macro-generated method/path position requires review'))
+    return findings
+
+
 def check_text(text: str, path: Path, crate_macros=None, macro_uses=()) -> list[tuple[int, str]]:
     if path == BOUNDARY:
         return []
@@ -845,7 +764,8 @@ def check_text(text: str, path: Path, crate_macros=None, macro_uses=()) -> list[
                      or source.is_relative_to(COMMANDS / 'journal')
                      or (source, name) in CRATE_MACRO_ALLOWLIST for source in sources)}
     findings = [(text.count("\n", 0, offset) + 1, reason)
-                for offset, reason in import_findings(code, path, local)]
+                for offset, reason in (import_findings(code, path, local)
+                                       + macro_position_findings(code, path))]
     findings.extend(method_findings(text, code, path))
     attribute_depth = 0
     for i, (name, offset) in enumerate(code):

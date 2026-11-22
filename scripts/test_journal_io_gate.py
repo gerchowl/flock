@@ -1,6 +1,7 @@
 """Mutation coverage for the journal's counted-I/O architecture gate."""
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from scripts import journal_io_gate as gate
@@ -45,7 +46,9 @@ use self::filesystem;
 use filesystem::fs;
 filesystem::sync_directory(root)?;
 files::open_append_file(path)?;
-self.source.read(bytes)?;
+impl<R: Read> Read for ReplayReader<R> {
+    fn read(&mut self) { self.source.read(bytes)?; }
+}
 // ::std::fs::write(path, bytes)
 /* outer /* tokio::fs */ OpenOptions */
 let message = "::std::fs::write";
@@ -310,7 +313,8 @@ set_permissions spawn output status""".split()
                     self.assertTrue(gate.check_text(source, gate.COMMANDS / 'journal.rs'))
         for source in ['let operation = Unknown::read_dir; operation(value);',
                        'object.r#read_dir();', 'object.read::<u8>(value);',
-                       'Input::write::<u8>(value);', 'object.read("literal ) { text");']:
+                       'Input::write::<u8>(value);', 'object.read("literal ) { text");',
+                       'object.read::<u8>;']:
             with self.subTest(source=source):
                 self.assertTrue(gate.check_text(source, gate.COMMANDS / 'journal.rs'))
 
@@ -336,18 +340,99 @@ set_permissions spawn output status""".split()
             with self.subTest(source=source):
                 self.assertEqual(gate.check_text(source, gate.COMMANDS / 'journal.rs'), [])
 
-    def test_call_exceptions_require_exact_file_arguments_and_occurrence_limit(self):
+    def test_call_exceptions_require_file_item_receiver_and_method(self):
         path = gate.COMMANDS / 'journal.rs'
-        self.assertEqual(gate.check_text('self.source.read(bytes);', path), [])
+        allowed = 'impl<R: Read> Read for ReplayReader<R> { fn read() { self.source.read(other); } }'
+        self.assertEqual(gate.check_text(allowed, path), [])
         for source, other_path in [
-            ('self.source.read(other);', path),
-            ('self.source.read(bytes);', gate.COMMANDS / 'journal/compact.rs'),
-            ('self.source.read(bytes); self.source.read(bytes);', path),
-            ('file.write_all(b"other");', path),
+            (allowed, gate.COMMANDS / 'journal/compact.rs'),
+            (allowed.replace('ReplayReader<R>', 'Other<R>'), path),
+            (allowed.replace('fn read()', 'fn unrelated()'), path),
+            (allowed.replace('self.source', 'other.source'), path),
+            (allowed.replace('.read(other)', '.write(other)'), path),
+            ('mod nested { ' + allowed + ' }', path),
+            ('self.source.read(bytes);', path),
+            ('fn read() { self.source.read(bytes); }', path),
+            (allowed.replace('self.source.read(other);',
+                             'fn read() { self.source.read(other); }'), path),
         ]:
             with self.subTest(source=source, path=other_path):
                 self.assertTrue(gate.check_text(source, other_path))
-        self.assertEqual(gate.check_text('file.write_all(b"\\n");', path), [])
+        self.assertEqual(gate.check_text(allowed.replace('other', 'changed'), path), [])
+        self.assertEqual(gate.check_text(allowed.replace('self.source.read(other);',
+            'self /* receiver */ . source . read(other); self.source.read(again);'), path), [])
+
+    def test_deleted_pinned_call_cannot_authorize_another_item(self):
+        path = gate.COMMANDS / 'journal.rs'
+        source = (gate.ROOT / path).read_text()
+        source = source.replace('file.metadata()', 'file.reviewed_metadata()', 1)
+        self.assertEqual(gate.check_text(source, path), [])
+        source += '\nfn unrelated(file: &Path) { file.metadata(); }\n'
+        self.assertTrue(gate.check_text(source, path))
+
+    def test_macro_method_substitution_is_rejected(self):
+        source = ('macro_rules! probe { ($p:expr, $method:ident) => { $p.$method() } } '
+                  'probe!(path, read_dir);')
+        self.assertTrue(gate.check_text(source, gate.COMMANDS / 'journal.rs'))
+        for left, right in [('(', ')'), ('[', ']')]:
+            with self.subTest(delimiter=left):
+                definition = ('macro_rules! probe ' + left
+                              + ' ($p:expr, $method:ident) => { $p.$method() } '
+                              + right + '; probe!(path, read_dir);')
+                self.assertTrue(gate.check_text(definition, gate.COMMANDS / 'journal.rs'))
+
+    def test_macro_path_positions_require_explicit_review(self):
+        path = gate.COMMANDS / 'journal.rs'
+        for body in ['$p::helper()', '$crate::helper::read_dir(path)',
+                     'path.$method::<u8>()', '$crate::helper::metadata',
+                     '$crate::$method(path)', '$crate::helper::$method(path)',
+                     'helper::$method(path)']:
+            with self.subTest(body=body):
+                source = 'macro_rules! probe { ($p:ident) => { ' + body + ' } }'
+                code = gate.tokens(source)
+                self.assertTrue(gate.macro_position_findings(code, path))
+                self.assertTrue(gate.check_text(source, path))
+        for body in ['$value', '$crate::web::wire::commands::ack(id, result)',
+                     '($($value),*)', '".$method() $p::read_dir()"']:
+            with self.subTest(body=body):
+                self.assertEqual(gate.macro_position_findings(gate.tokens(
+                    'macro_rules! safe { ($value:expr) => { ' + body + ' } }'), path), [])
+        with patch.dict(gate.MACRO_POSITION_ALLOWLIST,
+                        {(path, 'probe'): 'fixture for explicit macro review'}):
+            self.assertEqual(gate.macro_position_findings(gate.tokens(
+                'macro_rules! probe { () => { path.$method() } }'), path), [])
+            self.assertEqual(gate.check_text(
+                'macro_rules! probe { ($method:ident) => { path.$method() } }', path), [])
+        # Generated functions cannot inherit a real function's exception.
+        for wrapper in ['macro_rules! probe { () => { %s } }',
+                        'const NESTED: () = { %s };', 'const _: () = const { %s };',
+                        'static mut NESTED: () = { %s };']:
+            with self.subTest(wrapper=wrapper):
+                self.assertTrue(gate.check_text(
+                    wrapper % 'fn private() { file.sync_all(); }', path))
+
+    def test_non_risky_arguments_and_closure_edits_pass(self):
+        path = gate.COMMANDS / 'journal.rs'
+        source = (gate.ROOT / path).read_text()
+        edited = source.replace('journal.replay_advanced(0);', 'journal.replay_advanced(1);')
+        edited = edited.replace('self.file.set_len(good)', 'self.file.set_len(other)')
+        self.assertNotEqual(source, edited)
+        self.assertEqual(gate.check_text(edited, path), [])
+        self.assertTrue(gate.check_text(edited.replace(
+            '.name("wire-journal".into())', '.name("different-worker".into())'), path))
+        self.assertTrue(gate.check_text(edited.replace('journal.replay_advanced(1);',
+            'journal.replay_advanced(1); unreviewed.read_dir();'), path))
+
+    def test_item_paths_distinguish_impls_modules_and_preserve_closures(self):
+        source = ("impl<T> Trait for Thing<T> { fn read(x: fn()) { "
+                  "let task = || { self.source.read(x); }; } } "
+                  "mod nested { impl Other { fn read() { self.source.read(x); } } }")
+        code = gate.tokens(source)
+        names = [name for name, _ in code]
+        items = gate.item_paths(names, gate.delimiter_pairs(names))
+        paths = [items[i] for i, name in enumerate(names) if name == 'source']
+        self.assertEqual(paths, [('impl < T > Trait for Thing < T >', 'fn read'),
+                                 ('mod nested', 'impl Other', 'fn read')])
 
     def test_method_layer_skips_only_boundary_and_path_enforced_test_files(self):
         for relative in ['journal/filesystem.rs', 'journal/tests.rs', 'journal/tests/compaction.rs']:
