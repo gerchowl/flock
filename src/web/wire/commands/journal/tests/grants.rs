@@ -559,3 +559,369 @@ fn in_flight_compaction_cannot_publish_over_consumption() {
         matches!(journal.grant(retry).unwrap(), Admission::Granted {state, ..} if matches!(*state, Admission::Replayed(ref frame) if frame == &outcome))
     );
 }
+
+fn clock_request(
+    root: &std::path::Path,
+    generation: u64,
+    issuance: &str,
+    id: &str,
+    wall: u64,
+    elapsed: u64,
+) -> Claim {
+    let mut c = request(root, generation, issuance, id);
+    c.environment = Box::new(move || {
+        (
+            Some(crate::api::gateway_grants::ClockPair {
+                domain: "fixture-boot".into(),
+                wall_ms: wall,
+                elapsed_ms: elapsed,
+            }),
+            Some("w1".into()),
+        )
+    });
+    c
+}
+
+#[test]
+fn backward_step_latches_before_claim_and_survives_restart() {
+    let (root, _store, generation, issuance) = gateway::claim_timed_fixture(10000, 20000);
+    let mut j = Journal::open(root.path()).unwrap();
+    claimed(j.grant(clock_request(
+        root.path(),
+        generation,
+        &issuance,
+        "first",
+        11000,
+        21000,
+    )));
+    // Still within the issuance drift bound, but behind the durable admission.
+    refused(
+        j.grant(clock_request(
+            root.path(),
+            generation,
+            &issuance,
+            "step",
+            10900,
+            21100,
+        )),
+        Refusal::Expired,
+    );
+    assert_eq!(j.index.consumed[&issuance], 1);
+    drop(j);
+    let mut j = Journal::open(root.path()).unwrap();
+    refused(
+        j.grant(clock_request(
+            root.path(),
+            generation,
+            &issuance,
+            "restored",
+            12000,
+            22000,
+        )),
+        Refusal::Expired,
+    );
+    assert_eq!(j.index.consumed[&issuance], 1);
+}
+
+#[test]
+fn forward_discontinuity_latches_other_timed_grants() {
+    let (root, _store, generation, issuance) = gateway::claim_timed_fixture(10000, 20000);
+    let mut j = Journal::open(root.path()).unwrap();
+    refused(
+        j.grant(clock_request(
+            root.path(),
+            generation,
+            &issuance,
+            "jump",
+            13001,
+            21000,
+        )),
+        Refusal::Expired,
+    );
+    refused(
+        j.grant(clock_request(
+            root.path(),
+            generation,
+            &issuance,
+            "restored",
+            12000,
+            22000,
+        )),
+        Refusal::Expired,
+    );
+    assert!(j.index.records.is_empty());
+}
+
+#[test]
+fn cumulative_drift_latches_even_when_each_increment_is_small() {
+    let (root, _store, generation, issuance) = gateway::claim_timed_fixture(10000, 20000);
+    let mut j = Journal::open(root.path()).unwrap();
+    claimed(j.grant(clock_request(
+        root.path(),
+        generation,
+        &issuance,
+        "first",
+        10600,
+        21000,
+    )));
+    claimed(j.grant(clock_request(
+        root.path(),
+        generation,
+        &issuance,
+        "second",
+        11200,
+        22000,
+    )));
+    refused(
+        j.grant(clock_request(
+            root.path(),
+            generation,
+            &issuance,
+            "drift",
+            11800,
+            23000,
+        )),
+        Refusal::Expired,
+    );
+    refused(
+        j.grant(clock_request(
+            root.path(),
+            generation,
+            &issuance,
+            "restored",
+            14000,
+            24000,
+        )),
+        Refusal::Expired,
+    );
+    assert_eq!(j.index.consumed[&issuance], 2);
+}
+
+#[test]
+fn destination_offsets_and_suspend_never_extend_lifetime() {
+    for wall in [10000, 1_000_000] {
+        let (root, _store, generation, issuance) = gateway::claim_timed_fixture(wall, 20000);
+        let mut j = Journal::open(root.path()).unwrap();
+        claimed(j.grant(clock_request(
+            root.path(),
+            generation,
+            &issuance,
+            "valid",
+            wall + 1000,
+            21000,
+        )));
+        // Inject suspend-inclusive progress across expiry, with a behind wall clock.
+        refused(
+            j.grant(clock_request(
+                root.path(),
+                generation,
+                &issuance,
+                "suspended",
+                wall + 9000,
+                30000,
+            )),
+            Refusal::Expired,
+        );
+        assert_eq!(j.index.consumed[&issuance], 1);
+    }
+}
+
+fn acknowledge(store: &Store, wall: u64, elapsed: u64) {
+    gateway::claim_acknowledge(
+        store,
+        crate::api::gateway_grants::ClockPair {
+            domain: "fixture-boot".into(),
+            wall_ms: wall,
+            elapsed_ms: elapsed,
+        },
+    );
+}
+
+#[test]
+fn acknowledgement_rebases_comparisons_without_reviving_expiry() {
+    let (root, store, generation, issuance) = gateway::claim_timed_fixture(10000, 20000);
+    let mut j = Journal::open(root.path()).unwrap();
+    refused(
+        j.grant(clock_request(
+            root.path(),
+            generation,
+            &issuance,
+            "jump",
+            12500,
+            21000,
+        )),
+        Refusal::Expired,
+    );
+    acknowledge(&store, 12500, 21000);
+    claimed(j.grant(clock_request(
+        root.path(),
+        generation,
+        &issuance,
+        "rebased",
+        13000,
+        21500,
+    )));
+    refused(
+        j.grant(clock_request(
+            root.path(),
+            generation,
+            &issuance,
+            "expired",
+            21000,
+            22000,
+        )),
+        Refusal::Expired,
+    );
+    acknowledge(&store, 14000, 23000);
+    refused(
+        j.grant(clock_request(
+            root.path(),
+            generation,
+            &issuance,
+            "cannot-revive",
+            14500,
+            23500,
+        )),
+        Refusal::Expired,
+    );
+    assert_eq!(j.index.consumed[&issuance], 1);
+}
+
+#[test]
+fn lost_boot_evidence_stays_refused_after_acknowledgement() {
+    let (root, store, generation, issuance) = gateway::claim_timed_fixture(10000, 20000);
+    let mut j = Journal::open(root.path()).unwrap();
+    let mut c = clock_request(root.path(), generation, &issuance, "boot", 11000, 21000);
+    c.environment = Box::new(|| {
+        (
+            Some(crate::api::gateway_grants::ClockPair {
+                domain: "other-fixture-boot".into(),
+                wall_ms: 11000,
+                elapsed_ms: 1000,
+            }),
+            Some("w1".into()),
+        )
+    });
+    refused(j.grant(c), Refusal::Expired);
+    drop(j);
+    let mut j = Journal::open(root.path()).unwrap();
+    acknowledge(&store, 12000, 22000);
+    refused(
+        j.grant(clock_request(
+            root.path(),
+            generation,
+            &issuance,
+            "lost",
+            13000,
+            23000,
+        )),
+        Refusal::Expired,
+    );
+    assert!(j.index.records.is_empty());
+}
+
+#[test]
+fn expired_after_preflight_does_not_spend_once_or_claim() {
+    let (root, store, generation, issuance) =
+        gateway::claim_timed_fixture_limit(10000, 20000, Some(1));
+    let mut j = Journal::open(root.path()).unwrap();
+    let c = clock_request(root.path(), generation, &issuance, "expired", 20000, 30000);
+    let request = gateway::Request {
+        home: &c.home,
+        principal: &c.principal,
+        scopes: &c.scopes,
+        verb: &c.command.verb,
+        target: gateway::Target::Agent(&c.target),
+    };
+    assert!(matches!(
+        store
+            .evaluate(
+                &gateway::lifecycle::Evaluation {
+                    request: &request,
+                    source: PrincipalKind::User,
+                    destination: &c.destination,
+                    clock: Some(crate::api::gateway_grants::ClockPair {
+                        domain: "fixture-boot".into(),
+                        wall_ms: 18000,
+                        elapsed_ms: 28000,
+                    }),
+                    consumed: &j.index.consumed,
+                },
+                generation,
+                |_| Some("w1".into())
+            )
+            .unwrap(),
+        gateway::lifecycle::Decision::Allowed { .. }
+    ));
+    refused(j.grant(c), Refusal::Expired);
+    assert!(j.index.records.is_empty());
+    assert!(!j.index.consumed.contains_key(&issuance));
+}
+
+#[test]
+fn latched_clock_leaves_untimed_and_local_claims_working() {
+    let (root, store, generation, issuance) = gateway::claim_timed_fixture(10000, 20000);
+    let mut j = Journal::open(root.path()).unwrap();
+    refused(
+        j.grant(clock_request(
+            root.path(),
+            generation,
+            &issuance,
+            "jump",
+            15000,
+            21000,
+        )),
+        Refusal::Expired,
+    );
+    let (generation, untimed) = gateway::claim_install(&store, "untimed", Some(1));
+    claimed(j.grant(request(root.path(), generation, &untimed, "untimed")));
+    assert!(matches!(
+        j.claim("local", "operator", &super::command("local"), 100),
+        Ok(Admission::Claimed(100))
+    ));
+    refused(
+        j.grant(clock_request(
+            root.path(),
+            generation,
+            &issuance,
+            "still-latched",
+            12000,
+            22000,
+        )),
+        Refusal::Expired,
+    );
+}
+
+#[test]
+fn admission_pair_survives_outcome_and_compacted_checkpoint() {
+    let (root, _store, generation, issuance) = gateway::claim_timed_fixture(10000, 20000);
+    let mut j = Journal::open(root.path()).unwrap();
+    let consumption = claimed(j.grant(clock_request(
+        root.path(),
+        generation,
+        &issuance,
+        "paired",
+        11000,
+        21000,
+    )));
+    let clock = consumption.clock.as_ref().unwrap();
+    assert_eq!((clock.wall_ms, clock.elapsed_ms), (11000, 21000));
+    j.finish(
+        &("a".repeat(64), "client-1".into(), "paired".into()),
+        100,
+        Ok(json!({})),
+    )
+    .unwrap();
+    let now = 101 + super::super::super::super::IDEMPOTENCY_WINDOW_MS;
+    let rx = super::compaction::start(&mut j, now);
+    super::compaction::finish_compaction(&mut j, &rx);
+    drop(j);
+    let j = Journal::open(root.path()).unwrap();
+    assert!(!j.blocked);
+    assert_eq!(j.index.consumed[&issuance], 1);
+    let raw = super::super::filesystem::fs::read(root.path().join("wire/commands.jsonl")).unwrap();
+    let record: super::super::Record =
+        serde_json::from_slice(raw.split(|b| *b == b'\n').next().unwrap()).unwrap();
+    assert_eq!(record.version, 3);
+    assert_eq!(record.consumption.unwrap(), consumption);
+}

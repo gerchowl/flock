@@ -256,6 +256,7 @@ impl Store {
                                     .checked_add(lifetime)
                                     .ok_or(E::InvalidParams)?,
                             );
+                            clocks::initialize(&mut value, &issuance.id, &clock)?;
                             issuance.issued = Some(clock);
                         }
                         if p.max_uses.is_some() {
@@ -270,6 +271,9 @@ impl Store {
                     let id = value["entries"][&key]["lifecycle"]["issuance"]["id"]
                         .as_str()
                         .map(str::to_owned);
+                    if let Some(id) = &id {
+                        clocks::remove(&mut value, id);
+                    }
                     if let (Some(id), Some(evidence)) = (
                         id,
                         value.get_mut("accounting").and_then(Value::as_object_mut),
@@ -364,6 +368,7 @@ mod tests;
 mod lifecycle_tests;
 
 pub(crate) mod accounting;
+mod clocks;
 pub(crate) mod lifecycle;
 #[cfg(test)]
 use lifecycle::{Decision, Evaluation, PrincipalKind, Refusal};
@@ -455,4 +460,77 @@ pub(crate) fn claim_install(store: &Store, name: &str, max_uses: Option<u64>) ->
         .id
         .clone();
     (listing.generation, id)
+}
+
+#[cfg(test)]
+pub(crate) fn claim_timed_fixture(
+    wall: u64,
+    elapsed: u64,
+) -> (
+    crate::structured::launch::SessionConfigDir,
+    Store,
+    u64,
+    String,
+) {
+    claim_timed_fixture_limit(wall, elapsed, Some(10))
+}
+
+#[cfg(test)]
+pub(crate) fn claim_timed_fixture_limit(
+    wall: u64,
+    elapsed: u64,
+    max_uses: Option<u64>,
+) -> (
+    crate::structured::launch::SessionConfigDir,
+    Store,
+    u64,
+    String,
+) {
+    let (root, store, mut app) = tests::fixture();
+    let mut grant = tests::grant(&["*"]);
+    grant.lifecycle = Some(Box::new(Lifecycle {
+        subject: Subject::User,
+        destination_node_id: "b".repeat(64),
+        max_uses,
+        lifetime_ms: Some(10000),
+        issuance: None,
+    }));
+    let listing = store
+        .manage_issued(
+            &app.client_token_authority().unwrap(),
+            Some(Change::Add(grant)),
+            || {
+                Ok((
+                    "b".repeat(64),
+                    Some(ClockPair {
+                        domain: "fixture-boot".into(),
+                        wall_ms: wall,
+                        elapsed_ms: elapsed,
+                    }),
+                ))
+            },
+        )
+        .unwrap();
+    let id = listing.entries["tablet"]
+        .as_ref()
+        .unwrap()
+        .lifecycle
+        .as_ref()
+        .unwrap()
+        .issuance
+        .as_ref()
+        .unwrap()
+        .id
+        .clone();
+    (root, store, listing.generation, id)
+}
+
+#[cfg(test)]
+pub(crate) fn claim_acknowledge(store: &Store, clock: ClockPair) {
+    store
+        .acknowledge_clock_at(
+            &tests::operator().client_token_authority().unwrap(),
+            Some(clock),
+        )
+        .unwrap();
 }

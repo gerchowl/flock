@@ -391,3 +391,20 @@ fn retirement_requires_proven_expiry_in_the_issued_clock_domain() {
     other.domain = "other-fixture-domain".into();
     assert!(!lifecycle::expired(p, Some(&other)));
 }
+
+#[test]
+fn agent_cannot_obtain_clock_acknowledgement_authority() {
+    let (_root, store, mut app) = fixture();
+    let mut lease = app
+        .session_leases
+        .reserve("agent_atlas_1", "clock-fixture", None)
+        .unwrap();
+    lease.bind(std::process::id()).unwrap();
+    match app.client_token_authority() {
+        Ok(authority) => {
+            store.acknowledge_clock(&authority).unwrap();
+            panic!("agent gained operator authority");
+        }
+        Err(error) => assert_eq!(error, E::OperatorOnly),
+    };
+}

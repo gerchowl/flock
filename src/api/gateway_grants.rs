@@ -75,7 +75,7 @@ pub struct Issuance {
 }
 /// Paired destination UTC and suspend-inclusive elapsed milliseconds.
 /// Domain equality is required; missing recovery evidence refuses timed authority.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClockPair {
     pub domain: String,

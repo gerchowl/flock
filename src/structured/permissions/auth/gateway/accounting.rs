@@ -20,8 +20,8 @@ struct Mark {
     pending: Option<Stamp>,
 }
 pub(crate) struct Fence<'a> {
-    store: &'a Store,
-    value: Value,
+    pub(super) store: &'a Store,
+    pub(super) value: Value,
 }
 impl Store {
     /// Keep generation, integrity evidence, J1 sync and publication under one lease.
