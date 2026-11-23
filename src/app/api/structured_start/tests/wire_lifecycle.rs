@@ -549,7 +549,7 @@ async fn granted_fresh_start_launches_owned_fixture_in_bound_workspace() {
     })
     .await;
     let target = crate::structured::view::Target {
-        agent_id: id,
+        agent_id: id.clone(),
         generation,
     };
     assert_eq!(
@@ -568,5 +568,80 @@ async fn granted_fresh_start_launches_owned_fixture_in_bound_workspace() {
     assert!(
         fixture.app.state.terminals.is_empty(),
         "grant must not allocate a terminal runtime"
+    );
+    let expected =
+        json!(["mesh-grant-v1", {"home":"a".repeat(64),"principal":"client-1"}]).to_string();
+    assert_eq!(
+        fixture
+            .app
+            .session_leases
+            .admitted_identities()
+            .unwrap()
+            .get(&id),
+        Some(&Some(expected.clone()))
+    );
+    let session = fixture
+        .app
+        .state
+        .structured_agents
+        .get(&id)
+        .unwrap()
+        .0
+        .session_id
+        .clone();
+    fixture
+        .app
+        .structured_workers
+        .shutdown(&mut fixture.app.state.structured_agents)
+        .unwrap();
+    let saved = serde_json::to_vec(&fixture.app.state.structured_agents).unwrap();
+    fixture.app.state.structured_agents = serde_json::from_slice(&saved).unwrap();
+    fixture.app.structured_workers = crate::structured::workers::Workers::new(notify.clone());
+    fixture.app.session_leases = Default::default();
+    assert!(fixture
+        .app
+        .session_leases
+        .admitted_identities()
+        .unwrap()
+        .is_empty());
+    let args = json!({"target":id,"reason":"resume after recovery","when":"after_turn"});
+    let grant =
+        crate::web::wire::claim_lifecycle_fixture("agent.restart", args.clone(), &id, "w1").await;
+    let command = serde_json::from_value(json!({"verb":"agent.restart","args":args})).unwrap();
+    let result = fixture
+        .app
+        .wire_agent_lifecycle(
+            command,
+            crate::structured::permissions::auth::lifecycle::Authority::Grant(Box::new(grant)),
+        )
+        .unwrap();
+    assert_eq!(result["agent"]["agent_id"], id);
+    assert_eq!(result["agent"]["session_id"], session);
+    let generation = fixture.app.state.structured_agents.get(&id).unwrap().2;
+    crate::structured::workers::tests::wait(&notify, || {
+        fixture.app.service_structured_workers(Instant::now());
+        assert!(
+            fixture
+                .app
+                .structured_workers
+                .report(&id, generation)
+                .is_none(),
+            "resumed producer exited before readiness"
+        );
+        fixture
+            .app
+            .structured_workers
+            .runtime(&id, generation)
+            .is_some()
+    })
+    .await;
+    assert_eq!(
+        fixture
+            .app
+            .session_leases
+            .admitted_identities()
+            .unwrap()
+            .get(&id),
+        Some(&Some(expected))
     );
 }

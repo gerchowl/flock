@@ -2,6 +2,24 @@
 use super::tokens::{server::Session, Scope};
 use crate::api::{error_code::ErrorCode, schema::AgentStartParams};
 
+/// Remote attribution is a pair; the ancestry book stores its tagged encoding.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RemoteSubject {
+    pub home: String,
+    pub principal: String,
+}
+impl RemoteSubject {
+    pub(crate) fn parent_key(&self) -> String {
+        serde_json::json!(["mesh-grant-v1", self]).to_string()
+    }
+    pub(crate) fn from_parent_key(value: &str) -> Option<Self> {
+        let (kind, subject): (String, Self) = serde_json::from_str(value).ok()?;
+        (kind == "mesh-grant-v1" && !subject.home.is_empty() && !subject.principal.is_empty())
+            .then_some(subject)
+    }
+}
+
 pub(crate) enum Authority<'a> {
     Local(&'a Session),
     #[cfg(feature = "web")]
@@ -15,7 +33,7 @@ impl Authority<'_> {
             Self::Grant(_) => false,
         }
     }
-    pub(crate) fn remote_subject(&self) -> Option<String> {
+    pub(crate) fn remote_subject(&self) -> Option<RemoteSubject> {
         match self {
             Self::Local(_) => None,
             #[cfg(feature = "web")]
@@ -67,3 +85,6 @@ pub(crate) fn restart_start(target: &str) -> Result<AgentStartParams, ErrorCode>
     }))
     .map_err(|_| ErrorCode::SerializationError)
 }
+
+#[cfg(test)]
+mod tests;

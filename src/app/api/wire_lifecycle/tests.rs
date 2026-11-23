@@ -45,8 +45,8 @@ fn bound_grant_stops_exact_target_without_operator_identity() {
         let authority = Authority::Grant(Box::new(grant));
         assert!(!authority.app_operator());
         assert_eq!(
-            authority.remote_subject().unwrap(),
-            format!("{}:client-1", "a".repeat(64))
+            authority.remote_subject().unwrap().parent_key(),
+            json!(["mesh-grant-v1", {"home":"a".repeat(64),"principal":"client-1"}]).to_string()
         );
         assert!(case.app.wire_agent_lifecycle(stop(&id), authority).is_ok());
         assert_eq!(case.app.state.active, Some(1));
@@ -232,6 +232,124 @@ fn granted_resume_preserves_runtime_policy_and_cannot_enter_stop_handler() {
             )
             .expect_err("resume cannot become a fresh launch");
         assert_eq!(refusal, ErrorCode::NotAuthorized);
+        case.stop().await;
+    });
+}
+
+async fn non_structured_target_is_fenced(verb: &str, n: u32) {
+    let mut case = fixture(n).await;
+    case.app.state.ensure_test_terminals();
+    let pane = case.app.state.workspaces[1].focused_pane_id().unwrap();
+    let terminal_id = case.app.state.workspaces[1]
+        .terminal_id(pane)
+        .unwrap()
+        .clone();
+    let terminal = case.app.state.terminals.get_mut(&terminal_id).unwrap();
+    terminal.detected_agent = Some(crate::detect::Agent::Claude);
+    let id = terminal.agent_id.to_string();
+    assert!(case.app.resolve_terminal_target(&id).is_ok());
+    assert!(case.app.structured_target(&id).unwrap().is_none());
+    let args = if verb == "agent.stop" {
+        json!({"target":id})
+    } else {
+        json!({"target":id,"reason":"","when":"after_turn"})
+    };
+    let grant = issue(verb, args.clone(), &id, "w2").await;
+    let command = serde_json::from_value(json!({"verb":verb,"args":args})).unwrap();
+    assert_eq!(
+        case.app
+            .wire_agent_lifecycle(command, Authority::Grant(Box::new(grant)))
+            .unwrap_err(),
+        ErrorCode::AgentNotFound
+    );
+    case.stop().await;
+}
+#[test]
+fn grant_cannot_enter_legacy_terminal_stop_handler() {
+    run(non_structured_target_is_fenced("agent.stop", 32811));
+}
+#[test]
+fn grant_cannot_enter_legacy_terminal_restart_handler() {
+    run(non_structured_target_is_fenced("agent.restart", 32812));
+}
+async fn unbound_launch_inputs_are_fenced(verb: crate::spawn::SpawnVerb, opening: bool, n: u32) {
+    let mut case = fixture(n).await;
+    let args =
+        json!({"runtime":"structured","name":"grant-framed","argv":["claude"],"workspace_id":"w1"});
+    let grant = issue("agent.start", args.clone(), "w1", "w1").await;
+    let authority = Authority::Grant(Box::new(grant));
+    let prompt = opening
+        .then(|| crate::spawn::prompt::SpawnPrompt::compose("fixture opening turn").unwrap());
+    let result = case.app.start_structured_request_authenticated(
+        serde_json::from_value(args).unwrap(),
+        &super::super::spawn::SpawnCaller::Operator { pane: None },
+        verb,
+        prompt,
+        Some(&authority),
+    );
+    assert_eq!(result.unwrap_err(), ErrorCode::NotAuthorized);
+    case.stop().await;
+}
+#[test]
+fn grant_cannot_supply_an_unbound_opening_turn() {
+    run(unbound_launch_inputs_are_fenced(
+        crate::spawn::SpawnVerb::Fork,
+        true,
+        32813,
+    ));
+}
+#[test]
+fn grant_cannot_switch_the_spawn_verb() {
+    run(unbound_launch_inputs_are_fenced(
+        crate::spawn::SpawnVerb::Spawn,
+        false,
+        32814,
+    ));
+}
+#[test]
+fn bound_workspace_requires_valid_tab_membership() {
+    run(async {
+        let mut case = fixture(32815).await;
+        let panes = std::mem::take(&mut case.app.state.workspaces[0].tabs[0].panes);
+        assert!(!case.app.state.workspaces[0].tabs[0].membership_valid());
+        let result = case.app.granted_destination("w1", None);
+        case.app.state.workspaces[0].tabs[0].panes = panes;
+        assert_eq!(result.unwrap_err(), ErrorCode::NotAuthorized);
+        assert_eq!(case.app.state.active, Some(1));
+        case.stop().await;
+    });
+}
+#[test]
+fn grants_for_stop_and_restart_reject_reusable_names() {
+    run(async {
+        let mut case = fixture(32816).await;
+        let alias = case
+            .app
+            .state
+            .structured_agents
+            .get(&case.case.id)
+            .unwrap()
+            .0
+            .name
+            .clone()
+            .unwrap();
+        assert_ne!(alias, case.case.id);
+        for verb in ["agent.stop", "agent.restart"] {
+            let args = if verb == "agent.stop" {
+                json!({"target":alias})
+            } else {
+                json!({"target":alias,"reason":"resume","when":"after_turn"})
+            };
+            let grant = issue(verb, args.clone(), &alias, "w1").await;
+            let command = serde_json::from_value(json!({"verb":verb,"args":args})).unwrap();
+            assert_eq!(
+                case.app
+                    .wire_agent_lifecycle(command, Authority::Grant(Box::new(grant)))
+                    .unwrap_err(),
+                ErrorCode::NotAuthorized,
+                "{verb}"
+            );
+        }
         case.stop().await;
     });
 }

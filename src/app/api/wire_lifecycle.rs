@@ -18,7 +18,7 @@ impl App {
         let caller = remote
             .as_ref()
             .map(|subject| super::spawn::SpawnCaller::Structured {
-                agent_id: Some(subject.clone()),
+                agent_id: Some(subject.parent_key()),
                 depth: 0,
             });
         // Socket attribution must never leak from a previously serviced request.

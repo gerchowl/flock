@@ -48,8 +48,8 @@ impl App {
         let remote_caller =
             authority
                 .and_then(|a| a.remote_subject())
-                .map(|agent_id| SpawnCaller::Structured {
-                    agent_id: Some(agent_id),
+                .map(|subject| SpawnCaller::Structured {
+                    agent_id: Some(subject.parent_key()),
                     depth: 0,
                 });
         let caller = remote_caller.as_ref().unwrap_or(caller);
@@ -87,7 +87,8 @@ impl App {
             .transpose()?;
         let existing = self.structured_target(&params.name)?;
         if granted_workspace.is_some()
-            && (existing.is_some() != authority.is_some_and(|a| a.permits_resume()))
+            && ((existing.is_some() != authority.is_some_and(|a| a.permits_resume()))
+                || existing.as_ref().is_some_and(|(id, _)| id != &params.name))
         {
             return Err(ErrorCode::NotAuthorized);
         }

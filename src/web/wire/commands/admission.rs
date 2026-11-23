@@ -93,8 +93,11 @@ impl GrantAdmission {
     pub(crate) fn workspace(&self) -> &str {
         &self.workspace
     }
-    pub(crate) fn subject(&self) -> String {
-        format!("{}:{}", self.home, self.principal)
+    pub(crate) fn subject(&self) -> crate::structured::permissions::auth::lifecycle::RemoteSubject {
+        crate::structured::permissions::auth::lifecycle::RemoteSubject {
+            home: self.home.clone(),
+            principal: self.principal.clone(),
+        }
     }
     pub(crate) fn start(
         &self,
