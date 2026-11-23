@@ -20,11 +20,14 @@ impl Read for Positioned {
 pub(super) struct Snapshot {
     reader: io::BufReader<Positioned>,
     file: File,
-    index: Index,
+    index: Box<Index>,
     offset: u64,
     bytes: u64,
     now: u64,
     limit: usize,
+    pending: BTreeMap<String, Record>,
+    retry: std::collections::BTreeSet<String>,
+    discard: std::collections::BTreeSet<String>,
     #[cfg(test)]
     hook: Option<fn(&str)>,
 }
@@ -46,9 +49,29 @@ impl Snapshot {
             self.offset += line.len() as u64;
             let record = Record::decode(&line)
                 .ok_or_else(|| io::Error::other("opaque compaction record"))?;
-            if self.now.saturating_sub(record.admitted_ms)
-                < super::super::super::IDEMPOTENCY_WINDOW_MS
-            {
+            let recent = self.now.saturating_sub(record.admitted_ms)
+                < super::super::super::IDEMPOTENCY_WINDOW_MS;
+            if record.version == 3 || (!recent && record.consumption.is_some()) {
+                if record.outcome.is_none() {
+                    if !self.index.consume(&record) {
+                        return Err(io::Error::other("invalid grant checkpoint"));
+                    }
+                    let checkpoint = record
+                        .checkpoint(self.now)
+                        .ok_or_else(|| io::Error::other("invalid checkpoint digest"))?;
+                    let id = checkpoint
+                        .consumption
+                        .as_ref()
+                        .ok_or(io::ErrorKind::InvalidData)?
+                        .issuance
+                        .clone();
+                    self.pending.insert(id, checkpoint);
+                }
+            } else if recent {
+                if let Some(c) = &record.consumption {
+                    self.retry.insert(c.issuance.clone());
+                    self.emit_pending(Some(&c.issuance))?;
+                }
                 if !self.index.fold(record, self.limit) {
                     return Err(io::Error::other("invalid compaction record"));
                 }
@@ -57,6 +80,32 @@ impl Snapshot {
                 self.checkpoint("row_written");
                 self.bytes += line.len() as u64;
             }
+        }
+        self.emit_pending(None)
+    }
+    fn emit_pending(&mut self, only: Option<&str>) -> io::Result<()> {
+        let ids: Vec<_> = self
+            .pending
+            .keys()
+            .filter(|id| {
+                only.map_or_else(
+                    || !self.discard.contains(*id) || self.retry.contains(*id),
+                    |chosen| chosen == id.as_str(),
+                )
+            })
+            .cloned()
+            .collect();
+        for id in ids {
+            let Some(record) = self.pending.remove(&id) else {
+                continue;
+            };
+            let mut line = serde_json::to_vec(&record)?;
+            line.push(b'\n');
+            if !self.index.fold(record, self.limit) {
+                return Err(io::Error::other("invalid checkpoint publication"));
+            }
+            self.file.write_all(&line)?;
+            self.bytes += line.len() as u64;
         }
         Ok(())
     }
@@ -72,9 +121,7 @@ impl Journal {
         let expired = self.index.oldest_ms.is_some_and(|oldest| {
             now.saturating_sub(oldest) >= super::super::super::IDEMPOTENCY_WINDOW_MS
         });
-        // P3b must retain consumption beyond the replay window before sweeping it.
         if self.blocked
-            || !self.index.consumed.is_empty()
             || self.compaction.is_some()
             || (self.bytes < self.next_compaction && !expired)
         {
@@ -94,6 +141,12 @@ impl Journal {
         };
         let root = self.root.clone();
         let prefix = self.bytes;
+        let known = self
+            .index
+            .consumed
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
         let limit = self.global_limit;
         #[cfg(test)]
         let hook = self.compaction_hook;
@@ -116,16 +169,27 @@ impl Journal {
                         }),
                         file: files::open_append_file(&path)?,
                         // Reserve on the copier so the bounded publication tail cannot rehash.
-                        index: Index {
-                            records: HashMap::with_capacity(limit),
+                        index: Box::new(Index {
+                            records: HashMap::with_capacity(limit + GRANT_LIMIT),
                             counts: HashMap::with_capacity(limit),
                             oldest_ms: None,
                             consumed: super::grants::Totals::new(),
-                        },
+                            ..Index::default()
+                        }),
                         offset: 0,
                         bytes: 0,
                         now,
                         limit,
+                        pending: BTreeMap::new(),
+                        retry: std::collections::BTreeSet::new(),
+                        discard: if known.is_empty() {
+                            std::collections::BTreeSet::new()
+                        } else {
+                            super::grants::retired(
+                                root.parent().ok_or(io::ErrorKind::InvalidInput)?,
+                                &known,
+                            )
+                        },
                         #[cfg(test)]
                         hook,
                     };
@@ -173,14 +237,14 @@ impl Journal {
             }
         };
         // A failed append may have left a torn tail. Keep the authoritative log intact.
-        if self.blocked || !self.index.consumed.is_empty() {
-            let _ = control.send(Continue::Retire(snapshot.index));
+        if self.blocked {
+            let _ = control.send(Continue::Retire(*snapshot.index));
             return;
         }
         if let Err(error) = files::rollout_identity(&self.file, &self.root.join("commands.jsonl")) {
             self.blocked = true;
             unavailable(&error);
-            let _ = control.send(Continue::Retire(snapshot.index));
+            let _ = control.send(Continue::Retire(*snapshot.index));
             return;
         }
         if self.bytes.saturating_sub(snapshot.offset) > TAIL_BYTES {
@@ -194,6 +258,10 @@ impl Journal {
         }
         let published = (|| -> io::Result<()> {
             snapshot.copy_to(self.bytes)?;
+            for id in snapshot.discard.difference(&snapshot.retry) {
+                snapshot.index.consumed.remove(id);
+                snapshot.index.proofs.remove(id);
+            }
             #[cfg(test)]
             snapshot.checkpoint("catchup_copied");
             snapshot.file.sync_all()?;
@@ -212,7 +280,7 @@ impl Journal {
             let file = snapshot.file.try_clone()?;
             self.file = file;
             self.bytes = snapshot.bytes;
-            std::mem::swap(&mut self.index, &mut snapshot.index);
+            std::mem::swap(&mut self.index, &mut *snapshot.index);
             filesystem::sync_directory(&self.root)?;
             #[cfg(test)]
             snapshot.checkpoint("directory_synced");
@@ -224,6 +292,6 @@ impl Journal {
         }
         self.next_compaction = self.bytes.saturating_add(THRESHOLD);
         // Destruction of the old index is also off the writer's request path.
-        let _ = control.send(Continue::Retire(snapshot.index));
+        let _ = control.send(Continue::Retire(*snapshot.index));
     }
 }

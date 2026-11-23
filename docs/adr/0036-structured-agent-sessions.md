@@ -2158,7 +2158,7 @@ trying again. Unexpired claims remain retained in either case.
 Expired entries occupy their counts until successful compaction: resume-only
 lookup refuses them as uncertain, and reuse as a new claim refuses busy. No
 unexpired entry is evicted. There are at most two records per retained key and
-a hard active-file byte bound of twice the global entry cap times the record byte cap.
+a hard ordinary-command byte bound of twice the global entry cap times the record byte cap, plus the separate Q9 grant-accounting reserve described below.
 Unknown/invalid complete records stay raw in place, are skipped and logged,
 and fence further writes while readable indexed results remain available.
 Opaque journals are not compacted, preserving every raw row and the recovery
@@ -2168,6 +2168,45 @@ file-synced before the active tail is truncated and synced. The archive is
 bounded to 32 record byte caps; recovery refuses without truncation when full.
 A recovered pending claim remains uncertain and a completed claim returns
 its first acknowledgement through the live wire after fresh authorization.
+
+**Dormant Q9 grant retention (#1380, P3b).** Grant command rows and outcomes
+have the ordinary 24-hour replay window. Outside it, compaction emits version-3
+issuance checkpoints carrying the last consumption ordinal and bound claim
+digest. Checkpoints precede any retained row that needs them; adjacent expired
+history collapses into one checkpoint. Recovered totals never refund uses.
+Expired resume-only keys return uncertainty, never dispatch. Callers must not
+force an old uncertain effect with a new command ID.
+
+A checkpoint remains while its issuance is live or a retained retry row needs
+it. Revoked issuances leave after their last retry row expires. Expiry permits
+collection only when both destination deadlines have passed in the same paired
+clock domain; missing or incomparable evidence conservatively retains history.
+A retirement snapshot never discards a subsequently issued ID. Grant rows have
+a separate 4096-entry budget, issuance totals a separate 4096-entry budget, and
+reserved log bytes covering grant rows and checkpoint publication. Neither
+occupies the local operator's principal/global capacity. Capacity refusal affects
+grant admission rather than permanently locking out local recovery commands.
+
+Counted issuances additionally carry integrity evidence in A1's existing private
+`gateway-grants/grants.json`, outside `wire/`. New counted issuances start with
+zero evidence. Under the generation lease, admission persists a pending claim
+reservation, syncs the J1 claim, then persists its committed ordinal/digest before
+returning Claimed. The committed watermark never runs ahead of J1. A known
+synced rollback clears the reservation; uncertain rollback does not. Recovery
+can finalize a pending reservation only from its exact synced claim. Missing,
+behind, mismatched, invalid or legacy absent evidence refuses that counted
+issuance with AccountingLost; it does not fence local or standing commands.
+Unknown evidence stays raw and cannot silently become zero. Evidence shares
+A1's one-MiB file bound and is removed only with explicit issuer revocation.
+To recover lost accounting, the local operator inspects effects, revokes the
+affected grant and adds it again with the intended policy and a new issuance.
+Never erase A1 evidence or copy an old issuance ID to restore uses.
+
+First initialization syncs the log before creating the lease file and reopens
+it after acquiring the lease. Interrupted initialization can therefore resume;
+A1's counted fence also survives replacement of the entire wire directory.
+P3c supplies durable clock evidence through the existing leased environment
+seam. Remote lifecycle remains refused and mesh VERSION remains 5.
 
 Automatic resend is allowed for the listed §5 verbs only through this durable
 idempotency path, not based on an assumed harmless verb. Permission/question
