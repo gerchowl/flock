@@ -112,7 +112,7 @@ impl Record {
 }
 pub(super) fn digest(command: &Command) -> Result<[u8; 32], ErrorCode> {
     Ok(Sha256::digest(
-        serde_json::to_vec(&(&command.verb, &command.args))
+        crate::mesh::command::canonical_json(&serde_json::json!([command.verb, command.args]))
             .map_err(|_| ErrorCode::SerializationError)?,
     )
     .into())

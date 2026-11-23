@@ -26,9 +26,11 @@ pub(in crate::web::wire) struct Consumption {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clock: Option<ClockPair>,
 }
+type EnvironmentReader = dyn FnMut() -> Result<(Option<ClockPair>, Option<String>), Refusal> + Send;
+
 /// Authenticated preflight facts, never constructed from unverified mesh JSON.
-/// `environment` runs under the generation lease immediately before evaluation.
-/// M2 adds authenticated budget/enrollment checks before this final clock read.
+/// `environment` rechecks destination enrollment, membership, policy and budget
+/// under the generation lease at preflight and immediately before the claim.
 pub(in crate::web::wire) struct Claim {
     pub store: std::sync::Arc<Store>,
     pub generation: u64,
@@ -41,10 +43,10 @@ pub(in crate::web::wire) struct Claim {
     pub target: String,
     pub command: Command,
     pub now: u64,
-    pub environment: Box<dyn FnOnce() -> (Option<ClockPair>, Option<String>) + Send>,
+    pub environment: Box<EnvironmentReader>,
 }
 impl Journal {
-    pub(super) fn grant(&mut self, c: Claim) -> Result<Admission, ErrorCode> {
+    pub(super) fn grant(&mut self, mut c: Claim) -> Result<Admission, ErrorCode> {
         if self.blocked {
             return Err(ErrorCode::SessionBusy);
         }
@@ -76,7 +78,8 @@ impl Journal {
             }
             let selected = existing
                 .and_then(|r| r.consumption.as_ref())
-                .map_or(c.issuance.as_str(), |u| u.issuance.as_str());
+                .map(|u| u.issuance.as_str())
+                .or_else(|| (!c.issuance.is_empty()).then_some(c.issuance.as_str()));
             let request = gateway::Request {
                 home: &c.home,
                 principal: &c.principal,
@@ -84,20 +87,82 @@ impl Journal {
                 verb: &c.command.verb,
                 target: gateway::lifecycle::target(&c.command.verb, &c.target),
             };
-            let (clock, workspace) = (c.environment)();
-            let timed = listing
-                .entries
-                .values()
-                .flatten()
-                .filter_map(|g| g.lifecycle.as_ref())
-                .any(|p| {
-                    p.lifetime_ms.is_some() && p.issuance.as_ref().is_some_and(|i| i.id == selected)
-                });
-            if timed && !fence.clock_check(listing, selected, clock.as_ref())? {
+            let (clock, workspace) = match (c.environment)() {
+                Ok(environment) => environment,
+                Err(reason) => return Ok(Admission::Refused(reason)),
+            };
+            let mut candidates = listing.clone();
+            let mut clock_refused = false;
+            let (issuance, timed) = loop {
+                let preflight = gateway::lifecycle::evaluate_listing(
+                    &Evaluation {
+                        request: &request,
+                        source: c.source,
+                        destination: &c.destination,
+                        clock: clock.clone(),
+                        consumed: &consumed,
+                    },
+                    c.generation,
+                    &candidates,
+                    selected,
+                    |_| workspace.clone(),
+                );
+                let selected = match &preflight {
+                    Decision::Allowed { issuance_id, .. } => Some(issuance_id.as_str()),
+                    Decision::Refused(_) => selected,
+                };
+                let timed = listing
+                    .entries
+                    .values()
+                    .flatten()
+                    .filter_map(|g| g.lifecycle.as_ref())
+                    .any(|p| {
+                        p.lifetime_ms.is_some()
+                            && p.issuance
+                                .as_ref()
+                                .is_some_and(|i| Some(i.id.as_str()) == selected)
+                    });
+                if timed
+                    && !fence.clock_check(
+                        listing,
+                        selected.ok_or(ErrorCode::SessionUnconfirmed)?,
+                        clock.as_ref(),
+                    )?
+                {
+                    if selected.is_some() && (existing.is_some() || !c.issuance.is_empty()) {
+                        return Ok(Admission::Refused(Refusal::Expired));
+                    }
+                    candidates.entries.retain(|_, grant| {
+                        grant
+                            .as_ref()
+                            .and_then(|g| g.lifecycle.as_ref())
+                            .and_then(|p| p.issuance.as_ref())
+                            .is_none_or(|i| Some(i.id.as_str()) != selected)
+                    });
+                    clock_refused = true;
+                    continue;
+                }
+                let issuance = match preflight {
+                    Decision::Refused(reason) => {
+                        return Ok(Admission::Refused(if clock_refused {
+                            Refusal::Expired
+                        } else {
+                            reason
+                        }))
+                    }
+                    Decision::Allowed { issuance_id, .. } => issuance_id,
+                };
+                break (issuance, timed);
+            };
+            let (clock, workspace) = match (c.environment)() {
+                Ok(environment) => environment,
+                Err(reason) => return Ok(Admission::Refused(reason)),
+            };
+            if timed && !fence.clock_check(listing, &issuance, clock.as_ref())? {
                 return Ok(Admission::Refused(Refusal::Expired));
             }
             let evidence = timed.then(|| clock.clone()).flatten();
-            let decision = gateway::lifecycle::evaluate_listing(
+            if let Decision::Refused(reason) = gateway::lifecycle::evaluate_listing(
                 &Evaluation {
                     request: &request,
                     source: c.source,
@@ -107,13 +172,11 @@ impl Journal {
                 },
                 c.generation,
                 listing,
-                Some(selected),
+                Some(&issuance),
                 |_| workspace,
-            );
-            let issuance = match decision {
-                Decision::Refused(reason) => return Ok(Admission::Refused(reason)),
-                Decision::Allowed { issuance_id, .. } => issuance_id,
-            };
+            ) {
+                return Ok(Admission::Refused(reason));
+            }
             let counted = listing.entries.values().flatten().any(|g| {
                 g.lifecycle.as_ref().is_some_and(|p| {
                     p.max_uses.is_some() && p.issuance.as_ref().is_some_and(|i| i.id == issuance)

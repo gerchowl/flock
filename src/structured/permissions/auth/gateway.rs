@@ -384,6 +384,48 @@ pub(crate) fn claim_fixture() -> (
 }
 
 #[cfg(test)]
+pub(crate) fn attested_fixture(
+    agent: bool,
+    max_uses: Option<u64>,
+    timed: bool,
+) -> (crate::structured::launch::SessionConfigDir, Store, u64) {
+    let (root, store, mut app) = tests::fixture();
+    let mut grant = tests::grant(&["*"]);
+    grant.home_node_id = crate::mesh::identity::NodeIdentity::fixture([7; 32]).node_id();
+    grant.principals = [if agent {
+        "agent_atlas_subject"
+    } else {
+        "client-1"
+    }
+    .into()]
+    .into();
+    grant.lifecycle = Some(Box::new(Lifecycle {
+        subject: if agent { Subject::Agent } else { Subject::User },
+        destination_node_id: "b".repeat(64),
+        max_uses,
+        lifetime_ms: timed.then_some(10000),
+        issuance: None,
+    }));
+    let listing = store
+        .manage_issued(
+            &app.client_token_authority().unwrap(),
+            Some(Change::Add(grant)),
+            || {
+                Ok((
+                    "b".repeat(64),
+                    timed.then_some(ClockPair {
+                        domain: "fixture-boot".into(),
+                        wall_ms: 10000,
+                        elapsed_ms: 20000,
+                    }),
+                ))
+            },
+        )
+        .unwrap();
+    (root, store, listing.generation)
+}
+
+#[cfg(test)]
 pub(crate) fn claim_fixture_limit(
     max_uses: Option<u64>,
 ) -> (
@@ -532,5 +574,30 @@ pub(crate) fn claim_acknowledge(store: &Store, clock: ClockPair) {
             &tests::operator().client_token_authority().unwrap(),
             Some(clock),
         )
+        .unwrap();
+}
+
+#[cfg(test)]
+pub(crate) fn attest_sibling(store: &Store, name: &str, home: &str) {
+    let (_lease, mut value) = store.snapshot().unwrap();
+    value["entries"][name]["home_node_id"] = json!(home);
+    // Keep the timed issuance first so the untimed fallback is exercised every run.
+    value["entries"][name]["lifecycle"]["issuance"]["id"] = json!("f".repeat(32));
+    store.persist(&value).unwrap();
+}
+
+#[cfg(test)]
+pub(crate) fn reserve_ahead_fixture(store: &Store, id: &str) {
+    store
+        .with_accounting(|_, fence| {
+            fence.prepare(
+                id,
+                accounting::Stamp::default(),
+                accounting::Stamp {
+                    total: 1,
+                    digest: [1; 32],
+                },
+            )
+        })
         .unwrap();
 }

@@ -597,7 +597,10 @@ historical contract until this amendment is accepted and implemented.
    revoked authentication never falls back to operator identity. Across nodes,
    reuse the enrolled home's signed M1 `Body` (`src/mesh/command.rs`), verified
    by `Frame::verify` and `src/mesh/sign.rs`; it binds home, principal, scopes,
-   destination, target, verb and argument digest. A1 accepts principal strings,
+   destination, target, verb and argument digest. The argument digest is SHA-256
+   over `flock-m1-args-v1\0` followed by canonical JSON of the arguments alone
+   (sorted object keys, no whitespace, JSON value types preserved), using the
+   same canonical encoder as J1's `(verb, args)` digest. A1 accepts principal strings,
    not identity proofs. P1 extends M1's `TokenSource` with Agent and adds dormant
    admission adapters for app sessions and scoped MCP identities. Before agent
    forwarding, M3 must invoke these adapters inside authenticated admission and
@@ -771,8 +774,10 @@ historical contract until this amendment is accepted and implemented.
    evaluate current grant, scope and verb policy, including single-use selection
    → durable J1 write with atomic consumption → dispatch through existing verb
    handlers → admission/result receipt. Evaluation/consumption and J1 write are
-   one admission transaction under paragraph 4's fence, not two durable commits;
-   recheck budget and destination expiry immediately before consume/claim.
+   one admission transaction under paragraph 4's fence: A1 reserves the use, J1
+   syncs the authoritative claim, then A1 commits its integrity mark; uncertain
+   durability fences recovery rather than refunding the use. Recheck budget and
+   destination expiry immediately before consume/claim.
    Keep M1's monotonic residence and ADR-0026 next-hop version gates; no offline
    mail custody. M2 acceptance must
    exercise user and agent admission, file-token refusal, once/count/expiry,
