@@ -9,6 +9,7 @@ pub(crate) mod tailscale;
 mod url;
 pub use url::{open_url, validate_url, OpenUrlError};
 
+pub(crate) mod boot_identity;
 pub(crate) mod peer;
 pub(crate) mod process_exit;
 pub(crate) mod profile_bindings;
