@@ -645,3 +645,111 @@ async fn granted_fresh_start_launches_owned_fixture_in_bound_workspace() {
         Some(&Some(expected))
     );
 }
+
+// VERSION 6 negotiation overrides exist only in debug builds.
+#[cfg(debug_assertions)]
+#[tokio::test]
+async fn verified_grant_start_stop_and_resume_real_harness() {
+    let _guard = crate::config::test_config_env_guard();
+    let mut fixture = AdmissionFixture::new("init-restricted", 120_000);
+    std::env::set_var("FLOCK_TEST_MESH_VERSION", "6");
+    std::env::set_var("FLOCK_TEST_MESH_MIN", "5");
+    fixture.app.node_id = Some("b".repeat(64));
+    fixture.app.state.config.fleet.agent_spawn_enabled = true;
+    let mut workspace = crate::workspace::Workspace::test_new("grant-destination");
+    workspace.id = "w1".into();
+    fixture.app.state.workspaces = vec![workspace];
+    fixture.app.state.active = Some(0);
+    let original = fs::read_to_string(fixture.fixture.root.path().join("claude")).unwrap();
+    let script = format!(
+        "{}\n{}",
+        original.lines().next().unwrap(),
+        r#"
+import json, pathlib, sys
+root = pathlib.Path(__file__).parent
+if sys.argv[1:] == ['--version']:
+    print('2.1.296 (Claude Code)', flush=True)
+    sys.exit(0)
+flag = '--resume' if '--resume' in sys.argv else '--session-id'
+init = json.loads((root / 'restricted-init.json').read_text())
+init['session_id'] = sys.argv[sys.argv.index(flag) + 1]
+print(json.dumps(init), flush=True)
+sys.stdin.read()
+"#
+    );
+    fixture.fixture.file("claude", script.as_bytes(), 0o700);
+    let started = crate::web::wire::dispatch_lifecycle_fixture(&mut fixture.app, "agent.start",
+        json!({"runtime":"structured", "name":"granted-fresh", "argv":["claude"], "workspace_id":"w1", "cwd":fixture.fixture.root.path().join("project")}), "w1").await;
+    assert_eq!(started["ok"], true, "{started}");
+    let id = started["result"]["agent"]["agent_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let session = started["result"]["agent"]["session_id"].clone();
+    let generation = fixture.app.state.structured_agents.get(&id).unwrap().2;
+    let notify = fixture.app.render_notify.clone();
+    crate::structured::workers::tests::wait(&notify, || {
+        fixture.app.service_structured_workers(Instant::now());
+        assert!(
+            fixture
+                .app
+                .structured_workers
+                .report(&id, generation)
+                .is_none(),
+            "fresh harness exited"
+        );
+        fixture
+            .app
+            .state
+            .structured_agents
+            .get(&id)
+            .unwrap()
+            .0
+            .harness_established
+    })
+    .await;
+    let stopped = crate::web::wire::dispatch_lifecycle_fixture(
+        &mut fixture.app,
+        "agent.stop",
+        json!({"target":id}),
+        &id,
+    )
+    .await;
+    assert_eq!(stopped["ok"], true, "{stopped}");
+    crate::structured::workers::tests::wait(&notify, || {
+        fixture.app.service_structured_workers(Instant::now());
+        fixture
+            .app
+            .structured_workers
+            .report(&id, generation)
+            .is_some()
+    })
+    .await;
+    let restarted = crate::web::wire::dispatch_lifecycle_fixture(
+        &mut fixture.app,
+        "agent.restart",
+        json!({"target":id, "reason":"granted resume", "when":"after_turn"}),
+        &id,
+    )
+    .await;
+    assert_eq!(restarted["ok"], true, "{restarted}");
+    assert_eq!(restarted["result"]["agent"]["session_id"], session);
+    let generation = fixture.app.state.structured_agents.get(&id).unwrap().2;
+    crate::structured::workers::tests::wait(&notify, || {
+        fixture.app.service_structured_workers(Instant::now());
+        assert!(
+            fixture
+                .app
+                .structured_workers
+                .report(&id, generation)
+                .is_none(),
+            "resumed harness exited"
+        );
+        fixture
+            .app
+            .structured_workers
+            .runtime(&id, generation)
+            .is_some()
+    })
+    .await;
+}

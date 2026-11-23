@@ -1178,6 +1178,14 @@ impl<D: DiskSpace> Store<D> {
             .map_err(Into::into)
     }
 
+    /// Lifecycle authority requires an explicit outbound enrollment, never TOFU.
+    pub(crate) fn explicitly_enrolled(&self, node_id: &str) -> Result<bool> {
+        Ok(self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM identity_pins WHERE node_id=?1 AND source='configured' AND origin='dialed')",
+            [node_id], |row| row.get(0),
+        )?)
+    }
+
     /// Prefer the operator's configured alias over the authenticated inbound name.
     pub fn origin_name(&self, node_id: &str) -> Result<Option<String>> {
         Ok(self.connection.query_row(

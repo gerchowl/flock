@@ -2,6 +2,8 @@
 use super::{journal, Ownership};
 use crate::{api::error_code::ErrorCode, structured_wire::AgentLifecycleCommand};
 
+mod transaction;
+
 /// A single dispatch capability, never a credential or management authority.
 /// Only this module constructs it, after a newly committed J1 claim.
 pub(crate) struct GrantAdmission {
@@ -42,13 +44,13 @@ impl GrantAdmission {
         let captured = workspace.clone();
         let start_workspace =
             matches!(command, AgentLifecycleCommand::Start(_)).then(|| claim.target.clone());
-        let environment = claim.environment;
+        let mut environment = claim.environment;
         claim.environment = Box::new(move || {
-            let (clock, member) = environment();
+            let (clock, member) = environment()?;
             let member =
                 member.filter(|w| start_workspace.as_ref().is_none_or(|target| target == w));
             *captured.lock() = member.clone();
-            (clock, member)
+            Ok((clock, member))
         });
         let result = owner
             .submit(phase, journal::Operation::Grant(Box::new(claim)))?
@@ -128,3 +130,6 @@ impl GrantAdmission {
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+#[cfg(all(test, debug_assertions))]
+pub(crate) use transaction::tests::dispatch_fixture;

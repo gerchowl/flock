@@ -872,3 +872,6 @@ async fn mutate_apps(
 
 #[cfg(test)]
 pub(crate) use commands::admission::tests::issue as claim_lifecycle_fixture;
+
+#[cfg(all(test, debug_assertions))]
+pub(crate) use commands::admission::dispatch_fixture as dispatch_lifecycle_fixture;

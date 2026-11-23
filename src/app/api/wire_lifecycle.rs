@@ -5,6 +5,51 @@ use crate::{api::error_code::ErrorCode, structured_wire::AgentLifecycleCommand};
 use serde_json::Value;
 
 impl App {
+    /// Resolve only stable local membership and apply the handler's spawn policy.
+    /// The destination transaction retains exclusive App ownership after this cut.
+    pub(crate) fn gateway_lifecycle_member(
+        &mut self,
+        body: &crate::mesh::command::Body,
+    ) -> Result<String, crate::structured::permissions::auth::gateway::lifecycle::Refusal> {
+        use crate::{
+            mesh::command::Target, structured::permissions::auth::gateway::lifecycle::Refusal,
+        };
+        let workspace = match &body.target {
+            Target::Workspace(id) if body.verb == "agent.start" => {
+                self.granted_destination(id, None)
+                    .map_err(|_| Refusal::Target)?;
+                id.clone()
+            }
+            Target::Agent(id) if body.verb != "agent.start" => {
+                if self.state.structured_agents.get(id).is_none() {
+                    return Err(Refusal::Target);
+                }
+                self.state
+                    .workspaces
+                    .iter()
+                    .find(|w| self.granted_destination(&w.id, Some(id)).is_ok())
+                    .map(|w| w.id.clone())
+                    .ok_or(Refusal::Target)?
+            }
+            _ => return Err(Refusal::Target),
+        };
+        if matches!(body.verb.as_str(), "agent.start" | "agent.restart") {
+            let caller = super::spawn::SpawnCaller::Structured {
+                agent_id: Some(
+                    crate::structured::permissions::auth::lifecycle::RemoteSubject {
+                        home: body.home_node_id.clone(),
+                        principal: body.principal.clone(),
+                    }
+                    .parent_key(),
+                ),
+                depth: 0,
+            };
+            self.admit_spawn(crate::spawn::SpawnVerb::Fork, &caller, None)
+                .map_err(|_| Refusal::Verb)?;
+        }
+        Ok(workspace)
+    }
+
     /// Enter with a fenced local session or a newly committed grant capability.
     pub(crate) fn wire_agent_lifecycle(
         &mut self,
