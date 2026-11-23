@@ -1,15 +1,26 @@
-//! Authenticated app-session lifecycle authority (ADR-0036 §1a).
+//! Shared local-session and claim-bound lifecycle dispatch (ADR-0043 Q9).
 use super::App;
+use crate::structured::permissions::auth::lifecycle::{restart_start, Authority};
 use crate::{api::error_code::ErrorCode, structured_wire::AgentLifecycleCommand};
 use serde_json::Value;
 
 impl App {
-    /// Called by the wire owner inside the live token's Operate admission fence.
+    /// Enter with a fenced local session or a newly committed grant capability.
     pub(crate) fn wire_agent_lifecycle(
         &mut self,
         command: AgentLifecycleCommand,
-        session: &crate::structured::permissions::auth::tokens::server::Session,
+        authority: Authority<'_>,
     ) -> Result<Value, ErrorCode> {
+        if let Authority::Grant(grant) = &authority {
+            grant.check(self.node_id.as_deref(), &command)?;
+        }
+        let remote = authority.remote_subject();
+        let caller = remote
+            .as_ref()
+            .map(|subject| super::spawn::SpawnCaller::Structured {
+                agent_id: Some(subject.clone()),
+                depth: 0,
+            });
         // Socket attribution must never leak from a previously serviced request.
         let previous = super::super::ApiCaller {
             scope: self.current_api_scope.take(),
@@ -17,11 +28,7 @@ impl App {
             birth: self.current_api_peer_birth.take(),
             uid: self.current_api_peer_uid.take(),
         };
-        let app_operator = session.app().is_some()
-            && session
-                .info
-                .scopes
-                .contains(&crate::api::client_tokens::Scope::Operate);
+        let app_operator = authority.app_operator();
         let result = (|| {
             let response = match command {
                 AgentLifecycleCommand::Start(params) => {
@@ -30,24 +37,44 @@ impl App {
                     {
                         return Err(ErrorCode::OperatorOnly);
                     }
-                    self.handle_agent_start(String::new(), params)
+                    if let Some(caller) = &caller {
+                        if params.runtime != crate::api::schema::AgentRuntime::Structured {
+                            return Err(ErrorCode::RuntimeUnsupported);
+                        }
+                        let result = self.start_structured_request_authenticated(
+                            params,
+                            caller,
+                            crate::spawn::SpawnVerb::Fork,
+                            None,
+                            Some(&authority),
+                        )?;
+                        super::responses::encode_success(String::new(), result)
+                    } else {
+                        self.handle_agent_start(String::new(), params)
+                    }
                 }
                 AgentLifecycleCommand::Stop(target) => {
                     if self.structured_target(&target.target)?.is_some() {
-                        if !app_operator {
+                        if !app_operator && remote.is_none() {
                             return Err(ErrorCode::OperatorOnly);
                         }
-                        self.handle_structured_stop_as(
+                        self.handle_structured_stop_authorized(
                             String::new(),
                             target,
-                            super::spawn::SpawnCaller::Operator { pane: None },
+                            caller.unwrap_or(super::spawn::SpawnCaller::Operator { pane: None }),
+                            Some(&authority),
                         )
                     } else {
+                        if remote.is_some() {
+                            return Err(ErrorCode::AgentNotFound);
+                        }
                         self.handle_structured_stop(String::new(), target)
                     }
                 }
                 AgentLifecycleCommand::Restart(params) => {
-                    if app_operator && self.structured_target(&params.target)?.is_some() {
+                    if (app_operator || remote.is_some())
+                        && self.structured_target(&params.target)?.is_some()
+                    {
                         if params.when != "after_turn"
                             || params.reason.trim().is_empty()
                             || params.reason.len() > 1024
@@ -58,19 +85,19 @@ impl App {
                         if params.continue_with.is_some() {
                             return Err(ErrorCode::RuntimeUnsupported);
                         }
-                        let start = serde_json::from_value(serde_json::json!({
-                            "runtime":"structured", "name":params.target, "argv":["claude"],
-                        }))
-                        .map_err(|_| ErrorCode::SerializationError)?;
+                        let start = restart_start(&params.target)?;
                         let result = self.start_structured_request_authenticated(
                             start,
-                            &super::spawn::SpawnCaller::Operator { pane: None },
+                            &caller.unwrap_or(super::spawn::SpawnCaller::Operator { pane: None }),
                             crate::spawn::SpawnVerb::Fork,
                             None,
-                            Some(session),
+                            Some(&authority),
                         )?;
                         super::responses::encode_success(String::new(), result)
                     } else {
+                        if remote.is_some() {
+                            return Err(ErrorCode::AgentNotFound);
+                        }
                         self.handle_agent_restart(String::new(), params)
                     }
                 }
@@ -95,3 +122,6 @@ impl App {
         result
     }
 }
+
+#[cfg(test)]
+mod tests;
