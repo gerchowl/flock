@@ -362,3 +362,32 @@ fn newer_role_restriction_cannot_be_ignored() {
     raw["entries"]["tablet"]["lifecycle"]["subject"]["role"]["future_restriction"] = json!(true);
     assert_eq!(Store::listing(&raw).entries["tablet"], None);
 }
+
+#[test]
+fn retirement_requires_proven_expiry_in_the_issued_clock_domain() {
+    let (_root, store, mut app) = fixture();
+    let mut g = grant(&["*"]);
+    let mut p = policy();
+    p.lifetime_ms = Some(5000);
+    g.lifecycle = Some(Box::new(p));
+    let listing = store
+        .manage_issued(
+            &app.client_token_authority().unwrap(),
+            Some(Change::Add(g)),
+            || Ok(("b".repeat(64), Some(pair(10000, 20000)))),
+        )
+        .unwrap();
+    let p = listing.entries["tablet"]
+        .as_ref()
+        .unwrap()
+        .lifecycle
+        .as_ref()
+        .unwrap();
+    for clock in [None, Some(pair(14999, 25000)), Some(pair(15000, 24999))] {
+        assert!(!lifecycle::expired(p, clock.as_ref()));
+    }
+    assert!(lifecycle::expired(p, Some(&pair(15000, 25000))));
+    let mut other = pair(20000, 30000);
+    other.domain = "other-fixture-domain".into();
+    assert!(!lifecycle::expired(p, Some(&other)));
+}

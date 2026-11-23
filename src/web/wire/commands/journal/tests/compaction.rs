@@ -11,13 +11,13 @@ fn receive(rx: &mpsc::Receiver<Message>) -> io::Result<compact::Snapshot> {
         _ => panic!("unexpected journal job"),
     }
 }
-fn start(journal: &mut Journal, now: u64) -> mpsc::Receiver<Message> {
+pub(super) fn start(journal: &mut Journal, now: u64) -> mpsc::Receiver<Message> {
     let (tx, rx) = mpsc::sync_channel(QUEUED);
     journal.next_compaction = 1;
     journal.start_compaction(now, tx);
     rx
 }
-fn finish_compaction(journal: &mut Journal, rx: &mpsc::Receiver<Message>) {
+pub(super) fn finish_compaction(journal: &mut Journal, rx: &mpsc::Receiver<Message>) {
     while journal.compaction.is_some() {
         journal.compacted(receive(rx));
     }
