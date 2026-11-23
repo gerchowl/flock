@@ -155,3 +155,52 @@ fn websocket_token_cannot_become_local_operator() {
         ("fn elevate(token: auth::VerifiedToken<'static>) -> app::LocalOperator<'static> { token.into() }", Some("E0277")),
     ]);
 }
+
+/// Grant capabilities are neither freely constructible nor local credentials.
+#[test]
+fn lifecycle_grant_compile_fail() {
+    let source = include_str!("../src/web/wire/commands/admission.rs");
+    let structure = source.find("pub(crate) struct GrantAdmission {").unwrap();
+    let start = source[..structure].rfind("\n\n").unwrap() + 2;
+    let end = source[structure..].find("\n}").unwrap() + structure + 2;
+    let declaration = &source[start..end];
+    syn::parse_str::<syn::ItemStruct>(declaration).expect("actual grant declaration");
+    let issuer = source.find("async fn claim(").expect("claim issuer");
+    let issuer_start = source[..issuer].rfind('\n').unwrap() + 1;
+    let issuer_end = source[issuer_start..].find('{').unwrap() + issuer_start;
+    let issuer = &source[issuer_start..issuer_end];
+    let method = |source: &str, name: &str| {
+        let start = source
+            .find(&format!("pub(crate) fn {name}("))
+            .expect("actual management entry point");
+        let end = source[start..].find('{').unwrap() + start;
+        let signature = &source[start..end];
+        format!("{signature} {{ Err(()) }}")
+    };
+    let manage = method(
+        include_str!("../src/structured/permissions/auth/gateway.rs"),
+        "manage",
+    );
+    let acknowledge = method(
+        include_str!("../src/structured/permissions/auth/gateway/clocks.rs"),
+        "acknowledge_clock",
+    );
+    let context = format!("{} struct Ownership; type ErrorCode = (); \
+        mod journal {{ pub struct Admission; pub mod grants {{ pub struct Claim; }} }} \
+        mod admission {{ use crate::{{Ownership, ErrorCode, journal}}; type AgentLifecycleCommand = (); \
+        {declaration} impl GrantAdmission {{ {issuer} {{ Err(()) }} }} }} struct Session; \
+        mod gateway {{ use crate::app::LocalOperator; type E = (); type Change = (); type Listing = (); \
+        pub struct Store; impl Store {{ {manage} {acknowledge} }} }}", local_operator_context());
+    check_probes(&context, &[
+        ("let _: Option<admission::GrantAdmission> = None;", None),
+        ("let _ = admission::GrantAdmission::claim(&Ownership, 0, journal::grants::Claim);", Some("E0624")),
+        ("fn allowed(s: &gateway::Store, a: &app::LocalOperator<'_>) { let _ = s.manage(a, None); let _ = s.acknowledge_clock(a); }", None),
+        ("fn forbidden(s: &gateway::Store, g: &admission::GrantAdmission) { let _ = s.manage(g, None); }", Some("E0308")),
+        ("fn forbidden(s: &gateway::Store, g: &admission::GrantAdmission) { let _ = s.acknowledge_clock(g); }", Some("E0308")),
+        ("let _ = admission::GrantAdmission { home: String::new(), principal: String::new(), issuance: String::new(), ordinal: 1, destination: String::new(), target: String::new(), workspace: String::new(), payload_digest: [0;32], command: () };", Some("E0451")),
+        ("fn duplicate(g: admission::GrantAdmission) { let _ = g.clone(); }", Some("E0599")),
+        ("fn manage(_: &app::LocalOperator<'_>) {} fn forbidden(g: &admission::GrantAdmission) { manage(g); }", Some("E0308")),
+        ("fn session(g: admission::GrantAdmission) -> Session { g.into() }", Some("E0277")),
+        ("fn elevate(g: admission::GrantAdmission) -> app::LocalOperator<'static> { g.into() }", Some("E0277")),
+    ]);
+}

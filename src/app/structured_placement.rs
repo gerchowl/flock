@@ -50,6 +50,32 @@ impl App {
         }
         Ok(Some((wi, ws.active_tab)))
     }
+    /// A grant never falls back to the workspace the operator currently views.
+    pub(in crate::app) fn granted_destination(
+        &self,
+        workspace: &str,
+        existing: Option<&str>,
+    ) -> Result<(usize, usize), ErrorCode> {
+        if let Some(id) = existing {
+            return self
+                .native_location(id)?
+                .filter(|(wi, _, _)| self.state.workspaces[*wi].id == workspace)
+                .map(|(wi, ti, _)| (wi, ti))
+                .ok_or(ErrorCode::NotAuthorized);
+        }
+        let wi = self
+            .state
+            .workspaces
+            .iter()
+            .position(|w| w.id == workspace)
+            .ok_or(ErrorCode::NotAuthorized)?;
+        let ws = &self.state.workspaces[wi];
+        ws.tabs
+            .get(ws.active_tab)
+            .filter(|t| t.membership_valid())
+            .ok_or(ErrorCode::NotAuthorized)?;
+        Ok((wi, ws.active_tab))
+    }
     pub(in crate::app) fn place_structured_view(
         &mut self,
         target: Target,

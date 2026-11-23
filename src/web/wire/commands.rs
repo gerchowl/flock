@@ -1,6 +1,9 @@
 //! Bounded app-owner command admission (ADR-0036 §5/§5a, S7-min slice 5).
 use super::*;
 mod journal;
+// Dormant until M2a-2 verifies destination ingress.
+#[allow(dead_code)]
+pub(super) mod admission;
 mod ownership;
 use crate::structured::publication::causal::{Ack, Cause};
 use crate::{
@@ -148,7 +151,10 @@ fn dispatch(
         }))
         .map_err(|_| ErrorCode::InvalidParams)?;
         return app
-            .wire_agent_lifecycle(typed, session)
+            .wire_agent_lifecycle(
+                typed,
+                crate::structured::permissions::auth::lifecycle::Authority::Local(session),
+            )
             .map(Outcome::Decided);
     }
     match command.verb.as_str() {

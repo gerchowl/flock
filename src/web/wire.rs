@@ -1,5 +1,6 @@
 //! Server-owned, opt-in structured transport; no PTY or model dispatch.
 mod commands;
+pub(crate) use commands::admission::GrantAdmission;
 pub(crate) mod fleet;
 mod output;
 mod refusals;
@@ -868,3 +869,6 @@ async fn mutate_apps(
         .run(move || store.finish_mutation(fence, session.as_ref()))
         .await
 }
+
+#[cfg(test)]
+pub(crate) use commands::admission::tests::issue as claim_lifecycle_fixture;
