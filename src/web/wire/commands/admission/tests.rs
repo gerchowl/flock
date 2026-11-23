@@ -71,7 +71,7 @@ fn request(
             read_only: false,
         },
         now: 100,
-        environment: Box::new(move || (None, Some(workspace))),
+        environment: Box::new(move || Ok((None, Some(workspace.clone())))),
     }
 }
 #[test]

@@ -17,8 +17,12 @@ pub(crate) struct Evaluation<'a> {
     pub consumed: &'a BTreeMap<String, u64>,
 }
 /// Closed reasons for refusing a lifecycle preflight or fenced admission.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Refusal {
+    Provenance,
+    Binding,
+    Enrollment,
+    Budget,
     Revoked,
     Principal,
     Destination,
@@ -29,6 +33,7 @@ pub(crate) enum Refusal {
     Exhausted,
     NoGrant,
     AccountingLost,
+    SelectionLimit,
 }
 /// Preflight only: an allowed decision does not consume or authorize dispatch.
 #[derive(Debug, PartialEq)]

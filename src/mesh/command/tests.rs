@@ -47,6 +47,22 @@ fn frame() -> Frame {
     .unwrap()
 }
 
+pub(crate) fn admission_frame(body: Body) -> Frame {
+    let mut valid = body.clone();
+    valid.home_node_id = NodeIdentity::fixture([7; 32]).node_id();
+    valid.token_source = TokenSource::App;
+    let mut frame = Frame::originate(
+        valid.clone(),
+        &NodeIdentity::fixture([7; 32]),
+        6,
+        &Provenance::fixture(&valid),
+    )
+    .unwrap();
+    frame.envelope.body = serde_json::to_vec(&body).unwrap();
+    sign::seal(&mut frame.envelope, &NodeIdentity::fixture([7; 32]));
+    frame
+}
+
 #[test]
 fn signed_round_trip_preserves_home_after_multiple_hops() {
     let (_lock, _scrub) = six();
@@ -615,4 +631,46 @@ fn scoped_admission_binds_profile_ceiling_identity_and_revocation() {
         &registry
     )
     .is_err());
+}
+
+#[test]
+fn argument_identity_is_canonical_typed_and_domain_separated() {
+    let a: serde_json::Value =
+        serde_json::from_str(r#" { "z": [true, null], "a": {"b":1,"a":"x"} } "#).unwrap();
+    let b: serde_json::Value =
+        serde_json::from_str(r#"{"a":{"a":"x","b":1},"z":[true,null]}"#).unwrap();
+    assert_eq!(
+        canonical_json(&a).unwrap(),
+        br#"{"a":{"a":"x","b":1},"z":[true,null]}"#
+    );
+    assert_eq!(args_digest(&a).unwrap(), args_digest(&b).unwrap());
+    let mut bytes = b"flock-m1-args-v1\0".to_vec();
+    bytes.extend(canonical_json(&a).unwrap());
+    assert_eq!(
+        args_digest(&a).unwrap(),
+        <[u8; 32]>::from(Sha256::digest(bytes))
+    );
+    assert_ne!(
+        args_digest(&a).unwrap(),
+        <[u8; 32]>::from(Sha256::digest(canonical_json(&a).unwrap()))
+    );
+    for changed in [
+        serde_json::json!({"a":{"b":"1","a":"x"}, "z":[true,null]}),
+        serde_json::json!({"a":{"b":1.0,"a":"x"}, "z":[true,null]}),
+        serde_json::json!({"a":{"b":2,"a":"x"}, "z":[true,null]}),
+    ] {
+        assert_ne!(args_digest(&a).unwrap(), args_digest(&changed).unwrap());
+    }
+}
+#[test]
+fn file_provenance_allows_only_known_nonlifecycle_verbs() {
+    let (_lock, _scrub) = six();
+    for verb in ["agent.fork", "agent.reload", "agent.future"] {
+        let mut body = body();
+        body.token_source = TokenSource::File;
+        body.verb = verb.into();
+        body.scopes.insert(Scope::Operate);
+        body.requested_scope = Scope::Operate;
+        assert_eq!(admission_frame(body).verify(), Err("not_authorized"));
+    }
 }

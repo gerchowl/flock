@@ -13,12 +13,27 @@ use super::{
 };
 use crate::{api::client_tokens::Scope, platform::suspend_clock, terminal::AgentId};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{collections::BTreeSet, time::Duration};
 
 mod provenance;
 pub(crate) use provenance::Provenance;
 
 pub(crate) const BUDGET_MS: u64 = 30_000;
+
+/// Canonical JSON: sorted object keys, compact encoding, preserved JSON types.
+pub(crate) fn canonical_json(value: &serde_json::Value) -> Result<Vec<u8>, serde_json::Error> {
+    let mut value = value.clone();
+    value.sort_all_objects();
+    serde_json::to_vec(&value)
+}
+/// M1 signs this domain-separated argument identity; the verb is signed separately.
+pub(crate) fn args_digest(value: &serde_json::Value) -> Result<[u8; 32], serde_json::Error> {
+    let mut hash = Sha256::new();
+    hash.update(b"flock-m1-args-v1\0");
+    hash.update(canonical_json(value)?);
+    Ok(hash.finalize().into())
+}
 
 /// Authenticated principal class: App is a process-bound user, Agent a live lease.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -106,10 +121,8 @@ impl Body {
             return Err("invalid_envelope");
         }
         if self.token_source == TokenSource::File
-            && matches!(
-                self.verb.as_str(),
-                "agent.start" | "agent.stop" | "agent.restart" | "agent.resume"
-            )
+            && !crate::structured::permissions::auth::gateway::required_scope(&self.verb)
+                .is_some_and(|scope| matches!(scope, Scope::Read | Scope::Send | Scope::Answer))
         {
             return Err("not_authorized");
         }
@@ -259,16 +272,10 @@ impl Hop {
         }
     }
 
-    /// Recheck at every dequeue/reroute, even after a peer renegotiates lower.
-    /// The caller reads `suspend_clock::now` at ingress and every forward.
-    /// A failed clock or backward reading permanently loses residence evidence.
-    fn forward(
-        &mut self,
-        next_version: u32,
-        clock: &impl suspend_clock::Read,
-    ) -> Result<Frame, &'static str> {
+    /// Charge destination queue residence again under the grant lease.
+    pub(crate) fn recheck(&mut self, now: Option<Duration>) -> Result<(), &'static str> {
         let since = self.since.take().ok_or("message_expired")?;
-        let now = suspend_clock::now(clock).map_err(|_| "message_expired")?;
+        let now = now.ok_or("message_expired")?;
         let residence = now.checked_sub(since).ok_or("message_expired")?;
         let ms = residence
             .as_nanos()
@@ -277,6 +284,18 @@ impl Hop {
         self.frame.elapsed_ms = self.frame.elapsed_ms.saturating_add(ms);
         self.since = Some(now);
         self.frame.verify()?;
+        Ok(())
+    }
+
+    /// Recheck at every dequeue/reroute, even after a peer renegotiates lower.
+    /// The caller reads `suspend_clock::now` at ingress and every forward.
+    /// A failed clock or backward reading permanently loses residence evidence.
+    fn forward(
+        &mut self,
+        next_version: u32,
+        clock: &impl suspend_clock::Read,
+    ) -> Result<Frame, &'static str> {
+        self.recheck(suspend_clock::now(clock).ok())?;
         if let Err(code) = enabled(next_version) {
             self.since = None;
             return Err(code);

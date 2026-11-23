@@ -112,7 +112,7 @@ impl Record {
 }
 pub(super) fn digest(command: &Command) -> Result<[u8; 32], ErrorCode> {
     Ok(Sha256::digest(
-        serde_json::to_vec(&(&command.verb, &command.args))
+        crate::mesh::command::canonical_json(&serde_json::json!([command.verb, command.args]))
             .map_err(|_| ErrorCode::SerializationError)?,
     )
     .into())
@@ -361,6 +361,10 @@ struct Journal {
     replay_step: Option<tests::ReplayStep>,
 }
 impl Journal {
+    #[cfg(test)]
+    fn selection_stalled(&self) -> bool {
+        self.fault == Some(Fault::SelectionStalled)
+    }
     #[cfg(test)]
     fn open(data: &Path) -> io::Result<Self> {
         let mut journal = Self::lease(data)?;
@@ -840,6 +844,7 @@ impl Index {
 #[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Fault {
+    SelectionStalled,
     Partial,
     Sync,
     Rollback,

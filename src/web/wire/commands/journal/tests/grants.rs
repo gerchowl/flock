@@ -45,7 +45,7 @@ pub(super) fn request_from(store: Arc<Store>, generation: u64, issuance: &str, i
             read_only: false,
         },
         now: 100,
-        environment: Box::new(|| (None, Some("w1".into()))),
+        environment: Box::new(|| Ok((None, Some("w1".into())))),
     }
 }
 pub(super) fn claimed(result: Result<Admission, ErrorCode>) -> Consumption {
@@ -570,14 +570,14 @@ fn clock_request(
 ) -> Claim {
     let mut c = request(root, generation, issuance, id);
     c.environment = Box::new(move || {
-        (
+        Ok((
             Some(crate::api::gateway_grants::ClockPair {
                 domain: "fixture-boot".into(),
                 wall_ms: wall,
                 elapsed_ms: elapsed,
             }),
             Some("w1".into()),
-        )
+        ))
     });
     c
 }
@@ -793,14 +793,14 @@ fn lost_boot_evidence_stays_refused_after_acknowledgement() {
     let mut j = Journal::open(root.path()).unwrap();
     let mut c = clock_request(root.path(), generation, &issuance, "boot", 11000, 21000);
     c.environment = Box::new(|| {
-        (
+        Ok((
             Some(crate::api::gateway_grants::ClockPair {
                 domain: "other-fixture-boot".into(),
                 wall_ms: 11000,
                 elapsed_ms: 1000,
             }),
             Some("w1".into()),
-        )
+        ))
     });
     refused(j.grant(c), Refusal::Expired);
     drop(j);
@@ -924,4 +924,41 @@ fn admission_pair_survives_outcome_and_compacted_checkpoint() {
         serde_json::from_slice(raw.split(|b| *b == b'\n').next().unwrap()).unwrap();
     assert_eq!(record.version, 3);
     assert_eq!(record.consumption.unwrap(), consumption);
+}
+
+#[test]
+fn pending_accounting_ahead_of_journal_refuses_without_use() {
+    let (root, store, generation, issuance) = gateway::claim_fixture();
+    let mut journal = Journal::open(root.path()).unwrap();
+    gateway::reserve_ahead_fixture(&store, &issuance);
+    refused(
+        journal.grant(request(root.path(), generation, &issuance, "pending-ahead")),
+        Refusal::AccountingLost,
+    );
+    assert!(journal.index.records.is_empty());
+    assert!(journal.index.consumed.is_empty());
+}
+
+#[test]
+fn fix1_stalled_selection_has_a_structural_bound_and_spends_nothing() {
+    let (root, _store, generation, issuance) = gateway::claim_fixture();
+    let data = root.path().to_owned();
+    let c = request(root.path(), generation, &issuance, "stalled");
+    let (send, receive) = mpsc::channel();
+    drop(std::thread::spawn(move || {
+        let mut journal = Journal::open(&data).unwrap();
+        journal.fault = Some(Fault::SelectionStalled);
+        let result = journal.grant(c);
+        send.send((
+            result,
+            journal.index.records.len(),
+            journal.index.consumed.len(),
+        ))
+        .unwrap();
+    }));
+    let (result, records, consumed) = receive
+        .recv_timeout(Duration::from_secs(5))
+        .expect("selection producer died or failed to return within its structural bound");
+    refused(result, Refusal::SelectionLimit);
+    assert_eq!((records, consumed), (0, 0));
 }

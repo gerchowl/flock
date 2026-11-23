@@ -408,3 +408,18 @@ fn agent_cannot_obtain_clock_acknowledgement_authority() {
         Err(error) => assert_eq!(error, E::OperatorOnly),
     };
 }
+
+#[test]
+fn elapsed_before_issuance_refuses_without_the_clock_latch() {
+    let mut p = policy();
+    p.lifetime_ms = Some(10000);
+    p.issuance = Some(crate::api::gateway_grants::Issuance {
+        id: "fixture-issuance".into(),
+        issuer: "fixture-issuer".into(),
+        issued: Some(pair(10000, 20000)),
+        expires_at_ms: Some(20000),
+        elapsed_deadline_ms: Some(30000),
+    });
+    assert!(!super::lifecycle::unexpired(&p, Some(&pair(11000, 19999))));
+    assert!(super::lifecycle::unexpired(&p, Some(&pair(11000, 21000))));
+}
