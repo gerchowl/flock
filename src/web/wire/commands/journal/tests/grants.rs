@@ -938,3 +938,27 @@ fn pending_accounting_ahead_of_journal_refuses_without_use() {
     assert!(journal.index.records.is_empty());
     assert!(journal.index.consumed.is_empty());
 }
+
+#[test]
+fn fix1_stalled_selection_has_a_structural_bound_and_spends_nothing() {
+    let (root, _store, generation, issuance) = gateway::claim_fixture();
+    let data = root.path().to_owned();
+    let c = request(root.path(), generation, &issuance, "stalled");
+    let (send, receive) = mpsc::channel();
+    drop(std::thread::spawn(move || {
+        let mut journal = Journal::open(&data).unwrap();
+        journal.fault = Some(Fault::SelectionStalled);
+        let result = journal.grant(c);
+        send.send((
+            result,
+            journal.index.records.len(),
+            journal.index.consumed.len(),
+        ))
+        .unwrap();
+    }));
+    let (result, records, consumed) = receive
+        .recv_timeout(Duration::from_secs(5))
+        .expect("selection producer died or failed to return within its structural bound");
+    refused(result, Refusal::SelectionLimit);
+    assert_eq!((records, consumed), (0, 0));
+}

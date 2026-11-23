@@ -362,6 +362,10 @@ struct Journal {
 }
 impl Journal {
     #[cfg(test)]
+    fn selection_stalled(&self) -> bool {
+        self.fault == Some(Fault::SelectionStalled)
+    }
+    #[cfg(test)]
     fn open(data: &Path) -> io::Result<Self> {
         let mut journal = Self::lease(data)?;
         tests::replay_barrier(data)?;
@@ -840,6 +844,7 @@ impl Index {
 #[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Fault {
+    SelectionStalled,
     Partial,
     Sync,
     Rollback,

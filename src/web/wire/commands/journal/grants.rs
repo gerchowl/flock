@@ -93,7 +93,16 @@ impl Journal {
             };
             let mut candidates = listing.clone();
             let mut clock_refused = false;
+            // Each retry removes an entry, followed by one final no-match evaluation.
+            let mut budget = 0..=candidates.entries.len();
             let (issuance, timed) = loop {
+                if budget.next().is_none() {
+                    return Ok(Admission::Refused(Refusal::SelectionLimit));
+                }
+                #[cfg(test)]
+                if self.selection_stalled() {
+                    continue;
+                }
                 let preflight = gateway::lifecycle::evaluate_listing(
                     &Evaluation {
                         request: &request,

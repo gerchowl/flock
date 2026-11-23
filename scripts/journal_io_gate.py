@@ -610,6 +610,8 @@ CALL_EXCEPTIONS = {
         ('journal/tests/grants.rs', ('fn crash_at_claim_dispatch_and_result_never_redispatches_after_recovery',), ('super::super::filesystem::fs',), 'read', 'read the isolated durable effect through the counted filesystem boundary'),
         ('journal/tests/grants.rs', ('fn missing_authoritative_log_refuses_restart_without_recreating_uses',), ('Journal',), 'open', 'isolated replay refuses a lost authoritative log'),
         ('journal/tests/grants.rs', ('fn pending_accounting_ahead_of_journal_refuses_without_use',), ('Journal',), 'open', 'isolated pending reservation fixture through the counted journal opener'),
+        ('journal/tests/grants.rs', ('fn fix1_stalled_selection_has_a_structural_bound_and_spends_nothing',), ('Journal',), 'open', 'isolated stalled selection fixture through the counted journal opener'),
+        ('journal/tests/grants.rs', ('fn fix1_stalled_selection_has_a_structural_bound_and_spends_nothing',), ('std::thread',), 'spawn', 'owned no-progress producer with bounded failure on silence or disconnection'),
         ('journal/tests/grants.rs', ('fn missing_authoritative_log_refuses_restart_without_recreating_uses',), ('super::super::filesystem::fs',), 'remove_file read', 'isolated log-loss fixture through the counted filesystem boundary'),
         ('journal/compact.rs', ('impl Read for Positioned', 'fn read'), ('<definition>',), 'read', 'existing journal method declaration, not an expression permission'),
         ('journal/compact.rs', ('impl Read for Positioned', 'fn read'), ('<namespace>',), 'files', 'existing use of reviewed counted stream/namespace alias; this use site reviewed separately'),

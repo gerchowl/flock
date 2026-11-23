@@ -117,6 +117,7 @@ impl Fixture {
         };
         admit(
             &self.owner,
+            self.owner.gate().load(Ordering::Acquire),
             ingress,
             self.store.clone(),
             self.generation,
@@ -433,6 +434,7 @@ fn changed_target_and_payload_under_existing_key_refuse() {
             assert!(matches!(
                 admit(
                     &f.owner,
+                    f.owner.gate().load(Ordering::Acquire),
                     ingress,
                     f.store.clone(),
                     f.generation,
@@ -475,6 +477,7 @@ fn clock_latch_refuses_timed_and_allows_untimed() {
         claimed(
             admit(
                 &f.owner,
+                f.owner.gate().load(Ordering::Acquire),
                 ingress,
                 f.store.clone(),
                 generation,
@@ -596,4 +599,18 @@ async fn real_destination_refusals(f: &Fixture) {
         journal::Admission::Refused(Refusal::Verb)
     ));
     assert_eq!(observation.sample().appended, 0);
+}
+
+mod fix1;
+
+type BeforeAdmit =
+    Box<dyn FnOnce(Ownership) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>>;
+thread_local! {
+    static BEFORE_ADMIT: std::cell::RefCell<Option<BeforeAdmit>> = const { std::cell::RefCell::new(None) };
+}
+pub(super) async fn before_admit(owner: &Ownership) {
+    let hook = BEFORE_ADMIT.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook(owner.clone()).await;
+    }
 }

@@ -601,7 +601,9 @@ historical contract until this amendment is accepted and implemented.
    over `flock-m1-args-v1\0` followed by canonical JSON of the arguments alone
    (sorted object keys, no whitespace, JSON value types preserved), using the
    same canonical encoder as J1's `(verb, args)` digest. A1 accepts principal strings,
-   not identity proofs. P1 extends M1's `TokenSource` with Agent and adds dormant
+   not identity proofs. Destination lifecycle admission requires a configured pin
+   established by explicit outbound enrollment; first-contact TOFU pins and
+   legacy pins with unknown origin confer no lifecycle authority. P1 extends M1's `TokenSource` with Agent and adds dormant
    admission adapters for app sessions and scoped MCP identities. Before agent
    forwarding, M3 must invoke these adapters inside authenticated admission and
    use the verified agent identity and policy-derived scope ceiling; an agent

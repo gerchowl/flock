@@ -33,6 +33,7 @@ pub(crate) enum Refusal {
     Exhausted,
     NoGrant,
     AccountingLost,
+    SelectionLimit,
 }
 /// Preflight only: an allowed decision does not consume or authorize dispatch.
 #[derive(Debug, PartialEq)]

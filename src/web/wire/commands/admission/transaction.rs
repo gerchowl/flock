@@ -33,6 +33,7 @@ fn verified(frame: &Frame) -> Result<Body, Refusal> {
 }
 async fn admit(
     owner: &Ownership,
+    phase: u64,
     ingress: Ingress,
     store: Arc<gateway::Store>,
     generation: u64,
@@ -106,7 +107,6 @@ async fn admit(
             Ok((clock, member))
         }),
     };
-    let phase = owner.gate().load(std::sync::atomic::Ordering::Acquire);
     GrantAdmission::claim(owner, phase, claim).await
 }
 /// In-process destination dispatcher, deliberately disconnected from mesh ingress.
@@ -127,12 +127,10 @@ async fn execute(
         read: Box::new(move |body| {
             let enrolled = crate::mesh::hello::with_store(|store| {
                 store
-                    .origin_name(&body.home_node_id)
+                    .explicitly_enrolled(&body.home_node_id)
                     .map_err(|e| e.to_string())
             })
-            .ok()
-            .flatten()
-            .is_some();
+            .unwrap_or(false);
             if !enrolled {
                 return Err(Refusal::Enrollment);
             }
@@ -145,7 +143,9 @@ async fn execute(
     };
     let store = Arc::new(gateway::Store::open(owner.data())?);
     let generation = store.generation()?;
-    let (result, grant) = admit(owner, ingress, store, generation, destination).await?;
+    #[cfg(all(test, debug_assertions))]
+    tests::before_admit(owner).await;
+    let (result, grant) = admit(owner, phase, ingress, store, generation, destination).await?;
     let Some(grant) = grant else {
         return Ok(result);
     };
