@@ -104,6 +104,15 @@ impl App {
         target: AgentTarget,
         caller: SpawnCaller,
     ) -> String {
+        self.handle_structured_stop_authorized(id, target, caller, None)
+    }
+    pub(super) fn handle_structured_stop_authorized(
+        &mut self,
+        id: String,
+        target: AgentTarget,
+        caller: SpawnCaller,
+        authority: Option<&crate::structured::permissions::auth::lifecycle::Authority<'_>>,
+    ) -> String {
         let (agent, generation) = match self.structured_target(&target.target) {
             Ok(Some(target)) => target,
             Err(code) => {
@@ -126,7 +135,14 @@ impl App {
                 };
             }
         };
-        let allowed = may_stop(caller, &agent);
+        let allowed = match authority {
+            Some(a) if a.grant_workspace().is_some() => {
+                a.grants_stop(self.node_id.as_deref(), &agent)
+                    && a.grant_workspace()
+                        .is_some_and(|w| self.granted_destination(w, Some(&agent)).is_ok())
+            }
+            _ => may_stop(caller, &agent),
+        };
         if !allowed {
             return encode_error(
                 id,

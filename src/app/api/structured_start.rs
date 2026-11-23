@@ -37,19 +37,31 @@ impl App {
         caller: &SpawnCaller,
         verb: crate::spawn::SpawnVerb,
         opening_turn: Option<crate::spawn::prompt::SpawnPrompt>,
-        app_session: Option<&crate::structured::permissions::auth::tokens::server::Session>,
+        authority: Option<&crate::structured::permissions::auth::lifecycle::Authority<'_>>,
     ) -> Result<ResponseResult, ErrorCode> {
-        let app_operator = app_session.is_some_and(|session| {
-            session.app().is_some()
-                && session
-                    .info
-                    .scopes
-                    .contains(&crate::api::client_tokens::Scope::Operate)
-        });
+        let app_operator = authority.is_some_and(|a| a.app_operator());
+        let granted_workspace = authority
+            .map(|a| a.start_workspace(self.node_id.as_deref(), &params))
+            .transpose()?
+            .flatten()
+            .map(str::to_owned);
+        let remote_caller =
+            authority
+                .and_then(|a| a.remote_subject())
+                .map(|subject| SpawnCaller::Structured {
+                    agent_id: Some(subject.parent_key()),
+                    depth: 0,
+                });
+        let caller = remote_caller.as_ref().unwrap_or(caller);
+        if granted_workspace.is_some()
+            && (opening_turn.is_some() || verb != crate::spawn::SpawnVerb::Fork)
+        {
+            return Err(ErrorCode::NotAuthorized);
+        }
         if params.dry_run
             || params.here
             || params.split.is_some()
-            || params.workspace_id.is_some()
+            || (params.workspace_id.is_some() && granted_workspace.is_none())
             || params.tab_id.is_some()
             || params.label.is_some()
             || params.questions.is_some()
@@ -74,9 +86,20 @@ impl App {
             })
             .transpose()?;
         let existing = self.structured_target(&params.name)?;
-        let destination = self.native_destination(existing.as_ref().map(|(id, _)| id.as_str()))?;
+        if granted_workspace.is_some()
+            && ((existing.is_some() != authority.is_some_and(|a| a.permits_resume()))
+                || existing.as_ref().is_some_and(|(id, _)| id != &params.name))
+        {
+            return Err(ErrorCode::NotAuthorized);
+        }
+        let destination = if let Some(workspace) = &granted_workspace {
+            Some(self.granted_destination(workspace, existing.as_ref().map(|(id, _)| id.as_str()))?)
+        } else {
+            self.native_destination(existing.as_ref().map(|(id, _)| id.as_str()))?
+        };
         // ADR-0036 §1a: neither history ownership nor a relay grants resume authority.
         if (existing.is_some()
+            && granted_workspace.is_none()
             && (!matches!(caller, SpawnCaller::Operator { .. })
                 || (!app_operator
                     && self.current_api_peer_uid.is_none_or(|uid| {

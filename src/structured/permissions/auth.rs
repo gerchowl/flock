@@ -31,3 +31,7 @@ pub(crate) mod tokens;
 // Dormant destination authority API, consumed by M2 admission, never local tokens.
 #[allow(dead_code)]
 pub(crate) mod gateway;
+
+// Grant authority remains dormant until verified destination ingress is wired.
+#[allow(dead_code)]
+pub(crate) mod lifecycle;
