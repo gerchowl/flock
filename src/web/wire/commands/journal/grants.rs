@@ -23,10 +23,12 @@ pub(in crate::web::wire) struct Consumption {
     pub ordinal: u64,
     pub destination: String,
     pub target: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clock: Option<ClockPair>,
 }
 /// Authenticated preflight facts, never constructed from unverified mesh JSON.
 /// `environment` runs under the generation lease immediately before evaluation.
-/// P3c will supply durable paired-clock evidence; M2 adds budget/enrollment checks.
+/// M2 adds authenticated budget/enrollment checks before this final clock read.
 pub(in crate::web::wire) struct Claim {
     pub store: std::sync::Arc<Store>,
     pub generation: u64,
@@ -83,6 +85,18 @@ impl Journal {
                 target: gateway::lifecycle::target(&c.command.verb, &c.target),
             };
             let (clock, workspace) = (c.environment)();
+            let timed = listing
+                .entries
+                .values()
+                .flatten()
+                .filter_map(|g| g.lifecycle.as_ref())
+                .any(|p| {
+                    p.lifetime_ms.is_some() && p.issuance.as_ref().is_some_and(|i| i.id == selected)
+                });
+            if timed && !fence.clock_check(listing, selected, clock.as_ref())? {
+                return Ok(Admission::Refused(Refusal::Expired));
+            }
+            let evidence = timed.then(|| clock.clone()).flatten();
             let decision = gateway::lifecycle::evaluate_listing(
                 &Evaluation {
                     request: &request,
@@ -120,6 +134,7 @@ impl Journal {
                     issuance,
                     destination: c.destination,
                     target: c.target,
+                    clock: evidence,
                 },
             };
             let state = self.claim_with(
