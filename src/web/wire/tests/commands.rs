@@ -1408,3 +1408,32 @@ fn ended_history_cut_recovers_after_restart_without_losing_the_socket() {
 }
 
 mod causal;
+
+#[test]
+fn send_and_answer_refusals_share_lifecycle_audit_context() {
+    let logs = crate::logging::capture_logs(|| {
+        runtime(async {
+            let mut case = Case::new(183118).await;
+            let mut socket = case.open().await;
+            let send = case.command(&mut socket, "agent.send", json!({"target":"missing-audit-target", "text":"audit-sensitive-text", "submit":true})).await;
+            assert_eq!(send["ok"], false);
+            let answer = case.command(&mut socket, "agent.decide", json!({"agent":"missing-audit-target", "request_id":"missing-request", "request_seq":1, "decision":"deny"})).await;
+            assert_eq!(answer["ok"], false);
+            case.stop().await;
+        })
+    });
+    let events: Vec<_> = logs
+        .lines()
+        .filter(|line| line.contains("wire.lifecycle.admission"))
+        .collect();
+    assert_eq!(events.len(), 2, "{logs}");
+    for verb in ["agent.send", "agent.decide"] {
+        assert!(
+            events.iter().any(|line| line.contains(verb)
+                && line.contains("target=\"missing-audit-target\"")
+                && line.contains("identity=\"verified\"")),
+            "{logs}"
+        );
+    }
+    assert!(!logs.contains("audit-sensitive-text"));
+}

@@ -962,3 +962,95 @@ fn fix1_stalled_selection_has_a_structural_bound_and_spends_nothing() {
     refused(result, Refusal::SelectionLimit);
     assert_eq!((records, consumed), (0, 0));
 }
+
+#[test]
+fn single_implicitly_selected_latched_grant_reports_expired() {
+    let (root, _store, generation, issuance) = gateway::claim_timed_fixture(10000, 20000);
+    let mut journal = Journal::open(root.path()).unwrap();
+    let c = clock_request(root.path(), generation, &issuance, "latch", 9000, 21000);
+    refused(journal.grant(c), Refusal::Expired);
+    let c = clock_request(root.path(), generation, "", "implicit", 11000, 21000);
+    refused(journal.grant(c), Refusal::Expired);
+    assert!(journal.index.records.is_empty());
+    assert!(journal.index.consumed.is_empty());
+}
+
+#[test]
+fn receipts_survive_outcome_recovery_and_unknown_fields_stay_raw() {
+    let (root, _store, generation, issuance) = gateway::claim_fixture();
+    let mut journal = Journal::open(root.path()).unwrap();
+    let original = claimed(journal.grant(request(root.path(), generation, &issuance, "bound")));
+    journal
+        .claim("local", "local-principal", &super::command("old"), 100)
+        .unwrap();
+    let key = ("a".repeat(64), "client-1".into(), "bound".into());
+    let frame = journal.finish(&key, 100, Ok(json!({"effect":1}))).unwrap();
+    drop(journal);
+    let mut journal = Journal::open(root.path()).unwrap();
+    assert!(!journal.blocked);
+    assert_eq!(
+        journal.index.records[&key].consumption.as_ref(),
+        Some(&original)
+    );
+    assert!(journal
+        .index
+        .records
+        .values()
+        .any(|r| r.version == 1 && r.consumption.is_none()));
+    assert!(
+        matches!(journal.grant(request(root.path(), generation, &issuance, "bound")).unwrap(), Admission::Granted { consumption, state } if consumption == original && matches!(*state, Admission::Replayed(ref result) if result == &frame))
+    );
+    assert_eq!(journal.index.consumed[&issuance], 1);
+    let path = root.path().join("wire/commands.jsonl");
+    drop(journal);
+    let raw = super::super::filesystem::fs::read_to_string(&path).unwrap();
+    let mut rows: Vec<serde_json::Value> = raw
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let legacy: String = rows
+        .iter()
+        .cloned()
+        .map(|mut row| {
+            if row["cmd_id"] == "bound" {
+                row["version"] = json!(2);
+                row["consumption"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("binding");
+            }
+            format!("{row}\n")
+        })
+        .collect();
+    super::super::filesystem::fs::write(&path, &legacy).unwrap();
+    let legacy_journal = Journal::open(root.path()).unwrap();
+    assert!(!legacy_journal.blocked);
+    assert_eq!(legacy_journal.index.consumed[&issuance], 1);
+    let old = legacy_journal.index.records[&key]
+        .consumption
+        .as_ref()
+        .unwrap();
+    assert!(old.binding.is_none());
+    assert_eq!(old.issuance, original.issuance);
+    assert_eq!(old.ordinal, original.ordinal);
+    assert_eq!(
+        legacy_journal.index.records[&key].outcome,
+        Some(serde_json::to_value(&frame).unwrap())
+    );
+    drop(legacy_journal);
+    for row in &mut rows {
+        if row["cmd_id"] == "bound" {
+            row["consumption"]["binding"]["future"] = json!({"opaque":true});
+        }
+    }
+    let unknown: String = rows.iter().map(|row| format!("{row}\n")).collect();
+    super::super::filesystem::fs::write(&path, &unknown).unwrap();
+    let journal = Journal::open(root.path()).unwrap();
+    assert!(journal.blocked);
+    assert!(journal.index.records.values().any(|r| r.cmd_id == "old"));
+    assert!(!journal.index.records.contains_key(&key));
+    assert_eq!(
+        super::super::filesystem::fs::read_to_string(path).unwrap(),
+        unknown
+    );
+}

@@ -5342,6 +5342,46 @@ pub(crate) fn mesh_protocol_violation(peer: &str, version: u32, kind: &str) {
     tracing::warn!(target: "flock::mesh", event = "mesh_protocol_violation", peer, version, kind, "mesh session refused");
 }
 
+#[cfg(feature = "web")]
+#[derive(Default)]
+pub(crate) struct LifecycleAudit<'a> {
+    pub(crate) credential: &'a str,
+    pub(crate) principal: &'a str,
+    pub(crate) target: &'a str,
+    pub(crate) agent_id: &'a str,
+    pub(crate) session_id: &'a str,
+    pub(crate) verb: &'a str,
+    pub(crate) cmd_id: &'a str,
+    pub(crate) outcome: &'a str,
+    pub(crate) identity: &'a str,
+    pub(crate) home: &'a str,
+    pub(crate) issuance: Option<&'a str>,
+    pub(crate) use_ordinal: Option<u64>,
+    pub(crate) generation: Option<u64>,
+    pub(crate) detail: &'a str,
+}
+#[cfg(feature = "web")]
+pub(crate) fn wire_lifecycle_admission(a: LifecycleAudit<'_>) {
+    tracing::info!(
+        event = "wire.lifecycle.admission",
+        credential = a.credential,
+        principal = a.principal,
+        target = a.target,
+        agent_id = a.agent_id,
+        session_id = a.session_id,
+        verb = a.verb,
+        cmd_id = a.cmd_id,
+        outcome = a.outcome,
+        identity = a.identity,
+        home = a.home,
+        issuance = ?a.issuance,
+        use_ordinal = ?a.use_ordinal,
+        generation = ?a.generation,
+        detail = a.detail,
+        "wire lifecycle admission"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -25,6 +25,19 @@ pub(in crate::web::wire) struct Consumption {
     pub target: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clock: Option<ClockPair>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding: Option<Binding>,
+}
+/// Immutable receipt context, retained by both the J1 claim and its outcome.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(in crate::web::wire) struct Binding {
+    pub home: String,
+    pub principal: String,
+    pub cmd_id: String,
+    pub args_digest: [u8; 32],
+    pub verb: String,
+    pub generation: u64,
 }
 type EnvironmentReader = dyn FnMut() -> Result<(Option<ClockPair>, Option<String>), Refusal> + Send;
 
@@ -50,13 +63,13 @@ impl Journal {
         if self.blocked {
             return Err(ErrorCode::SessionBusy);
         }
-        c.store.with_accounting(|listing, fence| {
+        let store = c.store.clone();
+        store.with_accounting(|listing, fence| {
             if listing.generation != c.generation {
                 return Ok(Admission::Refused(Refusal::Revoked));
             }
             let key = (c.home.clone(), c.principal.clone(), c.command.id.clone());
             let existing = self.index.records.get(&key);
-            let mut consumed = self.index.consumed.clone();
             if let Some(record) = existing {
                 let Some(use_) = &record.consumption else {
                     return Err(ErrorCode::InvalidParams);
@@ -67,19 +80,19 @@ impl Journal {
                 {
                     return Err(ErrorCode::InvalidParams);
                 }
-                // Recheck present authority without charging the retry's own use.
-                let total = consumed
-                    .get_mut(&use_.issuance)
-                    .ok_or(ErrorCode::SessionUnconfirmed)?;
-                *total = total.checked_sub(1).ok_or(ErrorCode::SessionUnconfirmed)?;
+                let Some(binding) = &use_.binding else {
+                    return Ok(Admission::Refused(Refusal::AccountingLost));
+                };
+                if binding.generation != listing.generation {
+                    return Ok(Admission::Refused(Refusal::Revoked));
+                }
+                return self.replay_grant(&mut c, listing, record.clone());
             }
-            if c.command.resume_only && existing.is_none() {
+            if c.command.resume_only {
                 return Err(ErrorCode::SessionUnconfirmed);
             }
-            let selected = existing
-                .and_then(|r| r.consumption.as_ref())
-                .map(|u| u.issuance.as_str())
-                .or_else(|| (!c.issuance.is_empty()).then_some(c.issuance.as_str()));
+            let consumed = &self.index.consumed;
+            let selected = (!c.issuance.is_empty()).then_some(c.issuance.as_str());
             let request = gateway::Request {
                 home: &c.home,
                 principal: &c.principal,
@@ -109,7 +122,7 @@ impl Journal {
                         source: c.source,
                         destination: &c.destination,
                         clock: clock.clone(),
-                        consumed: &consumed,
+                        consumed,
                     },
                     c.generation,
                     &candidates,
@@ -138,7 +151,7 @@ impl Journal {
                         clock.as_ref(),
                     )?
                 {
-                    if selected.is_some() && (existing.is_some() || !c.issuance.is_empty()) {
+                    if selected.is_some() && !c.issuance.is_empty() {
                         return Ok(Admission::Refused(Refusal::Expired));
                     }
                     candidates.entries.retain(|_, grant| {
@@ -177,7 +190,7 @@ impl Journal {
                     source: c.source,
                     destination: &c.destination,
                     clock,
-                    consumed: &consumed,
+                    consumed,
                 },
                 c.generation,
                 listing,
@@ -194,20 +207,26 @@ impl Journal {
             if counted && !fence.check(&issuance, self.index.stamp(&issuance))? {
                 return Ok(Admission::Refused(Refusal::AccountingLost));
             }
-            let consumption = match existing {
-                Some(r) => r.consumption.clone().ok_or(ErrorCode::SessionUnconfirmed)?,
-                None => Consumption {
-                    ordinal: consumed
-                        .get(&issuance)
-                        .copied()
-                        .unwrap_or(0)
-                        .checked_add(1)
-                        .ok_or(ErrorCode::SessionBusy)?,
-                    issuance,
-                    destination: c.destination,
-                    target: c.target,
-                    clock: evidence,
-                },
+            let consumption = Consumption {
+                ordinal: consumed
+                    .get(&issuance)
+                    .copied()
+                    .unwrap_or(0)
+                    .checked_add(1)
+                    .ok_or(ErrorCode::SessionBusy)?,
+                issuance,
+                destination: c.destination,
+                target: c.target,
+                clock: evidence,
+                binding: Some(Binding {
+                    home: c.home.clone(),
+                    principal: c.principal.clone(),
+                    cmd_id: c.command.id.clone(),
+                    args_digest: crate::mesh::command::args_digest(&c.command.args)
+                        .map_err(|_| ErrorCode::SerializationError)?,
+                    verb: c.command.verb.clone(),
+                    generation: c.generation,
+                }),
             };
             let state = self.claim_with(
                 &c.home,
@@ -221,6 +240,75 @@ impl Journal {
                 consumption,
                 state: Box::new(state),
             })
+        })
+    }
+    /// Expiry and remaining uses apply only at claim. Replay rechecks identity,
+    /// generation, membership, enrollment and disclosure policy without a use.
+    fn replay_grant(
+        &mut self,
+        c: &mut Claim,
+        listing: &crate::api::gateway_grants::Listing,
+        record: super::Record,
+    ) -> Result<Admission, ErrorCode> {
+        let consumption = record.consumption.ok_or(ErrorCode::SessionUnconfirmed)?;
+        let mut current = listing.clone();
+        let mut present = false;
+        for policy in current
+            .entries
+            .values_mut()
+            .flatten()
+            .filter_map(|g| g.lifecycle.as_mut())
+        {
+            if policy
+                .issuance
+                .as_ref()
+                .is_some_and(|i| i.id == consumption.issuance)
+            {
+                policy.lifetime_ms = None;
+                policy.max_uses = None;
+                present = true;
+            }
+        }
+        if !present {
+            return Ok(Admission::Refused(Refusal::Revoked));
+        }
+        let (clock, workspace) = match (c.environment)() {
+            Ok(environment) => environment,
+            Err(reason) => return Ok(Admission::Refused(reason)),
+        };
+        let request = gateway::Request {
+            home: &c.home,
+            principal: &c.principal,
+            scopes: &c.scopes,
+            verb: &c.command.verb,
+            target: gateway::lifecycle::target(&c.command.verb, &c.target),
+        };
+        if let Decision::Refused(reason) = gateway::lifecycle::evaluate_listing(
+            &Evaluation {
+                request: &request,
+                source: c.source,
+                destination: &c.destination,
+                clock,
+                consumed: &BTreeMap::new(),
+            },
+            c.generation,
+            &current,
+            Some(&consumption.issuance),
+            |_| workspace,
+        ) {
+            return Ok(Admission::Refused(reason));
+        }
+        let state = self.claim_with(
+            &c.home,
+            &c.principal,
+            &c.command,
+            c.now,
+            Some(consumption.clone()),
+            None,
+        )?;
+        Ok(Admission::Granted {
+            consumption,
+            state: Box::new(state),
         })
     }
 }

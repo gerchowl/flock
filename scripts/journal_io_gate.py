@@ -108,6 +108,8 @@ ALLOWLIST = {
     'std::collections::BTreeMap': 'recovered issuance consumption totals',
     'std::collections::BTreeSet': 'verified request scopes',
     'crate::api::gateway_grants::ClockPair': 'destination clock evidence value',
+    'crate::api::gateway_grants::Listing': 'owned grant snapshot value for replay disclosure checks',
+    'crate::mesh::command::args_digest': 'pure shared argument digest for bound receipts',
     'crate::structured::permissions::auth::gateway': 'A1 lease and pure grant evaluation; no journal file handles escape',
     'crate::structured::permissions::auth::tokens::Scope': 'verified request scope values',
     'std::collections::HashMap': 'journal indexes',
@@ -570,6 +572,9 @@ CALL_EXCEPTIONS = {
         ('journal/tests/recovery.rs', ('fn a_surviving_prefix_behind_the_a1_watermark_cannot_restore_uses',), ('filesystem::fs',), 'read write', 'fault injection changes only the isolated fixture storage through counted adapters'),
 
         ('journal/compact.rs', ('impl Snapshot', 'fn emit_pending'), ('self.file',), 'write_all', 'checkpoint publication uses the counted compaction stream'),
+        ('journal/tests/grants.rs', ('fn single_implicitly_selected_latched_grant_reports_expired',), ('Journal',), 'open', 'isolated selection-bound fixture through counted journal replay'),
+        ('journal/tests/grants.rs', ('fn receipts_survive_outcome_recovery_and_unknown_fields_stay_raw',), ('Journal',), 'open', 'isolated receipt recovery through counted journal replay'),
+        ('journal/tests/grants.rs', ('fn receipts_survive_outcome_recovery_and_unknown_fields_stay_raw',), ('super::super::filesystem::fs',), 'read_to_string write', 'inspect and inject future receipt fields only in isolated fixture storage through counted adapters'),
         ('journal/grants.rs', ('fn retired',), ('Store',), 'open', 'read A1 through its existing durable Namespace boundary, outside the wire directory'),
         ('journal/tests/recovery.rs', ('fn deleting_the_wire_directory_cannot_restore_counted_authority',), ('Journal',), 'open', 'isolated counted replay for loss, recovery and bounded retention'),
         ('journal/tests/recovery.rs', ('fn standing_history_is_bounded_over_two_months_without_operator_lockout',), ('Journal',), 'open', 'isolated counted replay for loss, recovery and bounded retention'),

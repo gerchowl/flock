@@ -695,6 +695,8 @@ historical contract until this amendment is accepted and implemented.
    state without consuming again; a different target/payload refuses. A retry
    must still pass current identity, revocation and result-disclosure checks,
    but exhaustion caused by its own claim is not a second-use refusal.
+   Expiry is evaluated only at claim; a replay of an already-claimed command is
+   fenced by identity, revocation and disclosure policy, not by expiry or remaining uses.
    Select one matching issuance deterministically (issuance ID order); consume
    only that grant, recording its ID and use ordinal in the claim. Two homes
    or different command IDs competing for one use serialize at the destination.
@@ -735,7 +737,13 @@ historical contract until this amendment is accepted and implemented.
    and refusals, extending its fields for gateway context and send/answer, and
    existing durable event surfaces (ADR-0005/ADR-0036 §5a). Extend the versioned
    J1 claim/outcome with grant consumption metadata for admitted commands and
-   replayable results; today J1 has no grant ID. A refused attempt emits audit
+   replayable results. M2b's version-4 grant rows bind home, principal, `cmd_id`,
+   argument digest, verb, destination, canonical target, issuance ID, use ordinal
+   and generation; the outcome path returns that original receipt context.
+   Versions 1–3 remain readable. Legacy grant rows without a recorded generation
+   cannot prove the disclosure fence and refuse replay with `AccountingLost`;
+   loading never invents authority metadata. Unknown newer fields remain raw.
+   A refused attempt emits audit
    metadata without creating a dispatchable claim or spending a use. Replays
    record replay/pending/refused outcomes, not another effect. Preserve unknown
    records per ADR-0028 §3a; no second audit log format or secret payload logging.

@@ -31,7 +31,26 @@ fn verified(frame: &Frame) -> Result<Body, Refusal> {
         _ => Refusal::Provenance,
     })
 }
+mod audit;
 async fn admit(
+    owner: &Ownership,
+    phase: u64,
+    ingress: Ingress,
+    store: Arc<gateway::Store>,
+    generation: u64,
+    destination: Destination,
+) -> Result<(journal::Admission, Option<GrantAdmission>), ErrorCode> {
+    let audit = audit::Context::new(&ingress, generation);
+    let result = admit_inner(owner, phase, ingress, store, generation, destination).await;
+    audit.record(
+        result
+            .as_ref()
+            .map(|(admission, _)| admission)
+            .map_err(|e| *e),
+    );
+    result
+}
+async fn admit_inner(
     owner: &Ownership,
     phase: u64,
     ingress: Ingress,
@@ -85,6 +104,7 @@ async fn admit(
     let source = match body.token_source {
         TokenSource::App => PrincipalKind::User,
         TokenSource::Agent => PrincipalKind::Agent,
+        // Defence in depth: Body::validate also rejects File lifecycle tokens.
         TokenSource::File => return Ok((journal::Admission::Refused(Refusal::Principal), None)),
     };
     let mut hop =
@@ -119,7 +139,11 @@ async fn execute(
     let phase = owner.gate().load(std::sync::atomic::Ordering::Acquire);
     let body = match verified(&ingress.frame) {
         Ok(body) => body,
-        Err(reason) => return Ok(journal::Admission::Refused(reason)),
+        Err(reason) => {
+            let result = journal::Admission::Refused(reason);
+            audit::Context::new(&ingress, 0).record(Ok(&result));
+            return Ok(result);
+        }
     };
     let member = app.gateway_lifecycle_member(&body);
     let destination = Destination {
@@ -143,13 +167,14 @@ async fn execute(
     };
     let store = Arc::new(gateway::Store::open(owner.data())?);
     let generation = store.generation()?;
+    let audit = audit::Context::new(&ingress, generation);
     #[cfg(all(test, debug_assertions))]
     tests::before_admit(owner).await;
     let (result, grant) = admit(owner, phase, ingress, store, generation, destination).await?;
     let Some(grant) = grant else {
         return Ok(result);
     };
-    let journal::Admission::Granted { consumption, state } = result else {
+    let journal::Admission::Granted { state, .. } = result else {
         return Err(ErrorCode::SessionUnconfirmed);
     };
     let journal::Admission::Claimed(admitted_ms) = *state else {
@@ -174,10 +199,8 @@ async fn execute(
         )?
         .await
         .map_err(|_| ErrorCode::SessionUnconfirmed)??;
-    Ok(journal::Admission::Granted {
-        consumption,
-        state: Box::new(state),
-    })
+    audit.completed(&state);
+    Ok(state)
 }
 
 // VERSION 6 negotiation overrides exist only in debug builds.
