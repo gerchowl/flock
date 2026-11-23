@@ -383,18 +383,45 @@ fn another_enrolled_node_cannot_collect_even_with_the_origins_token() {
             .filter(|line| line.ends_with('\n'))
     });
     assert!(line.contains("mesh_collection_refused"), "{line}");
+    // Scope every count to the answer key. The intruder's outbound poll
+    // imports its own delivery receipt (kind='receipt', request_origin IS
+    // NULL) for the "own conversation" message 0.7-0.95 s after the
+    // refusal, and while that receipt awaits nodec's ack it is a second
+    // held envelope on nodeb, so bare counts race.
+    let (o, i) = (
+        original["key"]["origin_node"].as_str().unwrap(),
+        original["key"]["message_id"].as_str().unwrap(),
+    );
+    let nodec = database(fleet.node("nodec"));
     assert_eq!(
-        database(fleet.node("nodec"))
-            .query_row("SELECT count(*) FROM inbox_imports", [], |r| r
-                .get::<_, i64>(0))
+        nodec
+            .query_row(
+                "SELECT count(*) FROM envelopes WHERE request_origin=?1 AND request_id=?2",
+                [o, i],
+                |r| r.get::<_, i64>(0),
+            )
             .unwrap(),
-        0
+        0,
+        "intruder stored a copy of the origin's answer",
+    );
+    assert_eq!(
+        nodec
+            .query_row(
+                "SELECT count(*) FROM inbox_imports JOIN envelopes USING(origin,id) \
+                 WHERE kind!='receipt' OR request_origin IS NOT NULL",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0,
+        "intruder imported something other than its own delivery receipts",
     );
     assert_eq!(
         database(fleet.node("nodeb"))
             .query_row(
-                "SELECT count(*) FROM envelopes WHERE state='held'",
-                [],
+                "SELECT count(*) FROM envelopes WHERE state='held' \
+                 AND request_origin=?1 AND request_id=?2",
+                [o, i],
                 |r| r.get::<_, i64>(0)
             )
             .unwrap(),
