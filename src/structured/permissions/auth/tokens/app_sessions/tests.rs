@@ -462,3 +462,15 @@ fn authenticated_app_and_file_provenance_round_trip_without_lifecycle_file_autho
         })
         .unwrap();
 }
+
+#[cfg(feature = "web")]
+pub(crate) fn replay_fixture() -> (
+    crate::structured::launch::SessionConfigDir,
+    Arc<Store>,
+    Session,
+) {
+    let (root, _files, store, _clock, mut app) = fixture();
+    let issued = store.issue(&app.client_token_authority().unwrap()).unwrap();
+    let session = store.authenticate(&issued.token).unwrap();
+    (root, Arc::new(store), session)
+}

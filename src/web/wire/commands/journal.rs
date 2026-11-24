@@ -133,6 +133,10 @@ pub(super) enum Admission {
     // Dormant M2 refusal receipt, before any durable claim or use.
     #[allow(dead_code)]
     Refused(crate::structured::permissions::auth::gateway::lifecycle::Refusal),
+    RefusedReplay {
+        consumption: Consumption,
+        reason: crate::structured::permissions::auth::gateway::lifecycle::Refusal,
+    },
     Claimed(u64),
     Replayed(ServerFrame),
     Pending(u64),

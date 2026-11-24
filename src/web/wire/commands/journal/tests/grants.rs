@@ -58,7 +58,9 @@ pub(super) fn claimed(result: Result<Admission, ErrorCode>) -> Consumption {
     }
 }
 fn refused(result: Result<Admission, ErrorCode>, expected: Refusal) {
-    assert!(matches!(result, Ok(Admission::Refused(reason)) if reason == expected));
+    assert!(
+        matches!(result, Ok(Admission::Refused(reason) | Admission::RefusedReplay { reason, .. }) if reason == expected)
+    );
 }
 #[test]
 fn final_lifecycle_use_is_not_admitted_twice() {
@@ -985,6 +987,11 @@ fn receipts_survive_outcome_recovery_and_unknown_fields_stay_raw() {
         .unwrap();
     let key = ("a".repeat(64), "client-1".into(), "bound".into());
     let frame = journal.finish(&key, 100, Ok(json!({"effect":1}))).unwrap();
+    for field in ["home", "principal", "cmd_id"] {
+        let mut mismatched = serde_json::to_value(&journal.index.records[&key]).unwrap();
+        mismatched["consumption"]["binding"][field] = json!("mismatched-binding");
+        assert!(super::super::Record::decode(&serde_json::to_vec(&mismatched).unwrap()).is_none());
+    }
     drop(journal);
     let mut journal = Journal::open(root.path()).unwrap();
     assert!(!journal.blocked);
@@ -1036,6 +1043,11 @@ fn receipts_survive_outcome_recovery_and_unknown_fields_stay_raw() {
     assert_eq!(
         legacy_journal.index.records[&key].outcome,
         Some(serde_json::to_value(&frame).unwrap())
+    );
+    let mut legacy_journal = legacy_journal;
+    refused(
+        legacy_journal.grant(request(root.path(), generation, &issuance, "bound")),
+        Refusal::AccountingLost,
     );
     drop(legacy_journal);
     for row in &mut rows {

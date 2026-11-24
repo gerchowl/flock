@@ -14,6 +14,7 @@ use tokio::sync::Notify;
 
 fn run(future: impl std::future::Future<Output = ()>) {
     let (_guard, _scrub) = crate::config::test_config_env_guard();
+    let _mesh = crate::mesh::runtime_store::TestStore::new();
     std::env::set_var("FLOCK_TEST_MESH_VERSION", "6");
     std::env::set_var("FLOCK_TEST_MESH_MIN", "5");
     crate::web::wire::tests::runtime(future);
@@ -129,7 +130,9 @@ impl Fixture {
     async fn refused(&self, dest: Destination, reason: Refusal) {
         let observation = self.owner.observe_writes_test();
         let (admission, grant) = self.submit(dest).await;
-        assert!(matches!(admission, journal::Admission::Refused(actual) if actual == reason));
+        assert!(
+            matches!(admission, journal::Admission::Refused(actual) | journal::Admission::RefusedReplay { reason: actual, .. } if actual == reason)
+        );
         assert!(grant.is_none());
         assert_eq!(observation.sample().appended, 0);
     }
@@ -675,3 +678,5 @@ pub(super) async fn before_admit(owner: &Ownership) {
 }
 
 mod receipts;
+
+mod review;

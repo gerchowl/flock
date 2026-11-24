@@ -63,12 +63,14 @@ impl Journal {
         if self.blocked {
             return Err(ErrorCode::SessionBusy);
         }
+        let key = (c.home.clone(), c.principal.clone(), c.command.id.clone());
+        let receipt = self
+            .index
+            .records
+            .get(&key)
+            .and_then(|r| r.consumption.clone());
         let store = c.store.clone();
-        store.with_accounting(|listing, fence| {
-            if listing.generation != c.generation {
-                return Ok(Admission::Refused(Refusal::Revoked));
-            }
-            let key = (c.home.clone(), c.principal.clone(), c.command.id.clone());
+        let result = store.with_accounting(|listing, fence| {
             let existing = self.index.records.get(&key);
             if let Some(record) = existing {
                 let Some(use_) = &record.consumption else {
@@ -80,13 +82,13 @@ impl Journal {
                 {
                     return Err(ErrorCode::InvalidParams);
                 }
-                let Some(binding) = &use_.binding else {
+                if use_.binding.is_none() {
                     return Ok(Admission::Refused(Refusal::AccountingLost));
-                };
-                if binding.generation != listing.generation {
-                    return Ok(Admission::Refused(Refusal::Revoked));
                 }
                 return self.replay_grant(&mut c, listing, record.clone());
+            }
+            if listing.generation != c.generation {
+                return Ok(Admission::Refused(Refusal::Revoked));
             }
             if c.command.resume_only {
                 return Err(ErrorCode::SessionUnconfirmed);
@@ -240,10 +242,18 @@ impl Journal {
                 consumption,
                 state: Box::new(state),
             })
+        });
+        result.map(|state| match (state, receipt) {
+            (Admission::Refused(reason), Some(consumption)) => Admission::RefusedReplay {
+                consumption,
+                reason,
+            },
+            (state, _) => state,
         })
     }
-    /// Expiry and remaining uses apply only at claim. Replay rechecks identity,
-    /// generation, membership, enrollment and disclosure policy without a use.
+    /// Expiry and remaining uses apply only at claim. Replay rechecks current
+    /// identity, membership, enrollment and disclosure policy under the A1 lease.
+    /// The receipt's historical generation does not fence unrelated store edits.
     fn replay_grant(
         &mut self,
         c: &mut Claim,
@@ -252,24 +262,16 @@ impl Journal {
     ) -> Result<Admission, ErrorCode> {
         let consumption = record.consumption.ok_or(ErrorCode::SessionUnconfirmed)?;
         let mut current = listing.clone();
-        let mut present = false;
-        for policy in current
+        let selected = current
             .entries
             .values_mut()
             .flatten()
             .filter_map(|g| g.lifecycle.as_mut())
-        {
-            if policy
-                .issuance
-                .as_ref()
-                .is_some_and(|i| i.id == consumption.issuance)
-            {
-                policy.lifetime_ms = None;
-                policy.max_uses = None;
-                present = true;
-            }
-        }
-        if !present {
+            .find(|p| matches!(&p.issuance, Some(i) if i.id == consumption.issuance));
+        if let Some(policy) = selected {
+            policy.lifetime_ms = None;
+            policy.max_uses = None;
+        } else {
             return Ok(Admission::Refused(Refusal::Revoked));
         }
         let (clock, workspace) = match (c.environment)() {
@@ -291,7 +293,7 @@ impl Journal {
                 clock,
                 consumed: &BTreeMap::new(),
             },
-            c.generation,
+            listing.generation,
             &current,
             Some(&consumption.issuance),
             |_| workspace,

@@ -8,7 +8,7 @@ use crate::{
     workspace::Workspace,
 };
 
-fn placed_app(f: &Fixture) -> crate::app::App {
+pub(super) fn placed_app(f: &Fixture) -> crate::app::App {
     let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = crate::app::App::new(
         &crate::config::Config::default(),
@@ -53,7 +53,7 @@ fn placed_app(f: &Fixture) -> crate::app::App {
         .unwrap();
     app
 }
-fn ingress(f: &Fixture) -> Ingress {
+pub(super) fn ingress(f: &Fixture) -> Ingress {
     Ingress {
         frame: f.frame(),
         since: crate::platform::suspend_clock::now(&crate::platform::suspend_clock::Kernel).ok(),
@@ -66,7 +66,7 @@ fn pin(f: &Fixture) -> IdentityPin {
         public_key: NodeIdentity::fixture([7; 32]).public_key().to_vec(),
     }
 }
-fn enroll(f: &Fixture) {
+pub(super) fn enroll(f: &Fixture) {
     crate::mesh::hello::with_store(|s| {
         s.put_pin("explicit.example", &pin(f))
             .map_err(|e| e.to_string())

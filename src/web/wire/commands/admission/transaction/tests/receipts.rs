@@ -87,6 +87,7 @@ fn admission_and_replay_audit_keep_verified_receipt_context() {
     let logs = crate::logging::capture_logs(|| {
         run(async {
             let mut f = Fixture::new(false, Some(1), false).await;
+            super::fix1::enroll(&f);
             f.command.args["private"] = json!("receipt-test-sensitive");
             f.body.args_digest = args_digest(&f.command.args);
             let (first, _) = f.submit(destination()).await;
@@ -192,6 +193,7 @@ fn authenticated_no_grant_and_changed_payload_are_audited_without_a_use() {
     let logs = crate::logging::capture_logs(|| {
         run(async {
             let mut f = Fixture::new(false, Some(1), false).await;
+            super::fix1::enroll(&f);
             claimed(f.submit(destination()).await, 1);
             let original = f.command.id.clone();
             f.command.args["extra"] = json!(true);

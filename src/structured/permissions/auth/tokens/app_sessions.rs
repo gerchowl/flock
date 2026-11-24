@@ -375,3 +375,6 @@ impl Store {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, feature = "web"))]
+pub(crate) use tests::replay_fixture;

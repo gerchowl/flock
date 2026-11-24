@@ -31,6 +31,14 @@ fn verified(frame: &Frame) -> Result<Body, Refusal> {
         _ => Refusal::Provenance,
     })
 }
+fn enrolled(body: &Body) -> bool {
+    crate::mesh::hello::with_store(|store| {
+        store
+            .explicitly_enrolled(&body.home_node_id)
+            .map_err(|e| e.to_string())
+    })
+    .unwrap_or(false)
+}
 mod audit;
 async fn admit(
     owner: &Ownership,
@@ -149,13 +157,7 @@ async fn execute(
     let destination = Destination {
         node: app.node_id.clone().ok_or(ErrorCode::NotAuthorized)?,
         read: Box::new(move |body| {
-            let enrolled = crate::mesh::hello::with_store(|store| {
-                store
-                    .explicitly_enrolled(&body.home_node_id)
-                    .map_err(|e| e.to_string())
-            })
-            .unwrap_or(false);
-            if !enrolled {
+            if !enrolled(body) {
                 return Err(Refusal::Enrollment);
             }
             Ok((
@@ -167,13 +169,26 @@ async fn execute(
     };
     let store = Arc::new(gateway::Store::open(owner.data())?);
     let generation = store.generation()?;
-    let audit = audit::Context::new(&ingress, generation);
+    let mut audit = audit::Context::new(&ingress, generation);
     #[cfg(all(test, debug_assertions))]
     tests::before_admit(owner).await;
     let (result, grant) = admit(owner, phase, ingress, store, generation, destination).await?;
     let Some(grant) = grant else {
         return Ok(result);
     };
+    audit.remember(&result);
+    let result = complete(app, owner, phase, body, grant, result).await;
+    audit.completed(result.as_ref().map_err(|code| *code));
+    result
+}
+async fn complete(
+    app: &mut crate::app::App,
+    owner: &Ownership,
+    phase: u64,
+    body: Body,
+    grant: GrantAdmission,
+    result: journal::Admission,
+) -> Result<journal::Admission, ErrorCode> {
     let journal::Admission::Granted { state, .. } = result else {
         return Err(ErrorCode::SessionUnconfirmed);
     };
@@ -199,7 +214,6 @@ async fn execute(
         )?
         .await
         .map_err(|_| ErrorCode::SessionUnconfirmed)??;
-    audit.completed(&state);
     Ok(state)
 }
 
