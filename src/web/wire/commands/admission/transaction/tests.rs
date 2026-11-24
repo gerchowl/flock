@@ -14,6 +14,7 @@ use tokio::sync::Notify;
 
 fn run(future: impl std::future::Future<Output = ()>) {
     let (_guard, _scrub) = crate::config::test_config_env_guard();
+    let _mesh = crate::mesh::runtime_store::TestStore::new();
     std::env::set_var("FLOCK_TEST_MESH_VERSION", "6");
     std::env::set_var("FLOCK_TEST_MESH_MIN", "5");
     crate::web::wire::tests::runtime(future);
@@ -129,7 +130,9 @@ impl Fixture {
     async fn refused(&self, dest: Destination, reason: Refusal) {
         let observation = self.owner.observe_writes_test();
         let (admission, grant) = self.submit(dest).await;
-        assert!(matches!(admission, journal::Admission::Refused(actual) if actual == reason));
+        assert!(
+            matches!(admission, journal::Admission::Refused(actual) | journal::Admission::RefusedReplay { reason: actual, .. } if actual == reason)
+        );
         assert!(grant.is_none());
         assert_eq!(observation.sample().appended, 0);
     }
@@ -450,8 +453,10 @@ fn changed_target_and_payload_under_existing_key_refuse() {
 #[test]
 fn clock_latch_refuses_timed_and_allows_untimed() {
     run(async {
-        let f = Fixture::new(false, Some(2), true).await;
+        let mut f = Fixture::new(false, Some(2), true).await;
         claimed(f.submit(destination()).await, 1);
+        f.command.id = "latched-new-command".into();
+        f.body.cmd_id = f.command.id.clone();
         let mut dest = destination();
         dest.read = Box::new(|_| {
             Ok((
@@ -523,11 +528,68 @@ pub(crate) async fn dispatch_fixture(
     let ingress = Ingress {
         frame: f.frame(),
         since: crate::platform::suspend_clock::now(&crate::platform::suspend_clock::Kernel).ok(),
-        command: f.command,
+        command: f.command.clone(),
     };
-    let result = execute(app, &f.owner, ingress).await;
+    let result = execute(app, &f.owner, ingress).await.unwrap();
+    let journal::Admission::Granted {
+        consumption: original,
+        state,
+    } = &result
+    else {
+        panic!("expected grant");
+    };
+    let journal::Admission::Replayed(frame) = state.as_ref() else {
+        panic!("expected durable result");
+    };
+    let expected = serde_json::to_value(frame).unwrap();
+    let snapshot = || {
+        app.state
+            .structured_agents
+            .records()
+            .iter()
+            .map(|r| {
+                (
+                    r.agent_id.clone(),
+                    app.state.structured_agents.get(&r.agent_id).unwrap().2,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let before = snapshot();
+    // Lose the response and reacquire J1 before retrying the actual dispatcher.
+    f.owner.freeze().await.unwrap();
+    f.owner.acquire().await.unwrap();
+    let retry = Ingress {
+        frame: f.frame(),
+        since: crate::platform::suspend_clock::now(&crate::platform::suspend_clock::Kernel).ok(),
+        command: f.command.clone(),
+    };
+    let replay = execute(app, &f.owner, retry).await.unwrap();
+    let journal::Admission::Granted { consumption, state } = replay else {
+        panic!("replay grant")
+    };
+    assert_eq!(consumption, *original);
+    assert!(
+        matches!(*state, journal::Admission::Replayed(ref frame) if serde_json::to_value(frame).unwrap() == expected)
+    );
+    let after = app
+        .state
+        .structured_agents
+        .records()
+        .iter()
+        .map(|r| {
+            (
+                r.agent_id.clone(),
+                app.state.structured_agents.get(&r.agent_id).unwrap().2,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        before, after,
+        "recovery must not repeat the lifecycle effect"
+    );
     f.owner.shutdown().await.unwrap();
-    match result.unwrap() {
+    match result {
         journal::Admission::Granted { state, .. } => match *state {
             journal::Admission::Replayed(frame) => serde_json::to_value(frame).unwrap(),
             _ => panic!("new execution must persist its result"),
@@ -614,3 +676,7 @@ pub(super) async fn before_admit(owner: &Ownership) {
         hook(owner.clone()).await;
     }
 }
+
+mod receipts;
+
+mod review;

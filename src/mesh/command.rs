@@ -178,6 +178,11 @@ impl Frame {
         })
     }
 
+    /// Claimed audit attribution only. This never authenticates the returned identity.
+    pub(crate) fn claimed_body(&self) -> Option<Body> {
+        serde_json::from_slice(&self.envelope.body).ok()
+    }
+
     /// The signer establishes the home, never the identity of the last hop.
     /// This verifies attestation and expiry only; M2 must enforce local grants.
     pub(crate) fn verify(&self) -> Result<Body, &'static str> {

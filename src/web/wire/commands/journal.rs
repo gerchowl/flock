@@ -72,6 +72,12 @@ impl Record {
         let version = match r.version {
             1 => r.consumption.is_none(),
             2 => consumption,
+            4 => {
+                consumption
+                    && r.consumption.as_ref()?.binding.as_ref().is_some_and(|b| {
+                        b.home == r.namespace && b.principal == r.principal && b.cmd_id == r.cmd_id
+                    })
+            }
             3 => {
                 consumption
                     && r.namespace.is_empty()
@@ -127,6 +133,10 @@ pub(super) enum Admission {
     // Dormant M2 refusal receipt, before any durable claim or use.
     #[allow(dead_code)]
     Refused(crate::structured::permissions::auth::gateway::lifecycle::Refusal),
+    RefusedReplay {
+        consumption: Consumption,
+        reason: crate::structured::permissions::auth::gateway::lifecycle::Refusal,
+    },
     Claimed(u64),
     Replayed(ServerFrame),
     Pending(u64),
@@ -614,9 +624,23 @@ impl Journal {
                 key,
                 admitted_ms,
                 result,
-            } => self
-                .finish(&key, admitted_ms, result)
-                .map(Admission::Replayed),
+            } => {
+                let state = Admission::Replayed(self.finish(&key, admitted_ms, result)?);
+                Ok(
+                    match self
+                        .index
+                        .records
+                        .get(&key)
+                        .and_then(|r| r.consumption.clone())
+                    {
+                        Some(consumption) => Admission::Granted {
+                            consumption,
+                            state: Box::new(state),
+                        },
+                        None => state,
+                    },
+                )
+            }
         }
     }
     fn claim(
@@ -684,7 +708,7 @@ impl Journal {
             return Err(ErrorCode::SessionBusy);
         }
         let record = Record {
-            version: if consumption.is_some() { 2 } else { 1 },
+            version: if consumption.is_some() { 4 } else { 1 },
             namespace: key.0,
             principal: key.1,
             cmd_id: key.2,

@@ -601,3 +601,15 @@ pub(crate) fn reserve_ahead_fixture(store: &Store, id: &str) {
         })
         .unwrap();
 }
+
+#[cfg(all(test, feature = "web"))]
+pub(crate) fn claim_edit(store: &Store, edit: impl FnOnce(&mut Grant)) -> u64 {
+    let (_lease, mut value) = store.snapshot().unwrap();
+    let mut grant: Grant = serde_json::from_value(value["entries"]["tablet"].clone()).unwrap();
+    edit(&mut grant);
+    value["entries"]["tablet"] = serde_json::to_value(grant).unwrap();
+    let generation = value["generation"].as_u64().unwrap() + 1;
+    value["generation"] = generation.into();
+    store.persist(&value).unwrap();
+    generation
+}

@@ -285,16 +285,20 @@ fn respond(request: Request, frame: ServerFrame, shared: &Shared, app: &App) {
         causal: request.causal,
     });
 }
+
 fn trace_reply(app: &App, request: &Request, frame: &ServerFrame, shared: &Shared) {
     let ServerFrame::Ack { result, error, .. } = frame else {
         return;
     };
     let registry = &app.state.structured_agents;
-    if lifecycle(&request.command.verb) {
+    if lifecycle(&request.command.verb)
+        || matches!(request.command.verb.as_str(), "agent.send" | "agent.decide")
+    {
         let target = request
             .command
             .args
             .get("target")
+            .or_else(|| request.command.args.get("agent"))
             .and_then(Value::as_str)
             .unwrap_or_default();
         // Registry context keeps refused decisions attributable without granting authority.
@@ -327,22 +331,23 @@ fn trace_reply(app: &App, request: &Request, frame: &ServerFrame, shared: &Share
             .map(|(agent, _)| agent.clone())
             .or_else(|| app.locate_agent(target).map(|location| location.agent_id))
             .unwrap_or_default();
-        tracing::info!(
-            event = "wire.lifecycle.admission",
-            credential = request.session.info.name.as_str(),
-            principal = request.session.info.principal.as_str(),
+        crate::logging::wire_lifecycle_admission(crate::logging::LifecycleAudit {
+            credential: request.session.info.name.as_str(),
+            principal: request.session.info.principal.as_str(),
             target,
-            agent_id = agent_id.as_str(),
-            session_id = identity
+            agent_id: agent_id.as_str(),
+            session_id: identity
                 .as_ref()
                 .map_or("", |(_, session)| session.as_str()),
-            verb = request.command.verb.as_str(),
-            cmd_id = request.command.id.as_str(),
-            outcome = error
+            verb: request.command.verb.as_str(),
+            cmd_id: request.command.id.as_str(),
+            outcome: error
                 .as_ref()
                 .map_or("admitted", |error| error.code.as_str()),
-            "wire lifecycle admission"
-        );
+            identity: "verified",
+            home: app.node_id.as_deref().unwrap_or_default(),
+            ..Default::default()
+        });
     }
     if let Some(code) = error
         .as_ref()
